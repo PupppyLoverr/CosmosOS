@@ -1,0 +1,9 @@
+hostname(1) - show or set the system nodename
+NAME
+    hostname - kernel nodename
+SYNOPSIS
+    hostname [name]
+DESCRIPTION
+    Prints the kernel nodename. With an argument, sets it via the
+    kernel (sysctl kernel.hostname, /proc/sys/kernel/hostname) and
+    persists it to /hostname for the next boot.

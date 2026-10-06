@@ -392,6 +392,140 @@ fn tokenize(s: &str) -> Vec<(String, bool)> {
     out
 }
 
+/// bash-style brace expansion of one word: `{a,b}` lists and `{x..y[..step]}`
+/// numeric/alpha ranges. Nested braces recurse; unexpandable braces stay
+/// literal. An unbraced word returns as a single item.
+fn brace_expand(s: &str) -> Vec<String> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'{' {
+            // find the matching '}' tracking nesting
+            let mut depth = 0usize;
+            let mut close: Option<usize> = None;
+            let mut j = i;
+            while j < b.len() {
+                match b[j] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if let Some(j) = close {
+                if let Some(alts) = brace_alts(&s[i + 1..j]) {
+                    let (pre, post) = (&s[..i], &s[j + 1..]);
+                    let mut out = Vec::new();
+                    for alt in &alts {
+                        for tail in brace_expand(post) {
+                            out.push(alloc::format!("{}{}{}", pre, alt, tail));
+                        }
+                    }
+                    return out;
+                }
+            }
+        }
+        i += 1;
+    }
+    alloc::vec![String::from(s)]
+}
+
+/// Alternatives inside `{...}`: a `A..B[..S]` range (numbers or single
+/// letters) or a depth-0 comma list. None when not expandable.
+fn brace_alts(inner: &str) -> Option<Vec<String>> {
+    let rp: Vec<&str> = inner.split("..").collect();
+    if rp.len() > 1 {
+        if rp.len() > 3 {
+            return None;
+        }
+        let end = |x: &str| -> Option<(i64, bool)> {
+            if let Ok(n) = x.parse::<i64>() {
+                return Some((n, false));
+            }
+            let mut cs = x.chars();
+            match (cs.next(), cs.next()) {
+                (Some(c), None) if c.is_ascii_alphabetic() => Some((c as i64, true)),
+                _ => None,
+            }
+        };
+        let (a, is_char) = end(rp[0])?;
+        let (b, _) = end(rp[1])?;
+        let step = rp
+            .get(2)
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(|s| s.abs())
+            .unwrap_or(1)
+            .max(1);
+        let mut out = Vec::new();
+        let mut v = a;
+        let render = |v: i64| -> String {
+            if is_char {
+                char::from_u32(v as u32)
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| alloc::format!("{}", v))
+            } else {
+                alloc::format!("{}", v)
+            }
+        };
+        if a <= b {
+            while v <= b {
+                out.push(render(v));
+                v += step;
+            }
+        } else {
+            while v >= b {
+                out.push(render(v));
+                v -= step;
+            }
+        }
+        return Some(out);
+    }
+    // comma list at depth 0; `{a}` without a comma does not expand
+    let mut out: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    let mut saw_comma = false;
+    for c in inner.chars() {
+        match c {
+            '{' => {
+                depth += 1;
+                cur.push(c);
+            }
+            '}' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if depth == 0 => {
+                saw_comma = true;
+                out.push(core::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !saw_comma {
+        return None;
+    }
+    out.push(cur);
+    Some(out.iter().flat_map(|p| brace_expand(p)).collect())
+}
+
+/// `~` / `~/...` at a word start expands to $HOME (`/` when unset), like bash.
+fn tilde_expand(w: &str, home: &str) -> String {
+    if w == "~" {
+        return String::from(home);
+    }
+    if w.starts_with("~/") {
+        return alloc::format!("{}{}", home.trim_end_matches('/'), w);
+    }
+    String::from(w)
+}
+
 /// Unix epoch seconds -> (y, m, d, h, min, s) UTC.
 fn epoch_to_dt(secs: u64) -> (u16, u8, u8, u8, u8, u8) {
     let mut d = secs / 86400;
@@ -1987,6 +2121,7 @@ struct Term {
     heredocs: Vec<String>,                             // heredoc bodies extracted by norm_stmts (`<<\x01N` markers)
     flow: u8,                                          // 0 none, 1 break, 2 continue, 3 script-exit
     script_depth: u8,                                  // >0 inside sh/source/eval -- `exit` stops script not window
+    fc_depth: u8,                                      // recursion guard: `fc` reruns can't nest forever
     dirstack: Vec<String>,                             // pushd/popd stack (dirs prints it)
     host: String,                                      // hostname (persisted in /hostname)
 }
@@ -2351,6 +2486,13 @@ impl Term {
                 "-r" | "-w" | "-x" => ustd::stat(a[1]).is_ok(), // single permissive fs
                 "-z" => a[1].is_empty(),
                 "-n" => !a[1].is_empty(),
+                // -v VAR: shell variable is set; -R VAR: set and non-empty
+                "-v" => self.vars.get(a[1]).is_some(),
+                "-R" => self
+                    .vars
+                    .get(a[1])
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false),
                 _ => {
                     self.fail(&alloc::format!("test: unknown unary '{}'", a[0]));
                     false
@@ -2375,6 +2517,16 @@ impl Term {
                                 self.fail("test: integer expression expected");
                                 false
                             }
+                        }
+                    }
+                    // file age: -nt/-ot compare mtimes (missing file = false)
+                    "-nt" | "-ot" => {
+                        let lm = ustd::stat(l).map(|s| s.mtime);
+                        let rm = ustd::stat(r).map(|s| s.mtime);
+                        match (lm, rm) {
+                            (Ok(a), Ok(b)) if op == "-nt" => a > b,
+                            (Ok(a), Ok(b)) => a < b,
+                            _ => false,
                         }
                     }
                     _ => {
@@ -2447,6 +2599,152 @@ impl Term {
             }
         }
         out
+    }
+
+    /// bash `!` history expansion on a raw interactive line: `!!`, `!n`,
+    /// `!-n`, `!prefix`, `!?substr?` select a history entry; `!$`, `!^`,
+    /// `!*`, `!:N` and `<event>:N` pick words from it. Single quotes suppress
+    /// expansion; `!` that starts no designator (e.g. `!=`, trailing `!`)
+    /// stays literal. Err on a valid-looking spec with no matching event.
+    fn hist_expand(&self, input: &str) -> Result<String, String> {
+        let b = input.as_bytes();
+        let mut out = String::with_capacity(input.len() + 16);
+        let mut sq = false;
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'\'' => {
+                    sq = !sq;
+                    out.push('\'');
+                    i += 1;
+                }
+                b'!' if !sq => match self.bang_designator(&b[i + 1..])? {
+                    Some((text, eaten)) => {
+                        out.push_str(&text);
+                        i += 1 + eaten;
+                    }
+                    None => {
+                        out.push('!');
+                        i += 1;
+                    }
+                },
+                c => {
+                    out.push(c as char);
+                    i += 1;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Parse one `!` designator at the start of `rest`. Returns the expansion
+    /// text plus how many bytes of `rest` it consumed, or None when `!` is
+    /// literal text. Err = a spec was present but no event matched.
+    fn bang_designator(&self, rest: &[u8]) -> Result<Option<(String, usize)>, String> {
+        if rest.is_empty() {
+            return Ok(None);
+        }
+        let mut off = 0usize;
+        // event designator -> the referenced command line
+        let entry: Option<String> = match rest[0] {
+            b'!' => {
+                off = 1;
+                self.hist.last().cloned()
+            }
+            b'0'..=b'9' => {
+                while off < rest.len() && rest[off].is_ascii_digit() {
+                    off += 1;
+                }
+                let n: usize = String::from_utf8_lossy(&rest[..off])
+                    .parse()
+                    .unwrap_or(usize::MAX);
+                n.checked_sub(1)
+                    .and_then(|i| self.hist.get(i))
+                    .cloned()
+            }
+            b'-' if rest.get(1).map(|c| c.is_ascii_digit()).unwrap_or(false) => {
+                off = 1;
+                while off < rest.len() && rest[off].is_ascii_digit() {
+                    off += 1;
+                }
+                let n: usize = String::from_utf8_lossy(&rest[1..off])
+                    .parse()
+                    .unwrap_or(usize::MAX);
+                self.hist
+                    .len()
+                    .checked_sub(n)
+                    .and_then(|i| self.hist.get(i))
+                    .cloned()
+            }
+            b'?' => {
+                // `!?substr?` — trailing `?` optional (omitted = to EOL/space)
+                let start = 1;
+                let mut end = rest.len();
+                for j in start..rest.len() {
+                    if rest[j] == b'?' || rest[j].is_ascii_whitespace() {
+                        end = j;
+                        break;
+                    }
+                }
+                let q = String::from_utf8_lossy(&rest[start..end]).into_owned();
+                off = if rest.get(end) == Some(&b'?') { end + 1 } else { end };
+                self.hist.iter().rev().find(|l| l.contains(&q)).cloned()
+            }
+            b'^' | b'$' | b'*' | b':' => self.hist.last().cloned(),
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                // `!prefix` — most recent entry starting with the word
+                while off < rest.len()
+                    && !rest[off].is_ascii_whitespace()
+                    && rest[off] != b':'
+                {
+                    off += 1;
+                }
+                let prefix = String::from_utf8_lossy(&rest[..off]).into_owned();
+                self.hist
+                    .iter()
+                    .rev()
+                    .find(|l| l.starts_with(&prefix))
+                    .cloned()
+            }
+            _ => return Ok(None),
+        };
+        let line = entry.ok_or_else(|| String::from("bash: !: event not found"))?;
+        // optional word designator: `:` + N|^|$|* or bare ^ $ * after the event
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let mut from = off;
+        let mut spec = rest.get(from).copied();
+        if spec == Some(b':') {
+            from += 1;
+            spec = rest.get(from).copied();
+        }
+        match spec {
+            Some(b'^') => Ok(Some((
+                words.get(1).map(|s| String::from(*s)).unwrap_or_default(),
+                from + 1,
+            ))),
+            Some(b'$') => Ok(Some((
+                words.last().map(|s| String::from(*s)).unwrap_or_default(),
+                from + 1,
+            ))),
+            Some(b'*') => Ok(Some((
+                words.get(1..).map(|w| w.join(" ")).unwrap_or_default(),
+                from + 1,
+            ))),
+            Some(c) if c.is_ascii_digit() => {
+                let mut j = from;
+                while j < rest.len() && rest[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let n: usize = String::from_utf8_lossy(&rest[from..j])
+                    .parse()
+                    .unwrap_or(usize::MAX);
+                Ok(Some((
+                    words.get(n).map(|s| String::from(*s)).unwrap_or_default(),
+                    j,
+                )))
+            }
+            _ => Ok(Some((line, off))),
+        }
     }
 
     /// Replace the command word with its alias (repeat up to 8 hops so
@@ -2780,7 +3078,9 @@ impl Term {
         // history. `!`-lines record their expansion (inside run_body)
         if top {
             let t = input.trim();
-            if !t.is_empty() && !t.starts_with('!') {
+            // `!` anywhere in the line defers recording to run_body: real
+            // designators record their expansion, literal `!` the raw line
+            if !t.is_empty() && !t.contains('!') {
                 self.hist.push(String::from(t));
                 self.hi = self.hist.len();
                 self.save_hist();
@@ -3157,32 +3457,32 @@ impl Term {
         if input.is_empty() {
             return;
         }
-        // history expansion: `!!` reruns the last command, `!n` reruns entry n
-        // (1-based, as `history` lists it). A lone `!` line is ignored.
-        if input.starts_with('!') {
-            let spec = &input[1..];
-            let idx = if spec == "!" {
-                self.hist.len().checked_sub(1)
-            } else if let Ok(n) = spec.parse::<usize>() {
-                n.checked_sub(1)
-            } else {
-                // !prefix -- most recent history entry starting with `spec`
-                self.hist.iter().rposition(|l| l.starts_with(spec))
-            };
-            match idx.and_then(|i| self.hist.get(i).cloned()) {
-                Some(line) => {
-                    self.push_line(&alloc::format!("$ {}", line));
-                    if top {
-                        // like bash: `!!`/!n records the expansion, not the `!` line
-                        self.hist.push(line.clone());
-                        self.hi = self.hist.len();
-                        self.save_hist();
-                    }
-                    self.run(&line);
+        // history expansion (interactive lines only, like bash histexpand):
+        // !! !n !-n !prefix !?substr? select an entry anywhere in the line,
+        // and !$ !^ !* !:N / <event>:N pick words from it. The expanded text
+        // is echoed and recorded, not the `!` form itself.
+        if top && input.contains('!') {
+            match self.hist_expand(input) {
+                Ok(expanded) if expanded != input => {
+                    self.push_line(&alloc::format!("$ {}", expanded));
+                    // like bash: `!!`/`!n` records the expansion, not the `!` line
+                    self.hist.push(expanded.clone());
+                    self.hi = self.hist.len();
+                    self.save_hist();
+                    self.run(&expanded);
+                    return;
                 }
-                None => self.fail(&alloc::format!("!: no such history entry '{}'", spec)),
+                Err(e) => {
+                    self.fail(&e);
+                    return;
+                }
+                _ => {
+                    // no designator matched (literal `!`) -- record as typed
+                    self.hist.push(String::from(input));
+                    self.hi = self.hist.len();
+                    self.save_hist();
+                }
             }
-            return;
         }
         // set -x: echo each statement (bash-style '+' prefix)
         if self.setx {
@@ -3370,8 +3670,25 @@ impl Term {
         let expanded = self.expand_vars(&substd);
         let input = expanded.as_str();
         // quote-aware word-split; quoted words keep metachars literal and are
-        // exempt from glob expansion
-        let toks = tokenize(input);
+        // exempt from brace/tilde/glob expansion
+        let home = self
+            .vars
+            .get("HOME")
+            .cloned()
+            .unwrap_or_else(|| String::from("/"));
+        let toks: Vec<(String, bool)> = tokenize(input)
+            .iter()
+            .flat_map(|t| {
+                if t.1 {
+                    alloc::vec![t.clone()]
+                } else {
+                    brace_expand(&t.0)
+                        .into_iter()
+                        .map(|w| (tilde_expand(&w, &home), false))
+                        .collect()
+                }
+            })
+            .collect();
         let cmd = toks.first().map(|t| t.0.as_str()).unwrap_or("");
         let mut args: Vec<&str> = toks[1.min(toks.len())..]
             .iter()
@@ -4274,16 +4591,30 @@ impl Term {
                 // mv [-i] <from> <to>: -i asks before overwriting an existing
                 // target (via the same read modal as rm -i when interactive)
                 let inter = args.iter().any(|a| a.starts_with('-') && a.contains('i'));
+                // -n never overwrites; -u only when src is newer or dst absent
+                let noclob = args.iter().any(|a| a.starts_with('-') && a.contains('n'));
+                let update = args.iter().any(|a| a.starts_with('-') && a.contains('u'));
                 let pos: Vec<&str> = args
                     .iter()
                     .filter(|a| !a.starts_with('-'))
                     .copied()
                     .collect();
                 if pos.len() < 2 {
-                    self.fail("usage: mv [-i] <from> <to>");
+                    self.fail("usage: mv [-inu] <from> <to>");
                     return;
                 }
                 let (f, t) = (pos[0], pos[1]);
+                if noclob && ustd::stat(t).is_ok() {
+                    return;
+                }
+                if update {
+                    if let (Ok(sm), Ok(dm)) = (ustd::stat(f).map(|s| s.mtime),
+                                               ustd::stat(t).map(|s| s.mtime)) {
+                        if sm <= dm {
+                            return;
+                        }
+                    }
+                }
                 if inter && ustd::stat(t).is_ok() {
                     if let Some(pi) = self.pipe_in.as_mut() {
                         let ans = pi.split('\n').next().unwrap_or("n").to_string();
@@ -4311,9 +4642,13 @@ impl Term {
                 }
             }
             "cp" => {
-                // cp [-r] [-i] <from> <to>: -i asks before overwriting
+                // cp [-r] [-i] [-n] [-u] <from> <to>: -i asks before
+                // overwriting, -n never overwrites, -u only when src is
+                // newer or dst absent
                 let rec = args.iter().any(|a| a == &"-r" || a == &"-R");
                 let inter = args.iter().any(|a| a.starts_with('-') && a.contains('i'));
+                let noclob = args.iter().any(|a| a.starts_with('-') && a.contains('n'));
+                let update = args.iter().any(|a| a.starts_with('-') && a.contains('u'));
                 let pos: Vec<&str> = args
                     .iter()
                     .filter(|a| !a.starts_with('-'))
@@ -4337,6 +4672,36 @@ impl Term {
                             Ok(_) => true,
                             _ => false,
                         };
+                        if noclob && dst_exists {
+                            return;
+                        }
+                        if update {
+                            // mtime of the real destination (file, or dst-dir member)
+                            let dst_mtime = match ustd::stat(t) {
+                                Ok(d) if d.is_dir != 0 => {
+                                    let base = f
+                                        .trim_end_matches('/')
+                                        .rsplit('/')
+                                        .next()
+                                        .unwrap_or(f);
+                                    ustd::stat(&alloc::format!(
+                                        "{}/{}",
+                                        t.trim_end_matches('/'),
+                                        base
+                                    ))
+                                    .map(|s| s.mtime)
+                                }
+                                Ok(d) => Ok(d.mtime),
+                                Err(e) => Err(e),
+                            };
+                            if let (Ok(sm), Ok(dm)) =
+                                (ustd::stat(f).map(|s| s.mtime), dst_mtime)
+                            {
+                                if sm <= dm {
+                                    return;
+                                }
+                            }
+                        }
                         if inter && dst_exists {
                             if let Some(pi) = self.pipe_in.as_mut() {
                                 let ans =
@@ -5549,27 +5914,34 @@ impl Term {
                 }
             }
             "uname" => {
-                // uname [-srmva]: kernel name/release/machine -- bare prints -s
+                // uname [-snrvmoap]: kernel name/nodename/release/machine --
+                // bare prints -s; -a prints all
                 let all = args.iter().any(|a| a.contains('a'));
-                let mut parts: Vec<&str> = Vec::new();
+                let mut parts: Vec<String> = Vec::new();
                 let f = args.first().copied().unwrap_or("");
                 if args.is_empty() || all || f.contains('s') {
-                    parts.push("CosmosOS");
+                    parts.push(String::from("CosmosOS"));
+                }
+                if all || f.contains('n') {
+                    parts.push(ustd::hostname());
                 }
                 if all || f.contains('r') {
-                    parts.push("0.1");
+                    parts.push(String::from("0.1"));
                 }
                 if all || f.contains('v') {
-                    parts.push("rust-kernel");
+                    parts.push(String::from("rust-kernel"));
                 }
                 if all || f.contains('m') {
-                    parts.push("x86_64");
+                    parts.push(String::from("x86_64"));
+                }
+                if all || f.contains('p') {
+                    parts.push(String::from("x86_64"));
                 }
                 if all || f.contains('o') {
-                    parts.push("CosmosOS");
+                    parts.push(String::from("CosmosOS"));
                 }
                 if parts.is_empty() {
-                    parts.push("CosmosOS");
+                    parts.push(String::from("CosmosOS"));
                 }
                 self.emit(&parts.join(" "));
             }
@@ -6679,14 +7051,113 @@ impl Term {
                     }
                 }
             }
+            "fc" => {
+                // fc -l [n] lists recent entries; fc [-s [old=new]] [n] reruns
+                // entry n (default: the last one)
+                if args.iter().any(|a| *a == "-l") {
+                    let n: usize = args
+                        .iter()
+                        .position(|a| *a == "-l")
+                        .and_then(|i| args.get(i + 1))
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(16);
+                    // like bash: the running fc command isn't in the list
+                    let end = self.hist.len().saturating_sub(1);
+                    let start = end.saturating_sub(n);
+                    for i in start..end {
+                        self.emit(&alloc::format!("  {:>3}  {}", i + 1, self.hist[i]));
+                    }
+                    return;
+                }
+                // -s [old=new]: rerun with an optional literal substitution
+                let sub = args.iter().position(|a| *a == "-s").and_then(|i| {
+                    args.get(i + 1).and_then(|s| {
+                        if s.contains('=') {
+                            let mut it = s.splitn(2, '=');
+                            Some((String::from(it.next().unwrap()), String::from(it.next().unwrap())))
+                        } else {
+                            None
+                        }
+                    })
+                });
+                let si = args.iter().position(|x| *x == "-s");
+                let pos: Vec<&str> = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, a)| {
+                        !a.starts_with('-')
+                            && !(si == Some(i.saturating_sub(1)) && a.contains('='))
+                    })
+                    .map(|(_, a)| *a)
+                    .collect();
+                // default = the entry before the fc command itself
+                let n: usize = pos
+                    .first()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| self.hist.len().saturating_sub(1));
+                match n.checked_sub(1).and_then(|i| self.hist.get(i).cloned()) {
+                    Some(line) => {
+                        let rerun = match &sub {
+                            Some((old, new)) => line.replacen(old, new, 1),
+                            None => line,
+                        };
+                        if self.fc_depth >= 8 {
+                            self.fail("fc: recursive rerun");
+                            return;
+                        }
+                        self.push_line(&alloc::format!("$ {}", rerun));
+                        self.hist.push(rerun.clone());
+                        self.hi = self.hist.len();
+                        self.save_hist();
+                        self.fc_depth += 1;
+                        self.run(&rerun);
+                        self.fc_depth -= 1;
+                    }
+                    None => self.fail("fc: no such history entry"),
+                }
+            }
+            "times" => {
+                // shell + job CPU time from real per-task ticks (100Hz → 10ms)
+                let ticks_of = |pid: u32| -> u64 {
+                    ustd::read_all(&alloc::format!("/proc/{}/status", pid))
+                        .ok()
+                        .and_then(|d| {
+                            String::from_utf8_lossy(&d)
+                                .lines()
+                                .find(|l| l.starts_with("CpuTicks:"))
+                                .and_then(|l| l.split(':').nth(1).and_then(|v| v.trim().parse().ok()))
+                        })
+                        .unwrap_or(0)
+                };
+                let fmt = |ticks: u64| -> String {
+                    let ms = ticks * 10;
+                    alloc::format!("{}m{}.{:03}s", ms / 60_000, (ms % 60_000) / 1000, ms % 1000)
+                };
+                let mut jobs_ticks = 0u64;
+                for (p, _) in &self.jobs {
+                    jobs_ticks += ticks_of(*p);
+                }
+                // user/sys are not split in the kernel; total goes in the
+                // first column like a monotasking shell
+                self.emit(&alloc::format!("{} {}", fmt(ticks_of(ustd::getpid())), fmt(0)));
+                self.emit(&alloc::format!("{} {}", fmt(jobs_ticks), fmt(0)));
+            }
             "wc" => self.wc_run(&args),
             "head" | "tail" | "sort" => {
                 // -n N (value arg, skipped as a file) or -N numeric shorthand
                 let ni = args.iter().position(|a| a == &"-n");
+                // head/tail -c N: byte counts instead of line counts
+                let ci = args.iter().position(|a| a == &"-c");
+                let cbytes: Option<usize> = (cmd != "sort")
+                    .then(|| ci.and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()))
+                    .flatten();
                 // value-arg positions: -n, -k, -t each consume their next token
                 let mut valpos: Vec<usize> = Vec::new();
                 for (i, a) in args.iter().enumerate() {
                     if *a == "-n" || *a == "-k" || *a == "-t" || *a == "-o" {
+                        valpos.push(i + 1);
+                    }
+                    if cmd != "sort" && *a == "-c" {
                         valpos.push(i + 1);
                     }
                 }
@@ -6729,6 +7200,33 @@ impl Term {
                     Some(s) => {
                         let mut ls: Vec<&str> = s.lines().collect();
                         if cmd == "sort" {
+                            // -f folds case, -b ignores leading blanks
+                            let fold = args.iter().any(|a| a == &"-f");
+                            let blanks = args.iter().any(|a| a == &"-b");
+                            let key = |l: &&str| -> String {
+                                let t = if blanks { l.trim_start() } else { *l };
+                                if fold {
+                                    t.to_lowercase()
+                                } else {
+                                    String::from(t)
+                                }
+                            };
+                            // numeric: compare leading signed-integer fields (0 if none)
+                            let num = |l: &&str| -> i64 {
+                                let t = l.trim_start();
+                                let neg = t.starts_with('-');
+                                let digits: String = t
+                                    .chars()
+                                    .skip(neg as usize)
+                                    .take_while(|c| c.is_ascii_digit())
+                                    .collect();
+                                let v: i64 = digits.parse().unwrap_or(0);
+                                if neg {
+                                    -v
+                                } else {
+                                    v
+                                }
+                            };
                             // -t SEP field separator; -k N sorts by Nth field (1-based)
                             let ti = args.iter().position(|a| a == &"-t");
                             let sep: Option<char> = ti
@@ -6739,33 +7237,50 @@ impl Term {
                                 .and_then(|i| args.get(i + 1))
                                 .and_then(|s| s.parse().ok())
                                 .unwrap_or(0);
+                            if args.iter().any(|a| a == &"-c") {
+                                // -c: check only — report the first out-of-order
+                                // line, emit nothing when sorted
+                                let numeric = args.iter().any(|a| a == &"-n");
+                                let dis = ls.windows(2).position(|w| {
+                                    if numeric {
+                                        num(&w[0]) > num(&w[1])
+                                    } else {
+                                        key(&w[0]) > key(&w[1])
+                                    }
+                                });
+                                match dis {
+                                    Some(i) => {
+                                        self.emit(&alloc::format!(
+                                            "sort: disorder: line {}",
+                                            i + 2
+                                        ));
+                                        self.last_ok = false;
+                                    }
+                                    None => self.last_ok = true,
+                                }
+                                return;
+                            }
                             if keyf > 0 || sep.is_some() {
                                 let field = |l: &&str| -> String {
                                     let parts: Vec<&str> = match sep {
                                         Some(c) => l.split(c).collect(),
                                         None => l.split_whitespace().collect(),
                                     };
-                                    parts
+                                    let k = parts
                                         .get(keyf.saturating_sub(1))
                                         .map(|s| String::from(*s))
-                                        .unwrap_or_default()
+                                        .unwrap_or_default();
+                                    if fold {
+                                        k.to_lowercase()
+                                    } else {
+                                        k
+                                    }
                                 };
                                 ls.sort_by_key(|l| field(l));
                             } else if args.iter().any(|a| a == &"-n") {
-                                // numeric: compare leading signed-integer fields (0 if none)
-                                let num = |l: &&str| -> i64 {
-                                    let t = l.trim_start();
-                                    let neg = t.starts_with('-');
-                                    let digits: String = t.chars()
-                                        .skip(neg as usize)
-                                        .take_while(|c| c.is_ascii_digit())
-                                        .collect();
-                                    let v: i64 = digits.parse().unwrap_or(0);
-                                    if neg { -v } else { v }
-                                };
                                 ls.sort_by_key(num);
                             } else {
-                                ls.sort();
+                                ls.sort_by_key(key);
                             }
                             if args.iter().any(|a| a == &"-u") {
                                 ls.dedup();
@@ -6792,12 +7307,36 @@ impl Term {
                                 }
                             }
                         } else if cmd == "head" {
-                            for l in ls.iter().take(n) {
-                                self.emit(l);
+                            match cbytes {
+                                Some(cn) => {
+                                    let text: String = s.chars().take(cn).collect();
+                                    for l in text.lines() {
+                                        self.emit(l);
+                                    }
+                                }
+                                None => {
+                                    for l in ls.iter().take(n) {
+                                        self.emit(l);
+                                    }
+                                }
                             }
                         } else {
-                            for l in ls.iter().skip(ls.len().saturating_sub(n)) {
-                                self.emit(l);
+                            match cbytes {
+                                Some(cn) => {
+                                    let total = s.chars().count();
+                                    let text: String = s
+                                        .chars()
+                                        .skip(total.saturating_sub(cn))
+                                        .collect();
+                                    for l in text.lines() {
+                                        self.emit(l);
+                                    }
+                                }
+                                None => {
+                                    for l in ls.iter().skip(ls.len().saturating_sub(n)) {
+                                        self.emit(l);
+                                    }
+                                }
                             }
                             // tail -f: keep following new appended bytes
                             if cmd == "tail" && args.iter().any(|a| *a == "-f") {
@@ -7291,13 +7830,61 @@ impl Term {
                 }
             }
             "netstat" => {
+                // netstat [-l] [-t] [-u]: -l listening only, -t/-u filter proto
+                let only_l = args.iter().any(|a| *a == "-l");
+                let tf = args.iter().any(|a| *a == "-t");
+                let uf = args.iter().any(|a| *a == "-u");
                 for l in ustd::net_stat().lines() {
+                    if only_l && !l.contains("LISTEN") {
+                        continue;
+                    }
+                    if (tf || uf)
+                        && !(tf && l.starts_with("tcp") || uf && l.starts_with("udp"))
+                    {
+                        continue;
+                    }
                     self.emit(l);
                 }
             }
             "arp" => {
-                for l in ustd::arp_stat().lines() {
-                    self.emit(l);
+                // arp [-d <ip>] [ip]: dump cache, delete an entry, or query one
+                match args.first() {
+                    Some(&"-d") => match args.get(1) {
+                        Some(ip) => {
+                            let oct: Vec<u8> = ip
+                                .split('.')
+                                .filter_map(|o| o.parse::<u8>().ok())
+                                .collect();
+                            if oct.len() != 4 {
+                                self.fail(&alloc::format!("arp: bad ip '{}'", ip));
+                            } else if ustd::arp_delete([oct[0], oct[1], oct[2], oct[3]]) {
+                                self.emit(&alloc::format!("{} deleted", ip));
+                            } else {
+                                self.fail(&alloc::format!("arp: no entry for {}", ip));
+                            }
+                        }
+                        None => self.fail("usage: arp [-d] [ip]"),
+                    },
+                    Some(ip) => {
+                        // single-entry lookup against the kernel cache dump
+                        let mut hit = false;
+                        for l in ustd::arp_stat().lines() {
+                            if l.contains(ip) || l.starts_with("ip ") {
+                                if l.contains(ip) {
+                                    hit = true;
+                                }
+                                self.emit(l);
+                            }
+                        }
+                        if !hit {
+                            self.emit(&alloc::format!("{} -- no entry", ip));
+                        }
+                    }
+                    None => {
+                        for l in ustd::arp_stat().lines() {
+                            self.emit(l);
+                        }
+                    }
                 }
             }
             "dmesg" => {
@@ -8435,7 +9022,8 @@ impl Term {
             "sysctl" => {
                 // real kernel/machine parameters
                 let mi = ustd::meminfo();
-                self.emit(&alloc::format!("kernel.hostname = {}", self.host));
+                let khn = ustd::hostname();
+                self.emit(&alloc::format!("kernel.hostname = {}", khn));
                 self.emit("kernel.osrelease = 0.1");
                 self.emit("kernel.arch = x86_64");
                 self.emit(&alloc::format!("vm.page_size = {}", 4096));
@@ -9074,14 +9662,21 @@ impl Term {
             }
             "hostname" => match args.first() {
                 None => {
-                    let h = self.host.clone();
+                    // kernel nodename is the truth (may differ from the
+                    // persisted /hostname after cross-process sets)
+                    let h = ustd::hostname();
+                    self.host = h.clone();
                     self.emit(&h);
                 }
                 Some(n) => {
-                    // persist so the next terminal boot reads the same name
+                    if !ustd::set_hostname(n) {
+                        self.fail("hostname: set failed");
+                        return;
+                    }
                     self.host = String::from(*n);
                     self.vars
                         .insert(String::from("HOSTNAME"), self.host.clone());
+                    // persist so the next boot restores the same name
                     if let Err(e) = ustd::write_all("/hostname", n.as_bytes()) {
                         self.fail(&alloc::format!("hostname: persist err {}", e));
                     }
@@ -9964,7 +10559,7 @@ impl Term {
         "function", "declare", "typeset",
         "local", "shift", "getopts", "trap", "timeout", "realpath", "pidof",
         "wmls", "wmfocus", "wmclose", "wmmove", "[[", "let", "bc", "csplit",
-        "getent", "host", "usleep",
+        "getent", "host", "usleep", "fc", "times",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -10339,17 +10934,19 @@ impl Term {
     /// row when several files are given. Byte counts use raw file bytes
     /// (not the lossy-decoded text). No files → counts stdin (pipe).
     fn wc_run(&mut self, args: &[&str]) {
-        let (fl, fw, fc) = (
+        let (fl, fw, fc, fm) = (
             args.iter().any(|a| a == &"-l"),
             args.iter().any(|a| a == &"-w"),
             args.iter().any(|a| a == &"-c"),
+            args.iter().any(|a| a == &"-L"),
         );
         let files: Vec<&str> = args
             .iter()
             .filter(|a| !a.starts_with('-'))
             .copied()
             .collect();
-        let counts = |raw: &[u8], s: &str| -> (usize, usize, usize) {
+        // (lines, words, bytes, max line length)
+        let counts = |raw: &[u8], s: &str| -> (usize, usize, usize, usize) {
             let (mut l, mut w) = (0usize, 0usize);
             let mut in_w = false;
             for ch in s.chars() {
@@ -10363,20 +10960,40 @@ impl Term {
                     w += 1;
                 }
             }
-            (l, w, raw.len())
+            let m = s.lines().map(|ln| ln.chars().count()).max().unwrap_or(0);
+            (l, w, raw.len(), m)
         };
-        let show = |t: &mut Term, c: (usize, usize, usize), name: &str| {
+        let show = |t: &mut Term, c: (usize, usize, usize, usize), name: &str| {
             let tag = if name.is_empty() {
                 String::new()
             } else {
                 alloc::format!(" {}", name)
             };
-            match (fl, fw, fc) {
-                (true, false, false) => t.emit(&alloc::format!("{}{}", c.0, tag)),
-                (false, true, false) => t.emit(&alloc::format!("{}{}", c.1, tag)),
-                (false, false, true) => t.emit(&alloc::format!("{}{}", c.2, tag)),
-                _ => t.emit(&alloc::format!("  {} {} {}{}", c.0, c.1, c.2, tag)),
+            if !fl && !fw && !fc && !fm {
+                t.emit(&alloc::format!("  {} {} {}{}", c.0, c.1, c.2, tag));
+                return;
             }
+            let mut cols: Vec<usize> = Vec::new();
+            if fl {
+                cols.push(c.0);
+            }
+            if fw {
+                cols.push(c.1);
+            }
+            if fc {
+                cols.push(c.2);
+            }
+            if fm {
+                cols.push(c.3);
+            }
+            t.emit(&alloc::format!(
+                "{}{}",
+                cols.iter()
+                    .map(|n| alloc::format!("{}", n))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                tag
+            ));
         };
         if files.is_empty() {
             if let Some(s) = self.pipe_in.clone() {
@@ -10387,7 +11004,7 @@ impl Term {
             return;
         }
         let multi = files.len() > 1;
-        let mut tot = (0usize, 0usize, 0usize);
+        let mut tot = (0usize, 0usize, 0usize, 0usize);
         for f in &files {
             match ustd::read_all(f) {
                 Ok(d) => {
@@ -10396,6 +11013,7 @@ impl Term {
                     tot.0 += c.0;
                     tot.1 += c.1;
                     tot.2 += c.2;
+                    tot.3 = tot.3.max(c.3);
                     show(self, c, if multi { f } else { "" });
                 }
                 Err(e) => self.fail(&alloc::format!("wc: {}: err {}", f, e)),
@@ -10878,7 +11496,7 @@ impl Term {
         };
         *i += 1;
         match w {
-            "-e" | "-f" | "-d" | "-s" | "-r" | "-w" | "-n" | "-z" => {
+            "-e" | "-f" | "-d" | "-s" | "-r" | "-w" | "-n" | "-z" | "-v" | "-R" => {
                 let Some(&a) = t.get(*i) else {
                     return Err(alloc::format!("{}: missing operand", w));
                 };
@@ -10890,6 +11508,12 @@ impl Term {
                     "-d" => st.map(|s| s.is_dir != 0).unwrap_or(false),
                     "-s" => st.map(|s| s.size > 0).unwrap_or(false),
                     "-n" => !a.is_empty(),
+                    "-v" => self.vars.get(a).is_some(),
+                    "-R" => self
+                        .vars
+                        .get(a)
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false),
                     _ => a.is_empty(),
                 })
             }
@@ -10931,6 +11555,16 @@ impl Term {
                                 _ => a >= b,
                             },
                             _ => return Err(String::from("integer expected")),
+                        }
+                    }
+                    // file age: -nt/-ot compare mtimes (missing file = false)
+                    "-nt" | "-ot" => {
+                        let lm = ustd::stat(w).map(|s| s.mtime);
+                        let rm = ustd::stat(r).map(|s| s.mtime);
+                        match (lm, rm) {
+                            (Ok(a), Ok(b)) if op == "-nt" => a > b,
+                            (Ok(a), Ok(b)) => a < b,
+                            _ => false,
                         }
                     }
                     _ => return Err(alloc::format!("unknown op '{}'", op)),
@@ -11113,6 +11747,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         heredocs: Vec::new(),
         flow: 0,
         script_depth: 0,
+        fc_depth: 0,
         dirstack: Vec::new(),
         rs: None,
         rs_saved: String::new(),
@@ -11122,6 +11757,8 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| String::from("cosmos")),
     };
+    // push the persisted name into the kernel so uname -n / /proc agree
+    ustd::set_hostname(&t.host);
     t.vars
         .insert(String::from("HOSTNAME"), t.host.clone());
     t.load_hist();

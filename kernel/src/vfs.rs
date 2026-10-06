@@ -150,11 +150,16 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     let exists = if is_dev {
         true
     } else if is_proc {
-        // procfs is read-only: opening a dir or creating is rejected
-        if crate::proc::is_dir(&full) || flags & shared::O_CREATE != 0 {
+        // procfs is read-only: dirs are rejected; O_CREATE only fails when
+        // the proc file is genuinely absent (no proc files can be created)
+        if crate::proc::is_dir(&full) {
             return Err(-4);
         }
-        crate::proc::exists(&full)
+        let ex = crate::proc::exists(&full);
+        if !ex && flags & shared::O_CREATE != 0 {
+            return Err(-4);
+        }
+        ex
     } else {
         fs.exists(&full)
     };
@@ -167,7 +172,7 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
         }
         fs.create_file(&full).map_err(err_to_i64)?;
     }
-    if exists && flags & O_TRUNC != 0 && !is_dev {
+    if exists && flags & O_TRUNC != 0 && !is_dev && !is_proc {
         fs.write_file(&full, &[]).map_err(err_to_i64)?;
     }
     // procfs files stream live data; their size is per-read, not on disk
@@ -249,7 +254,18 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
         return Ok(n as i64);
     }
     if crate::proc::handles(&path) {
-        return Err(-4); // procfs is read-only
+        // procfs is read-only except whitelisted sysctl files
+        match crate::proc::write_file(&path, buf) {
+            Some(n) => {
+                task::with_current(|t| {
+                    if let Some(Some(f)) = t.fds.get_mut(fd as usize) {
+                        f.pos += n as u64;
+                    }
+                });
+                return Ok(n as i64);
+            }
+            None => return Err(-4),
+        }
     }
     const O_APPEND: u64 = shared::O_APPEND;
     let mut g = FS.lock();

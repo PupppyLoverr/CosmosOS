@@ -8,3 +8,4 @@ DESCRIPTION
     -n numeric, -r reverse, -u unique, -f fold case
     -t field separator, -k sort by Nth field
     -o write result to file instead of stdout
+    -b ignore leading blanks, -c check only (no output when sorted)

@@ -869,3 +869,32 @@ pub fn strace(op: u64, pid: u32, out: &mut [u8]) -> i64 {
 pub fn kill2(pid: u32, sig: u64) -> i64 {
     sc2(shared::SYS_KILL2, pid as u64, sig) as i64
 }
+
+/// Kernel nodename (uname -n / hostname).
+pub fn hostname() -> String {
+    let mut buf = [0u8; 64];
+    let n = sc2(
+        shared::SYS_HOSTNAME_GET,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    ) as usize;
+    if n == usize::MAX {
+        return String::from("cosmos");
+    }
+    String::from_utf8_lossy(&buf[..n.min(64)]).into_owned()
+}
+
+/// Delete an ARP cache entry (`arp -d <ip>`). Returns true when one existed.
+pub fn arp_delete(ip: [u8; 4]) -> bool {
+    let v = ((ip[0] as u64) << 24) | ((ip[1] as u64) << 16) | ((ip[2] as u64) << 8) | ip[3] as u64;
+    sc1(shared::SYS_ARP_DEL, v) == 1
+}
+
+/// Set the kernel nodename. Returns true on success.
+pub fn set_hostname(s: &str) -> bool {
+    sc2(
+        shared::SYS_HOSTNAME_SET,
+        s.as_ptr() as u64,
+        s.len().min(64) as u64,
+    ) == 0
+}

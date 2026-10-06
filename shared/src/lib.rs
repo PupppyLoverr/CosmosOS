@@ -78,6 +78,9 @@ pub const SYS_NICE: u64 = 78;             // (pid, nice) -> stored nice | -3
 pub const SYS_PCAP: u64 = 79;             // (op, buf, cap) -> varies (see pcap.rs)
 pub const SYS_STRACE: u64 = 80;           // (op,pid,buf,cap): 0 start 1 stop 2 drain
 pub const SYS_KILL2: u64 = 81;            // (pid,sig): 9/15 kill, 19 STOP, 18 CONT -> 0 | ERR
+pub const SYS_HOSTNAME_GET: u64 = 82;      // (buf,cap) -> n | ERR
+pub const SYS_HOSTNAME_SET: u64 = 83;      // (ptr,len<=64) -> 0 | ERR
+pub const SYS_ARP_DEL: u64 = 84;           // (ip as u32 BE) -> 1 deleted | 0 absent
 pub const SYS_ERR: u64 = u64::MAX;
 
 // open flags

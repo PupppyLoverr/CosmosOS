@@ -1,0 +1,11 @@
+history(1) - command history
+NAME
+    history, fc, ! - command history
+SYNOPSIS
+    history [-c] [-d n] [-w]
+    fc -l [n] | fc [-s [old=new]] [n]
+    !! !n !-n !prefix !?substr? !$ !^ !* !:N <event>:N
+DESCRIPTION
+    history lists/clears/deletes/flushes entries (/history.txt).
+    fc -l lists the last n (16). fc reruns an entry, -s old=new
+    substitutes text first. ! forms expand anywhere in the line.
