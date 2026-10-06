@@ -447,9 +447,11 @@ impl Term {
         out
     }
 
-    /// Lines per `more` page (whole visible area).
+    /// Lines per `more` page. The scrollback region is rows_vis-1 (prompt
+    /// row) and the --More-- status row eats another: h/16 - 3 so a full
+    /// page fits without clipping its first line.
     fn page_lines(&self) -> usize {
-        ((self.c.h as usize / CH as usize) - 2).max(4)
+        ((self.c.h as usize / CH as usize) - 3).max(4)
     }
 
     /// First line after `top` matching self.pq, wrapping (less-style).
