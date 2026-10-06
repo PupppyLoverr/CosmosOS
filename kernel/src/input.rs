@@ -1,16 +1,59 @@
 //! PS/2 keyboard + mouse via i8042. Events go to the "cosmos:input" port.
+//!
+//! IRQ handlers must never take locks or allocate: a spinlock held by an
+//! interrupted syscall would deadlock the whole machine. So IRQs push into
+//! lock-free SPSC rings and `pump` drains them later, in syscall context
+//! (from `syscall::dispatch`) where locks and allocation are safe.
 use crate::ipc;
 use crate::sprintln;
-use alloc::collections::VecDeque;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use shared::{InputKey, InputKind, InputMouse, INPUT_PORT};
-use spin::Mutex;
 use x86_64::instructions::port::Port;
 
 const DATA: u16 = 0x60;
 const CMD: u16 = 0x64;
 
-pub static KEYS: Mutex<VecDeque<InputKey>> = Mutex::new(VecDeque::new());
-pub static MICE: Mutex<VecDeque<InputMouse>> = Mutex::new(VecDeque::new());
+/// Single-producer (IRQ) / single-consumer (syscall-context pump) ring.
+struct Spsc<T, const N: usize> {
+    buf: UnsafeCell<[core::mem::MaybeUninit<T>; N]>,
+    head: AtomicUsize, // written by producer
+    tail: AtomicUsize, // written by consumer
+}
+unsafe impl<T, const N: usize> Sync for Spsc<T, N> {}
+
+impl<T: Copy, const N: usize> Spsc<T, N> {
+    const fn new() -> Self {
+        Spsc {
+            buf: UnsafeCell::new([const { core::mem::MaybeUninit::uninit() }; N]),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
+    }
+    /// IRQ side. Drops when full.
+    fn push(&self, v: T) {
+        let h = self.head.load(Ordering::Relaxed);
+        let next = (h + 1) % N;
+        if next == self.tail.load(Ordering::Acquire) {
+            return; // full
+        }
+        unsafe { (*self.buf.get())[h].write(v) };
+        self.head.store(next, Ordering::Release);
+    }
+    /// Consumer side (any non-IRQ context).
+    fn pop(&self) -> Option<T> {
+        let t = self.tail.load(Ordering::Relaxed);
+        if t == self.head.load(Ordering::Acquire) {
+            return None;
+        }
+        let v = unsafe { (*self.buf.get())[t].assume_init() };
+        self.tail.store((t + 1) % N, Ordering::Release);
+        Some(v)
+    }
+}
+
+static KEYS: Spsc<InputKey, 128> = Spsc::new();
+static MICE: Spsc<InputMouse, 128> = Spsc::new();
 
 static mut MOUSE_PKT: [u8; 4] = [0; 4];
 static mut MOUSE_IDX: usize = 0;
@@ -103,20 +146,16 @@ pub fn on_kbd_irq() {
             _ => {}
         }
         let (key, chr) = scancode_to_key(code, e0);
-        let ev = InputKey {
+        let mods = MOD_CTRL | (MOD_SHIFT << 1) | (MOD_ALT << 2) | (MOD_SUPER << 3);
+        KEYS.push(InputKey {
             kind: InputKind::Key as u8,
             down: down as u8,
             chr: if down { chr } else { 0 },
-            _pad: 0,
+            mods,
             key,
             scancode: code as u32 | if e0 { 0x100 } else { 0 },
-        };
-        let mut q = KEYS.lock();
-        if q.len() < 256 {
-            q.push_back(ev);
-        }
+        });
     }
-    pump_input();
 }
 
 pub fn on_mouse_irq() {
@@ -138,45 +177,39 @@ pub fn on_mouse_irq() {
             if p[0] & 0x20 != 0 {
                 dy -= 256;
             }
-            let ev = InputMouse {
+            MICE.push(InputMouse {
                 kind: InputKind::Mouse as u8,
                 buttons: p[0] & 0x07,
                 dx,
                 dy: -dy, // ps/2 y is inverted
                 wheel: 0,
                 _pad: 0,
-            };
-            let mut q = MICE.lock();
-            if q.len() < 256 {
-                q.push_back(ev);
-            }
+            });
         }
     }
-    pump_input();
 }
 
-/// Drain queued input events to the winserver's input port (if listening).
-fn pump_input() {
+/// Drain raw ring events to the winserver's input port (if listening).
+/// MUST be called from a context where locks/allocs are safe (syscall or
+/// task context) — never from an IRQ.
+pub fn pump() {
     if ipc::connect(INPUT_PORT).is_none() {
         return; // nobody listening yet — keep events queued
     }
-    let mut keys = KEYS.lock();
-    let mut mice = MICE.lock();
-    while let Some(k) = keys.pop_front() {
+    while let Some(k) = KEYS.pop() {
         let bytes = unsafe {
             core::slice::from_raw_parts(&k as *const _ as *const u8, core::mem::size_of::<InputKey>())
         };
         if ipc::push_named(INPUT_PORT, bytes).is_err() {
-            keys.push_front(k);
+            // port queue full — drop (better than wedging the pipeline)
             break;
         }
     }
-    while let Some(m) = mice.pop_front() {
+    while let Some(m) = MICE.pop() {
         let bytes = unsafe {
             core::slice::from_raw_parts(&m as *const _ as *const u8, core::mem::size_of::<InputMouse>())
         };
         if ipc::push_named(INPUT_PORT, bytes).is_err() {
-            mice.push_front(m);
             break;
         }
     }
@@ -184,7 +217,7 @@ fn pump_input() {
 
 /// Called by ipc when a listener registers for the input port.
 pub fn flush() {
-    pump_input();
+    pump();
 }
 
 pub fn modifiers() -> (bool, bool, bool, bool, bool) {

@@ -151,7 +151,7 @@ pub struct InputKey {
     pub kind: u8, // InputKind::Key
     pub down: u8,
     pub chr: u8, // ASCII char if printable (0 otherwise)
-    pub _pad: u8,
+    pub mods: u8, // bit0 ctrl, bit1 shift, bit2 alt, bit3 super
     pub key: u32, // KeyCode
     pub scancode: u32, // raw set-1 scancode (with E0 bit 8 set for extended)
 }
@@ -175,7 +175,8 @@ pub struct InputMouse {
 #[derive(Clone, Copy)]
 pub struct WsHeader {
     pub kind: u16,
-    pub len: u16, // payload bytes following the header
+    pub len: u16,   // payload bytes following the header
+    pub reply: u32, // sender's reply/event port (client -> server requests)
 }
 
 // request kinds (app -> winserver)
@@ -208,6 +209,11 @@ pub struct ReqCreateWin {
 }
 pub const WIN_DECORATE: u32 = 1;
 pub const WIN_RESIZABLE: u32 = 2;
+
+/// Window decoration metrics used by the compositor (shared with apps so
+/// they can lay out their client area consistently).
+pub const TITLE_H: u32 = 26;
+pub const BORDER_W: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -243,7 +249,8 @@ pub struct EvKey {
     pub key: u32, // KeyCode
     pub chr: u8,  // ASCII char if printable
     pub down: u8,
-    pub _pad: [u8; 2],
+    pub mods: u8, // bit0 ctrl, bit1 shift, bit2 alt, bit3 super
+    pub _pad: u8,
 }
 
 #[repr(C)]
@@ -271,6 +278,7 @@ pub struct EvResizeReq {
     pub window_id: u32,
     pub w: u32,
     pub h: u32,
+    pub shm_id: u32, // new backing surface created by the server
 }
 
 #[repr(C)]

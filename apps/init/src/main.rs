@@ -31,7 +31,7 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         if !selftest {
             let alive = ustd::proclist(64)
                 .iter()
-                .any(|p| p.is_user == 1 && starts_with(&p.name, b"winserver"));
+                .any(|p| p.is_user == 1 && contains(&p.name, b"winserver"));
             if !alive {
                 println!("[init] winserver died — respawning");
                 let _ = spawn("/bin/cosmos-winserver", "");
@@ -40,6 +40,6 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
     }
 }
 
-fn starts_with(name: &[u8; 32], prefix: &[u8]) -> bool {
-    name.iter().take(prefix.len()).copied().eq(prefix.iter().copied())
+fn contains(name: &[u8; 32], needle: &[u8]) -> bool {
+    name.windows(needle.len()).any(|w| w == needle)
 }

@@ -1,9 +1,239 @@
+//! cosmos-editor: a real text editor  - open, edit, save (F2 or Ctrl+S), type
+//! directly into the file. Persisted to the FAT32 disk.
 #![no_std]
 #![no_main]
+
+extern crate alloc;
+
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use shared::*;
+use ustd::draw::{self, Canvas};
+use ustd::wm::{self, Window};
 use ustd::println;
 
+struct Editor {
+    win: Window,
+    c: Canvas,
+    path: String,
+    text: String,
+    cx: usize, // caret byte idx
+    scroll: usize, // first visible line
+    dirty_text: bool,
+    dirty_ui: bool,
+    status: String,
+}
+
+impl Editor {
+    fn lines(&self) -> Vec<&str> {
+        self.text.split('\n').collect()
+    }
+
+    fn caret_rc(&self) -> (usize, usize) {
+        // byte idx -> (row, col)
+        let mut r = 0usize;
+        let mut c = 0usize;
+        for (i, b) in self.text.bytes().enumerate() {
+            if i == self.cx {
+                break;
+            }
+            if b == b'\n' {
+                r += 1;
+                c = 0;
+            } else {
+                c += 1;
+            }
+        }
+        (r, c)
+    }
+
+    fn idx_of(&self, row: usize, col: usize) -> usize {
+        let mut r = 0;
+        let mut c = 0;
+        for (i, b) in self.text.bytes().enumerate() {
+            if r == row && c == col {
+                return i;
+            }
+            if b == b'\n' {
+                r += 1;
+                c = 0;
+            } else {
+                c += 1;
+            }
+        }
+        self.text.len()
+    }
+
+    fn redraw(&mut self) {
+        let c = self.c;
+        c.fill(0, 0, c.w as i32, c.h as i32, draw::BLACK);
+        // header
+        c.fill(0, 0, c.w as i32, 26, draw::PANEL);
+        c.text(8, 5, &alloc::format!("{}{}", self.path, if self.dirty_text { " *" } else { "" }), draw::TEXT, None);
+        c.text(c.w as i32 - 220, 5, "Ctrl-S saves  |  Arrows navigate", draw::DIM, None);
+        // text area
+        let lines = self.lines();
+        let vis = ((c.h as i32 - 34) / 16) as usize;
+        for (i, l) in lines.iter().skip(self.scroll).take(vis).enumerate() {
+            let y = 30 + i as i32 * 16;
+            // line numbers
+            c.text(4, y, &alloc::format!("{:>3}", self.scroll + i + 1), draw::DIM, None);
+            c.text(36, y, l, draw::TEXT, None);
+        }
+        // caret
+        let (r, col) = self.caret_rc();
+        if r >= self.scroll {
+            c.fill(36 + col as i32 * 8, 30 + (r - self.scroll) as i32 * 16, 2, 16, draw::ACCENT);
+        }
+        // status bar
+        c.fill(0, c.h as i32 - 22, c.w as i32, 22, draw::PANEL);
+        c.text(8, c.h as i32 - 19, &alloc::format!("{}:{}  {} bytes  {}", r + 1, col + 1, self.text.len(), self.status), draw::DIM, None);
+        self.win.present_all();
+    }
+
+    fn ensure_caret_visible(&mut self) {
+        let (r, _) = self.caret_rc();
+        let vis = ((self.c.h as i32 - 34) / 16) as usize;
+        if r < self.scroll {
+            self.scroll = r;
+        } else if r >= self.scroll + vis {
+            self.scroll = r + 1 - vis;
+        }
+    }
+
+    fn save(&mut self) {
+        match ustd::write_all(&self.path, self.text.as_bytes()) {
+            Ok(_) => {
+                self.dirty_text = false;
+                self.status = alloc::format!("saved {}", self.path);
+                self.win.set_title(&alloc::format!("Editor  - {}", self.path));
+            }
+            Err(e) => self.status = alloc::format!("save failed: {}", e),
+        }
+        self.dirty_ui = true;
+    }
+
+    fn on_key(&mut self, k: &EvKey) {
+        if k.down == 0 {
+            return;
+        }
+        if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 && (k.chr == b's' || k.chr == b'S') {
+            self.save();
+            self.dirty_ui = true;
+            return;
+        }
+        match k.key as u32 {
+            x if x == KeyCode::Char as u32 => {
+                self.text.insert(self.cx, k.chr as char);
+                self.cx += 1;
+                self.dirty_text = true;
+            }
+            x if x == KeyCode::Enter as u32 => {
+                self.text.insert(self.cx, '\n');
+                self.cx += 1;
+                self.dirty_text = true;
+            }
+            x if x == KeyCode::Backspace as u32 => {
+                if self.cx > 0 {
+                    self.cx -= 1;
+                    self.text.remove(self.cx);
+                    self.dirty_text = true;
+                }
+            }
+            x if x == KeyCode::Delete as u32 => {
+                if self.cx < self.text.len() {
+                    self.text.remove(self.cx);
+                    self.dirty_text = true;
+                }
+            }
+            x if x == KeyCode::Left as u32 => self.cx = self.cx.saturating_sub(1),
+            x if x == KeyCode::Right as u32 => {
+                if self.cx < self.text.len() {
+                    self.cx += 1;
+                }
+            }
+            x if x == KeyCode::Up as u32 => {
+                let (r, c) = self.caret_rc();
+                if r > 0 {
+                    self.cx = self.idx_of(r - 1, c);
+                }
+            }
+            x if x == KeyCode::Down as u32 => {
+                let (r, c) = self.caret_rc();
+                if r + 1 < self.lines().len() {
+                    self.cx = self.idx_of(r + 1, c);
+                }
+            }
+            x if x == KeyCode::Home as u32 => {
+                let (r, _) = self.caret_rc();
+                self.cx = self.idx_of(r, 0);
+            }
+            x if x == KeyCode::End as u32 => {
+                let (r, _) = self.caret_rc();
+                let eol = self.lines().get(r).map(|l| l.len()).unwrap_or(0);
+                self.cx = self.idx_of(r, eol);
+            }
+            x if x == KeyCode::PageUp as u32 => {
+                self.scroll = self.scroll.saturating_sub(10);
+            }
+            x if x == KeyCode::PageDown as u32 => {
+                self.scroll += 10;
+            }
+            _ => {}
+        }
+        self.ensure_caret_visible();
+        self.dirty_ui = true;
+    }
+}
+
 #[unsafe(no_mangle)]
-extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
-    println!("[editor] stub");
-    0
+extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
+    println!("[editor] starting");
+    let wm = loop {
+        match wm::connect() {
+            Some(w) => break w,
+            None => ustd::sleep_ms(200),
+        }
+    };
+    let args = unsafe {
+        core::str::from_utf8_unchecked(core::slice::from_raw_parts(args_ptr as *const u8, args_len as usize))
+    };
+    let path = if args.trim().is_empty() { "/notes.txt".to_string() } else { args.trim().to_string() };
+    let text = ustd::read_all(&path).map(|d| String::from_utf8_lossy(&d).into_owned()).unwrap_or_default();
+    let win = wm
+        .create_window(200, 60, 640, 480, WIN_DECORATE | WIN_RESIZABLE, &alloc::format!("Editor  - {}", path))
+        .expect("create window");
+    let mut e = Editor {
+        win,
+        c: win.canvas(),
+        path,
+        text,
+        cx: 0,
+        scroll: 0,
+        dirty_text: false,
+        dirty_ui: true,
+        status: String::from("ready"),
+    };
+    loop {
+        match wm.next_event(250) {
+            Some((EV_KEY, pl)) if pl.len() >= 12 => {
+                let k: EvKey = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
+                e.on_key(&k);
+            }
+            Some((EV_CLOSE, _)) => return 0,
+            Some((EV_RESIZE_REQ, pl)) if pl.len() >= 16 => {
+                let r: EvResizeReq = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
+                if e.win.remap(r.shm_id, r.w, r.h) {
+                    e.c = e.win.canvas();
+                    e.win.resize_ack(r.shm_id, r.w, r.h);
+                    e.dirty_ui = true;
+                }
+            }
+            _ => {}
+        }
+        if e.dirty_ui {
+            e.dirty_ui = false;
+            e.redraw();
+        }
+    }
 }

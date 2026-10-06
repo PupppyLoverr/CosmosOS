@@ -61,6 +61,12 @@ fn cur_id() -> u32 {
 }
 
 pub fn dispatch(ctx: &mut CpuContext) {
+    // Bottom-half for input IRQs: drain the lock-free event rings into IPC
+    // queues. Runs in syscall context where taking locks is safe; the IRQ
+    // handler itself never locks. Also gives blocked tasks a wake path: when
+    // this syscall is a restarted ipc_recv, the freshly-pushed port message
+    // is picked up by the try_recv below.
+    crate::input::pump();
     let nr = ctx.rax;
     let (a1, a2, a3, a4) = (ctx.rdi, ctx.rsi, ctx.rdx, ctx.r8);
     let ret: u64 = match nr {

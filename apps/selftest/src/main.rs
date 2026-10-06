@@ -6,8 +6,6 @@
 #![no_main]
 
 extern crate alloc;
-use alloc::string::String;
-use alloc::vec::Vec;
 use ustd::*;
 
 static mut PASS: u32 = 0;

@@ -12,6 +12,10 @@ use alloc::vec::Vec;
 use core::fmt;
 use linked_list_allocator::LockedHeap;
 
+pub mod draw;
+mod font16;
+pub mod wm;
+
 // ---------------------------------------------------------------------------
 // syscall raw wrappers (int 0x80; nr=rax, args rdi,rsi,rdx,r8,r9)
 // ---------------------------------------------------------------------------
