@@ -21,9 +21,14 @@ fn check(name: &str, ok: bool) {
     }
 }
 
+fn metric(name: &str, value: u64, unit: &str) {
+    println!("[selftest] METRIC {}={} {}", name, value, unit);
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
     println!("[selftest] starting");
+    metric("kernel-to-selftest", uptime_ms(), "ms");
 
     // --- fs: create/write/read/stat/rename/remove/mkdir/readdir ---
     check("mkdir", mkdir("/test").is_ok() || stat("/test").map(|s| s.is_dir == 1).unwrap_or(false));
@@ -124,6 +129,11 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         unsafe {
             let p = f.addr as *mut u32;
             *p = 0x00FF00FF; // top-left pixel magenta — proof of write access
+            // fb full-surface write cost (what one full repaint costs)
+            let bytes = (f.stride as u64 * f.height as u64 * 4) as usize;
+            let t0 = uptime_ms();
+            core::ptr::write_bytes(f.addr as *mut u8, 0x11, bytes);
+            metric("fb-fill-3mib", uptime_ms() - t0, "ms");
         }
     }
 
@@ -138,6 +148,48 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         "kern-ptr-rejected-in",
         ustd::sc2(shared::SYS_DEBUG, 0xFFFF_8000_0000_0000, 16) == u64::MAX,
     );
+
+    // --- performance baseline: real durations (tick = 10ms resolution) ---
+    {
+        // 4 MiB through write_all (virtio-blk -> FAT32)
+        let block = alloc::vec![0xA5u8; 64 * 1024];
+        let t0 = uptime_ms();
+        for i in 0..64u64 {
+            let p = alloc::format!("/test/perf{}", i);
+            let _ = write_all(&p, &block);
+        }
+        metric("fs-write-4mib", uptime_ms() - t0, "ms");
+        let t1 = uptime_ms();
+        let mut total = 0usize;
+        for i in 0..64u64 {
+            let p = alloc::format!("/test/perf{}", i);
+            total += read_all(&p).map(|d| d.len()).unwrap_or(0);
+        }
+        metric("fs-read-4mib", uptime_ms() - t1, "ms");
+        let _ = total;
+        for i in 0..64u64 {
+            let _ = remove(&alloc::format!("/test/perf{}", i));
+        }
+    }
+    // task spawn + exit + reap round trip
+    {
+        let t0 = uptime_ms();
+        match spawn("/bin/cosmos-selftest-child", "") {
+            Ok(pid) => {
+                let _ = waitpid(pid, 10_000);
+                metric("spawn-waitpid", uptime_ms() - t0, "ms");
+            }
+            Err(_) => {}
+        }
+    }
+    // syscall overhead: 1000 cheap syscalls
+    {
+        let t0 = uptime_ms();
+        for _ in 0..1000 {
+            let _ = uptime_ms();
+        }
+        metric("syscall-1000", uptime_ms() - t0, "ms");
+    }
 
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);

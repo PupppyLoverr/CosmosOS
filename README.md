@@ -71,8 +71,16 @@ are read with `ptr::read_unaligned` (no alignment guarantees on the wire).
 - Idle RAM at fresh desktop: ~53 MiB used of 1009 MiB (frame allocator).
   With 4–5 windows open: ~105–155 MiB. Well under the 1 GiB target.
 - Boot image: ~10.6 MiB; data image holds the FAT32 payload.
-- Selftest: `DONE ok=33 fail=0` — 33 checks across memory, fs, IPC,
-  shm, spawn/waitpid, fb, datetime.
+- Selftest: `DONE ok=35 fail=0` — 35 checks across memory, fs, IPC,
+  shm, spawn/waitpid, fb, datetime, syscall security boundary.
+- Kernel boot → selftest running: **20 ms** (kernel init + init spawn +
+  ELF load; excludes OVMF).
+- `spawn`+exit+reap round trip: **50 ms**. 1000 trivial syscalls: <10 ms.
+- Framebuffer full-fill (3 MiB): <10 ms (>300 MiB/s writes).
+- FS throughput (real path: `write_all`/`read_all` → FAT32 → virtio-blk
+  polled sectors): **write 4 MiB in 6.2 s (~0.66 MiB/s)**,
+  **read 4 MiB in 11.8 s (~0.34 MiB/s)** — the honest bottleneck;
+  cluster alloc + per-sector synchronous I/O, no cache.
 
 ## Rules in this codebase
 
