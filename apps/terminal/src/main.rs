@@ -129,7 +129,7 @@ impl Term {
                 for l in [
                     "commands: help ls cd pwd cat mkdir touch rm mv cp echo",
                     "          clear ps mem uname whoami date ping resolve httpget ifconfig dhcp",
-                    "          netstat kill <pid> kill",
+                    "          netstat kill <pid> grep <pat> <file> (or -r <dir>)",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -307,6 +307,18 @@ impl Term {
                 },
                 None => self.push_line("usage: httpget <host>  (real TCP/80 GET /)"),
             },
+            "grep" => {
+                // grep <pat> <file> | grep -r <pat> <dir>
+                let (rec, pat, path) = if args.first() == Some(&"-r") {
+                    (true, args.get(1).copied(), args.get(2).copied())
+                } else {
+                    (false, args.first().copied(), args.get(1).copied())
+                };
+                match (pat, path) {
+                    (Some(p), Some(path)) => self.grep_run(p, path, rec),
+                    _ => self.push_line("usage: grep <pat> <file> | grep -r <pat> <dir>"),
+                }
+            }
             "netstat" => {
                 for l in ustd::net_stat().lines() {
                     self.push_line(l);
@@ -422,6 +434,45 @@ impl Term {
             self.view = 0;
         }
         self.dirty_all = true;
+    }
+
+    fn grep_file(&mut self, pat: &str, path: &str) {
+        match ustd::read_all(path) {
+            Ok(d) => {
+                let s = String::from_utf8_lossy(&d);
+                for l in s.lines() {
+                    if l.contains(pat) {
+                        self.push_line(&alloc::format!("{}: {}", path, l));
+                    }
+                }
+            }
+            Err(e) => self.push_line(&alloc::format!("grep: {}: err {}", path, e)),
+        }
+    }
+
+    fn grep_run(&mut self, pat: &str, path: &str, rec: bool) {
+        if !rec {
+            self.grep_file(pat, path);
+            return;
+        }
+        let mut stack = alloc::vec::Vec::new();
+        stack.push(String::from(path));
+        while let Some(dir) = stack.pop() {
+            match ustd::readdir(&dir) {
+                Ok(ents) => {
+                    for e in ents {
+                        let name = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("?");
+                        let p = alloc::format!("{}{}{}", dir, if dir.ends_with('/') { "" } else { "/" }, name);
+                        if e.is_dir != 0 {
+                            stack.push(p);
+                        } else {
+                            self.grep_file(pat, &p);
+                        }
+                    }
+                }
+                Err(_) => self.grep_file(pat, &dir), // a plain file was passed
+            }
+        }
     }
 }
 

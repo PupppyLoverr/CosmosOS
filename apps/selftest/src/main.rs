@@ -216,6 +216,9 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         if let Some(n) = tcp_ok {
             metric("tcp-sock-bytes", n as u64);
         }
+        // netstat dump should list our closed-test sockets or none
+        let st = ustd::net_stat();
+        check("netstat", st.contains("udp") || st.contains("tcp") || st.contains("no sockets"));
     } else {
         check("net-mac", false);
         check("net-ip", false);
@@ -224,7 +227,13 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         check("http-example", false);
         check("udp-socket", false);
         check("tcp-socket", false);
+        check("netstat", false);
     }
+
+    // kernel clipboard round-trip
+    let payload = b"selftest-clipboard";
+    ustd::clip_set(payload);
+    check("clipboard", ustd::clip_get() == payload);
 
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
