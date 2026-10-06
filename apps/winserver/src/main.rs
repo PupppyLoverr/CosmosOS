@@ -299,6 +299,16 @@ fn spawn_app(path: &str) {
 fn on_key(s: &mut S, k: &InputKey) {
     // F4-F10 launch apps; F1/F2 switch workspaces
     if k.down != 0 {
+        // Alt+F4 closes the focused window (before the F4 app-launch match)
+        if k.key == KeyCode::F4 as u32 && k.mods & 4 != 0 {
+            let f = s.focus;
+            if f != 0 {
+                close_win(s, f);
+                s.focus = top_id(s);
+                s.dirty = true;
+            }
+            return;
+        }
         let app = match k.key {
             x if x == KeyCode::F4 as u32 => Some("/bin/cosmos-terminal"),
             x if x == KeyCode::F5 as u32 => Some("/bin/cosmos-files"),

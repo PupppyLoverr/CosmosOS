@@ -129,7 +129,7 @@ impl Term {
                 for l in [
                     "commands: help ls cd pwd cat mkdir touch rm mv cp echo",
                     "          clear ps mem uname whoami date ping resolve httpget ifconfig dhcp",
-                    "          netstat kill <pid> grep <pat> <file> (or -r <dir>)",
+                    "          netstat kill <pid> grep <pat> <file> (or -r <dir>) uptime",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -266,6 +266,15 @@ impl Term {
                 ));
             }
             "uname" => self.push_line("CosmosOS 0.1 x86_64 (rust kernel)"),
+            "uptime" => {
+                let ms = ustd::uptime_ms();
+                self.push_line(&alloc::format!(
+                    "up {}h {:02}m {:02}s",
+                    ms / 3_600_000,
+                    (ms / 60_000) % 60,
+                    (ms / 1000) % 60
+                ));
+            }
             "whoami" => self.push_line("cosmos"),
             "date" => {
                 let d = ustd::datetime();
