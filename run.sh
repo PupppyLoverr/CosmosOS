@@ -38,7 +38,7 @@ DATA_ARGS=()
 
 # user-mode net on a legacy virtio-net device (io-port driver)
 NET_ARGS=(
-    -netdev user,id=n0
+    -netdev user,id=n0,hostfwd=tcp::8080-:8080
     -device virtio-net-pci,netdev=n0,disable-modern=on
 )
 

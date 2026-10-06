@@ -255,6 +255,28 @@ pub fn dispatch(ctx: &mut CpuContext) {
             net::tcp_close(a1 as u16);
             0
         }
+        shared::SYS_NET_TCP_LISTEN => match net::tcp_listen(a1 as u16) {
+            Ok(()) => 0,
+            Err(_) => ERR,
+        },
+        shared::SYS_NET_TCP_ACCEPT => {
+            match net::tcp_accept(a1 as u16, a3.min(60_000)) {
+                Some((cid, rip, rport)) => {
+                    let mut out = [0u8; 8];
+                    out[..4].copy_from_slice(&rip);
+                    out[4..6].copy_from_slice(&rport.to_be_bytes());
+                    match copy_out(a2, &out) {
+                        Some(()) => cid as u64,
+                        None => ERR,
+                    }
+                }
+                None => ERR,
+            }
+        }
+        shared::SYS_NET_TCP_UNLISTEN => {
+            net::tcp_unlisten(a1 as u16);
+            0
+        }
         shared::SYS_CLIP_SET => match copy_in(a1, a2.min(1 << 16)) {
             Some(d) => {
                 *CLIPBOARD.lock() = d;

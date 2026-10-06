@@ -543,6 +543,9 @@ pub fn sockstat() -> String {
             p, k.rip[0], k.rip[1], k.rip[2], k.rip[3], k.rport, k.state
         ));
     }
+    for p in LISTENERS.lock().iter() {
+        s.push_str(&alloc::format!("tcp  :{} LISTEN\n", p));
+    }
     if s.is_empty() {
         s.push_str("no sockets open\n");
     }
@@ -775,14 +778,27 @@ fn dispatch(src_ip: [u8; 4], proto: u8, p: Vec<u8>) -> bool {
                 return false;
             };
             let mut t = TCP_SOCKS.lock();
-            let Some(k) = t
+            // accepted conns are matched by (rip, rport, lport) — the map
+            // key is synthetic so many clients can share one listener port
+            match t
                 .values_mut()
                 .find(|k| k.rip == src_ip && k.rport == s.sport && k.lport == s.dport)
-            else {
-                return false;
-            };
-            tcp_feed(k, &s);
-            true
+            {
+                Some(k) => {
+                    tcp_feed(k, &s);
+                    return true;
+                }
+                None => {}
+            }
+            drop(t);
+            // inbound SYN on a listening port -> open a server-side conn
+            if s.flags & TCP_SYN != 0 && s.flags & TCP_ACK == 0
+                && LISTENERS.lock().contains(&s.dport)
+            {
+                accept_syn(&s, src_ip);
+                return true;
+            }
+            false
         }
         _ => false,
     }
@@ -796,11 +812,13 @@ fn dispatch(src_ip: [u8; 4], proto: u8, p: Vec<u8>) -> bool {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum TcpState {
     SynSent,
+    SynRecv, // inbound SYN answered; waiting for the peer's ACK
     Open,
     Closed,
 }
 
 pub struct TcpSock {
+    cid: u16, // TCP_SOCKS map key (== lport for outbound; synthetic for accepted)
     lport: u16,
     rip: [u8; 4],
     rport: u16,
@@ -814,8 +832,34 @@ pub struct TcpSock {
 
 static TCP_SOCKS: Mutex<BTreeMap<u16, TcpSock>> = Mutex::new(BTreeMap::new());
 
+// Inbound connections: ports accepting SYNs, and the conns that completed
+// their handshake and are waiting for tcp_accept to pick them up.
+static LISTENERS: Mutex<alloc::collections::BTreeSet<u16>> =
+    Mutex::new(alloc::collections::BTreeSet::new());
+static ACCEPTED: Mutex<BTreeMap<u16, VecDeque<(u16, [u8; 4], u16)>>> =
+    Mutex::new(BTreeMap::new());
+static NEXT_CID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x8000);
+
 fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
     match k.state {
+        TcpState::SynRecv => {
+            if s.flags & TCP_RST != 0 {
+                k.state = TcpState::Closed;
+            } else if s.flags & TCP_ACK != 0 && s.ack == k.snd_nxt {
+                k.snd_una = s.ack;
+                k.state = TcpState::Open;
+                if s.seq == k.rcv_nxt && !s.payload.is_empty() {
+                    k.q.push_back(s.payload.clone());
+                    k.rcv_nxt += s.payload.len() as u32;
+                    send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[]);
+                }
+                ACCEPTED
+                    .lock()
+                    .entry(k.lport)
+                    .or_default()
+                    .push_back((k.cid, k.rip, k.rport));
+            }
+        }
         TcpState::SynSent => {
             if s.flags & (TCP_SYN | TCP_ACK) == TCP_SYN | TCP_ACK && s.ack == k.snd_nxt {
                 k.rcv_nxt = s.seq + 1;
@@ -870,6 +914,7 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
             rcv_nxt: 0,
             state: TcpState::SynSent,
             q: VecDeque::new(),
+            cid: lport,
         },
     );
     let deadline = now_ms() + timeout_ms;
@@ -902,6 +947,69 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
     } else {
         TCP_SOCKS.lock().remove(&lport);
         Err(-2)
+    }
+}
+
+/// Mark `lport` as listening for inbound TCP connections.
+pub fn tcp_listen(lport: u16) -> Result<(), i64> {
+    if TCP_SOCKS.lock().contains_key(&lport) || !LISTENERS.lock().insert(lport) {
+        return Err(-1);
+    }
+    Ok(())
+}
+
+pub fn tcp_unlisten(lport: u16) {
+    LISTENERS.lock().remove(&lport);
+    ACCEPTED.lock().remove(&lport);
+}
+
+/// Answer an inbound SYN: send SYN+ACK and park the conn in SynRecv.
+fn accept_syn(s: &TcpSeg, src_ip: [u8; 4]) {
+    let Some(mac) = next_hop(src_ip, 1000) else {
+        return;
+    };
+    let mut cid = NEXT_CID.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u16;
+    // skip keys that collide with real lports in the table
+    while TCP_SOCKS.lock().contains_key(&cid) {
+        cid = NEXT_CID.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u16;
+    }
+    let isn = (now_ms() as u32).wrapping_add(cid as u32) ^ 0x50EA_0000;
+    TCP_SOCKS.lock().insert(
+        cid,
+        TcpSock {
+            cid,
+            lport: s.dport,
+            rip: src_ip,
+            rport: s.sport,
+            mac,
+            snd_nxt: isn + 1,
+            snd_una: isn,
+            rcv_nxt: s.seq + 1,
+            state: TcpState::SynRecv,
+            q: VecDeque::new(),
+        },
+    );
+    send_tcp(mac, src_ip, s.dport, s.sport, isn, s.seq + 1, TCP_SYN | TCP_ACK, &[]);
+}
+
+/// Wait for an accepted conn on a listener. Returns (cid, peer ip, peer port).
+pub fn tcp_accept(lport: u16, timeout_ms: u64) -> Option<(u16, [u8; 4], u16)> {
+    let deadline = now_ms() + timeout_ms;
+    loop {
+        for (src_ip, proto, p) in pump_rx() {
+            dispatch(src_ip, proto, p);
+        }
+        if let Some(x) = ACCEPTED
+            .lock()
+            .get_mut(&lport)
+            .and_then(|q| q.pop_front())
+        {
+            return Some(x);
+        }
+        if now_ms() >= deadline {
+            return None;
+        }
+        wait_irq();
     }
 }
 
