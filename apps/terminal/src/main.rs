@@ -48,6 +48,7 @@ struct Term {
     cx: usize,          // cursor char pos
     hist: Vec<String>,
     hi: usize,
+    view: usize, // scrollback: lines hidden from the bottom (0 = tail)
     dirty_all: bool,
     needs_cursor_flip: bool,
 }
@@ -57,17 +58,27 @@ impl Term {
         // wrap at COLS
         let mut rest = s;
         loop {
-            if rest.len() <= COLS {
+            let n = if rest.len() <= COLS {
                 self.lines.push(String::from(rest));
+                true
+            } else {
+                let (a, b) = rest.split_at(COLS);
+                self.lines.push(String::from(a));
+                rest = b;
+                false
+            };
+            // each appended line bumps view so a scrolled window stays pinned
+            if self.view > 0 {
+                self.view += 1;
+            }
+            if n {
                 break;
             }
-            let (a, b) = rest.split_at(COLS);
-            self.lines.push(String::from(a));
-            rest = b;
         }
         if self.lines.len() > 400 {
             let drop = self.lines.len() - 400;
             self.lines.drain(0..drop);
+            self.view = self.view.saturating_sub(drop);
         }
     }
 
@@ -80,9 +91,11 @@ impl Term {
         let rows_vis = (self.c.h as usize / CH as usize).saturating_sub(1);
         let prompt = self.prompt_str();
         let total_cur_lines = (prompt.len() + self.cur.len()) / COLS + 1;
-        let start = self.lines.len().saturating_sub(rows_vis.saturating_sub(total_cur_lines));
+        let region = rows_vis.saturating_sub(total_cur_lines);
+        let end = self.lines.len().saturating_sub(self.view.min(self.lines.len()));
+        let start = end.saturating_sub(region);
         let mut y = 8i32;
-        for line in &self.lines[start..] {
+        for line in &self.lines[start..end] {
             if y + CH > self.c.h as i32 - 4 {
                 break;
             }
@@ -327,7 +340,12 @@ impl Term {
         if k.down == 0 {
             return;
         }
-        if k.key == KeyCode::Char as u32 {
+        if k.key == KeyCode::PageUp as u32 {
+            let max = self.lines.len().saturating_sub(1);
+            self.view = (self.view + 20).min(max);
+        } else if k.key == KeyCode::PageDown as u32 {
+            self.view = self.view.saturating_sub(20);
+        } else if k.key == KeyCode::Char as u32 {
             self.cur.insert(self.cx, k.chr as char);
             self.cx += 1;
         } else if k.key == KeyCode::Enter as u32 {
@@ -368,6 +386,10 @@ impl Term {
                 self.cx = self.cur.len();
             }
         }
+        // typing snaps back to the tail (PgUp/PgDn above keep the view)
+        if k.key != KeyCode::PageUp as u32 && k.key != KeyCode::PageDown as u32 {
+            self.view = 0;
+        }
         self.dirty_all = true;
     }
 }
@@ -392,6 +414,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         cx: 0,
         hist: Vec::new(),
         hi: 0,
+        view: 0,
         dirty_all: true,
         needs_cursor_flip: true,
     };
@@ -404,6 +427,17 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             Some((EV_KEY, pl)) if pl.len() >= 12 => {
                 let k: EvKey = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
                 t.on_key(&k);
+            }
+            Some((EV_POINTER, pl)) if pl.len() >= 16 => {
+                let p: shared::EvPointer = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
+                if p.wheel > 0 {
+                    let max = t.lines.len().saturating_sub(1);
+                    t.view = (t.view + 3 * p.wheel as usize).min(max);
+                    t.dirty_all = true;
+                } else if p.wheel < 0 {
+                    t.view = t.view.saturating_sub(3 * (-p.wheel) as usize);
+                    t.dirty_all = true;
+                }
             }
             Some((EV_CLOSE, _)) => return 0,
             Some((EV_FOCUS, _)) => {}
