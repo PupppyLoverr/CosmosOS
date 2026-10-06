@@ -113,6 +113,7 @@ struct S {
     damage: Option<(i32, i32, i32, i32)>, // union of damaged rects (x,y,w,h)
     last_tick: u64,
     last_frame: u64,
+    last_tc: (u64, u32), // (time, win) of last titlebar press — dblclick detect
     wall: Vec<u32>, // wallpaper cache (fh-TBAR_H rows)
 }
 
@@ -187,6 +188,7 @@ fn main_loop() -> ! {
         damage: None,
         last_tick: 0,
         last_frame: 0,
+        last_tc: (0, 0),
     };
 
     composite(&mut s);
@@ -395,6 +397,11 @@ fn on_mouse(s: &mut S, m: &InputMouse) {
         mouse_press(s, nx, ny);
         return;
     }
+    // middle-press on the taskbar's window buttons closes the window
+    if m.buttons & 4 != 0 && pbtns & 4 == 0 && ny >= s.fh - TBAR_H {
+        taskbar_click(s, nx, true);
+        return;
+    }
 
     // motion: cursor moved — damage only the two 16px cursor cells
     if nx != px || ny != py {
@@ -421,7 +428,7 @@ fn on_mouse(s: &mut S, m: &InputMouse) {
 fn mouse_press(s: &mut S, x: i32, y: i32) {
     // taskbar?
     if y >= s.fh - TBAR_H {
-        taskbar_click(s, x);
+        taskbar_click(s, x, false);
         s.dirty = true;
         return;
     }
@@ -473,8 +480,19 @@ fn mouse_press(s: &mut S, x: i32, y: i32) {
                 }
                 return;
             }
+            // double-click the titlebar (same window, <500ms) maximizes
+            let resizable = w.resizable();
+            let (wx, wy, ww, wh) = (w.x, w.y, w.w, w.h);
+            let now = ustd::uptime_ms();
+            let (lt, lw) = (s.last_tc.0, s.last_tc.1);
+            if resizable && lw == id && now - lt < 500 {
+                s.last_tc = (0, 0);
+                toggle_max(s, id);
+                return;
+            }
+            s.last_tc = (now, id);
             // titlebar drag
-            s.drag = Some(Drag { win: id, mode: 0, ox: rel_x, oy: rel_y, rx: w.x, ry: w.y, rw: w.w, rh: w.h });
+            s.drag = Some(Drag { win: id, mode: 0, ox: rel_x, oy: rel_y, rx: wx, ry: wy, rw: ww, rh: wh });
             return;
         }
         // resize border?
@@ -960,7 +978,7 @@ fn draw_launcher(s: &S) {
     }
 }
 
-fn taskbar_click(s: &mut S, x: i32) {
+fn taskbar_click(s: &mut S, x: i32, middle: bool) {
     if x < 96 {
         s.launcher.open = !s.launcher.open;
         return;
@@ -983,6 +1001,10 @@ fn taskbar_click(s: &mut S, x: i32) {
         }
         if x >= bx && x < bx + bw {
             let id = w.id;
+            if middle {
+                close_win(s, id);
+                return;
+            }
             if w.min {
                 if let Some(wr) = s.win_mut(id) {
                     wr.min = false;
