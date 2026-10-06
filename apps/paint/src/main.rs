@@ -28,6 +28,8 @@ struct Paint {
     brush: i32,               // half-size of the square brush
     eraser: bool,
     color: usize,             // index into PALETTE
+    line_mode: bool,          // `l`: drag draws a straight line on release
+    anchor: Option<(i32, i32)>, // button-down point for line mode
     status: String,
     dirty: bool,
 }
@@ -59,6 +61,17 @@ impl Paint {
             None => self.stamp(x, y),
         }
         self.last = Some((x, y));
+        self.dirty = true;
+    }
+
+    /// Line mode: draw a straight segment (a,b) with the current brush.
+    fn line(&mut self, ax: i32, ay: i32, bx: i32, by: i32) {
+        let dx = bx - ax;
+        let dy = by - ay;
+        let steps = dx.abs().max(dy.abs()).max(1);
+        for i in 0..=steps {
+            self.stamp(ax + dx * i / steps, ay + dy * i / steps);
+        }
         self.dirty = true;
     }
 
@@ -100,7 +113,7 @@ impl Paint {
             8,
             5,
             &alloc::format!(
-                "brush {} {}{}  b brush  e eraser  [/] size  1-8 color  c clear  s save",
+                "brush {} {}{}  b brush e eraser l line  [/] size 1-8 color c clear s save",
                 self.brush,
                 if self.eraser { "eraser" } else { "draw" },
                 if self.status.is_empty() {
@@ -144,6 +157,8 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         brush: 2,
         eraser: false,
         color: 0,
+        line_mode: false,
+        anchor: None,
         status: String::new(),
         dirty: true,
     };
@@ -176,6 +191,12 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                             p.brush = (p.brush + 1).min(8);
                             p.dirty = true;
                         }
+                        b'l' => {
+                            p.line_mode = !p.line_mode;
+                            p.anchor = None;
+                            p.status = String::from(if p.line_mode { "line mode" } else { "freehand" });
+                            p.dirty = true;
+                        }
                         b's' => p.save(),
                         c if (b'1'..=b'8').contains(&c) => {
                             p.color = (c - b'1') as usize;
@@ -189,7 +210,16 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             Some((EV_POINTER, pl)) if pl.len() >= 16 => {
                 let pt: EvPointer = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
                 if pt.y >= TOOL_H {
-                    if pt.buttons & 1 != 0 {
+                    if p.line_mode {
+                        // press anchors, release commits the segment
+                        if pt.buttons & 1 != 0 {
+                            if p.anchor.is_none() {
+                                p.anchor = Some((pt.x, pt.y));
+                            }
+                        } else if let Some((ax, ay)) = p.anchor.take() {
+                            p.line(ax, ay, pt.x, pt.y);
+                        }
+                    } else if pt.buttons & 1 != 0 {
                         p.stroke(pt.x, pt.y);
                     } else if pt.buttons & 2 != 0 {
                         let was = p.eraser;
