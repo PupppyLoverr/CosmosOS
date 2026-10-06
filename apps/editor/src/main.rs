@@ -287,6 +287,20 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
                 let k: EvKey = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
                 e.on_key(&k);
             }
+            Some((EV_POINTER, pl)) if pl.len() >= 16 => {
+                let p: EvPointer = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
+                // left-press inside the text area moves the caret there
+                if p.buttons & 1 != 0 && p.y >= 30 && p.x >= 36 {
+                    let row = e.scroll + ((p.y - 30) / 16).max(0) as usize;
+                    let col = ((p.x - 36) / 8).max(0) as usize;
+                    let lines = e.lines();
+                    if row < lines.len() {
+                        e.cx = e.idx_of(row, col.min(lines[row].len()));
+                        e.sel = None;
+                        e.dirty_ui = true;
+                    }
+                }
+            }
             Some((EV_CLOSE, _)) => return 0,
             Some((EV_RESIZE_REQ, pl)) if pl.len() >= 16 => {
                 let r: EvResizeReq = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
