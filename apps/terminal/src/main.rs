@@ -56,6 +56,7 @@ struct Term {
     watch: Option<(String, u64, u64)>, // (cmd, interval_ms, last_run_ms)
     vars: alloc::collections::BTreeMap<String, String>, // shell vars ($NAME)
     prev_cwd: String,                                  // for `cd -`
+    pager: Option<(Vec<String>, usize)>,               // (all lines, page top) for `more`
 }
 
 impl Term {
@@ -128,6 +129,25 @@ impl Term {
             }
         }
         out
+    }
+
+    /// Lines per `more` page (whole visible area).
+    fn page_lines(&self) -> usize {
+        ((self.c.h as usize / CH as usize) - 2).max(4)
+    }
+
+    /// Paint one page of `all` starting at `top`.
+    fn page(&mut self, top: usize, all: Vec<String>) {
+        let page = self.page_lines();
+        self.lines.clear();
+        self.view = 0;
+        for l in all.iter().skip(top).take(page) {
+            self.push_line(l);
+        }
+        let pct = if all.is_empty() { 100 } else { ((top + page).min(all.len())) * 100 / all.len() };
+        self.push_line(&alloc::format!("--More--({}%  Space next, b back, q quit)", pct));
+        self.pager = Some((all, top));
+        self.dirty_all = true;
     }
 
     /// Persist history to /history.txt (last 100 commands).
@@ -248,7 +268,7 @@ impl Term {
                     "          hex <file> wc <file> du <path> history time <cmd>",
                     "          head/tail [-n N] <file> sort <file>",
                     "          a | b   cmd > file   cmd >> file   watch [-n s] cmd",
-                    "          df  (volume usage)",
+                    "          df  (volume usage)  more <file> (pager)",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -597,6 +617,24 @@ impl Term {
                 }
                 None => self.emit("df: no volume mounted"),
             },
+            "more" => {
+                let content = match args.first() {
+                    Some(p) => match ustd::read_all(p) {
+                        Ok(d) => Some(String::from_utf8_lossy(&d).into_owned()),
+                        Err(e) => {
+                            self.emit(&alloc::format!("more: {}: err {}", p, e));
+                            None
+                        }
+                    },
+                    None => self.pipe_in.clone(),
+                };
+                if let Some(s) = content {
+                    let ls: Vec<String> = s.lines().map(String::from).collect();
+                    self.page(0, ls);
+                } else if args.is_empty() && self.pipe_in.is_none() {
+                    self.emit("usage: more <file>   (Space/PgDn next, b back, q quit)");
+                }
+            }
             "watch" => {
                 // watch [-n secs] <cmd...>: re-run every N secs until Esc/Enter
                 let (mut ms, mut i) = (1000u64, 0usize);
@@ -728,6 +766,50 @@ impl Term {
         if k.down == 0 {
             return;
         }
+        // pager mode: Space/PgDn next page, b/PgUp back, q/Esc/Enter quits
+        if self.pager.is_some() {
+            match k.key as u32 {
+                x if x == KeyCode::Char as u32 && (k.chr == b' ' || k.chr == b'q' || k.chr == b'Q' || k.chr == b'b') => {
+                    if k.chr == b' ' {
+                        let (all, top) = self.pager.take().unwrap();
+                        let page = self.page_lines();
+                        if top + page >= all.len() {
+                            self.push_line("(end)");
+                        } else {
+                            self.page(top + page, all);
+                        }
+                    } else if k.chr == b'b' || k.chr == b'B' {
+                        let (all, top) = self.pager.take().unwrap();
+                        let page = self.page_lines();
+                        self.page(top.saturating_sub(page), all);
+                    } else {
+                        self.pager = None;
+                        self.push_line("");
+                    }
+                }
+                x if x == KeyCode::PageDown as u32 => {
+                    let (all, top) = self.pager.take().unwrap();
+                    let page = self.page_lines();
+                    if top + page >= all.len() {
+                        self.push_line("(end)");
+                    } else {
+                        self.page(top + page, all);
+                    }
+                }
+                x if x == KeyCode::PageUp as u32 => {
+                    let (all, top) = self.pager.take().unwrap();
+                    let page = self.page_lines();
+                    self.page(top.saturating_sub(page), all);
+                }
+                x if x == KeyCode::Escape as u32 || x == KeyCode::Enter as u32 => {
+                    self.pager = None;
+                    self.push_line("");
+                }
+                _ => {}
+            }
+            self.dirty_all = true;
+            return;
+        }
         // during watch mode, Esc or Enter stops it; other keys are ignored
         if self.watch.is_some() {
             if k.key == KeyCode::Escape as u32 || k.key == KeyCode::Enter as u32 {
@@ -820,7 +902,7 @@ impl Term {
             "resolve", "httpget", "ifconfig", "dhcp", "netstat", "kill", "grep",
             "uptime", "reboot", "shutdown", "exit", "history", "time",
             "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
-            "set", "env", "which",
+            "set", "env", "which", "more",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
@@ -1016,6 +1098,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         watch: None,
         vars: alloc::collections::BTreeMap::new(),
         prev_cwd: String::new(),
+        pager: None,
     };
     t.load_hist();
     t.push_line("CosmosOS terminal - type 'help'");
