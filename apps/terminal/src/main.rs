@@ -17,6 +17,46 @@ const ROWS: usize = 40;
 const CW: i32 = 8;
 const CH: i32 = 16;
 
+const DIM_CAL: [u8; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"];
+
+fn cal_leap(y: u16) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Days since 1970-01-01 (a Thursday) for y-01-01 + in-year offset.
+fn cal_days(y: u16, m: u8, d: u8) -> u64 {
+    let mut n = 0u64;
+    for yy in 1970..y {
+        n += if cal_leap(yy) { 366 } else { 365 };
+    }
+    for mm in 1..m {
+        n += DIM_CAL[(mm - 1) as usize] as u64 + if mm == 2 && cal_leap(y) { 1 } else { 0 };
+    }
+    n + d as u64 - 1
+}
+
+/// Render one month as text lines (Sunday-first), or mark today.
+fn cal_render(m: u8, y: u16) -> Vec<String> {
+    let mut out = Vec::new();
+    let title = alloc::format!("{} {}", MONTHS[(m - 1) as usize], y);
+    let pad = (20usize.saturating_sub(title.len())) / 2;
+    out.push(alloc::format!("{}{}", " ".repeat(pad), title));
+    out.push(String::from("Su Mo Tu We Th Fr Sa"));
+    let first_wd = ((cal_days(y, m, 1) + 4) % 7) as usize; // 0=Sunday
+    let dim = DIM_CAL[(m - 1) as usize] + if m == 2 && cal_leap(y) { 1 } else { 0 };
+    let mut line = String::from("   ".repeat(first_wd));
+    for d in 1..=dim {
+        line.push_str(&alloc::format!("{:>2} ", d));
+        if (first_wd + d as usize) % 7 == 0 || d == dim {
+            out.push(String::from(line.trim_end()));
+            line.clear();
+        }
+    }
+    out
+}
+
 fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let mut out = [0u8; 4];
     let mut i = 0;
@@ -268,7 +308,7 @@ impl Term {
                     "          hex <file> wc <file> du <path> history time <cmd>",
                     "          head/tail [-n N] <file> sort <file>",
                     "          a | b   cmd > file   cmd >> file   watch [-n s] cmd",
-                    "          df  (volume usage)  more <file> (pager)",
+                    "          df  (volume usage)  more <file> (pager)  cal [m [y]]",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -491,6 +531,17 @@ impl Term {
                 ));
             }
             "whoami" => self.emit("cosmos"),
+            "cal" => {
+                // cal [month [year]] — real Gregorian calendar
+                let now = ustd::datetime();
+                let mo = args.first().and_then(|s| s.parse::<u32>().ok()).map(|m| m as u8).unwrap_or(now.month);
+                let yr = args.get(1).and_then(|s| s.parse::<u32>().ok()).map(|y| y as u16).unwrap_or(now.year);
+                if !(1..=12).contains(&mo) {
+                    self.emit("cal: month must be 1-12");
+                } else {
+                    for l in cal_render(mo, yr) { self.emit(&l); }
+                }
+            }
             "date" => {
                 let d = ustd::datetime();
                 self.emit(&alloc::format!(
@@ -902,7 +953,7 @@ impl Term {
             "resolve", "httpget", "ifconfig", "dhcp", "netstat", "kill", "grep",
             "uptime", "reboot", "shutdown", "exit", "history", "time",
             "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
-            "set", "env", "which", "more",
+            "set", "env", "which", "more", "cal",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
