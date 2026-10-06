@@ -98,6 +98,28 @@ pub fn waitpid(pid: u32, timeout_ms: u64) -> Result<i64, ()> {
 pub fn kill(pid: u32) -> bool {
     sc1(shared::SYS_KILL, pid as u64) == 0
 }
+// ---------------------------------------------------------------------------
+// networking
+// ---------------------------------------------------------------------------
+/// Ping an IPv4 host (a.b.c.d packed big-endian into u32).
+/// Returns round-trip ms, or None on timeout / no device.
+pub fn net_ping(ip: u32, timeout_ms: u64) -> Option<u64> {
+    let r = sc2(shared::SYS_NET_PING, ip as u64, timeout_ms);
+    if r == u64::MAX { None } else { Some(r) }
+}
+/// (mac, ip) of the virtio-net device, if present.
+pub fn net_info() -> Option<([u8; 6], [u8; 4])> {
+    let mut b = [0u8; 10];
+    if sc1(shared::SYS_NET_INFO, b.as_mut_ptr() as u64) == u64::MAX {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    let mut ip = [0u8; 4];
+    mac.copy_from_slice(&b[..6]);
+    ip.copy_from_slice(&b[6..]);
+    Some((mac, ip))
+}
+
 pub fn poweroff() -> ! {
     sc0(shared::SYS_POWEROFF);
     loop {}

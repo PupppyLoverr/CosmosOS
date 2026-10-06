@@ -13,6 +13,7 @@ mod idt;
 mod input;
 mod ipc;
 mod mem;
+mod net;
 mod pci;
 mod serial;
 mod shm;
@@ -21,6 +22,7 @@ mod task;
 mod timer;
 mod vfs;
 mod virtio;
+mod virtio_net;
 
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
@@ -73,6 +75,7 @@ fn main(boot_info: &'static mut BootInfo) -> ! {
 
     // devices
     virtio::init();
+    net::init();
     vfs::init();
     input::init();
 

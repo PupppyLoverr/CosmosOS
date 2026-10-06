@@ -36,6 +36,12 @@ DATA_ARGS=()
     -device virtio-blk-pci,drive=data,disable-modern=on
 )
 
+# user-mode net on a legacy virtio-net device (io-port driver)
+NET_ARGS=(
+    -netdev user,id=n0
+    -device virtio-net-pci,netdev=n0,disable-modern=on
+)
+
 exec qemu-system-x86_64 \
     -accel "$ACCEL" \
     -machine q35 \
@@ -46,6 +52,7 @@ exec qemu-system-x86_64 \
     -drive if=pflash,format=raw,file=./OVMF_VARS.fd \
     -drive format=raw,file="$OS_IMG" \
     "${DATA_ARGS[@]}" \
+    "${NET_ARGS[@]}" \
     "${SER_ARGS[@]}" \
     "${DISP_ARGS[@]}" \
     $EXTRA

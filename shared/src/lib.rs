@@ -44,6 +44,8 @@ pub const SYS_CHDIR: u64 = 47; // (path_ptr,len)
 pub const SYS_GETCWD: u64 = 48; // (buf,len) -> n
 pub const SYS_WAITPID: u64 = 49; // (pid,timeout_ms) -> exit_code | ERR
 pub const SYS_KILL: u64 = 50; // (pid) -> 0 | ERR
+pub const SYS_NET_PING: u64 = 51; // (ip u32 BE-packed, timeout_ms) -> rtt_ms | ERR
+pub const SYS_NET_INFO: u64 = 52; // (&mut [u8;10] {mac[6],ip[4]}) -> 0 | ERR
 
 pub const SYS_ERR: u64 = u64::MAX;
 

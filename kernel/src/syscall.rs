@@ -1,7 +1,7 @@
 //! int 0x80 syscall dispatch. nr=rax, args rdi,rsi,rdx,r8,r9 → ret rax.
 //! Runs on the faulting task's kernel stack; may block via task::yield_ctx.
 use crate::idt::CpuContext;
-use crate::{elf, fb, ipc, mem, shm, task, timer, vfs};
+use crate::{elf, fb, ipc, mem, net, shm, task, timer, vfs};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -151,6 +151,27 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_GETCWD => sys_getcwd(a1, a2),
         shared::SYS_WAITPID => sys_waitpid(ctx, a1, a2),
         shared::SYS_KILL => sys_kill(a1),
+        shared::SYS_NET_PING => {
+            let ip = [
+                (a1 >> 24) as u8,
+                (a1 >> 16) as u8,
+                (a1 >> 8) as u8,
+                a1 as u8,
+            ];
+            net::ping(ip, a2.min(10_000)).unwrap_or(ERR)
+        }
+        shared::SYS_NET_INFO => match net::info() {
+            Some((mac, ip)) => {
+                let mut b = [0u8; 10];
+                b[..6].copy_from_slice(&mac);
+                b[6..].copy_from_slice(&ip);
+                match copy_out(a1, &b) {
+                    Some(_) => 0,
+                    None => ERR,
+                }
+            }
+            None => ERR,
+        },
         _ => {
             crate::sprint!("[syscall] unknown nr\n");
             ERR

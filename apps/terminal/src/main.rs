@@ -17,6 +17,29 @@ const ROWS: usize = 40;
 const CW: i32 = 8;
 const CH: i32 = 16;
 
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut i = 0;
+    for part in s.split('.') {
+        if i >= 4 || part.is_empty() || part.len() > 3 {
+            return None;
+        }
+        let mut v: u32 = 0;
+        for c in part.bytes() {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            v = v * 10 + (c - b'0') as u32;
+        }
+        if v > 255 {
+            return None;
+        }
+        out[i] = v as u8;
+        i += 1;
+    }
+    if i == 4 { Some(out) } else { None }
+}
+
 struct Term {
     win: Window,
     c: Canvas,
@@ -92,7 +115,8 @@ impl Term {
             "help" => {
                 for l in [
                     "commands: help ls cd pwd cat mkdir touch rm mv cp echo",
-                    "          clear ps mem uname whoami date reboot shutdown exit",
+                    "          clear ps mem uname whoami date ping ifconfig",
+                    "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
                     self.push_line(l);
@@ -228,6 +252,35 @@ impl Term {
                     d.year, d.month, d.day, d.hour, d.minute, d.second
                 ));
             }
+            "ping" => match args.first() {
+                Some(s) => match parse_ipv4(s) {
+                    Some(ip) => {
+                        let (a, b, c, d) = (ip[0], ip[1], ip[2], ip[3]);
+                        let packed = ((a as u32) << 24) | ((b as u32) << 16)
+                            | ((c as u32) << 8) | d as u32;
+                        match ustd::net_ping(packed, 2000) {
+                            Some(rtt) => self.push_line(&alloc::format!(
+                                "reply from {}.{}.{}.{}: time={}ms", a, b, c, d, rtt
+                            )),
+                            None => self.push_line(&alloc::format!(
+                                "ping {}.{}.{}.{}: timeout", a, b, c, d
+                            )),
+                        }
+                    }
+                    None => self.push_line(&alloc::format!("ping: bad ip '{}'", s)),
+                },
+                None => self.push_line("usage: ping <a.b.c.d>  (try 10.0.2.2)"),
+            },
+            "ifconfig" => match ustd::net_info() {
+                Some((mac, ip)) => {
+                    self.push_line(&alloc::format!(
+                        "net0: ip {}.{}.{}.{} mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        ip[0], ip[1], ip[2], ip[3],
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                    ));
+                }
+                None => self.push_line("no network device"),
+            },
             "reboot" => ustd::reboot(),
             "shutdown" | "poweroff" => ustd::poweroff(),
             "exit" => self.win.close(),
