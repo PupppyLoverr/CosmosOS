@@ -338,6 +338,133 @@ fn rng(lo0: usize, hi0: usize) -> String {
     }
 }
 
+/// Real SHA-256 (FIPS 180-4). Verified against the "" and "abc" vectors.
+fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut msg = data.to_vec();
+    let bitlen = (data.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bitlen.to_be_bytes());
+    let mut w = [0u32; 64];
+    for chunk in msg.chunks(64) {
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        out[4 * i..4 * i + 4].copy_from_slice(&h[i].to_be_bytes());
+    }
+    out
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(data: &[u8]) -> String {
+    let mut out = String::new();
+    for ch in data.chunks(3) {
+        let n = ((ch[0] as u32) << 16)
+            | ((*ch.get(1).unwrap_or(&0) as u32) << 8)
+            | (*ch.get(2).unwrap_or(&0) as u32);
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if ch.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if ch.len() > 2 { B64[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut val = [255u8; 256];
+    for (i, &c) in B64.iter().enumerate() {
+        val[c as usize] = i as u8;
+    }
+    let mut out = Vec::new();
+    let mut acc = 0u32;
+    let mut nbits = 0u32;
+    for c in s.bytes() {
+        if c == b'=' || c == b'\n' || c == b'\r' || c == b' ' {
+            continue;
+        }
+        let v = val[c as usize];
+        if v == 255 {
+            return None;
+        }
+        acc = (acc << 6) | v as u32;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Write `v` as a zero-padded octal field of width `w` at `buf[off..]` (tar).
+fn tar_octal(buf: &mut [u8], off: usize, w: usize, v: u64) {
+    let s = alloc::format!("{:0>width$o}", v, width = w - 1);
+    let b = s.as_bytes();
+    let n = b.len().min(w - 1);
+    buf[off..off + n].copy_from_slice(&b[b.len() - n..]);
+    buf[off + n] = 0;
+}
+
 struct Term {
     win: Window,
     c: Canvas,
@@ -678,6 +805,8 @@ impl Term {
                     "          fserve <port> <file>  fget <ip> <port> <out>  shot [path]",
                     "          find <dir> [pat]  killall <name>  basename/dirname  strings",
                     "          diff <a> <b>  stat <path>  sort -n/-r/-u  wc -l/-w/-c",
+                    "          uniq [-c]  tr [-d] <a> <b>  cut -d X -f N  tee [-a] <file>",
+                    "          base64 [-d] <file>  sha256sum <file..>  tar cf|tf|xf  echo -n",
                     "          ops: a ; b   a && b   a || b   drag-select copies to clipboard",
                     "          more: Space/b page, / search, n next",
                     "          reboot shutdown exit",
@@ -858,12 +987,19 @@ impl Term {
             }
             "echo" => {
                 // echo hello > file  |  echo hello
-                let joined = args.join(" ");
+                let nonl = args.first() == Some(&"-n");
+                let joined = if nonl {
+                    args[1..].join(" ")
+                } else {
+                    args.join(" ")
+                };
                 if let Some(i) = joined.find('>') {
                     let (text, path) = joined.split_at(i);
                     let path = path[1..].trim();
                     let mut d = String::from(text.trim());
-                    d.push('\n');
+                    if !nonl {
+                        d.push('\n');
+                    }
                     if let Err(e) = ustd::write_all(path, d.as_bytes()) {
                         self.fail(&alloc::format!("echo: err {}", e));
                     }
@@ -1401,6 +1537,365 @@ impl Term {
                     None => self.fail(&alloc::format!("usage: {} [-n N] <file>", cmd)),
                 }
             }
+            "uniq" | "tr" | "cut" | "tee" | "base64" | "sha256sum" | "tar" => {
+                match cmd {
+                    "sha256sum" => {
+                        let mut any = false;
+                        for a in args.iter() {
+                            match ustd::read_all(a) {
+                                Ok(d) => {
+                                    any = true;
+                                    let dg = sha256(&d);
+                                    let mut hx = String::new();
+                                    for b in dg {
+                                        hx.push_str(&alloc::format!("{:02x}", b));
+                                    }
+                                    self.emit(&alloc::format!("{}  {}", hx, a));
+                                }
+                                Err(e) => self.fail(&alloc::format!("sha256sum: {}: err {}", a, e)),
+                            }
+                        }
+                        if !any && !args.is_empty() {
+                            // nothing readable — fail already reported
+                        } else if !any {
+                            match &self.pipe_in {
+                                Some(s) => {
+                                    let dg = sha256(s.as_bytes());
+                                    let mut hx = String::new();
+                                    for b in dg {
+                                        hx.push_str(&alloc::format!("{:02x}", b));
+                                    }
+                                    self.emit(&alloc::format!("{}  -", hx));
+                                }
+                                None => self.fail("usage: sha256sum <file...>"),
+                            }
+                        }
+                    }
+                    "base64" => {
+                        let decode = args.iter().any(|a| a == &"-d");
+                        let src = args.iter().find(|a| !a.starts_with('-'));
+                        let data: Option<Vec<u8>> = match src {
+                            Some(p) => match ustd::read_all(p) {
+                                Ok(d) => Some(d),
+                                Err(e) => {
+                                    self.fail(&alloc::format!("base64: {}: err {}", p, e));
+                                    None
+                                }
+                            },
+                            None => self.pipe_in.as_ref().map(|s| s.as_bytes().to_vec()),
+                        };
+                        match data {
+                            Some(d) if decode => match b64_decode(&String::from_utf8_lossy(&d)) {
+                                Some(dec) => self.emit(&String::from_utf8_lossy(&dec)),
+                                None => self.fail("base64: invalid input"),
+                            },
+                            Some(d) => {
+                                let enc = b64_encode(&d);
+                                for chunk in enc.as_bytes().chunks(76) {
+                                    self.emit(core::str::from_utf8(chunk).unwrap_or(""));
+                                }
+                            }
+                            None => {
+                                if src.is_none() {
+                                    self.fail("usage: base64 [-d] <file>");
+                                }
+                            }
+                        }
+                    }
+                    "tar" => {
+                        // minimal ustar: tar cf out.tar f.. | tar tf a.tar | tar xf a.tar
+                        let sub = args.first().copied().unwrap_or("");
+                        match sub {
+                            "cf" => match (args.get(1), args.get(2)) {
+                                (Some(out), Some(_)) => {
+                                    let mut arc: Vec<u8> = Vec::new();
+                                    let mut ok = true;
+                                    for f in &args[2..] {
+                                        let (d, st) = match (ustd::read_all(f), ustd::stat(f)) {
+                                            (Ok(d), Ok(st)) => (d, st),
+                                            _ => {
+                                                self.fail(&alloc::format!("tar: {}: unreadable", f));
+                                                ok = false;
+                                                break;
+                                            }
+                                        };
+                                        let mut h = [0u8; 512];
+                                        let name = f.rsplit('/').next().unwrap_or(f);
+                                        let nb = name.as_bytes();
+                                        let nn = nb.len().min(100);
+                                        h[..nn].copy_from_slice(&nb[..nn]);
+                                        tar_octal(&mut h, 100, 8, 0o644); // mode
+                                        tar_octal(&mut h, 108, 8, 0); // uid
+                                        tar_octal(&mut h, 116, 8, 0); // gid
+                                        tar_octal(&mut h, 124, 12, d.len() as u64); // size
+                                        tar_octal(&mut h, 136, 12, st.mtime); // mtime
+                                        for i in 148..156 {
+                                            h[i] = b' ';
+                                        }
+                                        h[156] = b'0'; // regular file
+                                        h[257..263].copy_from_slice(b"ustar\0");
+                                        h[263] = b'0';
+                                        h[264] = b'0';
+                                        let sum: u64 = h.iter().map(|b| *b as u64).sum();
+                                        tar_octal(&mut h, 148, 8, sum);
+                                        h[155] = b' ';
+                                        arc.extend_from_slice(&h);
+                                        arc.extend_from_slice(&d);
+                                        let pad = (512 - d.len() % 512) % 512;
+                                        arc.resize(arc.len() + pad, 0);
+                                    }
+                                    if ok {
+                                        arc.resize(arc.len() + 1024, 0);
+                                        match ustd::write_all(out, &arc) {
+                                            Ok(()) => self.emit(&alloc::format!(
+                                                "tar: {} -> {} ({} B)",
+                                                args.len() - 2,
+                                                out,
+                                                arc.len()
+                                            )),
+                                            Err(e) => self
+                                                .fail(&alloc::format!("tar: {}: err {}", out, e)),
+                                        }
+                                    }
+                                }
+                                _ => self.fail("usage: tar cf out.tar <file...>"),
+                            },
+                            "tf" | "xf" => match args.get(1) {
+                                Some(path) => match ustd::read_all(path) {
+                                    Ok(d) => {
+                                        let mut off = 0usize;
+                                        let mut nfiles = 0usize;
+                                        loop {
+                                            if off + 512 > d.len() || d[off..off + 100].iter().all(|b| *b == 0) {
+                                                break;
+                                            }
+                                            let h = &d[off..off + 512];
+                                            let name = core::str::from_utf8(&h[..100])
+                                                .unwrap_or("")
+                                                .trim_end_matches('\0');
+                                            let size = u64::from_str_radix(
+                                                core::str::from_utf8(&h[124..136])
+                                                    .unwrap_or("")
+                                                    .trim_end_matches('\0')
+                                                    .trim(),
+                                                8,
+                                            )
+                                            .unwrap_or(0);
+                                            off += 512;
+                                            if sub == "tf" {
+                                                self.emit(name);
+                                            } else {
+                                                let data = &d[off..off + size as usize];
+                                                let base = name.rsplit('/').next().unwrap_or(name);
+                                                match ustd::write_all(base, data) {
+                                                    Ok(()) => self.emit(&alloc::format!(
+                                                        "x {} ({} B)",
+                                                        base, size
+                                                    )),
+                                                    Err(e) => self.fail(&alloc::format!(
+                                                        "tar: {}: err {}",
+                                                        base, e
+                                                    )),
+                                                }
+                                            }
+                                            nfiles += 1;
+                                            off += ((size as usize) + 511) / 512 * 512;
+                                        }
+                                        if nfiles == 0 {
+                                            self.fail("tar: empty or invalid archive");
+                                        }
+                                    }
+                                    Err(e) => self.fail(&alloc::format!("tar: {}: err {}", path, e)),
+                                },
+                                None => self.fail(&alloc::format!("usage: tar {} <a.tar>", sub)),
+                            },
+                            _ => self.fail("usage: tar cf|tf|xf ..."),
+                        }
+                    }
+                    "uniq" => {
+                        let content = match args.iter().find(|a| !a.starts_with('-')) {
+                            Some(p) => match ustd::read_all(p) {
+                                Ok(d) => Some(String::from_utf8_lossy(&d).into_owned()),
+                                Err(e) => {
+                                    self.fail(&alloc::format!("uniq: {}: err {}", p, e));
+                                    None
+                                }
+                            },
+                            None => self.pipe_in.clone(),
+                        };
+                        if let Some(s) = content {
+                            let count = args.iter().any(|a| a == &"-c");
+                            let mut prev: Option<&str> = None;
+                            let mut n = 1usize;
+                            for l in s.lines() {
+                                if prev == Some(l) {
+                                    n += 1;
+                                    continue;
+                                }
+                                if let Some(p) = prev {
+                                    if count {
+                                        self.emit(&alloc::format!("{:7} {}", n, p));
+                                    } else {
+                                        self.emit(p);
+                                    }
+                                }
+                                prev = Some(l);
+                                n = 1;
+                            }
+                            if let Some(p) = prev {
+                                if count {
+                                    self.emit(&alloc::format!("{:7} {}", n, p));
+                                } else {
+                                    self.emit(p);
+                                }
+                            }
+                        }
+                    }
+                    "tr" => {
+                        // tr [-d] <set1> [set2] — ranges like a-z expand
+                        let del = args.iter().any(|a| a == &"-d");
+                        let pos: Vec<&&str> = args.iter().filter(|a| !a.starts_with('-')).collect();
+                        let expand = |spec: &str| -> Vec<u8> {
+                            let b = spec.as_bytes();
+                            let mut v = Vec::new();
+                            let mut i = 0;
+                            while i < b.len() {
+                                if i + 2 < b.len() && b[i + 1] == b'-' && b[i + 2] > b[i] {
+                                    for c in b[i]..=b[i + 2] {
+                                        v.push(c);
+                                    }
+                                    i += 3;
+                                } else {
+                                    v.push(b[i]);
+                                    i += 1;
+                                }
+                            }
+                            v
+                        };
+                        match (del, pos.first(), pos.get(1)) {
+                            (_, Some(s1), s2) => {
+                                let a = expand(s1);
+                                let b: Vec<u8> = s2.map(|s| expand(s)).unwrap_or_default();
+                                let mut map = [0u8; 256];
+                                let mut has = [false; 256];
+                                for &c in &a {
+                                    has[c as usize] = true;
+                                }
+                                let mut delm = [false; 256];
+                                if del {
+                                    delm = has;
+                                }
+                                for (i, &c) in a.iter().enumerate() {
+                                    map[c as usize] = if i < b.len() {
+                                        b[i]
+                                    } else {
+                                        *b.last().unwrap_or(&c)
+                                    };
+                                }
+                                let src = self.pipe_in.clone().unwrap_or_default();
+                                let mut out = String::new();
+                                for ch in src.chars() {
+                                    let cb = ch as usize;
+                                    if cb < 256 && delm[cb] && ch != '\n' {
+                                        continue;
+                                    }
+                                    if cb < 256 && has[cb] && !del {
+                                        let m = map[cb];
+                                        out.push(m as char);
+                                    } else {
+                                        out.push(ch);
+                                    }
+                                }
+                                for l in out.lines() {
+                                    self.emit(l);
+                                }
+                            }
+                            _ => self.fail("usage: tr [-d] <set1> <set2>"),
+                        }
+                    }
+                    "cut" => {
+                        // cut -d X -f N[,M..] <file|stdin>
+                        let delim = args
+                            .iter()
+                            .position(|a| a == &"-d")
+                            .and_then(|i| args.get(i + 1))
+                            .map(|s| s.chars().next().unwrap_or('\t'))
+                            .unwrap_or('\t');
+                        let fields: Vec<usize> = args
+                            .iter()
+                            .position(|a| a == &"-f")
+                            .and_then(|i| args.get(i + 1))
+                            .map(|s| {
+                                s.split(',')
+                                    .filter_map(|x| x.parse::<usize>().ok())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let src = args.iter().enumerate().find(|(i, a)| {
+                            !a.starts_with('-') && *i > 0 && args[i - 1] != "-d" && args[i - 1] != "-f"
+                        }).map(|(_, a)| *a);
+                        let content = match src {
+                            Some(p) => match ustd::read_all(p) {
+                                Ok(d) => Some(String::from_utf8_lossy(&d).into_owned()),
+                                Err(e) => {
+                                    self.fail(&alloc::format!("cut: {}: err {}", p, e));
+                                    None
+                                }
+                            },
+                            None => self.pipe_in.clone(),
+                        };
+                        match (content, fields.is_empty()) {
+                            (Some(s), false) => {
+                                let dstr = alloc::format!("{}", delim);
+                                for l in s.lines() {
+                                    let parts: Vec<&str> = l.split(delim).collect();
+                                    let got: Vec<&str> = fields
+                                        .iter()
+                                        .filter_map(|f| parts.get(f.saturating_sub(1)).copied())
+                                        .collect();
+                                    self.emit(&got.join(&dstr));
+                                }
+                            }
+                            (Some(_), true) => self.fail("cut: need -f N[,M..]"),
+                            (None, _) => self.fail("usage: cut -d X -f N[,M..] <file>"),
+                        }
+                    }
+                    "tee" => {
+                        // tee [-a] file — pipe stdin to stdout AND the file
+                        let append = args.iter().any(|a| a == &"-a");
+                        let src = args.iter().find(|a| !a.starts_with('-'));
+                        let inp_owned = self.pipe_in.clone();
+                        match (src, inp_owned) {
+                            (Some(path), Some(inp)) => {
+                                let r = if append {
+                                    match ustd::read_all(path) {
+                                        Ok(mut old) => {
+                                            old.extend_from_slice(inp.as_bytes());
+                                            ustd::write_all(path, &old)
+                                        }
+                                        Err(_) => ustd::write_all(path, inp.as_bytes()),
+                                    }
+                                } else {
+                                    ustd::write_all(path, inp.as_bytes())
+                                };
+                                match r {
+                                    Ok(()) => {
+                                        for l in inp.lines() {
+                                            self.emit(l);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.fail(&alloc::format!("tee: {}: err {}", path, e))
+                                    }
+                                }
+                            }
+                            (None, _) => self.fail("usage: tee [-a] <file>"),
+                            (_, None) => self.fail("tee: no stdin"),
+                        }
+                    }
+                    _ => {}
+                }
+            }
             "netstat" => {
                 for l in ustd::net_stat().lines() {
                     self.emit(l);
@@ -1809,6 +2304,7 @@ impl Term {
             "set", "env", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
             "dmesg", "arp", "httpd", "ntp", "nc", "fserve", "fget", "true", "false",
             "shot", "find", "killall", "basename", "dirname", "strings", "diff", "stat",
+            "uniq", "tr", "cut", "tee", "base64", "sha256sum", "tar",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
