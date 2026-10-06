@@ -26,6 +26,7 @@ struct Files {
     status: String,
     new_name: String,
     editing: bool,
+    rename_from: Option<String>, // F2 rename: full path of the entry being renamed
     dirty: bool,
 }
 
@@ -62,7 +63,10 @@ impl Files {
         c.border(c.w as i32 - bw - 8, 5, bw, 24, draw::EDGE);
         c.text(c.w as i32 - bw - 8 + 16, 9, "Delete", draw::TEXT, None);
         if self.editing {
-            c.text(10 + Canvas::text_w(&alloc::format!("{}  {} items", self.cwd, self.ents.len())) + 16, 9, &alloc::format!("name: {}_", self.new_name), 0xFF7FD08A, None);
+            let prompt = if self.rename_from.is_some() { "rename: " } else { "name: " };
+            c.text(10 + Canvas::text_w(&alloc::format!("{}  {} items", self.cwd, self.ents.len())) + 16, 9, &alloc::format!("{}{}", prompt, self.new_name), 0xFF7FD08A, None);
+            // caret underscore
+            c.text(10 + Canvas::text_w(&alloc::format!("{}  {} items", self.cwd, self.ents.len())) + 16 + Canvas::text_w(&alloc::format!("{}{}", prompt, self.new_name)), 9, "_", 0xFF7FD08A, None);
         }
         // list
         let vis = ((c.h as i32 - 44) / ROW_H) as i32;
@@ -110,6 +114,7 @@ impl Files {
             if x >= w - bw * 2 - 16 && x < w - bw - 8 {
                 // new folder: enter name-editing mode
                 self.editing = true;
+                self.rename_from = None;
                 self.new_name.clear();
                 self.status = String::from("type folder name, Enter to create");
             } else if x >= w - bw - 8 {
@@ -162,7 +167,7 @@ impl Files {
             }
             self.sel = i as i32;
             let e = &self.ents[i];
-            self.status = alloc::format!("{} {} B", Self::entry_name(e), e.size);
+            self.status = alloc::format!("{} {} B   (F2 rename, Del delete)", Self::entry_name(e), e.size);
             self.dirty = true;
         }
     }
@@ -189,18 +194,30 @@ impl Files {
                 self.new_name.pop();
             } else if k.key == KeyCode::Enter as u32 {
                 if !self.new_name.is_empty() {
-                    let path = alloc::format!("{}{}{}", self.cwd, if self.cwd.ends_with('/') { "" } else { "/" }, self.new_name);
-                    match ustd::mkdir(&path) {
-                        Ok(_) => {
-                            self.status = alloc::format!("created {}", self.new_name);
-                            self.editing = false;
-                            self.reload();
+                    let newp = alloc::format!("{}{}{}", self.cwd, if self.cwd.ends_with('/') { "" } else { "/" }, self.new_name);
+                    if let Some(oldp) = self.rename_from.take() {
+                        match ustd::rename(&oldp, &newp) {
+                            Ok(_) => {
+                                self.status = alloc::format!("renamed to {}", self.new_name);
+                                self.editing = false;
+                                self.reload();
+                            }
+                            Err(e) => self.status = alloc::format!("rename failed: {}", e),
                         }
-                        Err(e) => self.status = alloc::format!("mkdir failed: {}", e),
+                    } else {
+                        match ustd::mkdir(&newp) {
+                            Ok(_) => {
+                                self.status = alloc::format!("created {}", self.new_name);
+                                self.editing = false;
+                                self.reload();
+                            }
+                            Err(e) => self.status = alloc::format!("mkdir failed: {}", e),
+                        }
                     }
                 }
             } else if k.key == KeyCode::Escape as u32 {
                 self.editing = false;
+                self.rename_from = None;
             }
             self.dirty = true;
             return;
@@ -222,6 +239,32 @@ impl Files {
                         return;
                     }
                     self.open_selected();
+                }
+            }
+            x if x == KeyCode::Delete as u32 => {
+                if self.sel >= 0 && (self.sel as usize) < self.ents.len() {
+                    let name = Self::entry_name(&self.ents[self.sel as usize]);
+                    let path = alloc::format!("{}{}{}", self.cwd, if self.cwd.ends_with('/') { "" } else { "/" }, name);
+                    match ustd::remove(&path) {
+                        Ok(_) => {
+                            self.status = alloc::format!("deleted {}", name);
+                            self.reload();
+                        }
+                        Err(e) => self.status = alloc::format!("delete failed: {}", e),
+                    }
+                } else {
+                    self.status = String::from("nothing selected");
+                }
+            }
+            x if x == KeyCode::F2 as u32 => {
+                if self.sel >= 0 && (self.sel as usize) < self.ents.len() {
+                    let name = Self::entry_name(&self.ents[self.sel as usize]);
+                    self.rename_from = Some(alloc::format!("{}{}{}", self.cwd, if self.cwd.ends_with('/') { "" } else { "/" }, name));
+                    self.editing = true;
+                    self.new_name = name.clone();
+                    self.status = alloc::format!("rename {}", name);
+                } else {
+                    self.status = String::from("nothing selected");
                 }
             }
             x if x == KeyCode::Backspace as u32 => {
@@ -264,6 +307,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         status: String::new(),
         new_name: String::new(),
         editing: false,
+        rename_from: None,
         dirty: true,
     };
     f.reload();
