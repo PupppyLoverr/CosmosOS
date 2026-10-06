@@ -18,6 +18,7 @@ struct Editor {
     path: String,
     text: String,
     cx: usize, // caret byte idx
+    sel: Option<(usize, usize)>, // selected byte range [start,end)
     scroll: usize, // first visible line
     dirty_text: bool,
     dirty_ui: bool,
@@ -70,10 +71,29 @@ impl Editor {
         // header
         c.fill(0, 0, c.w as i32, 26, draw::PANEL);
         c.text(8, 5, &alloc::format!("{}{}", self.path, if self.dirty_text { " *" } else { "" }), draw::TEXT, None);
-        c.text(c.w as i32 - 220, 5, "Ctrl-S saves  |  Arrows navigate", draw::DIM, None);
+        c.text(c.w as i32 - 228, 5, "Ctrl-S save  Ctrl-A/C/X/V", draw::DIM, None);
         // text area
         let lines = self.lines();
         let vis = ((c.h as i32 - 34) / 16) as usize;
+        // selection highlight rects first (under the text)
+        if let Some((s0, s1)) = self.sel {
+            let mut byte_i = 0usize;
+            for (row, l) in lines.iter().enumerate() {
+                if row < self.scroll || row >= self.scroll + vis {
+                    byte_i += l.len() + 1;
+                    continue;
+                }
+                let line_end = byte_i + l.len() + 1; // +1 for the \n
+                let lo = s0.max(byte_i);
+                let hi = s1.min(line_end);
+                if lo < hi {
+                    let x0 = 36 + (lo - byte_i) as i32 * 8;
+                    let x1 = 36 + (hi - byte_i).min(l.len()) as i32 * 8;
+                    c.fill(x0, 30 + (row - self.scroll) as i32 * 16, x1 - x0 + 8, 16, draw::EDGE);
+                }
+                byte_i = line_end;
+            }
+        }
         for (i, l) in lines.iter().skip(self.scroll).take(vis).enumerate() {
             let y = 30 + i as i32 * 16;
             // line numbers
@@ -117,10 +137,56 @@ impl Editor {
         if k.down == 0 {
             return;
         }
-        if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 && (k.chr == b's' || k.chr == b'S') {
-            self.save();
+        // ctrl chords: save + clipboard
+        if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 {
+            match k.chr.to_ascii_lowercase() {
+                b's' => self.save(),
+                b'a' => {
+                    self.sel = if self.text.is_empty() { None } else { Some((0, self.text.len())) };
+                }
+                b'c' | b'x' => {
+                    if let Some((s0, s1)) = self.sel {
+                        ustd::clip_set(&self.text.as_bytes()[s0..s1]);
+                        self.status = alloc::format!("{}d {}B", if k.chr == b'c' || k.chr == b'C' { "copie" } else { "cut" }, s1 - s0);
+                        if k.chr == b'x' || k.chr == b'X' {
+                            self.text.replace_range(s0..s1, "");
+                            self.cx = s0;
+                            self.sel = None;
+                            self.dirty_text = true;
+                        }
+                    }
+                }
+                b'v' => {
+                    let d = ustd::clip_get();
+                    if !d.is_empty() {
+                        let s = String::from_utf8_lossy(&d).into_owned();
+                        if let Some((s0, s1)) = self.sel.take() {
+                            self.text.replace_range(s0..s1, "");
+                            self.cx = s0;
+                        }
+                        self.text.insert_str(self.cx, &s);
+                        self.cx += s.len();
+                        self.dirty_text = true;
+                    }
+                }
+                _ => {}
+            }
             self.dirty_ui = true;
             return;
+        }
+        // selection-aware edit keys
+        if let Some((s0, s1)) = self.sel {
+            match k.key as u32 {
+                x if x == KeyCode::Backspace as u32 || x == KeyCode::Delete as u32 => {
+                    self.text.replace_range(s0..s1, "");
+                    self.cx = s0;
+                    self.sel = None;
+                    self.dirty_text = true;
+                    self.dirty_ui = true;
+                    return;
+                }
+                _ => self.sel = None, // any other key collapses the selection
+            }
         }
         match k.key as u32 {
             x if x == KeyCode::Char as u32 => {
@@ -209,6 +275,7 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         path,
         text,
         cx: 0,
+        sel: None,
         scroll: 0,
         dirty_text: false,
         dirty_ui: true,

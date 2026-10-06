@@ -58,6 +58,8 @@ pub const SYS_NET_TCP_OPEN: u64 = 60;  // (lport, ip u32, rport) -> 0 | ERR (SYN
 pub const SYS_NET_TCP_SEND: u64 = 61;  // (lport, ptr, len<=1400) -> 0 | ERR (retransmit till acked)
 pub const SYS_NET_TCP_RECV: u64 = 62;  // (lport, buf, cap, timeout_ms) -> n | ERR
 pub const SYS_NET_TCP_CLOSE: u64 = 63; // (lport) -> 0 (FIN + drop)
+pub const SYS_CLIP_SET: u64 = 64;      // (ptr,len) -> 0 | ERR  (kernel clipboard)
+pub const SYS_CLIP_GET: u64 = 65;      // (buf,cap) -> n | ERR
 
 pub const SYS_ERR: u64 = u64::MAX;
 
