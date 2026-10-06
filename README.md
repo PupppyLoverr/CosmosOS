@@ -78,9 +78,11 @@ are read with `ptr::read_unaligned` (no alignment guarantees on the wire).
 - `spawn`+exit+reap round trip: **50 ms**. 1000 trivial syscalls: <10 ms.
 - Framebuffer full-fill (3 MiB): <10 ms (>300 MiB/s writes).
 - FS throughput (real path: `write_all`/`read_all` → FAT32 → virtio-blk
-  polled sectors): **write 4 MiB in 6.2 s (~0.66 MiB/s)**,
-  **read 4 MiB in 11.8 s (~0.34 MiB/s)** — the honest bottleneck;
-  cluster alloc + per-sector synchronous I/O, no cache.
+  polled sectors): **write 4 MiB in 3.2 s (~1.3 MiB/s)**,
+  **read 4 MiB in 3.4 s (~1.2 MiB/s)** — after adding a 128-entry
+  direct-mapped sector cache (was 6.2 s / 11.8 s; metadata sectors no
+  longer cost a virtqueue round trip per access). Remaining cost is
+  per-sector synchronous I/O for unique data sectors.
 
 ## Rules in this codebase
 
