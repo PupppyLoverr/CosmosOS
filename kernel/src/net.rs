@@ -740,6 +740,14 @@ pub fn udp_recv(lport: u16, timeout_ms: u64) -> Option<([u8; 4], u16, Vec<u8>)> 
     if let Some(d) = SOCKS.lock().get_mut(&lport).and_then(|q| q.pop_front()) {
         return Some(d);
     }
+    // one non-blocking pump even at timeout=0 — poll-style callers (nc -u,
+    // nc -lu) must still move NIC-ring packets into the socket queues
+    for (src_ip, proto, p) in pump_rx() {
+        dispatch(src_ip, proto, p);
+    }
+    if let Some(d) = SOCKS.lock().get_mut(&lport).and_then(|q| q.pop_front()) {
+        return Some(d);
+    }
     let deadline = now_ms() + timeout_ms;
     while now_ms() < deadline {
         for (src_ip, proto, p) in pump_rx() {
@@ -1079,11 +1087,15 @@ pub fn tcp_recv(lport: u16, timeout_ms: u64) -> Option<Vec<u8>> {
                 return None;
             }
         }
-        if now_ms() >= deadline {
-            return None;
-        }
+        // pump before the deadline check so recv(0) still forwards packets
         for (src_ip, proto, p) in pump_rx() {
             dispatch(src_ip, proto, p);
+        }
+        if let Some(d) = TCP_SOCKS.lock().get_mut(&lport).and_then(|k| k.q.pop_front()) {
+            return Some(d);
+        }
+        if now_ms() >= deadline {
+            return None;
         }
         wait_irq();
     }

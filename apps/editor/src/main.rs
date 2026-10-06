@@ -26,6 +26,7 @@ struct Editor {
     saveas_q: Option<String>, // Ctrl-Shift-S: save-as path prompt
     open_q: Option<String>,   // Ctrl-O: open-file path prompt
     open_confirm: bool,       // dirty-buffer: Ctrl-O pressed once (confirm pending)
+    new_confirm: bool,        // dirty-buffer: Ctrl-N pressed once (confirm pending)
     close_confirm: bool,      // dirty-buffer: Ctrl-W pressed once (confirm pending)
     scroll: usize, // first visible line
     dirty_text: bool,
@@ -261,18 +262,32 @@ impl Editor {
         if k.down == 0 {
             return;
         }
-        // the dirty-buffer Ctrl-O confirm arms for exactly one chord —
-        // any other key disarms it
+        // the dirty-buffer confirm arms for exactly one chord — any
+        // other key disarms it, but bare modifier presses (the Ctrl
+        // half of the confirming chord itself) must not
+        let is_mod_key = matches!(
+            k.key as u32,
+            x if x == KeyCode::Super as u32
+                || x == KeyCode::Ctrl as u32
+                || x == KeyCode::Alt as u32
+                || x == KeyCode::Shift as u32
+        );
         let is_ctrlo = k.key == KeyCode::Char as u32
             && k.mods & 1 != 0
             && k.chr.to_ascii_lowercase() == b'o';
-        if !is_ctrlo {
+        if !is_ctrlo && !is_mod_key {
             self.open_confirm = false;
+        }
+        let is_ctrln = k.key == KeyCode::Char as u32
+            && k.mods & 1 != 0
+            && k.chr.to_ascii_lowercase() == b'n';
+        if !is_ctrln && !is_mod_key {
+            self.new_confirm = false;
         }
         let is_ctrlw = k.key == KeyCode::Char as u32
             && k.mods & 1 != 0
             && k.chr.to_ascii_lowercase() == b'w';
-        if !is_ctrlw {
+        if !is_ctrlw && !is_mod_key {
             self.close_confirm = false;
         }
         // save-as mode: keys go to the path prompt
@@ -507,6 +522,26 @@ impl Editor {
                     self.dirty_ui = true;
                     return;
                 }
+                b'n' => {
+                    // Ctrl-N: new buffer — same dirty guard as Ctrl-O
+                    if self.dirty_text && !self.new_confirm {
+                        self.new_confirm = true;
+                        self.status = String::from("unsaved changes - Ctrl-N again to discard");
+                    } else {
+                        self.new_confirm = false;
+                        self.text.clear();
+                        self.cx = 0;
+                        self.scroll = 0;
+                        self.sel = None;
+                        self.undo.clear();
+                        self.redo.clear();
+                        self.path = String::from("/untitled.txt");
+                        self.dirty_text = false;
+                        self.status = String::from("new buffer");
+                        self.dirty_ui = true;
+                    }
+                    return;
+                }
                 _ => {}
             }
         }
@@ -710,6 +745,7 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         saveas_q: None,
         open_q: None,
         open_confirm: false,
+        new_confirm: false,
         close_confirm: false,
         scroll: 0,
         dirty_text: false,

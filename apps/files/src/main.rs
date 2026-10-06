@@ -29,6 +29,7 @@ struct Files {
     rename_from: Option<String>, // F2 rename: full path of the entry being renamed
     menu: Option<(i32, i32, usize)>, // right-click menu: (x, y, entry index)
     sort_by_size: bool,              // `s` toggles name<->size ordering
+    clip: Option<(bool, String)>,    // file clipboard: (cut?, full path) via c/x
     dirty: bool,
 }
 
@@ -61,6 +62,27 @@ impl Files {
             if self.cwd.ends_with('/') { "" } else { "/" },
             Self::entry_name(&self.ents[i])
         )
+    }
+
+    /// Recursive copy used by the file clipboard's paste (v).
+    fn copy_tree(&mut self, src: &str, dst: &str) -> Result<(), i64> {
+        match ustd::stat(src) {
+            Ok(st) if st.is_dir != 0 => {
+                ustd::mkdir(dst)?;
+                for e in ustd::readdir(src).unwrap_or_default() {
+                    let n = Self::entry_name(&e);
+                    let s2 = alloc::format!("{}/{}", src.trim_end_matches('/'), n);
+                    let d2 = alloc::format!("{}/{}", dst.trim_end_matches('/'), n);
+                    self.copy_tree(&s2, &d2)?;
+                }
+                Ok(())
+            }
+            Ok(_) => {
+                let d = ustd::read_all(src)?;
+                ustd::write_all(dst, &d)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Rename prompt armed on the selected entry (F2 / context menu).
@@ -244,7 +266,7 @@ impl Files {
             }
             self.sel = i as i32;
             let e = &self.ents[i];
-            self.status = alloc::format!("{} {} B   (F2 rename, Del delete)", Self::entry_name(e), e.size);
+            self.status = alloc::format!("{} {} B   (F2 rename, Del delete, c/x/v clip)", Self::entry_name(e), e.size);
             self.dirty = true;
         }
     }
@@ -329,6 +351,57 @@ impl Files {
                 self.status = String::from("refreshed");
                 self.reload();
             }
+            x if x == KeyCode::Char as u32 && (k.chr.to_ascii_lowercase() == b'c' || k.chr.to_ascii_lowercase() == b'x') => {
+                // file clipboard: c copies, x marks for move; v pastes into cwd
+                if self.sel >= 0 && (self.sel as usize) < self.ents.len() {
+                    let cut = k.chr.to_ascii_lowercase() == b'x';
+                    let p = self.path_of(self.sel as usize);
+                    self.status = alloc::format!(
+                        "{}: {}",
+                        if cut { "cut" } else { "copied" },
+                        p
+                    );
+                    self.clip = Some((cut, p));
+                }
+            }
+            x if x == KeyCode::Char as u32 && k.chr.to_ascii_lowercase() == b'v' => {
+                // the clipboard is only consumed by a successful paste —
+                // a blocked or failed one keeps it armed
+                if let Some((cut, src)) = self.clip.clone() {
+                    let base = src.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
+                    let dst = alloc::format!(
+                        "{}{}{}",
+                        self.cwd,
+                        if self.cwd.ends_with('/') { "" } else { "/" },
+                        base
+                    );
+                    if dst == src || src.is_empty() {
+                        self.status = String::from("paste: same path");
+                    } else if ustd::stat(&dst).is_ok() {
+                        self.status = alloc::format!("paste: {} exists", base);
+                    } else if cut {
+                        match ustd::rename(&src, &dst) {
+                            Ok(_) => {
+                                self.clip = None;
+                                self.status = alloc::format!("moved {}", base);
+                                self.reload();
+                            }
+                            Err(e) => self.status = alloc::format!("move failed: {}", e),
+                        }
+                    } else {
+                        match self.copy_tree(&src, &dst) {
+                            Ok(()) => {
+                                self.clip = None;
+                                self.status = alloc::format!("pasted {}", base);
+                                self.reload();
+                            }
+                            Err(e) => self.status = alloc::format!("copy failed: {}", e),
+                        }
+                    }
+                } else {
+                    self.status = String::from("clipboard empty");
+                }
+            }
             x if x == KeyCode::Char as u32 && k.chr.to_ascii_lowercase() == b's' => {
                 self.sort_by_size = !self.sort_by_size;
                 self.status = alloc::format!(
@@ -380,6 +453,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         rename_from: None,
         menu: None,
         sort_by_size: false,
+        clip: None,
         dirty: true,
     };
     f.reload();
