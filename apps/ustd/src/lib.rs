@@ -243,6 +243,17 @@ pub fn df() -> Option<(u64, u64)> {
     Some((out[0], out[1]))
 }
 
+/// Tail of the kernel log ring buffer (`dmesg`).
+pub fn klog() -> String {
+    let mut buf = alloc::vec![0u8; 16 * 1024];
+    let n = sc2(shared::SYS_KLOG, buf.as_mut_ptr() as u64, buf.len() as u64);
+    if n == shared::SYS_ERR {
+        return String::new();
+    }
+    buf.truncate(n as usize);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// `netstat` dump of the kernel socket tables.
 pub fn net_stat() -> String {
     let mut buf = alloc::vec![0u8; 4096];

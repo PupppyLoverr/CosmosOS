@@ -12,6 +12,7 @@ pub fn init() {
 }
 
 pub fn write_str(s: &str) {
+    crate::klog::append(s);
     let mut g = SERIAL.lock();
     if let Some(p) = g.as_mut() {
         use core::fmt::Write;
@@ -21,6 +22,7 @@ pub fn write_str(s: &str) {
 
 /// Raw byte write (userspace SYS_DEBUG output).
 pub fn write_byte(b: u8) {
+    crate::klog::append_byte(b);
     let mut g = SERIAL.lock();
     if let Some(p) = g.as_mut() {
         p.send(b);

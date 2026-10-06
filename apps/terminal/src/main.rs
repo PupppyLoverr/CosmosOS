@@ -914,6 +914,14 @@ impl Term {
                     self.emit(l);
                 }
             }
+            "dmesg" => {
+                // last 40 lines of the kernel log ring buffer
+                let s = ustd::klog();
+                let ls: Vec<&str> = s.lines().collect();
+                for l in ls.iter().skip(ls.len().saturating_sub(40)) {
+                    self.emit(l);
+                }
+            }
             "kill" => match args.first() {
                 Some(p) => match p.parse::<u32>() {
                     Ok(pid) if ustd::kill(pid) => self.emit(&alloc::format!("killed {}", pid)),
@@ -1109,6 +1117,7 @@ impl Term {
             "uptime", "reboot", "shutdown", "exit", "history", "time",
             "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
             "set", "env", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
+            "dmesg",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
