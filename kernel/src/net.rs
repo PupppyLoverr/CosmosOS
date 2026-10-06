@@ -565,6 +565,59 @@ pub fn info() -> Option<([u8; 6], [u8; 4])> {
     NET.lock().as_ref().map(|n| (n.mac, our_ip()))
 }
 
+/// Linux-style `/proc/net/tcp` dump: hex little-endian addr:port + state code.
+pub fn net_tcp() -> String {
+    fn hexaddr(ip: [u8; 4], port: u16) -> String {
+        alloc::format!(
+            "{:02X}{:02X}{:02X}{:02X}:{:04X}",
+            ip[3], ip[2], ip[1], ip[0], port
+        )
+    }
+    fn stcode(s: &TcpState) -> u8 {
+        match s {
+            TcpState::Open => 0x01,
+            TcpState::SynSent => 0x02,
+            TcpState::SynRecv => 0x03,
+            TcpState::Closed => 0x07,
+        }
+    }
+    let lip = our_ip();
+    let mut s = String::from("  sl  local_address rem_address   st tx_queue rx_queue\n");
+    let mut i = 0u32;
+    for (p, k) in TCP_SOCKS.lock().iter() {
+        s.push_str(&alloc::format!(
+            "  {:>2}: {} {} {:02X} 00000000:00000000\n",
+            i,
+            hexaddr(lip, *p),
+            hexaddr(k.rip, k.rport),
+            stcode(&k.state)
+        ));
+        i += 1;
+    }
+    for p in LISTENERS.lock().iter() {
+        s.push_str(&alloc::format!(
+            "  {:>2}: {} 00000000:0000 0A 00000000:00000000\n",
+            i,
+            hexaddr(lip, *p)
+        ));
+        i += 1;
+    }
+    s
+}
+
+/// Linux-style `/proc/net/udp` dump.
+pub fn net_udp() -> String {
+    let lip = our_ip();
+    let mut s = String::from("  sl  local_address rem_address   st tx_queue rx_queue\n");
+    for (i, (p, _)) in SOCKS.lock().iter().enumerate() {
+        s.push_str(&alloc::format!(
+            "  {:>2}: {:02X}{:02X}{:02X}{:02X}:{:04X} 00000000:0000 07 00000000:00000000\n",
+            i, lip[3], lip[2], lip[1], lip[0], p
+        ));
+    }
+    s
+}
+
 // ---------------------------------------------------------------------------
 // DHCP — real DISCOVER/OFFER/REQUEST/ACK to configure CUR_IP.
 // ---------------------------------------------------------------------------
