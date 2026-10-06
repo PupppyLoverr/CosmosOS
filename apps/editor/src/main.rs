@@ -19,6 +19,7 @@ struct Editor {
     text: String,
     cx: usize, // caret byte idx
     sel: Option<(usize, usize)>, // selected byte range [start,end)
+    find_q: Option<String>, // Ctrl-F: live find query (None = not finding)
     scroll: usize, // first visible line
     dirty_text: bool,
     dirty_ui: bool,
@@ -105,9 +106,13 @@ impl Editor {
         if r >= self.scroll {
             c.fill(36 + col as i32 * 8, 30 + (r - self.scroll) as i32 * 16, 2, 16, draw::ACCENT);
         }
-        // status bar
+        // status bar (becomes the find field while Ctrl-F is active)
         c.fill(0, c.h as i32 - 22, c.w as i32, 22, draw::PANEL);
-        c.text(8, c.h as i32 - 19, &alloc::format!("{}:{}  {} bytes  {}", r + 1, col + 1, self.text.len(), self.status), draw::DIM, None);
+        if let Some(q) = &self.find_q {
+            c.text(8, c.h as i32 - 19, &alloc::format!("find: {}_", q), draw::TEXT, None);
+        } else {
+            c.text(8, c.h as i32 - 19, &alloc::format!("{}:{}  {} bytes  {}", r + 1, col + 1, self.text.len(), self.status), draw::DIM, None);
+        }
         self.win.present_all();
     }
 
@@ -137,7 +142,50 @@ impl Editor {
         if k.down == 0 {
             return;
         }
+        // find mode: keys go to the query
+        if self.find_q.is_some() {
+            match k.key as u32 {
+                x if x == KeyCode::Char as u32 => {
+                    self.find_q.as_mut().unwrap().push(k.chr.to_ascii_lowercase() as char);
+                }
+                x if x == KeyCode::Backspace as u32 => {
+                    self.find_q.as_mut().unwrap().pop();
+                }
+                x if x == KeyCode::Enter as u32 => {
+                    let q = core::mem::take(&mut self.find_q).unwrap_or_default();
+                    if !q.is_empty() {
+                        // first match at/after the caret, wrapping around
+                        let hay = self.text.to_lowercase();
+                        let hit = hay[self.cx..].find(&q).map(|i| self.cx + i)
+                            .or_else(|| hay[..self.cx].find(&q));
+                        match hit {
+                            Some(i) => {
+                                self.cx = i;
+                                self.sel = Some((i, i + q.len()));
+                                self.ensure_caret_visible();
+                                self.status = alloc::format!("found '{}':", q);
+                            }
+                            None => self.status = alloc::format!("no match for '{}'", q),
+                        }
+                    }
+                }
+                x if x == KeyCode::Escape as u32 => self.find_q = None,
+                _ => {}
+            }
+            self.dirty_ui = true;
+            return;
+        }
         // ctrl chords: save + clipboard
+        if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 {
+            match k.chr.to_ascii_lowercase() {
+                b'f' => {
+                    self.find_q = Some(String::new());
+                    self.dirty_ui = true;
+                    return;
+                }
+                _ => {}
+            }
+        }
         if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 {
             match k.chr.to_ascii_lowercase() {
                 b's' => self.save(),
@@ -276,6 +324,7 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         text,
         cx: 0,
         sel: None,
+        find_q: None,
         scroll: 0,
         dirty_text: false,
         dirty_ui: true,
