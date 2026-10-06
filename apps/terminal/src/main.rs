@@ -130,6 +130,7 @@ impl Term {
                     "commands: help ls cd pwd cat mkdir touch rm mv cp echo",
                     "          clear ps mem uname whoami date ping resolve httpget ifconfig dhcp",
                     "          netstat kill <pid> grep <pat> <file> (or -r <dir>) uptime",
+                    "          hex <file> wc <file> du <path>",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -337,6 +338,61 @@ impl Term {
                     _ => self.push_line("usage: grep <pat> <file> | grep -r <pat> <dir>"),
                 }
             }
+            "hex" => match args.first() {
+                Some(p) => match ustd::read_all(p) {
+                    Ok(d) => {
+                        for (i, ch) in d.chunks(16).take(64).enumerate() {
+                            let mut line = alloc::format!("{:04x}: ", i * 16);
+                            for b in ch {
+                                line.push_str(&alloc::format!("{:02x} ", b));
+                            }
+                            for _ in ch.len()..16 {
+                                line.push_str("   ");
+                            }
+                            line.push_str(" ");
+                            for b in ch {
+                                line.push(if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' });
+                            }
+                            self.push_line(&line);
+                        }
+                        if d.len() > 1024 {
+                            self.push_line(&alloc::format!("  ... ({} bytes total)", d.len()));
+                        }
+                    }
+                    Err(e) => self.push_line(&alloc::format!("hex: {}: err {}", p, e)),
+                },
+                None => self.push_line("usage: hex <file>  (first 1KiB)"),
+            },
+            "wc" => match args.first() {
+                Some(p) => match ustd::read_all(p) {
+                    Ok(d) => {
+                        let s = String::from_utf8_lossy(&d);
+                        let (mut l, mut w) = (0usize, 0usize);
+                        let mut in_w = false;
+                        for ch in s.chars() {
+                            if ch == '\n' {
+                                l += 1;
+                            }
+                            if ch.is_whitespace() {
+                                in_w = false;
+                            } else if !in_w {
+                                in_w = true;
+                                w += 1;
+                            }
+                        }
+                        self.push_line(&alloc::format!("  {} lines {} words {} bytes", l, w, d.len()));
+                    }
+                    Err(e) => self.push_line(&alloc::format!("wc: {}: err {}", p, e)),
+                },
+                None => self.push_line("usage: wc <file>"),
+            },
+            "du" => match args.first() {
+                Some(p) => {
+                    let n = self.du_tree(p, 0);
+                    self.push_line(&alloc::format!("  {} B total", n));
+                }
+                None => self.push_line("usage: du <path>  (recursive bytes)"),
+            },
             "netstat" => {
                 for l in ustd::net_stat().lines() {
                     self.push_line(l);
@@ -540,6 +596,35 @@ impl Term {
             for c in &cands {
                 self.push_line(&alloc::format!("  {}", c));
             }
+        }
+    }
+
+    /// Recursive byte total for `du`.
+    fn du_tree(&mut self, path: &str, depth: usize) -> u64 {
+        match ustd::readdir(path) {
+            Ok(ents) => {
+                let mut total = 0u64;
+                for e in ents {
+                    let name = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("?");
+                    let p = alloc::format!("{}{}{}", path, if path.ends_with('/') { "" } else { "/" }, name);
+                    if e.is_dir != 0 {
+                        total += self.du_tree(&p, depth + 1);
+                    } else {
+                        total += e.size;
+                        if depth == 0 {
+                            self.push_line(&alloc::format!("  {:>8} {}", e.size, p));
+                        }
+                    }
+                }
+                total
+            }
+            Err(_) => match ustd::stat(path) {
+                Ok(st) => st.size,
+                Err(_) => {
+                    self.push_line(&alloc::format!("du: {}: not found", path));
+                    0
+                }
+            },
         }
     }
 
