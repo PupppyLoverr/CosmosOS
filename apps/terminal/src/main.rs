@@ -1478,6 +1478,104 @@ fn dig_query(name: &str, qtype: u16) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+fn hexs(data: &[u8]) -> String {
+    let mut s = String::new();
+    for b in data {
+        s.push_str(&alloc::format!("{:02x}", b));
+    }
+    s
+}
+
+/// 5-row block glyphs for `banner` (A-Z 0-9 and common punct).
+fn banner_glyph(c: char) -> [&'static str; 5] {
+    match c.to_ascii_uppercase() {
+        'A' => [" ### ", "#   #", "#####", "#   #", "#   #"],
+        'B' => ["#### ", "#   #", "#### ", "#   #", "#### "],
+        'C' => [" ####", "#    ", "#    ", "#    ", " ####"],
+        'D' => ["#### ", "#   #", "#   #", "#   #", "#### "],
+        'E' => ["#####", "#    ", "#### ", "#    ", "#####"],
+        'F' => ["#####", "#    ", "#### ", "#    ", "#    "],
+        'G' => [" ####", "#    ", "#  ##", "#   #", " ####"],
+        'H' => ["#   #", "#   #", "#####", "#   #", "#   #"],
+        'I' => ["#####", "  #  ", "  #  ", "  #  ", "#####"],
+        'J' => ["#####", "   # ", "   # ", "#  # ", " ##  "],
+        'K' => ["#   #", "#  # ", "###  ", "#  # ", "#   #"],
+        'L' => ["#    ", "#    ", "#    ", "#    ", "#####"],
+        'M' => ["#   #", "## ##", "# # #", "#   #", "#   #"],
+        'N' => ["#   #", "##  #", "# # #", "#  ##", "#   #"],
+        'O' => [" ### ", "#   #", "#   #", "#   #", " ### "],
+        'P' => ["#### ", "#   #", "#### ", "#    ", "#    "],
+        'Q' => [" ### ", "#   #", "# # #", "#  # ", " ## #"],
+        'R' => ["#### ", "#   #", "#### ", "#  # ", "#   #"],
+        'S' => [" ####", "#    ", " ### ", "    #", "#### "],
+        'T' => ["#####", "  #  ", "  #  ", "  #  ", "  #  "],
+        'U' => ["#   #", "#   #", "#   #", "#   #", " ### "],
+        'V' => ["#   #", "#   #", "#   #", " # # ", "  #  "],
+        'W' => ["#   #", "#   #", "# # #", "## ##", "#   #"],
+        'X' => ["#   #", " # # ", "  #  ", " # # ", "#   #"],
+        'Y' => ["#   #", " # # ", "  #  ", "  #  ", "  #  "],
+        'Z' => ["#####", "   # ", "  #  ", " #   ", "#####"],
+        '0' => [" ### ", "#  ##", "# # #", "##  #", " ### "],
+        '1' => ["  #  ", " ##  ", "  #  ", "  #  ", "#####"],
+        '2' => [" ### ", "#   #", "  ## ", " #   ", "#####"],
+        '3' => ["#### ", "    #", " ### ", "    #", "#### "],
+        '4' => ["#  # ", "#  # ", "#####", "   # ", "   # "],
+        '5' => ["#####", "#    ", "#### ", "    #", "#### "],
+        '6' => [" ### ", "#    ", "#### ", "#   #", " ### "],
+        '7' => ["#####", "   # ", "  #  ", " #   ", " #   "],
+        '8' => [" ### ", "#   #", " ### ", "#   #", " ### "],
+        '9' => [" ### ", "#   #", " ####", "    #", " ### "],
+        '!' => ["  #  ", "  #  ", "  #  ", "     ", "  #  "],
+        '?' => [" ### ", "#   #", "  ## ", "     ", "  #  "],
+        '.' => ["     ", "     ", "     ", "     ", "  #  "],
+        '-' => ["     ", "     ", "#####", "     ", "     "],
+        '+' => ["     ", "  #  ", "#####", "  #  ", "     "],
+        '*' => ["# # #", " ### ", "#####", " ### ", "# # #"],
+        '/' => ["    #", "   # ", "  #  ", " #   ", "#    "],
+        ':' => ["     ", "  #  ", "     ", "  #  ", "     "],
+        '=' => ["     ", "#####", "     ", "#####", "     "],
+        '#' => [" # # ", "#####", " # # ", "#####", " # # "],
+        _ => ["     ", "     ", "     ", "     ", "     "],
+    }
+}
+
+/// units table: (name, micro-multiplier to category base, category)
+const UNITS: &[(&str, u64, &str)] = &[
+    ("mm", 1_000, "len"), ("cm", 10_000, "len"), ("m", 1_000_000, "len"),
+    ("km", 1_000_000_000, "len"), ("in", 25_400, "len"), ("ft", 304_800, "len"),
+    ("yd", 914_400, "len"), ("mi", 1_609_344_000, "len"),
+    ("mg", 1, "mass"), ("g", 1_000, "mass"), ("kg", 1_000_000, "mass"),
+    ("t", 1_000_000_000, "mass"), ("oz", 28_350, "mass"), ("lb", 453_592, "mass"),
+    ("B", 1, "data"), ("KiB", 1_024, "data"), ("MiB", 1_048_576, "data"),
+    ("GiB", 1_073_741_824, "data"), ("TiB", 1_099_511_627_776, "data"),
+    ("KB", 1_000, "data"), ("MB", 1_000_000, "data"), ("GB", 1_000_000_000, "data"),
+    ("ms", 1_000, "time"), ("s", 1_000_000, "time"), ("min", 60_000_000, "time"),
+    ("h", 3_600_000_000, "time"), ("d", 86_400_000_000, "time"),
+    ("w", 604_800_000_000, "time"),
+];
+
+fn now_str() -> String {
+    let d = ustd::datetime();
+    alloc::format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        d.year, d.month, d.day, d.hour, d.minute, d.second
+    )
+}
+
+fn fmt_fixed(millionths: u64) -> String {
+    // millionths -> "i.frac" with trailing zeros trimmed
+    let i = millionths / 1_000_000;
+    let mut f = millionths % 1_000_000;
+    if f == 0 {
+        return alloc::format!("{}", i);
+    }
+    let mut digs = alloc::format!("{:06}", f);
+    while digs.ends_with('0') {
+        digs.pop();
+    }
+    alloc::format!("{}.{}", i, digs)
+}
+
 fn mkdir_parents(path: &str) {
     let mut acc = String::new();
     if path.starts_with('/') {
@@ -1685,6 +1783,7 @@ struct Term {
     yank: String,                                       // readline kill-ring (Ctrl-K/U/W -> Ctrl-Y)
     cap_bin: Option<Vec<u8>>,                           // binary capture channel (gzip -c etc.)
     last_cap_bin: Vec<u8>,                              // bin captured by the last run_captured
+    script_fd: Option<i64>,                             // `script` typescript log fd
     prev_buttons: u8,                                  // pointer buttons last event (edge detect)
     aliases: Vec<(String, String)>,                    // `alias` table (name -> expansion)
     subst_depth: u8,                                   // $(...) recursion guard
@@ -1707,6 +1806,9 @@ impl Term {
         } else {
             String::from(s)
         };
+        if let Some(fd) = self.script_fd {
+            let _ = ustd::write(fd, alloc::format!("{}\n", owned).as_bytes());
+        }
         // wrap at COLS
         let mut rest = owned.as_str();
         loop {
@@ -2957,46 +3059,7 @@ impl Term {
         self.last_ok = true;
         match cmd {
             "help" => {
-                let lines = [
-                    "commands: help ls cd pwd cat mkdir touch rm mv cp echo",
-                    "          clear ps mem uname whoami date ping resolve httpget ifconfig dhcp",
-                    "          netstat kill <pid> grep <pat> <file> (or -r <dir>) uptime",
-                    "          hex <file> wc <file> du <path> history time <cmd>",
-                    "          head/tail [-n N] <file> sort <file>",
-                    "          a | b   cmd > file   cmd >> file   watch [-n s] cmd",
-                    "          df  (volume usage)  more  cal  tree  seq  sleep  sh  calc  ntp",
-                    "          httpd <port>  arp  dmesg  nc <ip> <port>  true  false",
-                    "          fserve <port> <file>  fget <ip> <port> <out>  shot [path]",
-                    "          find <dir> [pat]  killall <name>  basename/dirname  strings",
-                    "          diff <a> <b>  stat <path>  sort -n/-r/-u  wc -l/-w/-c",
-                    "          uniq [-c]  tr [-d] <a> <b>  cut -d X -f N  tee [-a] <file>",
-                    "          base64 [-d] <file>  sha256sum <file..>  tar cf|tf|xf  echo -n",
-                    "          show <file.ppm> (image viewer)  globs: ls *.txt  cat *.ppm",
-                    "          grep -r/-v/-n/-c/-i  sed 's/a/b/g'  xargs  nl  rev  fmt [-w N]",
-                    "          cmp <a> <b>  tail -f <file>  yes  read VAR  wait <pid>  !! / !n",
-                    "          ops: a ; b   a && b   a || b   drag-select copies to clipboard",
-                    "          alias/unalias  type  printf  dd  split  wget  hostname  id",
-                    "          $(cmd) substitution   echo -e \\n \\t   help <cmd> filters",
-                    "          cmd < file  source/. <file>  comm join paste  cp -r",
-                    "          grep -A/-B/-C/-m/-w/-x  sed -i / '2,4d' / 'Np'  expand -t N",
-                    "          find -name/-type/-maxdepth  Ctrl-R history search  .cosmosrc",
-                    "          at <secs> <cmd>  httpd <port> [root] serves real files",
-                    "          nc -l <port> listens  file <path> magic type  du/df -h human",
-                    "          test/[ expr: -e -f -d -z -n = != -eq -ne -lt -le -gt -ge !",
-                    "          ls -a -S -r  rand [n] [-x]  mount  rmdir  uname -srmva",
-                    "          sh <file> args -> $0 $1..$N $#   !<prefix> reruns match",
-                    "          more: Space/b page, / search, n next",
-                    "          beep [hz ms]  play <file> (NOTE|HZ,DUR per line, R=rest)",
-                    "          zip (deflate)/unzip/zipinfo  gzip [-c]  gunzip  zcat  /proc/*",
-                    "          sh: case W in p|p) .. ;; esac   cmd <<EOF heredoc",
-                    "          diff -u <a> <b>  patch <file.diff>  awk [-F c] 'prog' [file]",
-                    "          tar cf|tf|tv|xf (dirs recurse, xf honors paths, 'z' = gz)",
-                    "          /dev/{null,zero,full,random,urandom}  md5sum  uuencode/uudecode",
-                    "          zgrep <pat> <file.gz>  portscan <host> [lo-hi|p..]  dig <name> [type]",
-                    "          readline: Ctrl-A/E/K/U/W/Y",
-                    "          reboot shutdown exit",
-                    "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
-                ];
+                let lines = Self::HELP_LINES;
                 match args.first() {
                     Some(q) => {
                         let mut any = false;
@@ -5699,6 +5762,349 @@ impl Term {
                     Err(e) => self.fail(&e),
                 }
             }
+            "sha1sum" => {
+                // real SHA-1 (RFC 3174) of each file
+                for a in args.iter() {
+                    match ustd::read_all(a) {
+                        Ok(d) => self.emit(&alloc::format!("{}  {}", hexs(&ustd::sha1(&d)), a)),
+                        Err(e) => self.fail(&alloc::format!("sha1sum: {}: err {}", a, e)),
+                    }
+                }
+                if args.is_empty() {
+                    self.fail("usage: sha1sum <file>...");
+                }
+            }
+            "od" => {
+                // od [-An] [-t x1|c] <file> — canonical octal-dump-style view
+                let mut offbase = 8usize; // octal offsets by default
+                let mut chars = false;
+                let mut path = "";
+                for a in args.iter() {
+                    match *a {
+                        "-A" | "-Ax" | "-tx1" | "-A x" => {}
+                        "-Ax" => offbase = 16,
+                        "-An" => offbase = 0,
+                        "-c" | "-t c" | "-tc" => chars = true,
+                        "-tx1c" => chars = true,
+                        _ if !a.starts_with('-') => path = a,
+                        _ => {}
+                    }
+                }
+                if path.is_empty() {
+                    self.fail("usage: od [-An|-Ax] [-tx1c] <file>");
+                    return;
+                }
+                match ustd::read_all(path) {
+                    Ok(d) => {
+                        for (i, ch) in d.chunks(16).enumerate() {
+                            let mut l = if offbase == 16 {
+                                alloc::format!("{:08x}  ", i * 16)
+                            } else if offbase == 8 {
+                                alloc::format!("{:07o}  ", i * 16)
+                            } else {
+                                String::new()
+                            };
+                            for b in ch {
+                                l.push_str(&alloc::format!("{:02x} ", b));
+                            }
+                            for _ in 0..16 - ch.len() {
+                                l.push_str("   ");
+                            }
+                            if chars {
+                                l.push(' ');
+                                for b in ch {
+                                    l.push(if b.is_ascii_graphic() || *b == b' ' {
+                                        *b as char
+                                    } else {
+                                        '.'
+                                    });
+                                }
+                            }
+                            self.emit(&l);
+                        }
+                        self.emit(&alloc::format!("{:07o}", d.len()));
+                    }
+                    Err(e) => self.fail(&alloc::format!("od: {}: err {}", path, e)),
+                }
+            }
+            "xxd" => {
+                // xxd <file> — hex + ascii, vim-style
+                match args.first() {
+                    Some(p) => match ustd::read_all(p) {
+                        Ok(d) => {
+                            for (i, ch) in d.chunks(16).enumerate() {
+                                let mut l = alloc::format!("{:08x}: ", i * 16);
+                                for (j, b) in ch.iter().enumerate() {
+                                    if j == 8 { l.push(' '); }
+                                    l.push_str(&alloc::format!("{:02x} ", b));
+                                }
+                                let pad = 16 - ch.len();
+                                for _ in 0..pad { l.push_str("   "); }
+                                if ch.len() <= 8 { l.push(' '); }
+                                for b in ch {
+                                    l.push(if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' });
+                                }
+                                self.emit(&l);
+                            }
+                        }
+                        Err(e) => self.fail(&alloc::format!("xxd: {}: err {}", p, e)),
+                    },
+                    None => self.fail("usage: xxd <file>"),
+                }
+            }
+            "banner" => {
+                let text = args.join(" ");
+                if text.is_empty() {
+                    self.fail("usage: banner <text>");
+                    return;
+                }
+                for row in 0..5 {
+                    let mut l = String::new();
+                    for c in text.chars() {
+                        for g in banner_glyph(c)[row].chars() {
+                            l.push(g);
+                        }
+                        l.push(' ');
+                        if l.len() > 80 { break; }
+                    }
+                    self.emit(&l);
+                }
+            }
+            "units" => {
+                // units <n> <from> <to> — fixed-point unit conversion
+                match (args.first(), args.get(1), args.get(2)) {
+                    (Some(n), Some(f), Some(t)) => {
+                        let n: u64 = n.parse().unwrap_or(0);
+                        let fu = UNITS.iter().find(|u| u.0.eq_ignore_ascii_case(f));
+                        let tu = UNITS.iter().find(|u| u.0.eq_ignore_ascii_case(t));
+                        match (fu, tu) {
+                            (Some(fu), Some(tu)) if fu.2 == tu.2 => {
+                                // n*from in micro-base units, divide into 'to'
+                                let micro = n.saturating_mul(fu.1);
+                                let whole = micro / tu.1;
+                                let rem = micro % tu.1;
+                                let frac6 = rem.saturating_mul(1_000_000) / tu.1;
+                                self.emit(&alloc::format!(
+                                    "{} {} = {} {}",
+                                    n, f,
+                                    fmt_fixed(whole * 1_000_000 + frac6),
+                                    t
+                                ));
+                            }
+                            (Some(_), Some(_)) => self.fail("units: incompatible dimensions"),
+                            _ => self.fail("units: unknown unit"),
+                        }
+                    }
+                    _ => self.fail("usage: units <n> <from> <to>   (e.g. units 5 km mi)"),
+                }
+            }
+            "pr" => {
+                // pr <file> — paginate with page headers (66-line pages)
+                match args.first() {
+                    Some(p) => match ustd::read_all(p) {
+                        Ok(d) => {
+                            let text = String::from_utf8_lossy(&d);
+                            let lines: Vec<&str> = text.lines().collect();
+                            let per = 56usize;
+                            let mut page = 0usize;
+                            let mut i = 0usize;
+                            while i < lines.len() || page == 0 {
+                                self.emit(&alloc::format!("{}  {}  Page {}", now_str(), p, page + 1));
+                                self.emit("");
+                                for _ in 0..per {
+                                    if i < lines.len() {
+                                        self.emit(lines[i]);
+                                        i += 1;
+                                    }
+                                }
+                                self.emit("");
+                                page += 1;
+                            }
+                        }
+                        Err(e) => self.fail(&alloc::format!("pr: {}: err {}", p, e)),
+                    },
+                    None => self.fail("usage: pr <file>"),
+                }
+            }
+            "apropos" => match args.first() {
+                Some(q) => {
+                    let lines = Self::HELP_LINES;
+                    let mut any = false;
+                    for l in lines {
+                        if l.to_lowercase().contains(&q.to_lowercase()) {
+                            self.emit(l);
+                            any = true;
+                        }
+                    }
+                    if !any {
+                        self.emit(&alloc::format!("{}: nothing appropriate", q));
+                    }
+                }
+                None => self.fail("usage: apropos <keyword>"),
+            },
+            "whereis" => match args.first() {
+                Some(q) => {
+                    let mut found: Vec<String> = Vec::new();
+                    if Self::BUILTINS.contains(q) {
+                        found.push(String::from("builtin"));
+                    }
+                    let p = alloc::format!("/bin/{}", q);
+                    if ustd::stat(&p).is_ok() {
+                        found.push(p);
+                    }
+                    if ustd::stat(q).is_ok() {
+                        found.push(String::from(*q));
+                    }
+                    if found.is_empty() {
+                        self.emit(&alloc::format!("{}:", q));
+                    } else {
+                        self.emit(&alloc::format!("{}: {}", q, found.join(" ")));
+                    }
+                }
+                None => self.fail("usage: whereis <name>"),
+            },
+            "fortune" => {
+                match ustd::read_all("/fortunes.txt") {
+                    Ok(d) => {
+                        let text = String::from_utf8_lossy(&d);
+                        let items: Vec<&str> = text.split('%').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                        if items.is_empty() {
+                            self.fail("fortune: empty jar");
+                        } else {
+                            let i = (ustd::rand_u64().unwrap_or(1) as usize) % items.len();
+                            for l in items[i].lines() {
+                                self.emit(l);
+                            }
+                        }
+                    }
+                    Err(e) => self.fail(&alloc::format!("fortune: /fortunes.txt: err {}", e)),
+                }
+            }
+            "uuidgen" => {
+                let mut b = [0u8; 16];
+                ustd::rand_fill(&mut b);
+                b[6] = (b[6] & 0x0f) | 0x40; // v4
+                b[8] = (b[8] & 0x3f) | 0x80; // variant
+                self.emit(&alloc::format!(
+                    "{}-{}-{}-{}-{}",
+                    hexs(&b[0..4]), hexs(&b[4..6]), hexs(&b[6..8]),
+                    hexs(&b[8..10]), hexs(&b[10..])
+                ));
+            }
+            "logger" => {
+                // logger <msg...> — append a timestamped line to /log/messages.txt
+                if args.is_empty() {
+                    self.fail("usage: logger <message...>");
+                    return;
+                }
+                mkdir_parents("/log/x");
+                let line = alloc::format!(
+                    "[{}] term: {}\n",
+                    now_str(),
+                    args.join(" ")
+                );
+                let prev = ustd::read_all("/log/messages.txt").unwrap_or_default();
+                let mut d = prev;
+                d.extend_from_slice(line.as_bytes());
+                match ustd::write_all("/log/messages.txt", &d) {
+                    Ok(()) => self.emit("logger: recorded"),
+                    Err(e) => self.fail(&alloc::format!("logger: err {}", e)),
+                }
+            }
+            "whois" => {
+                // real WHOIS over TCP/43: query whois.iana.org, follow the
+                // 'refer:' referral to the registry server.
+                let Some(q) = args.first() else {
+                    self.fail("usage: whois <domain>");
+                    return;
+                };
+                match Self::whois_query(q) {
+                    Ok(lines) => {
+                        for l in &lines {
+                            self.emit(l);
+                        }
+                    }
+                    Err(e) => self.fail(&e),
+                }
+            }
+            "fdisk" => {
+                // fdisk -l — parse the real MBR partition table off /dev/vda
+                let list = args.iter().any(|a| *a == "-l") || args.is_empty();
+                if !list {
+                    self.fail("usage: fdisk -l");
+                    return;
+                }
+                let Ok(fd) = ustd::open("/dev/vda", ustd::O_RDONLY) else {
+                    self.fail("fdisk: no disk");
+                    return;
+                };
+                let mut sec = [0u8; 512];
+                let r = ustd::read(fd, &mut sec);
+                ustd::close(fd);
+                let Ok(n) = r else { self.fail("fdisk: read failed"); return; };
+                if n < 512 {
+                    self.fail("fdisk: short read");
+                    return;
+                }
+                if sec[510] != 0x55 || sec[511] != 0xAA {
+                    self.emit("no valid partition table (superfloppy / FAT BPB at sector 0)");
+                } else {
+                    self.emit("Disk /dev/vda: 128 MiB, 262144 sectors");
+                    self.emit("Dev       Start      Sectors    Size  Type");
+                    for i in 0..4 {
+                        let e = &sec[446 + i * 16..446 + i * 16 + 16];
+                        let ty = e[4];
+                        if ty == 0 { continue; }
+                        let lba = u32::from_le_bytes(e[8..12].try_into().unwrap());
+                        let sz = u32::from_le_bytes(e[12..16].try_into().unwrap());
+                        self.emit(&alloc::format!(
+                            "/dev/vda{}   {:<9} {:<10} {:>4}M  0x{:02x}",
+                            i + 1, lba, sz, (sz as u64) * 512 / (1 << 20), ty
+                        ));
+                    }
+                }
+            }
+            "vol" | "blkid" => {
+                // filesystem identity off /dev/vda's FAT BPB (real metadata)
+                let Ok(fd) = ustd::open("/dev/vda", ustd::O_RDONLY) else {
+                    self.fail("vol: no disk");
+                    return;
+                };
+                let mut sec = [0u8; 512];
+                let _ = ustd::read(fd, &mut sec);
+                ustd::close(fd);
+                let oem = String::from_utf8_lossy(&sec[3..11]).trim().to_string();
+                let bps = u16::from_le_bytes([sec[11], sec[12]]);
+                let spc = sec[13];
+                let nf = sec[16];
+                let spt = u16::from_le_bytes([sec[24], sec[25]]);
+                let fatsz = u32::from_le_bytes(sec[36..40].try_into().unwrap());
+                let serial = u32::from_le_bytes(sec[67..71].try_into().unwrap());
+                let label = String::from_utf8_lossy(&sec[71..82]).trim().to_string();
+                let fstyp = String::from_utf8_lossy(&sec[82..90]).trim().to_string();
+                self.emit(&alloc::format!("/dev/vda: {} [{}] serial {:08x}", fstyp, label, serial));
+                self.emit(&alloc::format!(
+                    "  oem={} bytes/sec={} sec/clus={} fats={} sec/track={} fatsz={}",
+                    oem, bps, spc, nf, spt, fatsz
+                ));
+            }
+            "script" => {
+                // script [file] — start/stop a session typescript log
+                if self.script_fd.is_some() {
+                    let fd = self.script_fd.take().unwrap();
+                    ustd::close(fd);
+                    self.emit("script: stopped");
+                } else {
+                    let p = args.first().copied().unwrap_or("/typescript.log");
+                    match ustd::open(p, ustd::O_WRONLY | ustd::O_CREATE | ustd::O_APPEND) {
+                        Ok(fd) => {
+                            self.script_fd = Some(fd);
+                            self.emit(&alloc::format!("script: logging to {}", p));
+                        }
+                        Err(e) => self.fail(&alloc::format!("script: {}: err {}", p, e)),
+                    }
+                }
+            }
             "stat" => match args.first() {
                 Some(p) => match ustd::stat(p) {
                     Ok(st) => {
@@ -6971,7 +7377,105 @@ impl Term {
         "dirs", "zip", "unzip", "zipinfo", "beep", "play", "gzip", "gunzip", "zcat",
         "patch", "awk", "case", "esac",
         "md5sum", "uuencode", "uudecode", "zgrep", "portscan", "dig",
+        "sha1sum", "od", "xxd", "banner", "units", "pr", "apropos", "whereis",
+        "fortune", "uuidgen", "logger", "whois", "fdisk", "vol", "blkid", "script",
     ];
+
+    const HELP_LINES: &'static [&'static str] = &[
+                    "commands: help ls cd pwd cat mkdir touch rm mv cp echo",
+                    "          clear ps mem uname whoami date ping resolve httpget ifconfig dhcp",
+                    "          netstat kill <pid> grep <pat> <file> (or -r <dir>) uptime",
+                    "          hex <file> wc <file> du <path> history time <cmd>",
+                    "          head/tail [-n N] <file> sort <file>",
+                    "          a | b   cmd > file   cmd >> file   watch [-n s] cmd",
+                    "          df  (volume usage)  more  cal  tree  seq  sleep  sh  calc  ntp",
+                    "          httpd <port>  arp  dmesg  nc <ip> <port>  true  false",
+                    "          fserve <port> <file>  fget <ip> <port> <out>  shot [path]",
+                    "          find <dir> [pat]  killall <name>  basename/dirname  strings",
+                    "          diff <a> <b>  stat <path>  sort -n/-r/-u  wc -l/-w/-c",
+                    "          uniq [-c]  tr [-d] <a> <b>  cut -d X -f N  tee [-a] <file>",
+                    "          base64 [-d] <file>  sha256sum <file..>  tar cf|tf|xf  echo -n",
+                    "          show <file.ppm> (image viewer)  globs: ls *.txt  cat *.ppm",
+                    "          grep -r/-v/-n/-c/-i  sed 's/a/b/g'  xargs  nl  rev  fmt [-w N]",
+                    "          cmp <a> <b>  tail -f <file>  yes  read VAR  wait <pid>  !! / !n",
+                    "          ops: a ; b   a && b   a || b   drag-select copies to clipboard",
+                    "          alias/unalias  type  printf  dd  split  wget  hostname  id",
+                    "          $(cmd) substitution   echo -e \\n \\t   help <cmd> filters",
+                    "          cmd < file  source/. <file>  comm join paste  cp -r",
+                    "          grep -A/-B/-C/-m/-w/-x  sed -i / '2,4d' / 'Np'  expand -t N",
+                    "          find -name/-type/-maxdepth  Ctrl-R history search  .cosmosrc",
+                    "          at <secs> <cmd>  httpd <port> [root] serves real files",
+                    "          nc -l <port> listens  file <path> magic type  du/df -h human",
+                    "          test/[ expr: -e -f -d -z -n = != -eq -ne -lt -le -gt -ge !",
+                    "          ls -a -S -r  rand [n] [-x]  mount  rmdir  uname -srmva",
+                    "          sh <file> args -> $0 $1..$N $#   !<prefix> reruns match",
+                    "          more: Space/b page, / search, n next",
+                    "          beep [hz ms]  play <file> (NOTE|HZ,DUR per line, R=rest)",
+                    "          zip (deflate)/unzip/zipinfo  gzip [-c]  gunzip  zcat  /proc/*",
+                    "          sh: case W in p|p) .. ;; esac   cmd <<EOF heredoc",
+                    "          diff -u <a> <b>  patch <file.diff>  awk [-F c] 'prog' [file]",
+                    "          tar cf|tf|tv|xf (dirs recurse, xf honors paths, 'z' = gz)",
+                    "          /dev/{null,zero,full,random,urandom}  md5sum  uuencode/uudecode",
+                    "          zgrep <pat> <file.gz>  portscan <host> [lo-hi|p..]  dig <name> [type]",
+                    "          readline: Ctrl-A/E/K/U/W/Y",
+                    "          sha1sum  od/xxd  banner  units  pr  apropos  whereis",
+                    "          fortune  uuidgen  logger  whois  fdisk -l  vol  script",
+                    "          reboot shutdown exit",
+                    "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
+    ];
+
+    /// Real WHOIS over TCP/43: query whois.iana.org for the referral,
+    /// then the registry server. Returns output lines.
+    fn whois_query(q: &str) -> Result<Vec<String>, String> {
+        fn query(server: &str, q: &str) -> Result<Vec<String>, String> {
+            let ip = ustd::net_dns(server)
+                .ok_or_else(|| alloc::format!("whois: {}: no DNS", server))?;
+            let mut lport = 16800u16;
+            let mut sock = None;
+            for _ in 0..8 {
+                lport += 1;
+                if let Some(s) = ustd::TcpSock::connect(lport, ip, 43) {
+                    sock = Some(s);
+                    break;
+                }
+            }
+            let sock = sock.ok_or_else(|| alloc::format!("whois: {}:43: connect failed", server))?;
+            sock.send(alloc::format!("{}\r\n", q).as_bytes())
+                .ok_or_else(|| String::from("whois: send failed"))?;
+            let mut out = Vec::new();
+            let mut buf = Vec::new();
+            let deadline = ustd::uptime_ms() + 6000;
+            loop {
+                match sock.recv(800) {
+                    Some(d) => {
+                        buf.extend_from_slice(&d);
+                        if buf.len() > 8192 || ustd::uptime_ms() > deadline {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            for l in String::from_utf8_lossy(&buf).lines() {
+                out.push(String::from(l));
+            }
+            Ok(out)
+        }
+        let mut lines = query("whois.iana.org", q)?;
+        let refer = lines
+            .iter()
+            .find(|l| l.to_lowercase().starts_with("refer:"))
+            .and_then(|l| l.split(':').nth(1))
+            .map(|s| s.trim().to_string());
+        if let Some(r) = refer {
+            lines.push(alloc::format!(";; referred to {}", r));
+            match query(&r, q) {
+                Ok(mut more) => lines.append(&mut more),
+                Err(e) => lines.push(alloc::format!(";; {}: {}", r, e)),
+            }
+        }
+        Ok(lines)
+    }
 
     /// Tab-complete: command names before the first space, paths after.
     /// Inserts the longest common prefix of the matches.
@@ -7434,6 +7938,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         yank: String::new(),
         cap_bin: None,
         last_cap_bin: Vec::new(),
+        script_fd: None,
         yesing: None,
         prev_buttons: 0,
         aliases: Vec::new(),

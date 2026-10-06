@@ -777,3 +777,56 @@ pub fn md5(data: &[u8] ) -> [u8; 16] {
     out
 }
 
+
+/// RFC 3174 SHA-1.
+pub fn sha1(data: &[u8]) -> [u8; 20] {
+    const K: [u32; 4] = [0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xca62c1d6];
+    let mut msg = data.to_vec();
+    let bitlen = (data.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bitlen.to_be_bytes());
+    let mut h = [0x67452301u32, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for i in 0..80 {
+            let (f, k) = match i / 20 {
+                0 => ((b & c) | (!b & d), K[0]),
+                1 => (b ^ c ^ d, K[1]),
+                2 => ((b & c) | (b & d) | (c & d), K[2]),
+                _ => (b ^ c ^ d, K[3]),
+            };
+            let t = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w[i]);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = [0u8; 20];
+    for i in 0..5 {
+        out[i * 4..i * 4 + 4].copy_from_slice(&h[i].to_be_bytes());
+    }
+    out
+}
+

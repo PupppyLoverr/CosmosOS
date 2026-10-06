@@ -22,17 +22,56 @@ pub fn handles(path: &str) -> bool {
     path == "/proc" || path.starts_with("/proc/")
 }
 
+/// `/proc/<pid>` when `pid` names an alive task (digits only).
+fn pid_of(path: &str) -> Option<u32> {
+    let rest = path.strip_prefix("/proc/")?;
+    let p = rest.split('/').next()?;
+    if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    p.parse().ok()
+}
+
+const PID_FILES: &[&str] = &["status", "cmdline", "stat", "fds"];
+
 pub fn is_dir(path: &str) -> bool {
     path == "/proc"
+        || pid_of(path)
+            .map(|p| task::pids().contains(&p) && path.matches('/').count() == 2)
+            .unwrap_or(false)
 }
 
 pub fn exists(path: &str) -> bool {
-    is_dir(path) || FILES.contains(&path.trim_start_matches("/proc/"))
+    if is_dir(path) {
+        return true;
+    }
+    if let Some(p) = pid_of(path) {
+        // /proc/<pid>/<file>
+        if path.matches('/').count() == 3 {
+            let f = path.rsplit('/').next().unwrap_or("");
+            return task::pids().contains(&p) && PID_FILES.contains(&f);
+        }
+        return false;
+    }
+    FILES.contains(&path.trim_start_matches("/proc/"))
 }
 
-/// Directory entries of `/proc` (flat: the directory has no subdirs).
-pub fn entries() -> Vec<shared::DirEntry> {
+/// Directory entries of a /proc dir (`/proc` or `/proc/<pid>`).
+pub fn entries(path: &str) -> Vec<shared::DirEntry> {
     let mut out = Vec::new();
+    if let Some(p) = pid_of(path) {
+        if is_dir(path) {
+            for name in PID_FILES {
+                let mut de = shared::DirEntry::default();
+                let nb = name.as_bytes();
+                de.name[..nb.len()].copy_from_slice(nb);
+                de.name_len = nb.len() as u8;
+                out.push(de);
+            }
+            return out;
+        }
+        let _ = p;
+    }
     for name in FILES {
         let mut de = shared::DirEntry::default();
         let nb = name.as_bytes();
@@ -43,6 +82,16 @@ pub fn entries() -> Vec<shared::DirEntry> {
             .map(|d| d.len() as u64)
             .unwrap_or(0);
         de.mtime = 0;
+        out.push(de);
+    }
+    // numeric pid dirs alongside the flat files
+    for pid in task::pids() {
+        let name = alloc::format!("{}", pid);
+        let mut de = shared::DirEntry::default();
+        let nb = name.as_bytes();
+        de.name[..nb.len()].copy_from_slice(nb);
+        de.name_len = nb.len() as u8;
+        de.is_dir = 1;
         out.push(de);
     }
     out
@@ -80,6 +129,13 @@ fn cpu_brand() -> String {
 /// Render a /proc file's current contents. Generated fresh on every read so
 /// values like uptime and the task list are live.
 pub fn read_file(path: &str) -> Option<Vec<u8>> {
+    if let Some(p) = pid_of(path) {
+        let file = path.rsplit('/').next().unwrap_or("");
+        if path.matches('/').count() == 3 && PID_FILES.contains(&file) {
+            return pid_file(p, file);
+        }
+        return None;
+    }
     let s = match path {
         "/proc/meminfo" => {
             let (total, used, heap) = mem::meminfo();
@@ -161,6 +217,31 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
             let secs = crate::virtio::block_device().map(|d| d.capacity_sectors()).unwrap_or(0);
             alloc::format!("major minor  #blocks  name\n   8     0  {} virtio-blk\n", secs / 2)
         }
+        _ => return None,
+    };
+    Some(s.into_bytes())
+}
+
+/// Render a `/proc/<pid>/<file>` — live task state each read.
+fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
+    let (name, argv, mem, ticks, is_user, state) = task::pid_info(pid)?;
+    let s = match file {
+        "status" => alloc::format!(
+            "Name:\t{}\nPid:\t{}\nState:\t{}\nUser:\t{}\nVmSize:\t{} kB\nCpuTicks:\t{}\n",
+            name, pid, state, is_user, mem / 1024, ticks
+        ),
+        "cmdline" => alloc::format!("{} {}\n", name, argv).trim_end().to_string() + "\n",
+        "stat" => alloc::format!(
+            "{} ({}) {} {} {} {} 0 0 0 {}\n",
+            pid,
+            name,
+            state.chars().next().unwrap_or('?'),
+            is_user as u8,
+            mem / 1024,
+            ticks,
+            ticks
+        ),
+        "fds" => task::fd_list(pid).unwrap_or_default(),
         _ => return None,
     };
     Some(s.into_bytes())

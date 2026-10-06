@@ -300,7 +300,7 @@ pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
     }
     if crate::proc::handles(&full) {
         return if crate::proc::is_dir(&full) {
-            Ok(crate::proc::entries())
+            Ok(crate::proc::entries(&full))
         } else {
             Err(-4) // ENOTDIR
         };
