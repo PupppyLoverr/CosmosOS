@@ -15,6 +15,56 @@ pub fn uptime_ms() -> u64 {
 }
 pub(crate) fn bump_ticks() {
     TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // PC speaker: silence when the programmed duration elapses.
+    let left = BEEP_TICKS_LEFT.load(core::sync::atomic::Ordering::Relaxed);
+    if left != 0 {
+        if left <= 1 {
+            speaker_off();
+        } else {
+            BEEP_TICKS_LEFT.store(left - 1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+// ---------------- PC speaker (PIT channel 2 + port 0x61) ----------------
+//
+// Channel 2 of the 8254 feeds a gate on port 0x61; setting bits 0 (gate from
+// PIT2) and 1 (speaker data enable) makes the cone oscillate at the channel's
+// programmed square-wave frequency. Real hardware path — on a physical PC this
+// is the classic "beep".
+static BEEP_TICKS_LEFT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+fn speaker_off() {
+    BEEP_TICKS_LEFT.store(0, core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let mut g: Port<u8> = Port::new(0x61);
+        let v = g.read();
+        g.write(v & !0x03u8);
+    }
+}
+
+/// Sound the PC speaker at `freq` Hz for `ms` milliseconds. Non-blocking: the
+/// expiry is armed in tick units and `bump_ticks` silences the gate. `freq==0`
+/// or `ms==0` silences immediately; re-arming replaces the pending beep.
+pub fn beep(freq: u32, ms: u64) {
+    if freq == 0 || ms == 0 {
+        speaker_off();
+        return;
+    }
+    let divisor = (1193182u32 / freq.max(20)).clamp(1, 0xFFFF);
+    unsafe {
+        let mut cmd: Port<u8> = Port::new(0x43);
+        cmd.write(0xB6u8); // channel 2, lobyte/hibyte, mode 3 (square wave)
+        let mut ch2: Port<u8> = Port::new(0x42);
+        ch2.write((divisor & 0xFF) as u8);
+        ch2.write(((divisor >> 8) & 0xFF) as u8);
+        let mut g: Port<u8> = Port::new(0x61);
+        let v = g.read();
+        g.write(v | 0x03);
+    }
+    let t = (ms.saturating_mul(TICK_HZ) / 1000).max(1);
+    BEEP_TICKS_LEFT.store(t.min(u64::from(u32::MAX)), core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Program PIT channel 0 for `TICK_HZ` periodic interrupts.

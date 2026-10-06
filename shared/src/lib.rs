@@ -71,6 +71,7 @@ pub const SYS_NET_TCP_UNLISTEN: u64 = 72; // (lport) -> 0
 pub const SYS_SHOT: u64 = 73;             // (path_ptr,path_len) -> 0 | ERR  fb -> PPM file
 pub const SYS_RAND: u64 = 74;             // (buf,cap<=4096) -> n | ERR  hardware/seeded random bytes
 pub const SYS_PCI_SCAN: u64 = 75;         // (&mut PciEnt buf, max) -> n | ERR
+pub const SYS_BEEP: u64 = 76;             // (freq_hz, ms) -> 0  PC speaker via PIT ch2 + port 0x61
 
 pub const SYS_ERR: u64 = u64::MAX;
 

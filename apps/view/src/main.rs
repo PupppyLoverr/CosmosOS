@@ -1,6 +1,6 @@
-//! cosmos-view: a real image viewer for binary PPM (P6) files — the format
-//! Paint saves. Opens `/x.ppm`, scales down by integer factor to fit the
-//! window, +/= and - zoom, arrows/hjkl pan, q/Esc quits.
+//! cosmos-view: a real image viewer — PPM (P6/P3), BMP (24/32-bit), and
+//! QOI, decoded by `ustd::img`. Opens a file, scales down by integer
+//! factor to fit, +/= and - zoom, arrows/hjkl pan, q/Esc quits.
 #![no_std]
 #![no_main]
 
@@ -10,64 +10,19 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use shared::*;
 use ustd::draw::{self, Canvas};
+use ustd::img::{self, Img};
 use ustd::wm::{self, Window};
 use ustd::println;
 
-struct Img {
-    w: usize,
-    h: usize,
-    px: Vec<u8>, // RGB triplets
-}
-
-/// Parse a binary P6 PPM: `P6` ws W ws H ws MAXVAL 1ws data.
-/// Comments (`#` to end-of-line) may appear after any token.
-fn parse_ppm(d: &[u8]) -> Option<Img> {
-    if d.len() < 3 || &d[0..2] != b"P6" {
-        return None;
-    }
-    let mut i = 2usize;
-    // token reader: skips whitespace + comments
-    let mut tok = |i: &mut usize| -> Option<usize> {
-        loop {
-            while *i < d.len() && (d[*i] as char).is_whitespace() {
-                *i += 1;
-            }
-            if *i < d.len() && d[*i] == b'#' {
-                while *i < d.len() && d[*i] != b'\n' {
-                    *i += 1;
-                }
-                continue;
-            }
-            break;
-        }
-        let mut v = 0usize;
-        let mut any = false;
-        while *i < d.len() && d[*i].is_ascii_digit() {
-            v = v * 10 + (d[*i] - b'0') as usize;
-            any = true;
-            *i += 1;
-        }
-        if any {
-            Some(v)
-        } else {
-            None
-        }
-    };
-    let w = tok(&mut i)?;
-    let h = tok(&mut i)?;
-    let max = tok(&mut i)?;
-    if w == 0 || h == 0 || max != 255 || w > 4096 || h > 4096 {
-        return None;
-    }
-    i += 1; // exactly one whitespace byte after maxval
-    if i + w * h * 3 > d.len() {
-        return None;
-    }
-    Some(Img {
-        w,
-        h,
-        px: d[i..i + w * h * 3].to_vec(),
-    })
+/// Extensions the viewer supports (for `n`/`p` sibling navigation and
+/// Files' open-association).
+pub fn is_image_name(n: &str) -> bool {
+    let l = n.len();
+    l > 4
+        && matches!(
+            &n[l - 4..].to_ascii_lowercase()[..],
+            ".ppm" | ".bmp" | ".qoi"
+        )
 }
 
 struct View {
@@ -95,8 +50,7 @@ impl View {
     }
 
     fn px_at(&self, ix: usize, iy: usize) -> u32 {
-        let o = (iy * self.img.w + ix) * 3;
-        ((self.img.px[o] as u32) << 16) | ((self.img.px[o + 1] as u32) << 8) | self.img.px[o + 2] as u32
+        self.img.px[iy * self.img.w + ix]
     }
 
     /// Origin that centers the image in the canvas at scale `s`.
@@ -162,9 +116,9 @@ impl View {
         }
     }
 
-    /// Load `path` (a P6 PPM) into this window — `n`/`p` navigation.
+    /// Load `path` (any supported format) into this window.
     fn open_file(&mut self, path: String) {
-        match ustd::read_all(&path).ok().and_then(|d| parse_ppm(&d)) {
+        match ustd::read_all(&path).ok().and_then(|d| img::decode(&d)) {
             Some(img) => {
                 self.img = img;
                 self.path = path;
@@ -189,7 +143,7 @@ impl View {
                 .iter()
                 .filter(|e| e.is_dir == 0)
                 .map(|e| String::from(core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("")))
-                .filter(|n| n.ends_with(".ppm") || n.ends_with(".PPM"))
+                .filter(|n| is_image_name(n))
                 .collect();
             names.sort();
             if names.is_empty() {
@@ -230,7 +184,7 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         .create_window(140, 80, 640, 500, WIN_DECORATE | WIN_RESIZABLE, "View")
         .expect("create window");
     let rd = ustd::read_all(&path);
-    let mut v = match rd.ok().and_then(|d| parse_ppm(&d)) {
+    let mut v = match rd.ok().and_then(|d| img::decode(&d)) {
         Some(img) => View {
             win,
             c: win.canvas(),
@@ -243,7 +197,7 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         },
         None => {
             // not a P6 PPM (or unreadable): say so in the window
-            let mut v = View {
+            let v = View {
                 win,
                 c: win.canvas(),
                 img: Img { w: 0, h: 0, px: Vec::new() },
@@ -254,8 +208,8 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
                 dirty: false,
             };
             v.c.fill(0, 0, v.c.w as i32, v.c.h as i32, draw::BLACK);
-            v.c.text(16, 20, "not a P6 PPM (or unreadable)", draw::TEXT, None);
-            v.c.text(16, 40, "usage: view <file.ppm>   q quits", draw::DIM, None);
+            v.c.text(16, 20, "unsupported image (PPM/BMP/QOI only)", draw::TEXT, None);
+            v.c.text(16, 40, "usage: view <file>   q quits", draw::DIM, None);
             v.win.present_all();
             v
         }

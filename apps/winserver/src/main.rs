@@ -91,7 +91,20 @@ struct Launcher {
     open: bool,
     items: Vec<(&'static str, &'static str)>, // (label, binary path)
     sel: i32,
+    x: i32, // menu origin; taskbar opens it bottom-left, right-click desktop anywhere
+    y: i32,
 }
+
+/// Right-click window menu: a winserver-owned popup over the titlebar.
+struct CtxMenu {
+    x: i32,
+    y: i32,
+    win: u32,
+    sel: i32,
+}
+const CTX_ITEMS: [&str; 4] = ["maximize/restore", "minimize", "other workspace", "close"];
+const CTX_W: i32 = 150;
+const CTX_IH: i32 = 22;
 
 static mut MX: i32 = 512;
 static mut MY: i32 = 384;
@@ -115,6 +128,9 @@ struct S {
     last_frame: u64,
     last_tc: (u64, u32), // (time, win) of last titlebar press -- dblclick detect
     wall: Vec<u32>, // wallpaper cache (fh-TBAR_H rows)
+    wall_file: Option<String>, // `wallpaper=file[:path]` resolved path
+    wall_sig: u64,             // size of the loaded image file (change detect)
+    menu: Option<CtxMenu>,     // titlebar right-click menu
     idle_since: u64, // ms of last input event -- screensaver clock
     blanked: bool,   // screensaver active: fb is black
     cfg: Cfg,
@@ -132,7 +148,10 @@ struct Cfg {
     saver_ms: u64,    // idle ms before the screensaver blanks (u64::MAX = off)
 }
 
-fn parse_cfg() -> Cfg {
+/// Returns the live settings plus the resolved wallpaper image path
+/// (`wallpaper=file[:path]` -> Some(path when it exists)).
+fn parse_cfg() -> (Cfg, Option<String>) {
+    let mut wall_v: Option<String> = None;
     let mut c = Cfg {
         wall_top: WALL_TOP,
         wall_bot: WALL_BOT,
@@ -147,20 +166,23 @@ fn parse_cfg() -> Cfg {
             if let Some((k, v)) = line.split_once('=') {
                 let (k, v) = (k.trim(), v.trim());
                 match k {
-                    "wallpaper" => match v {
-                        "darker" => {
-                            c.wall_top = 0xFF0A0B0D;
-                            c.wall_bot = 0xFF050607;
+                    "wallpaper" => {
+                        wall_v = Some(String::from(v));
+                        match v {
+                            "darker" => {
+                                c.wall_top = 0xFF0A0B0D;
+                                c.wall_bot = 0xFF050607;
+                            }
+                            "graphite" => {
+                                c.wall_top = 0xFF2A2D33;
+                                c.wall_bot = 0xFF17181B;
+                            }
+                            _ => {
+                                c.wall_top = WALL_TOP;
+                                c.wall_bot = WALL_BOT;
+                            }
                         }
-                        "graphite" => {
-                            c.wall_top = 0xFF2A2D33;
-                            c.wall_bot = 0xFF17181B;
-                        }
-                        _ => {
-                            c.wall_top = WALL_TOP;
-                            c.wall_bot = WALL_BOT;
-                        }
-                    },
+                    }
                     "cursor_speed" => match v {
                         "slow" => {
                             c.cm_num = 3;
@@ -189,7 +211,7 @@ fn parse_cfg() -> Cfg {
             }
         }
     }
-    c
+    (c, wall_file_of(wall_v))
 }
 
 impl S {
@@ -210,9 +232,39 @@ impl S {
     }
 }
 
-fn render_wall(wall: &mut [u32], w: u32, h: usize, top: u32, bot: u32) {
+fn render_wall(wall: &mut [u32], w: u32, h: usize, top: u32, bot: u32, file: Option<&String>) {
+    // `file` mode: decode the image and nearest-scale it over the desktop.
+    // Any failure falls back to the configured gradient.
+    if let Some(path) = file {
+        if let Some(img) = ustd::read_all(path).ok().and_then(|d| ustd::img::decode(&d)) {
+            let scaled = ustd::img::scale(&img, w as usize, h);
+            wall[..w as usize * h].copy_from_slice(&scaled);
+            return;
+        }
+    }
     let cw = Canvas::new(wall.as_mut_ptr(), w, h as u32, w);
     cw.fill_grad(0, 0, w as i32, h as i32, top, bot);
+}
+
+/// Resolve `wallpaper=file[:path]` to an existing image path (auto-detects
+/// /wallpaper.qoi|.bmp|.ppm when no explicit path is given).
+fn wall_file_of(conf_val: Option<String>) -> Option<String> {
+    let v = conf_val?;
+    if v == "file" {
+        for p in ["/wallpaper.qoi", "/wallpaper.bmp", "/wallpaper.ppm"] {
+            if ustd::stat(p).is_ok() {
+                return Some(String::from(p));
+            }
+        }
+        return None;
+    }
+    if let Some(rest) = v.strip_prefix("file:") {
+        let p = alloc::format!("/{}", rest.trim_start_matches('/'));
+        if ustd::stat(&p).is_ok() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 fn send_ev(port: u32, kind: u16, payload: &[u8]) {
@@ -233,10 +285,10 @@ fn main_loop() -> ! {
 
     // pre-render wallpaper once into a cache buffer (re-rendered live when
     // the wallpaper setting changes)
-    let cfg0 = parse_cfg();
+    let (cfg0, wall_path0) = parse_cfg();
     let wall_h = (fbi.height as i32 - TBAR_H) as usize;
     let mut wall = alloc::vec![0u32; fbi.width as usize * wall_h];
-    render_wall(&mut wall, fbi.width, wall_h, cfg0.wall_top, cfg0.wall_bot);
+    render_wall(&mut wall, fbi.width, wall_h, cfg0.wall_top, cfg0.wall_bot, wall_path0.as_ref());
 
     let mut s = S {
         fb,
@@ -249,8 +301,13 @@ fn main_loop() -> ! {
         ws_port,
         in_port,
         drag: None,
+        wall_file: wall_path0,
+        wall_sig: 0,
+        menu: None,
         launcher: Launcher {
             open: false,
+            x: 0,
+            y: 0,
             items: alloc::vec![
                 ("Terminal", "/bin/cosmos-terminal"),
                 ("Files", "/bin/cosmos-files"),
@@ -274,6 +331,11 @@ fn main_loop() -> ! {
         cfg: cfg0,
         cfg_poll: 0,
     };
+    s.wall_sig = s
+        .wall_file
+        .as_ref()
+        .and_then(|p| ustd::stat(p).ok().map(|st| st.size))
+        .unwrap_or(0);
 
     composite(&mut s);
     // autostart: boot lands on a terminal, like a real desktop
@@ -305,13 +367,25 @@ fn main_loop() -> ! {
         // change re-renders the cache and damages the desktop
         if up.saturating_sub(s.cfg_poll) >= 2000 {
             s.cfg_poll = up;
-            let nc = parse_cfg();
-            if nc.wall_top != s.cfg.wall_top || nc.wall_bot != s.cfg.wall_bot {
+            let (nc, nfile) = parse_cfg();
+            // reload when the file path changed, or the image bytes did
+            // (same path, new size)
+            let fsig = nfile
+                .as_ref()
+                .and_then(|p| ustd::stat(p).ok().map(|st| st.size as u64))
+                .unwrap_or(0);
+            let changed = nc.wall_top != s.cfg.wall_top
+                || nc.wall_bot != s.cfg.wall_bot
+                || nfile != s.wall_file
+                || (nfile.is_some() && fsig != s.wall_sig);
+            if changed {
                 let (fw_u, wh) = (s.fw as u32, (s.fh - TBAR_H) as usize);
-                render_wall(&mut s.wall, fw_u, wh, nc.wall_top, nc.wall_bot);
+                render_wall(&mut s.wall, fw_u, wh, nc.wall_top, nc.wall_bot, nfile.as_ref());
+                s.wall_sig = fsig;
                 let (fw, fh) = (s.fw, s.fh);
                 dmg(&mut s, 0, 0, fw, fh - TBAR_H);
             }
+            s.wall_file = nfile;
             s.cfg = nc;
         }
         // screensaver: blank after the configured idle timeout; any input
@@ -410,7 +484,63 @@ fn spawn_app(path: &str) {
     }
 }
 
+/// Keyboard navigation while the launcher or a window context-menu is
+/// open. Returns true when the key was consumed (the rest close the menus
+/// and fall through to normal routing).
+fn menu_key(s: &mut S, k: &InputKey) -> bool {
+    let (count, sel, is_ctx) = if let Some(cm) = &s.menu {
+        (CTX_ITEMS.len() as i32, cm.sel, true)
+    } else if s.launcher.open {
+        (s.launcher.items.len() as i32, s.launcher.sel, false)
+    } else {
+        return false;
+    };
+    match k.key as u32 {
+        x if x == KeyCode::Escape as u32 => {
+            s.menu = None;
+            s.launcher.open = false;
+        }
+        x if x == KeyCode::Up as u32 || x == KeyCode::Down as u32 => {
+            let ns = if x == KeyCode::Up as u32 {
+                if sel <= 0 { count - 1 } else { sel - 1 }
+            } else {
+                (sel + 1) % count
+            };
+            if is_ctx {
+                if let Some(cm) = s.menu.as_mut() {
+                    cm.sel = ns;
+                }
+            } else {
+                s.launcher.sel = ns;
+            }
+        }
+        x if x == KeyCode::Enter as u32 => {
+            if is_ctx {
+                if let Some(cm) = s.menu.take() {
+                    ctx_act(s, cm.win, sel.max(0));
+                }
+            } else if sel >= 0 && (sel as usize) < s.launcher.items.len() {
+                let (_, path) = s.launcher.items[sel as usize];
+                let _ = ustd::spawn(path, "");
+                s.launcher.open = false;
+            }
+        }
+        _ => return false,
+    }
+    s.dirty = true;
+    true
+}
+
 fn on_key(s: &mut S, k: &InputKey) {
+    // menus capture nav keys while open; any other key dismisses them and
+    // falls through to normal routing
+    if k.down != 0 && (s.menu.is_some() || s.launcher.open) && !menu_key(s, k) {
+        s.menu = None;
+        s.launcher.open = false;
+        s.dirty = true;
+    } else if k.down != 0 && (s.menu.is_some() || s.launcher.open) {
+        return;
+    }
     // F4-F10 launch apps; F1/F2 switch workspaces
     if k.down != 0 {
         // Alt+F4 closes the focused window (before the F4 app-launch match)
@@ -568,11 +698,51 @@ fn on_mouse(s: &mut S, m: &InputMouse) {
         taskbar_click(s, nx, true);
         return;
     }
+    // right-press edge: titlebar -> window menu, desktop -> launcher at
+    // the cursor, client area -> forwarded to the app
+    if m.buttons & 2 != 0 && pbtns & 2 == 0 {
+        right_press(s, nx, ny);
+        s.dirty = true;
+        return;
+    }
 
     // motion: cursor moved -- damage only the two 16px cursor cells
     if nx != px || ny != py {
         dmg(s, px, py, 16, 16);
         dmg(s, nx, ny, 16, 16);
+    }
+    // hover-highlight inside open menus
+    let menu_hover: Option<(i32, i32, i32, i32)> = {
+        let mut r = None;
+        if let Some(cm) = s.menu.as_mut() {
+            let mh = CTX_ITEMS.len() as i32 * CTX_IH + 8;
+            let ns = if nx >= cm.x && nx < cm.x + CTX_W && ny >= cm.y && ny < cm.y + mh {
+                ((ny - cm.y - 4) / CTX_IH).clamp(0, CTX_ITEMS.len() as i32 - 1)
+            } else {
+                -1
+            };
+            if ns != cm.sel {
+                cm.sel = ns;
+                r = Some((cm.x, cm.y, CTX_W, mh));
+            }
+        } else if s.launcher.open {
+            let mw = 220;
+            let mh = s.launcher.items.len() as i32 * 30 + 8;
+            let (mx, my) = (s.launcher.x, s.launcher.y);
+            let ns = if nx >= mx && nx < mx + mw && ny >= my && ny < my + mh {
+                ((ny - my - 4) / 30).clamp(0, s.launcher.items.len() as i32 - 1)
+            } else {
+                -1
+            };
+            if ns != s.launcher.sel {
+                s.launcher.sel = ns;
+                r = Some((mx, my, mw, mh));
+            }
+        }
+        r
+    };
+    if let Some((dx, dy, dw, dh)) = menu_hover {
+        dmg(s, dx, dy, dw, dh);
     }
     // forward motion to the window under the cursor (or focused)
     if let Some(i) = s.win_at(nx, ny) {
@@ -594,7 +764,18 @@ fn on_mouse(s: &mut S, m: &InputMouse) {
 fn mouse_press(s: &mut S, x: i32, y: i32) {
     // taskbar?
     if y >= s.fh - TBAR_H {
+        s.menu = None;
         taskbar_click(s, x, false);
+        s.dirty = true;
+        return;
+    }
+    // an open window context-menu consumes the click (act or dismiss)
+    if let Some(cm) = s.menu.take() {
+        let mh = CTX_ITEMS.len() as i32 * CTX_IH + 8;
+        if x >= cm.x && x < cm.x + CTX_W && y >= cm.y && y < cm.y + mh {
+            let idx = (y - cm.y - 4) / CTX_IH;
+            ctx_act(s, cm.win, idx);
+        }
         s.dirty = true;
         return;
     }
@@ -602,8 +783,7 @@ fn mouse_press(s: &mut S, x: i32, y: i32) {
     if s.launcher.open {
         let mw = 220;
         let mh = s.launcher.items.len() as i32 * 30 + 8;
-        let mx = 0;
-        let my = s.fh - TBAR_H - mh;
+        let (mx, my) = (s.launcher.x, s.launcher.y);
         if x >= mx && x < mx + mw && y >= my && y < my + mh {
             let idx = (y - my - 4) / 30;
             if idx >= 0 && (idx as usize) < s.launcher.items.len() {
@@ -682,12 +862,91 @@ fn mouse_press(s: &mut S, x: i32, y: i32) {
     }
 }
 
+/// Dispatch a context-menu item against its target window.
+fn ctx_act(s: &mut S, win: u32, idx: i32) {
+    match idx {
+        0 => toggle_max(s, win),
+        1 => {
+            if let Some(w) = s.win_mut(win) {
+                w.min = true;
+            }
+            if s.focus == win {
+                s.focus = top_id(s);
+            }
+        }
+        2 => {
+            // move to the other workspace and focus it there
+            if let Some(w) = s.win_mut(win) {
+                w.ws ^= 1;
+                if w.ws == s.workspace {
+                    focus_raise(s, win);
+                } else if s.focus == win {
+                    s.focus = top_id(s);
+                }
+            }
+        }
+        _ => close_win(s, win),
+    }
+}
+
+fn right_press(s: &mut S, x: i32, y: i32) {
+    s.launcher.open = false;
+    if y >= s.fh - TBAR_H {
+        // taskbar right-click: nothing (taskbar buttons keep middle-close)
+        return;
+    }
+    if s.menu.is_some() {
+        // re-open at the new spot below
+        s.menu = None;
+    }
+    if let Some(i) = s.win_at(x, y) {
+        let w = &s.wins[i];
+        let id = w.id;
+        let (wx, wy, ww) = (w.x, w.y, w.w);
+        let deco = w.deco();
+        let rel_y = y - wy;
+        let _ = wx;
+        let _ = ww;
+        if deco && rel_y < TITLE_H as i32 + BORDER_W as i32 {
+            focus_raise(s, id);
+            let mh = CTX_ITEMS.len() as i32 * CTX_IH + 8;
+            s.menu = Some(CtxMenu {
+                x: x.min(s.fw - CTX_W - 2).max(0),
+                y: y.min(s.fh - TBAR_H - mh - 2).max(0),
+                win: id,
+                sel: -1,
+            });
+            return;
+        }
+        // client area: forward the right-press to the app (Files menus etc.)
+        let w = &s.wins[i];
+        let ev = EvPointer {
+            window_id: id,
+            x: x - w.client_x(),
+            y: y - w.client_y(),
+            buttons: unsafe { BTNS },
+            wheel: 0,
+            _pad: [0; 2],
+        };
+        send_ev(w.owner, EV_POINTER, unsafe {
+            core::slice::from_raw_parts(&ev as *const _ as *const u8, core::mem::size_of::<EvPointer>())
+        });
+        return;
+    }
+    // desktop: open the launcher under the cursor
+    let mw = 220;
+    let mh = s.launcher.items.len() as i32 * 30 + 8;
+    s.launcher.x = x.min(s.fw - mw - 2).max(0);
+    s.launcher.y = y.min(s.fh - TBAR_H - mh - 2).max(0);
+    s.launcher.sel = -1;
+    s.launcher.open = true;
+}
+
 fn finish_drag(s: &mut S, d: Drag) {
     if d.mode == 0 {
         // move / snap
         let (w, h) = (s.fw, s.fh - TBAR_H);
         let edge_x = d.rx;
-        let edge_y = d.ry;
         if let Some(wr) = s.win_mut(d.win) {
             if d.ry <= -SNAP && wr.resizable() {
                 // snap top -> maximize
@@ -1007,6 +1266,7 @@ fn composite(s: &mut S) {
     if s.launcher.open {
         draw_launcher(s);
     }
+    draw_ctx_menu(s);
     blit_cursor(s, unsafe { MX }, unsafe { MY });
 }
 
@@ -1142,20 +1402,43 @@ fn draw_launcher(s: &S) {
     let fb = s.fb;
     let mw = 220;
     let mh = s.launcher.items.len() as i32 * 30 + 8;
-    let my = s.fh - TBAR_H - mh;
-    fb.fill(0, my, mw, mh, MENU_BG);
-    fb.border(0, my, mw, mh, TBAR_EDGE);
+    let (mx, my) = (s.launcher.x, s.launcher.y);
+    fb.fill(mx, my, mw, mh, MENU_BG);
+    fb.border(mx, my, mw, mh, TBAR_EDGE);
     for (i, (label, _)) in s.launcher.items.iter().enumerate() {
         let iy = my + 4 + i as i32 * 30;
         if s.launcher.sel == i as i32 {
-            fb.fill(2, iy, mw - 4, 28, MENU_HOV);
+            fb.fill(mx + 2, iy, mw - 4, 28, MENU_HOV);
         }
-        fb.text(16, iy + 6, label, TXT, None);
+        fb.text(mx + 16, iy + 6, label, TXT, None);
+    }
+}
+
+/// Window ops popup (titlebar right-click).
+fn draw_ctx_menu(s: &S) {
+    let Some(cm) = &s.menu else { return };
+    let fb = s.fb;
+    let mh = CTX_ITEMS.len() as i32 * CTX_IH + 8;
+    fb.fill(cm.x, cm.y, CTX_W, mh, MENU_BG);
+    fb.border(cm.x, cm.y, CTX_W, mh, TBAR_EDGE);
+    for (i, it) in CTX_ITEMS.iter().enumerate() {
+        let iy = cm.y + 4 + i as i32 * CTX_IH;
+        if cm.sel == i as i32 {
+            fb.fill(cm.x + 2, iy, CTX_W - 4, CTX_IH, MENU_HOV);
+        }
+        fb.text(cm.x + 10, iy + 4, it, TXT, None);
     }
 }
 
 fn taskbar_click(s: &mut S, x: i32, middle: bool) {
     if x < 96 {
+        // Cosmos button: launcher anchored bottom-left (right-click on the
+        // desktop anchors it at the cursor instead)
+        if !s.launcher.open {
+            s.launcher.x = 0;
+            s.launcher.y = s.fh - TBAR_H - (s.launcher.items.len() as i32 * 30 + 8);
+            s.launcher.sel = -1;
+        }
         s.launcher.open = !s.launcher.open;
         return;
     }
