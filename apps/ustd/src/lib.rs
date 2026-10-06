@@ -864,3 +864,8 @@ pub fn strace(op: u64, pid: u32, out: &mut [u8]) -> i64 {
         out.len() as u64,
     ) as i64
 }
+
+/// (pid, sig): POSIX-lite signal — 9/15 kill, 19 STOP, 18 CONT. 0 | <0.
+pub fn kill2(pid: u32, sig: u64) -> i64 {
+    sc2(shared::SYS_KILL2, pid as u64, sig) as i64
+}

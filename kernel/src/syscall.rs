@@ -389,6 +389,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
         }
         shared::SYS_NICE => task::set_nice(a1 as u32, a2 as i64) as u64,
+        shared::SYS_KILL2 => task::signal(a1 as u32, a2) as u64,
         shared::SYS_STRACE => match a1 {
             // (op, pid, out, cap): 0 start, 1 stop, 2 drain packed 7*u64 recs
             0 => task::trace_start(a2 as u32) as u64,

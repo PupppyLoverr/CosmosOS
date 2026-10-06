@@ -425,6 +425,26 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             .unwrap_or(false)
     });
 
+    // ---- signals: STOP freezes a task, CONT resumes it, KILL reaps it ----
+    check("sig-stop-cont", {
+        let ok = match ustd::spawn("/bin/cosmos-calc", "") {
+            Ok(pid) => {
+                let stopped = ustd::kill2(pid, 19) == 0
+                    && ustd::read_all(&alloc::format!("/proc/{}/status", pid))
+                        .map(|d| String::from_utf8_lossy(&d).contains("T (stopped)"))
+                        .unwrap_or(false);
+                let resumed = ustd::kill2(pid, 18) == 0
+                    && ustd::read_all(&alloc::format!("/proc/{}/status", pid))
+                        .map(|d| String::from_utf8_lossy(&d).contains("R (running)"))
+                        .unwrap_or(false);
+                let _ = ustd::kill2(pid, 9);
+                stopped && resumed
+            }
+            Err(_) => false,
+        };
+        ok
+    });
+
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64
