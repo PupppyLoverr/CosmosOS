@@ -1,0 +1,28 @@
+# Devin environment blueprint for CosmosOS.
+# Toolchain verified 2026-10-06: kernel builds via build-std on nightly;
+# the image boots in QEMU (OVMF) both windowed and headless via QMP.
+initialize: |
+  rustup toolchain install nightly
+  rustup component add --toolchain nightly rust-src llvm-tools-preview rustfmt
+  sudo apt-get update
+  sudo apt-get install -y qemu-system-x86 ovmf python3-pil
+knowledge:
+  - name: build
+    contents: |
+      ./build.sh  # produces dist/cosmos-uefi.img (UEFI disk image)
+  - name: test
+    contents: |
+      # selftest app: touch imgroot/selftest.flag && ./build.sh && rm imgroot/selftest.flag
+      # then boot and watch serial for "[selftest] DONE ok=33 fail=0"
+  - name: run
+    contents: |
+      ./run.sh  # boots QEMU with the framebuffer in a GTK window
+  - name: headless-testing
+    contents: |
+      # Headless boot with serial log + QMP control socket:
+      DISPLAY=none SERIAL="file:dist/log.txt" EXTRA="-no-reboot -qmp unix:/tmp/qmp.sock,server,nowait" ./run.sh
+      # DISPLAY selects the QEMU display backend (not X). -no-reboot makes QMP
+      # 'system_reset' exit QEMU. Drive it via QMP JSON: send-key (qcodes
+      # f1-f9/ret/spc/dot/slash/shift/backspace/tab/esc), input-send-event
+      # rel/abs+btn, screendump (PPM -> convert with PIL), human-monitor-command
+      # 'info registers' / 'x /Ngx <vaddr>'.

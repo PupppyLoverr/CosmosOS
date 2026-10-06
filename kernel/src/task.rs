@@ -19,7 +19,7 @@ pub const USER_STACK_PAGES: u64 = 64; // 256 KiB
 pub const USER_MMAP_BASE: u64 = 0x2000_0000;
 pub const USER_ARG_PAGE: u64 = 0x7EFF_F000;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum State {
     Running,
     Blocked, // until wake_at ticks
@@ -440,27 +440,29 @@ pub fn kill_current_or_halt(reason: &str) -> ! {
     }
     kill_at(s, idx, -1);
     drop(g);
-    // run the scheduler to move on
-    x86_64::instructions::interrupts::disable();
-    unsafe {
-        core::arch::asm!("int 32"); // fire the timer vector to reschedule
-    }
-    loop {
-        x86_64::instructions::hlt();
-    }
+    // run the scheduler to move on (int 32 = the timer vector); if nothing
+    // is runnable yet, idle with interrupts on until a tick switches away
+    park_dead_task();
 }
 
 fn kill_at(s: &mut Sched, idx: usize, code: i64) {
+    let dead_cur = idx == s.cur;
     let mut t = s.tasks.remove(idx);
     t.state = State::Dead;
     t.exit_code = code;
-    // wake any waiters
+    // no field on the tombstone may ever re-mark it schedulable
+    t.wake_at = u64::MAX;
+    t.wait_port = 0;
+    // wake any waiters (only live ones)
     for o in s.tasks.iter_mut() {
         if o.waiting_on == t.id {
             o.waiting_on = 0;
-            o.state = State::Running;
+            if o.state != State::Dead {
+                o.state = State::Running;
+            }
         }
     }
+    t.waiting_on = 0;
     // release ports, shm objects (frees their frames when refcount hits 0)
     ipc::close_task_ports(&mut t);
     shm::drop_task_shm(&mut t);
@@ -473,13 +475,26 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
                 mem::free_frame(f);
             }
         }
-        mem::free_frame(pml4.start_address().as_u64());
+        // Keep the pml4 frame: CR3 still points at it until the scheduler
+        // activates another task, so freeing it here could unmap the parked
+        // exit path if the frame got reallocated.
+        t.frames.push(pml4.start_address().as_u64());
     }
-    let frames = core::mem::take(&mut t.frames); // kernel stack frames
-    free_frames(&frames);
+    // Kernel-stack frames stay in the tombstone: the dying task may still be
+    // running on its own kstack while exit_current parks the CPU, and IRQ
+    // stubs keep pushing contexts onto it until the scheduler switches away.
     let id = t.id;
     let name = t.name.clone();
     s.tasks.push(t); // keep as tombstone for wait_pid
+    // s.cur bookkeeping after the remove: if the CURRENT task died, point
+    // s.cur at its tombstone so the next sched_tick records the int-32
+    // context on the dead entry instead of clobbering a live task's
+    // saved_rsp; if an earlier task died, s.cur shifts down one.
+    if dead_cur {
+        s.cur = s.tasks.len() - 1;
+    } else if idx < s.cur {
+        s.cur -= 1;
+    }
     if s.cur >= s.tasks.len() {
         s.cur = 0;
     }
@@ -492,12 +507,20 @@ pub fn exit_current(code: i64) -> ! {
     let idx = s.cur;
     kill_at(s, idx, code);
     drop(g);
-    x86_64::instructions::interrupts::disable();
+    park_dead_task();
+}
+
+/// Give up the CPU after the current task died. `int 32` re-runs the
+/// scheduler immediately; if no task is runnable it returns, and we idle on
+/// the (still-allocated) tombstone stack with interrupts ENABLED so the next
+/// timer IRQ retries and eventually switches away. Parking with IF=0 would
+/// freeze the machine: no IRQ could ever wake the CPU.
+fn park_dead_task() -> ! {
     unsafe {
         core::arch::asm!("int 32");
     }
     loop {
-        x86_64::instructions::hlt();
+        x86_64::instructions::interrupts::enable_and_hlt();
     }
 }
 
@@ -550,13 +573,7 @@ pub fn kill_pid(pid: u32) -> bool {
     kill_at(s, idx, -9);
     drop(g);
     if was_cur {
-        x86_64::instructions::interrupts::disable();
-        unsafe {
-            core::arch::asm!("int 32");
-        }
-        loop {
-            x86_64::instructions::hlt();
-        }
+        park_dead_task();
     }
     true
 }

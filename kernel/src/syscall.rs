@@ -104,6 +104,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_IPC_CONNECT => sys_ipc_connect(a1, a2),
         shared::SYS_IPC_SEND => sys_ipc_send(a1, a2, a3),
         shared::SYS_IPC_RECV => sys_ipc_recv(ctx, a1, a2, a3, a4),
+        shared::SYS_IPC_OWNER => ipc::owner_of(a1 as u32).map(|o| o as u64).unwrap_or(0),
         shared::SYS_IPC_CLOSE => {
             ipc::close(a1 as u32, cur_id());
             task::with_current(|t| t.ports.retain(|&p| p != a1 as u32));

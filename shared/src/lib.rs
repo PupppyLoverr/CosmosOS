@@ -32,6 +32,7 @@ pub const SYS_IPC_CONNECT: u64 = 31; // (name_ptr,len) -> port | !0
 pub const SYS_IPC_SEND: u64 = 32; // (port,buf,len)
 pub const SYS_IPC_RECV: u64 = 33; // (port,buf,buflen,timeout_ms) -> n | 0 timeout | !0
 pub const SYS_IPC_CLOSE: u64 = 34; // (port)
+pub const SYS_IPC_OWNER: u64 = 35; // (port) -> owner pid | 0
 
 pub const SYS_MEMINFO: u64 = 40; // (&mut MemInfo)
 pub const SYS_TIME: u64 = 41; // (&mut DateTime)
