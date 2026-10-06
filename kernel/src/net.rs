@@ -226,6 +226,23 @@ fn arp_resolve(ip: [u8; 4], ms: u64) -> Option<[u8; 6]> {
     }
 }
 
+/// Dump the ARP cache as text lines (for `arp`).
+pub fn arp_stat() -> String {
+    let c = ARP_CACHE.lock();
+    let mut s = String::from("ip              mac\n");
+    for (ip, mac) in c.iter() {
+        s.push_str(&alloc::format!(
+            "{}.{}.{}.{}\t{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+            ip[0], ip[1], ip[2], ip[3],
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        ));
+    }
+    if c.is_empty() {
+        s.push_str("(empty)\n");
+    }
+    s
+}
+
 /// `ping <ip>`: ARP-resolve, send one ICMP echo request, wait for the reply.
 /// Returns rtt in milliseconds, or None on timeout/unreachable.
 pub fn ping(ip: [u8; 4], timeout_ms: u64) -> Option<u64> {

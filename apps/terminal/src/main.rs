@@ -914,6 +914,11 @@ impl Term {
                     self.emit(l);
                 }
             }
+            "arp" => {
+                for l in ustd::arp_stat().lines() {
+                    self.emit(l);
+                }
+            }
             "dmesg" => {
                 // last 40 lines of the kernel log ring buffer
                 let s = ustd::klog();
@@ -1117,7 +1122,7 @@ impl Term {
             "uptime", "reboot", "shutdown", "exit", "history", "time",
             "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
             "set", "env", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
-            "dmesg",
+            "dmesg", "arp",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
