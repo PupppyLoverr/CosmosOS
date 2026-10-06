@@ -345,6 +345,22 @@ pub fn dispatch(ctx: &mut CpuContext) {
             ];
             net::arp_del(ip) as u64
         }
+        shared::SYS_UTIME => {
+            let Some(path) = copy_str(a1, a2.min(4096)) else {
+                ctx.rax = ERR;
+                return;
+            };
+            vfs::utime(&path, a3).map(|_| 0).unwrap_or_else(|e| e as u64)
+        }
+        shared::SYS_SETATTR => {
+            let Some(path) = copy_str(a1, a2.min(4096)) else {
+                ctx.rax = ERR;
+                return;
+            };
+            vfs::setattr(&path, a3 as u8)
+                .map(|_| 0)
+                .unwrap_or_else(|e| e as u64)
+        }
         shared::SYS_ARP => {
             let s = net::arp_stat();
             let n = s.len().min(a2 as usize);

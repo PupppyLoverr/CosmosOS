@@ -81,6 +81,8 @@ pub const SYS_KILL2: u64 = 81;            // (pid,sig): 9/15 kill, 19 STOP, 18 C
 pub const SYS_HOSTNAME_GET: u64 = 82;      // (buf,cap) -> n | ERR
 pub const SYS_HOSTNAME_SET: u64 = 83;      // (ptr,len<=64) -> 0 | ERR
 pub const SYS_ARP_DEL: u64 = 84;           // (ip as u32 BE) -> 1 deleted | 0 absent
+pub const SYS_UTIME: u64 = 85;             // (path_ptr,len,secs) -> 0 | ERR  set file mtime
+pub const SYS_SETATTR: u64 = 86;           // (path_ptr,len,attr) -> 0 | ERR  set FAT attr bits
 pub const SYS_ERR: u64 = u64::MAX;
 
 // open flags
@@ -140,6 +142,7 @@ pub struct Stat {
     pub size: u64,
     pub is_dir: u32,
     pub mtime: u64, // seconds since unix epoch (0 if unknown)
+    pub attr: u32,  // FAT attribute byte (0 on pseudo-fs)
 }
 
 #[repr(C)]
@@ -150,10 +153,11 @@ pub struct DirEntry {
     pub is_dir: u8,
     pub size: u64,
     pub mtime: u64,
+    pub attr: u8,   // FAT attribute byte (0 on pseudo-fs)
 }
 impl Default for DirEntry {
     fn default() -> Self {
-        Self { name: [0; 96], name_len: 0, is_dir: 0, size: 0, mtime: 0 }
+        Self { name: [0; 96], name_len: 0, is_dir: 0, size: 0, mtime: 0, attr: 0 }
     }
 }
 pub const DIR_ENTRY_MAX: usize = 64;

@@ -47,6 +47,7 @@ fn stmt_split(s: &str) -> Option<(&str, u8, &str)> {
     let (mut sq, mut dq) = (false, false);
     let mut pd = 0i32; // depth inside $(...)
     let mut bd = 0i32; // depth inside [[ ... ]]
+    let mut ad = 0i32; // depth inside (( ... )) arithmetic
     while i < b.len() {
         match b[i] {
             b'\'' if !dq => sq = !sq,
@@ -56,6 +57,14 @@ fn stmt_split(s: &str) -> Option<(&str, u8, &str)> {
                 i += 1;
             }
             b')' if pd > 0 => pd -= 1,
+            b'(' if !sq && !dq && pd == 0 && bd == 0 && ad > 0 => ad += 1,
+            b'(' if !sq && !dq && pd == 0 && bd == 0 && ad == 0
+                && b.get(i + 1) == Some(&b'(') =>
+            {
+                ad = 2;
+                i += 1;
+            }
+            b')' if !sq && !dq && pd == 0 && bd == 0 && ad > 0 => ad -= 1,
             b'[' if !sq && !dq && i + 1 < b.len() && b[i + 1] == b'['
                 && (i == 0 || b[i - 1].is_ascii_whitespace()) =>
             {
@@ -66,15 +75,15 @@ fn stmt_split(s: &str) -> Option<(&str, u8, &str)> {
                 bd -= 1;
                 i += 1;
             }
-            b';' if !sq && !dq && pd == 0 && bd == 0 => {
+            b';' if !sq && !dq && pd == 0 && bd == 0 && ad == 0 => {
                 return Some((&s[..i], b';', &s[i + 1..]))
             }
-            b'&' if !sq && !dq && pd == 0 && bd == 0
+            b'&' if !sq && !dq && pd == 0 && bd == 0 && ad == 0
                 && i + 1 < b.len() && b[i + 1] == b'&' =>
             {
                 return Some((&s[..i], b'&', &s[i + 2..]));
             }
-            b'|' if !sq && !dq && pd == 0 && bd == 0
+            b'|' if !sq && !dq && pd == 0 && bd == 0 && ad == 0
                 && i + 1 < b.len() && b[i + 1] == b'|' =>
             {
                 return Some((&s[..i], b'|', &s[i + 2..]));
@@ -93,6 +102,7 @@ fn find_unquoted(s: &str, want: u8) -> Option<usize> {
     let (mut sq, mut dq) = (false, false);
     let mut pd = 0i32;
     let mut bd = 0i32; // [[ ]] depth — pipes/redirects inside are not operators
+    let mut ad = 0i32; // (( )) arithmetic depth — < > | inside are operands
     let mut i = 0;
     while i < b.len() {
         match b[i] {
@@ -103,6 +113,14 @@ fn find_unquoted(s: &str, want: u8) -> Option<usize> {
                 i += 1;
             }
             b')' if pd > 0 => pd -= 1,
+            b'(' if !sq && !dq && pd == 0 && bd == 0 && ad > 0 => ad += 1,
+            b'(' if !sq && !dq && pd == 0 && bd == 0 && ad == 0
+                && b.get(i + 1) == Some(&b'(') =>
+            {
+                ad = 2;
+                i += 1;
+            }
+            b')' if !sq && !dq && pd == 0 && bd == 0 && ad > 0 => ad -= 1,
             b'[' if !sq && !dq && i + 1 < b.len() && b[i + 1] == b'['
                 && (i == 0 || b[i - 1].is_ascii_whitespace()) =>
             {
@@ -113,7 +131,14 @@ fn find_unquoted(s: &str, want: u8) -> Option<usize> {
                 bd -= 1;
                 i += 1;
             }
-            x if x == want && !sq && !dq && pd == 0 && bd == 0 => return Some(i),
+            x if x == want && !sq && !dq && pd == 0 && bd == 0 && ad == 0 => {
+                // `>|` is the noclobber-override redirect, not a pipe
+                if want == b'|' && i > 0 && b[i - 1] == b'>' {
+                    i += 1;
+                    continue;
+                }
+                return Some(i)
+            }
             _ => {}
         }
         i += 1;
@@ -129,6 +154,7 @@ fn split_semi(s: &str) -> Vec<String> {
     let (mut sq, mut dq) = (false, false);
     let mut pd = 0i32;
     let mut bd = 0i32;
+    let mut ad = 0i32;
     let mut start = 0usize;
     let mut i = 0;
     while i < b.len() {
@@ -140,6 +166,14 @@ fn split_semi(s: &str) -> Vec<String> {
                 i += 1;
             }
             b')' if pd > 0 => pd -= 1,
+            b'(' if !sq && !dq && pd == 0 && bd == 0 && ad > 0 => ad += 1,
+            b'(' if !sq && !dq && pd == 0 && bd == 0 && ad == 0
+                && b.get(i + 1) == Some(&b'(') =>
+            {
+                ad = 2;
+                i += 1;
+            }
+            b')' if !sq && !dq && pd == 0 && bd == 0 && ad > 0 => ad -= 1,
             b'[' if !sq && !dq && i + 1 < b.len() && b[i + 1] == b'['
                 && (i == 0 || b[i - 1].is_ascii_whitespace()) =>
             {
@@ -150,9 +184,21 @@ fn split_semi(s: &str) -> Vec<String> {
                 bd -= 1;
                 i += 1;
             }
-            b';' if !sq && !dq && pd == 0 && bd == 0 => {
+            b';' if !sq && !dq && pd == 0 && bd == 0 && ad == 0 => {
                 out.push(String::from(s[start..i].trim()));
-                start = i + 1;
+                if b.get(i + 1) == Some(&b'&') {
+                    // `;&` — case fall-through terminator
+                    out.push(String::from("\x02"));
+                    start = i + 2;
+                    i += 1;
+                } else if b.get(i + 1) == Some(&b';') && b.get(i + 2) == Some(&b'&') {
+                    // `;;&` — case continue-testing terminator
+                    out.push(String::from("\x03"));
+                    start = i + 3;
+                    i += 2;
+                } else {
+                    start = i + 1;
+                }
             }
             _ => {}
         }
@@ -187,6 +233,7 @@ fn heredoc_scan(s: &str) -> Option<(usize, String, usize)> {
     let b = s.as_bytes();
     let (mut sq, mut dq) = (false, false);
     let mut pd = 0i32;
+    let mut ad = 0i32;
     let mut i = 0;
     while i < b.len() {
         match b[i] {
@@ -206,7 +253,13 @@ fn heredoc_scan(s: &str) -> Option<(usize, String, usize)> {
                 pd -= 1;
                 i += 1;
             }
-            b'<' if !sq && !dq && pd == 0 && i + 1 < b.len() && b[i + 1] == b'<' => {
+            b'(' if !sq && !dq && pd == 0 && ad > 0 => ad += 1,
+            b'(' if !sq && !dq && pd == 0 && ad == 0 && b.get(i + 1) == Some(&b'(') => {
+                ad = 2;
+                i += 1;
+            }
+            b')' if !sq && !dq && pd == 0 && ad > 0 => ad -= 1,
+            b'<' if !sq && !dq && pd == 0 && ad == 0 && i + 1 < b.len() && b[i + 1] == b'<' => {
                 let mut j = i + 2;
                 if j < b.len() && b[j] == b'-' {
                     j += 1;
@@ -548,6 +601,52 @@ fn epoch_to_dt(secs: u64) -> (u16, u8, u8, u8, u8, u8) {
         ((rem % 3600) / 60) as u8,
         (rem % 60) as u8,
     )
+}
+
+/// Parse `touch -d` / date-ish specs: @SECS, bare SECS, YYYY-MM-DD with
+/// optional [HH:MM[:SS]] (space or 'T' separator). UTC, no timezone suffixes.
+fn parse_date_spec(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if let Some(rest) = t.strip_prefix('@') {
+        return rest.parse::<u64>().ok();
+    }
+    if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
+        return t.parse::<u64>().ok();
+    }
+    let (date, tm) = match t.find(|c| c == 'T' || c == ' ' || c == 't') {
+        Some(p) => (&t[..p], &t[p + 1..]),
+        None => (t, ""),
+    };
+    let dparts: Vec<&str> = date.split('-').collect();
+    if dparts.len() != 3 {
+        return None;
+    }
+    let (y, mo, d) = (
+        dparts[0].parse::<u16>().ok()?,
+        dparts[1].parse::<u8>().ok()?,
+        dparts[2].parse::<u8>().ok()?,
+    );
+    if !(1..=12).contains(&mo) || d == 0 || d > 31 || y < 1970 {
+        return None;
+    }
+    let (mut h, mut mi, mut se) = (0u64, 0u64, 0u64);
+    if !tm.is_empty() {
+        let tparts: Vec<&str> = tm.split(':').collect();
+        if tparts.is_empty() || tparts.len() > 3 {
+            return None;
+        }
+        h = tparts[0].parse::<u64>().ok()?;
+        if tparts.len() > 1 {
+            mi = tparts[1].parse::<u64>().ok()?;
+        }
+        if tparts.len() > 2 {
+            se = tparts[2].parse::<u64>().ok()?;
+        }
+        if h > 23 || mi > 59 || se > 59 {
+            return None;
+        }
+    }
+    Some(cal_days(y, mo, d) * 86400 + h * 3600 + mi * 60 + se)
 }
 
 /// Render one month as text lines (Sunday-first), or mark today.
@@ -2109,7 +2208,7 @@ struct Term {
     rs: Option<(String, usize)>,                       // Ctrl-R search: (query, oldest scanned hist idx)
     rs_saved: String,                                  // edit line saved when rsearch began
     run_depth: u8,                                     // nested run() calls don't record history
-    read_modal: Option<(String, usize)>,               // interactive `read VAR` awaiting a typed line
+    read_modal: Option<(String, usize, u64, bool)>,    // interactive `read VAR` awaiting a typed line: (vars, maxchars, deadline_ms, silent)
     rm_queue: Vec<String>,                             // `rm -i`: files awaiting per-file confirm
     funcs: Vec<(String, String)>,                      // user functions: name -> body source
     func_collect: Option<String>,                      // function name while its multi-line body is collected
@@ -2124,6 +2223,13 @@ struct Term {
     fc_depth: u8,                                      // recursion guard: `fc` reruns can't nest forever
     dirstack: Vec<String>,                             // pushd/popd stack (dirs prints it)
     host: String,                                      // hostname (persisted in /hostname)
+    noclobber: bool,                                   // set -C: `>` refuses existing files (>| forces)
+    noglob: bool,                                      // set -f: * ? glob expansion off
+    nounset: bool,                                     // set -u: expanding an unset var is an error
+    pipefail: bool,                                    // set -o pipefail: any stage's failure fails the pipe
+    ro_vars: alloc::collections::BTreeSet<String>,     // `readonly` variable names
+    sub_err: Option<String>,                           // expansion error (${V:?msg}, nounset, bad ${})
+    start_ms: u64,                                     // uptime at shell start — drives $SECONDS
 }
 
 impl Term {
@@ -2372,10 +2478,35 @@ impl Term {
         out
     }
 
-    /// Expand $NAME tokens from the shell var table (whole-word vars).
+    /// Variable lookup shared by $NAME and ${NAME}: dynamic vars ($RANDOM,
+    /// $SECONDS) resolve here too. `set -u` records an unbound-var error.
+    fn lookup_var(&mut self, name: &str) -> Option<String> {
+        match name {
+            "RANDOM" => Some(alloc::format!("{}", ustd::rand_u64().unwrap_or(0) % 32768)),
+            "SECONDS" => Some(alloc::format!(
+                "{}",
+                (ustd::uptime_ms().saturating_sub(self.start_ms)) / 1000
+            )),
+            _ => match self.vars.get(name) {
+                Some(v) => Some(v.clone()),
+                None => {
+                    if self.nounset {
+                        if self.sub_err.is_none() {
+                            self.sub_err =
+                                Some(alloc::format!("{}: unbound variable", name));
+                        }
+                    }
+                    None
+                }
+            },
+        }
+    }
+
+    /// Expand $NAME / ${NAME...} tokens from the shell var table.
     /// Single-quoted spans are literal (no expansion); double-quoted spans
-    /// still expand, matching real-shell quoting rules.
-    fn expand_vars(&self, s: &str) -> String {
+    /// still expand, matching real-shell quoting rules. Errors land in
+    /// `sub_err` for the caller to report (`${V:?msg}`, `set -u`).
+    fn expand_vars(&mut self, s: &str) -> String {
         let b = s.as_bytes();
         let mut out = String::with_capacity(s.len());
         let mut i = 0;
@@ -2415,8 +2546,8 @@ impl Term {
                 // $# -- script positional-argument count (0 outside scripts)
                 out.push_str(self.vars.get("#").map(|s| s.as_str()).unwrap_or("0"));
                 i += 2;
-            } else if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'@' {
-                // $@ -- all positional params space-joined
+            } else if b[i] == b'$' && i + 1 < b.len() && (b[i + 1] == b'@' || b[i + 1] == b'*') {
+                // $@ / $* -- all positional params space-joined
                 let n = self
                     .vars
                     .get("#")
@@ -2427,6 +2558,28 @@ impl Term {
                     .collect();
                 out.push_str(&parts.join(" "));
                 i += 2;
+            } else if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
+                // ${...} parameter expansion — nested braces count
+                let mut depth = 1i32;
+                let mut j = i + 2;
+                while j < b.len() && depth > 0 {
+                    match b[j] {
+                        b'{' => depth += 1,
+                        b'}' => depth -= 1,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if depth != 0 {
+                    out.push('$');
+                    i += 1;
+                    continue;
+                }
+                let inner = core::str::from_utf8(&b[i + 2..j - 1]).unwrap_or("");
+                if let Some(v) = self.param_expand(inner) {
+                    out.push_str(&v);
+                }
+                i = j;
             } else if b[i] == b'$' && i + 2 < b.len() && b[i + 1] == b'(' && b[i + 2] == b'(' {
                 // $((expr)) -- arithmetic via the real expression evaluator
                 let mut depth = 2usize;
@@ -2458,8 +2611,8 @@ impl Term {
                     j += 1;
                 }
                 let name = core::str::from_utf8(&b[i + 1..j]).unwrap_or("");
-                if let Some(v) = self.vars.get(name) {
-                    out.push_str(v);
+                if let Some(v) = self.lookup_var(name) {
+                    out.push_str(&v);
                 }
                 i = j;
             } else {
@@ -2468,6 +2621,285 @@ impl Term {
             }
         }
         out
+    }
+
+    /// `${...}` parameter expansion. `inner` is the text between the braces.
+    /// Supported: ${V} ${V:-w} ${V-w} ${V:=w} ${V=w} ${V:+a} ${V+a}
+    /// ${V:?msg} ${V?msg} ${#V} ${V#p} ${V##p} ${V%p} ${V%%p}
+    /// ${V/p/r} ${V//p/r} ${V:off[:len]} and the special params ${1} ${#}
+    /// ${@} ${*} ${?} ${!} {$$}. Returns None (error in sub_err) on failure.
+    fn param_expand(&mut self, inner: &str) -> Option<String> {
+        // ${#V}: value length in characters
+        if let Some(rest) = inner.strip_prefix('#') {
+            if !rest.is_empty()
+                && rest.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            {
+                let v = self.lookup_var(rest).unwrap_or_default();
+                return Some(alloc::format!("{}", v.chars().count()));
+            }
+        }
+        // split NAME from the operator: name is [A-Za-z_][A-Za-z0-9_]*,
+        // a digit run, or a single special char
+        let ib = inner.as_bytes();
+        if ib.is_empty() {
+            if self.sub_err.is_none() {
+                self.sub_err = Some(String::from("${}: bad substitution"));
+            }
+            return None;
+        }
+        let name_end = if ib[0].is_ascii_digit() {
+            let mut j = 0;
+            while j < ib.len() && ib[j].is_ascii_digit() {
+                j += 1;
+            }
+            j
+        } else if ib[0].is_ascii_alphabetic() || ib[0] == b'_' {
+            let mut j = 0;
+            while j < ib.len() && (ib[j].is_ascii_alphanumeric() || ib[j] == b'_') {
+                j += 1;
+            }
+            j
+        } else {
+            1 // single special char: # @ * ? ! $ etc.
+        };
+        let name = &inner[..name_end];
+        let op = &inner[name_end..];
+        // resolve the base value (empty string for unset-but-allowed ops)
+        let val_of = |t: &mut Term, n: &str| -> Option<String> {
+            match n {
+                "#" => t.vars.get("#").cloned().or_else(|| Some(String::from("0"))),
+                "@" | "*" => {
+                    let c = t
+                        .vars
+                        .get("#")
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let parts: Vec<String> = (1..=c)
+                        .filter_map(|k| t.vars.get(&alloc::format!("{}", k)).cloned())
+                        .collect();
+                    Some(parts.join(" "))
+                }
+                "?" => Some(String::from(if t.last_ok { "0" } else { "1" })),
+                "!" => Some(alloc::format!("{}", t.last_spawn)),
+                "$" => Some(alloc::format!("{}", ustd::getpid())),
+                _ => t.lookup_var(n),
+            }
+        };
+        let val = val_of(self, name);
+        if op.is_empty() {
+            return val.or_else(|| {
+                if self.nounset && self.sub_err.is_some() {
+                    None
+                } else {
+                    Some(String::new())
+                }
+            });
+        }
+        // operator dispatch
+        let ob = op.as_bytes();
+        let word_expand = |t: &mut Term, w: &str| -> String {
+            let sub = t.expand_subst(w);
+            t.expand_vars(&sub)
+        };
+        let set_or_val = |t: &mut Term, present: Option<String>| -> Option<String> {
+            if present.is_none() && t.nounset && t.sub_err.is_some() {
+                return None; // nounset already recorded
+            }
+            present.or_else(|| Some(String::new()))
+        };
+        match () {
+            _ if op.starts_with(":-") || op.starts_with('-') => {
+                // default: ${V:-w} uses w when unset-or-empty; ${V-w} unset only
+                let colon = op.starts_with(':');
+                let w = &op[if colon { 2 } else { 1 }..];
+                let empty_ok = !colon; // no colon → empty value is acceptable
+                match &val {
+                    Some(v) if empty_ok || !v.is_empty() => Some(v.clone()),
+                    _ => Some(word_expand(self, w)),
+                }
+            }
+            _ if op.starts_with(":=") || op.starts_with('=') => {
+                // assign-default: ${V:=w} sets V=w when unset/empty
+                let colon = op.starts_with(':');
+                let w = &op[if colon { 2 } else { 1 }..];
+                let empty_ok = !colon;
+                match &val {
+                    Some(v) if empty_ok || !v.is_empty() => Some(v.clone()),
+                    _ => {
+                        // only real identifier names can take a default
+                        // assign (${1:=x}, ${@:=x} are errors in bash)
+                        let ok_name = name
+                            .chars()
+                            .next()
+                            .map(|c| c.is_ascii_alphabetic() || c == '_')
+                            .unwrap_or(false)
+                            && name
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+                        if !ok_name {
+                            if self.sub_err.is_none() {
+                                self.sub_err =
+                                    Some(alloc::format!("${{{}}}: cannot assign", inner));
+                            }
+                            return None;
+                        }
+                        let wv = word_expand(self, w);
+                        if !self.assign(name, wv.clone()) {
+                            return None;
+                        }
+                        Some(wv)
+                    }
+                }
+            }
+            _ if op.starts_with(":+") || op.starts_with('+') => {
+                // alternate: ${V:+a} -> a when V set (colon) / set+nonempty
+                let colon = op.starts_with(':');
+                let w = &op[if colon { 2 } else { 1 }..];
+                let empty_ok = !colon;
+                match &val {
+                    Some(v) if empty_ok || !v.is_empty() => Some(word_expand(self, w)),
+                    _ => Some(String::new()),
+                }
+            }
+            _ if op.starts_with(":?") || op.starts_with('?') => {
+                // error: ${V:?msg} fails the expansion when unset/empty
+                let colon = op.starts_with(':');
+                let w = &op[if colon { 2 } else { 1 }..];
+                let empty_ok = !colon;
+                match &val {
+                    Some(v) if empty_ok || !v.is_empty() => Some(v.clone()),
+                    _ => {
+                        let msg = if w.is_empty() {
+                            String::from("parameter not set")
+                        } else {
+                            String::from(w)
+                        };
+                        if self.sub_err.is_none() {
+                            self.sub_err =
+                                Some(alloc::format!("{}: {}", name, msg));
+                        }
+                        None
+                    }
+                }
+            }
+            _ if op.starts_with("##") || op.starts_with('#') => {
+                // strip prefix glob: ## longest match, # shortest
+                let longest = op.starts_with("##");
+                let pat = &op[if longest { 2 } else { 1 }..];
+                let pat = word_expand(self, pat);
+                let v = set_or_val(self, val)?;
+                let chars: Vec<char> = v.chars().collect();
+                let mut pick: Option<usize> = None;
+                for k in 0..=chars.len() {
+                    let head: String = chars[..k].iter().collect();
+                    if wild_match(&pat, &head) {
+                        pick = Some(k);
+                        if !longest {
+                            break;
+                        }
+                    }
+                }
+                Some(chars[pick.unwrap_or(0)..].iter().collect())
+            }
+            _ if op.starts_with("%%") || op.starts_with('%') => {
+                // strip suffix glob: %% longest match, % shortest
+                let longest = op.starts_with("%%");
+                let pat = &op[if longest { 2 } else { 1 }..];
+                let pat = word_expand(self, pat);
+                let v = set_or_val(self, val)?;
+                let chars: Vec<char> = v.chars().collect();
+                let mut pick: Option<usize> = None;
+                for k in (0..=chars.len()).rev() {
+                    let tail: String = chars[k..].iter().collect();
+                    if wild_match(&pat, &tail) {
+                        pick = Some(k);
+                        if !longest {
+                            break;
+                        }
+                    }
+                }
+                Some(chars[..pick.unwrap_or(chars.len())].iter().collect())
+            }
+            _ if op.starts_with("//") || op.starts_with('/') => {
+                // replace: ${V/p/r} first match, ${V//p/r} all matches
+                let all = op.starts_with("//");
+                let body = &op[if all { 2 } else { 1 }..];
+                let (pat, rep) = match body.find('/') {
+                    Some(p) => (&body[..p], &body[p + 1..]),
+                    None => (body, ""),
+                };
+                let pat = word_expand(self, pat);
+                let rep = word_expand(self, rep);
+                let v = set_or_val(self, val)?;
+                let chars: Vec<char> = v.chars().collect();
+                let mut out = String::new();
+                let mut st = 0usize;
+                let mut i0 = 0usize;
+                while i0 < chars.len() {
+                    let mut hit: Option<usize> = None;
+                    for e in i0 + 1..=chars.len() {
+                        let sub: String = chars[i0..e].iter().collect();
+                        if wild_match(&pat, &sub) {
+                            hit = Some(e);
+                            break;
+                        }
+                    }
+                    match hit {
+                        Some(e) => {
+                            out.extend(chars[st..i0].iter());
+                            out.push_str(&rep);
+                            st = e;
+                            i0 = e;
+                            if !all {
+                                break;
+                            }
+                        }
+                        None => i0 += 1,
+                    }
+                }
+                out.extend(chars[st..].iter());
+                Some(out)
+            }
+            _ if op.starts_with(':') => {
+                // substring: ${V:off} or ${V:off:len} (off may be negative)
+                let v = set_or_val(self, val)?;
+                let parts: Vec<&str> = op[1..].splitn(2, ':').collect();
+                let off: i64 = parts[0].trim().parse().unwrap_or_else(|_| {
+                    expr_eval(&self.arith_vars(parts[0])).unwrap_or(0)
+                });
+                let len: Option<i64> = parts.get(1).map(|s| {
+                    s.trim()
+                        .parse()
+                        .unwrap_or_else(|_| expr_eval(&self.arith_vars(s)).unwrap_or(0))
+                });
+                let chars: Vec<char> = v.chars().collect();
+                let n = chars.len() as i64;
+                let st = if off < 0 { (n + off).max(0) } else { off.min(n) };
+                let en = match len {
+                    None => n,
+                    Some(l) if l >= 0 => (st + l).min(n),
+                    Some(l) => (n + l).max(st), // negative len: drop from the end
+                };
+                Some(chars[st as usize..en as usize].iter().collect())
+            }
+            _ => {
+                if self.sub_err.is_none() {
+                    self.sub_err = Some(alloc::format!("${{{}}}: bad substitution", inner));
+                }
+                None
+            }
+        }
+    }
+
+    /// Assign a shell variable, honoring `readonly` — returns false (and
+    /// reports) when the name is protected.
+    fn assign(&mut self, name: &str, val: String) -> bool {
+        if self.ro_vars.contains(name) {
+            self.fail(&alloc::format!("{}: readonly variable", name));
+            return false;
+        }
+        self.vars.insert(String::from(name), val);
+        true
     }
 
     /// `test`/`[` evaluator: unary file/string tests and three-token
@@ -2902,7 +3334,7 @@ impl Term {
     }
 
     fn finish_read(&mut self, line: String) {
-        if let Some((var, n)) = self.read_modal.take() {
+        if let Some((var, n, _, _)) = self.read_modal.take() {
             let v = if n > 0 && line.len() > n {
                 line[..n].to_string()
             } else {
@@ -2949,7 +3381,9 @@ impl Term {
                         self.vars.insert(String::from(*rv), val);
                     }
                 } else {
-                    self.vars.insert(var, v);
+                    if !self.assign(&var, v) {
+                        return;
+                    }
                 }
             }
         }
@@ -2992,12 +3426,15 @@ impl Term {
             self.c.text(8, y, line, draw::TEXT, None);
             y += CH;
         }
-        // prompt + input
+        // prompt + input (read -s renders nothing the user typed)
         self.c.text(8, y, &prompt, 0xFF7FD08A, None);
         let px = 8 + prompt.len() as i32 * CW;
-        self.c.text(px, y, &self.cur, draw::TEXT, None);
+        let silent = self.read_modal.as_ref().map(|m| m.3).unwrap_or(false);
+        if !silent {
+            self.c.text(px, y, &self.cur, draw::TEXT, None);
+        }
         // cursor
-        let curx = px + self.cx as i32 * CW;
+        let curx = px + if silent { 0 } else { self.cx as i32 * CW };
         if self.needs_cursor_flip {
             self.c.fill(curx, y, 2, CH, draw::ACCENT);
         }
@@ -3217,7 +3654,60 @@ impl Term {
                     };
                     let body: Vec<String> = stmts[i..end].to_vec();
                     i = end + 1;
-                    if head == "for" {
+                    if head == "for" && rest.starts_with("((") {
+                        // C-style: `for ((init; cond; incr))` — the stmts'
+                        // `;`-splitter tracks (( )) depth so the header stays
+                        // one statement; init/cond/incr go through arith_stmt.
+                        let Some(close) = rest.rfind("))") else {
+                            self.fail("for ((: '))' expected");
+                            return;
+                        };
+                        let inner = &rest[2..close];
+                        let mut parts = inner.splitn(3, ';');
+                        let init = parts.next().unwrap_or("").trim();
+                        let cond = parts.next().unwrap_or("").trim();
+                        let incr = parts.next().unwrap_or("").trim();
+                        if !init.is_empty() {
+                            if let Err(e) = self.arith_stmt(init) {
+                                self.fail(&alloc::format!("for ((: {}", e));
+                                return;
+                            }
+                        }
+                        let mut guard = 0u32;
+                        loop {
+                            guard += 1;
+                            if guard > 200_000 {
+                                self.fail("sh: loop iteration limit");
+                                return;
+                            }
+                            if !cond.is_empty() {
+                                match self.arith_stmt(cond) {
+                                    Ok(0) => break,
+                                    Err(e) => {
+                                        self.fail(&alloc::format!("for ((: {}", e));
+                                        return;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            self.run_stmts(&body, depth + 1, trace);
+                            match self.flow {
+                                1 => {
+                                    self.flow = 0;
+                                    break;
+                                }
+                                2 => self.flow = 0,
+                                f if f != 0 => return,
+                                _ => {}
+                            }
+                            if !incr.is_empty() {
+                                if let Err(e) = self.arith_stmt(incr) {
+                                    self.fail(&alloc::format!("for ((: {}", e));
+                                    return;
+                                }
+                            }
+                        }
+                    } else if head == "for" {
                         // `for V in w w w` -- expand subst+vars+globs per word.
                         // `for V in` (empty list) iterates zero times, like real sh.
                         let inpos = match rest.find(" in ") {
@@ -3244,13 +3734,21 @@ impl Term {
                         };
                         let substd = self.expand_subst(&wstr);
                         let vard = self.expand_vars(&substd);
+                        if let Some(e) = self.sub_err.take() {
+                            self.fail(&alloc::format!("sh: {}", e));
+                            return;
+                        }
                         let mut words: Vec<String> = Vec::new();
                         for (w, q) in tokenize(&vard) {
-                            if !q && (w.contains('*') || w.contains('?')) {
+                            if !q && (w.contains('*') || w.contains('?')) && !self.noglob {
                                 words.extend(self.glob_expand(&w));
                             } else {
                                 words.push(w);
                             }
+                        }
+                        if self.ro_vars.contains(&var) {
+                            self.fail(&alloc::format!("{}: readonly variable", var));
+                            return;
                         }
                         for w in words {
                             self.vars.insert(var.clone(), w);
@@ -3383,13 +3881,22 @@ impl Term {
                     };
                     i = e;
                     // arms split at the empty stmt a `;;` leaves behind;
+                    // `;&` arrives as a \x02 sentinel (run next arm's body
+                    // unconditionally), `;;&` as \x03 (keep testing patterns).
                     // each arm head is `pats) first-body-stmt`
-                    let mut arms: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-                    let mut cur: Option<(Vec<String>, Vec<String>)> = None;
+                    let mut arms: Vec<(Vec<String>, Vec<String>, u8)> = Vec::new();
+                    let mut cur: Option<(Vec<String>, Vec<String>, u8)> = None;
                     for st in region {
                         let t = st.trim();
-                        if t.is_empty() {
-                            if let Some(a) = cur.take() {
+                        let term = match t {
+                            "" => Some(0u8),
+                            "\u{2}" => Some(1),
+                            "\u{3}" => Some(2),
+                            _ => None,
+                        };
+                        if let Some(mode) = term {
+                            if let Some(mut a) = cur.take() {
+                                a.2 = mode;
                                 arms.push(a);
                             }
                             continue;
@@ -3420,7 +3927,7 @@ impl Term {
                                 if !r.is_empty() {
                                     body.push(String::from(r));
                                 }
-                                cur = Some((list, body));
+                                cur = Some((list, body, 0));
                             }
                         } else {
                             cur.as_mut().unwrap().1.push(String::from(t));
@@ -3429,13 +3936,28 @@ impl Term {
                     if let Some(a) = cur.take() {
                         arms.push(a);
                     }
-                    // expand the case word, match arms in order (first wins)
+                    // expand the case word, match arms in order (first wins);
+                    // `;&` runs the next body with no test, `;;&` keeps matching
                     let wsub = self.expand_subst(&word);
                     let w = self.expand_vars(&wsub);
-                    for (pats, body) in &arms {
-                        if pats.iter().any(|p| wild_match(p, &w)) {
+                    if let Some(e) = self.sub_err.take() {
+                        self.fail(&alloc::format!("sh: {}", e));
+                        return;
+                    }
+                    let mut force_next = false;
+                    for (pats, body, mode) in &arms {
+                        if force_next || pats.iter().any(|p| wild_match(p, &w)) {
                             self.run_stmts(body, depth + 1, trace);
-                            break;
+                            match mode {
+                                1 => force_next = true, // `;&`: fall into next arm's body
+                                2 => force_next = false, // `;;&`: keep testing
+                                _ => break,              // `;;`/bare end: done
+                            }
+                            if self.flow != 0 {
+                                break;
+                            }
+                        } else {
+                            force_next = false;
                         }
                     }
                 }
@@ -3545,8 +4067,14 @@ impl Term {
             let left = input[..pi].trim();
             let right = input[pi + 1..].trim();
             let out = self.run_captured(left);
+            let left_ok = self.last_ok;
             let saved = self.pipe_in.replace(out.join("\n"));
             self.run(right);
+            // set -o pipefail: a failed left stage fails the whole pipeline
+            // (the right side's own pipefail already folded its tail in)
+            if self.pipefail && !left_ok {
+                self.last_ok = false;
+            }
             self.pipe_in = saved;
             return;
         }
@@ -3621,10 +4149,15 @@ impl Term {
             }
             return;
         }
-        // redirect: cmd > file  /  cmd >> file
+        // redirect: cmd > file  /  cmd >> file  /  cmd >| file (force)
         if let Some(pi) = find_unquoted(input, b'>') {
             let left = input[..pi].trim();
             let mut rest = input[pi + 1..].trim();
+            let mut force = false;
+            if let Some(r) = rest.strip_prefix('|') {
+                force = true;
+                rest = r.trim_start();
+            }
             let append = rest.starts_with('>');
             if append {
                 rest = rest[1..].trim_start();
@@ -3632,6 +4165,14 @@ impl Term {
             let fname = rest.split_whitespace().next().unwrap_or("");
             if fname.is_empty() {
                 self.fail("usage: <cmd> > file  (or >> to append)");
+                return;
+            }
+            // set -C: `>` refuses to clobber an existing file (>| overrides)
+            if !append && !force && self.noclobber && ustd::stat(fname).is_ok() {
+                self.fail(&alloc::format!(
+                    "{}: cannot overwrite existing file",
+                    fname
+                ));
                 return;
             }
             // `echo -n ... > f` suppresses the trailing newline
@@ -3668,6 +4209,10 @@ impl Term {
         // $(cmd) substitution, then $VAR expansion
         let substd = self.expand_subst(input);
         let expanded = self.expand_vars(&substd);
+        if let Some(e) = self.sub_err.take() {
+            self.fail(&alloc::format!("sh: {}", e));
+            return;
+        }
         let input = expanded.as_str();
         // quote-aware word-split; quoted words keep metachars literal and are
         // exempt from brace/tilde/glob expansion
@@ -3702,9 +4247,10 @@ impl Term {
             "sha256sum", "strings", "sort", "uniq", "cut", "more", "diff", "base64",
             "show", "tar", "md5sum", "uuencode", "uudecode", "grep", "find", "file",
             "sha1sum", "cksum", "comm", "zgrep", "zip", "unzip", "chmod", "touch",
-            "csplit",
+            "csplit", "lsattr", "chattr", "unlink",
         ];
         let gexp: Vec<String> = if GLOBBABLE.contains(&cmd)
+            && !self.noglob
             && toks[1.min(toks.len())..]
                 .iter()
                 .any(|t| !t.1 && (t.0.contains('*') || t.0.contains('?')))
@@ -3752,10 +4298,19 @@ impl Term {
                 }
             }
             if ai > 0 {
+                let mut ro_hit = false;
                 for (w, _) in &toks[..ai] {
                     let eq = w.find('=').unwrap();
-                    self.vars
-                        .insert(String::from(&w[..eq]), String::from(&w[eq + 1..]));
+                    let (n, v) = (&w[..eq], &w[eq + 1..]);
+                    if self.ro_vars.contains(n) {
+                        self.fail(&alloc::format!("{}: readonly variable", n));
+                        ro_hit = true;
+                        continue;
+                    }
+                    self.vars.insert(String::from(n), String::from(v));
+                }
+                if ro_hit {
+                    return;
                 }
                 let rest: Vec<String> = toks[ai..]
                     .iter()
@@ -4001,6 +4556,10 @@ impl Term {
                             || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
                         {
                             self.fail(&alloc::format!("local: {}: bad name", name));
+                            continue;
+                        }
+                        if self.ro_vars.contains(name) {
+                            self.fail(&alloc::format!("local: {}: readonly variable", name));
                             continue;
                         }
                         let old = self.vars.get(name).cloned();
@@ -4267,16 +4826,66 @@ impl Term {
                 self.last_ok = found;
             }
             "set" => {
-                // set NAME=value | set | set -u NAME | set -x|+x|-e|+e
+                // set NAME=value | set | set -u NAME | set ±x/e/C/f/u
+                // set -o OPT / set +o OPT / set -o (list) — bash option surface
                 match args.first().map(|a| *a) {
-                    Some("-x") | Some("+x") | Some("-e") | Some("+e") => {
+                    Some("-x") | Some("+x") | Some("-e") | Some("+e")
+                    | Some("-C") | Some("+C") | Some("-f") | Some("+f") => {
                         match args[0] {
                             "-x" => self.setx = true,
                             "+x" => self.setx = false,
                             "-e" => self.errexit = true,
-                            _ => self.errexit = false,
+                            "+e" => self.errexit = false,
+                            "-C" => self.noclobber = true,
+                            "+C" => self.noclobber = false,
+                            "-f" => self.noglob = true,
+                            _ => self.noglob = false,
                         }
                         return;
+                    }
+                    Some("-u") | Some("+u") if args.len() == 1 => {
+                        // bare `set -u`/`set +u` = nounset (2-arg `set -u NAME`
+                        // remains the var-unset shorthand)
+                        self.nounset = args[0] == "-u";
+                        return;
+                    }
+                    Some("-o") | Some("+o") => {
+                        let on = args[0] == "-o";
+                        match args.get(1).map(|a| *a) {
+                            None => {
+                                // `set -o` / `set +o`: list every option state
+                                for (n, v) in [
+                                    ("errexit", self.errexit),
+                                    ("noclobber", self.noclobber),
+                                    ("noglob", self.noglob),
+                                    ("nounset", self.nounset),
+                                    ("pipefail", self.pipefail),
+                                    ("xtrace", self.setx),
+                                ] {
+                                    self.emit(&alloc::format!(
+                                        "{}\t{}",
+                                        n,
+                                        if v { "on" } else { "off" }
+                                    ));
+                                }
+                                return;
+                            }
+                            Some(o) => {
+                                match o {
+                                    "errexit" => self.errexit = on,
+                                    "noclobber" => self.noclobber = on,
+                                    "noglob" => self.noglob = on,
+                                    "nounset" => self.nounset = on,
+                                    "pipefail" => self.pipefail = on,
+                                    "xtrace" => self.setx = on,
+                                    _ => {
+                                        self.fail(&alloc::format!("set: {}: bad option", o));
+                                        return;
+                                    }
+                                }
+                                return;
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -4326,11 +4935,15 @@ impl Term {
                     Some(a) if a.contains('=') => {
                         let eq = a.find('=').unwrap();
                         let (n, v) = a.split_at(eq);
-                        self.vars.insert(String::from(n), String::from(&v[1..]));
+                        if !self.assign(n, String::from(&v[1..])) {
+                            return;
+                        }
                     }
                     Some(a) => {
                         if self.vars.get(*a).is_none() {
-                            self.vars.insert(String::from(*a), String::new());
+                            if !self.assign(a, String::new()) {
+                                return;
+                            }
                         }
                     }
                     None => {
@@ -4363,20 +4976,98 @@ impl Term {
                 for a in names {
                     if fflag {
                         self.funcs.retain(|(n, _)| n != a);
+                    } else if self.ro_vars.contains(a) {
+                        self.fail(&alloc::format!("unset: {}: readonly variable", a));
                     } else {
                         self.vars.remove(a);
                     }
                 }
             }
-            "function" | "declare" | "typeset" => {
-                // bare/`-f` lists defined functions; `function name { ... }`
-                // definitions are parsed by run() before we ever get here
-                let defs_only = args.iter().any(|a| *a == "-f");
+            "readonly" | "declare" | "typeset" => {
+                // readonly [-p] [NAME[=v]...]: mark vars non-reassignable.
+                // declare -r NAME[=v] same; declare -p NAME prints one var;
+                // declare -f / bare `typeset` lists functions.
+                let mut ro = cmd == "readonly";
+                let mut prt = false;
+                let mut fns = false;
+                let mut names: Vec<&str> = Vec::new();
+                for a in args.iter().copied() {
+                    match a {
+                        "-r" => ro = true,
+                        "-p" => prt = true,
+                        "-f" => fns = true,
+                        _ => names.push(a),
+                    }
+                }
+                if fns || cmd == "typeset" {
+                    let flist = self.funcs.clone();
+                    for (n, b) in &flist {
+                        self.emit(&alloc::format!("{}() {{ {}; }}", n, b));
+                    }
+                    if self.funcs.is_empty() {
+                        self.emit("no functions defined");
+                    }
+                    return;
+                }
+                if names.is_empty() || prt {
+                    // `readonly`/`-p` alone: list the readonly table
+                    let ros: Vec<String> = self.ro_vars.iter().cloned().collect();
+                    for n in &ros {
+                        let v = self.vars.get(n).cloned().unwrap_or_default();
+                        self.emit(&alloc::format!("readonly {}={}", n, v));
+                    }
+                    if ros.is_empty() && names.is_empty() {
+                        self.emit("no readonly variables");
+                    }
+                    if names.is_empty() {
+                        return;
+                    }
+                }
+                for a in names {
+                    if let Some(eq) = a.find('=') {
+                        let (n, v) = a.split_at(eq);
+                        if !n.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+                            || !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        {
+                            self.fail(&alloc::format!("{}: bad variable name", n));
+                            continue;
+                        }
+                        if prt {
+                            let v = self.vars.get(n).cloned().unwrap_or_default();
+                            self.emit(&alloc::format!("declare {}={}", n, v));
+                            continue;
+                        }
+                        if !self.assign(n, String::from(&v[1..])) {
+                            continue;
+                        }
+                        if ro {
+                            self.ro_vars.insert(String::from(n));
+                        }
+                    } else {
+                        if prt {
+                            match self.vars.get(a) {
+                                Some(v) => {
+                                    self.emit(&alloc::format!("declare {}={}", a, v))
+                                }
+                                None => self
+                                    .fail(&alloc::format!("declare: {}: not found", a)),
+                            }
+                            continue;
+                        }
+                        if ro {
+                            self.ro_vars.insert(String::from(a));
+                        }
+                    }
+                }
+            }
+            "function" => {
+                // `function name { ... }` defs are parsed in run(); bare
+                // `function` lists (function is not valid in POSIX sh anyway)
                 let flist = self.funcs.clone();
                 for (n, b) in &flist {
                     self.emit(&alloc::format!("{}() {{ {}; }}", n, b));
                 }
-                if self.funcs.is_empty() && !defs_only {
+                if self.funcs.is_empty() {
                     self.emit("no functions defined");
                 }
             }
@@ -4500,25 +5191,314 @@ impl Term {
                     }
                 }
             },
-            "touch" => match args.first() {
-                Some(p) => {
+            "touch" => {
+                // touch [-r ref] [-d spec] <files...>: default bumps mtime by
+                // rewriting content; -r copies a file's mtime, -d parses
+                // @SECS | SECS | YYYY-MM-DD [HH:MM[:SS]] via SYS_UTIME
+                let mut ref_mtime: Option<u64> = None;
+                let mut date_spec: Option<String> = None;
+                let mut files: Vec<&str> = Vec::new();
+                let mut ai = 0usize;
+                while ai < args.len() {
+                    match args[ai] {
+                        "-r" | "--reference" => {
+                            ref_mtime = args
+                                .get(ai + 1)
+                                .and_then(|r| ustd::stat(r).ok().map(|s| s.mtime));
+                            if ref_mtime.is_none() {
+                                self.fail("touch: bad reference file");
+                                return;
+                            }
+                            ai += 2;
+                        }
+                        a if a.starts_with("-r") && a.len() > 2 => {
+                            ref_mtime = ustd::stat(&a[2..]).ok().map(|s| s.mtime);
+                            if ref_mtime.is_none() {
+                                self.fail("touch: bad reference file");
+                                return;
+                            }
+                            ai += 1;
+                        }
+                        "-d" | "--date" => {
+                            match args.get(ai + 1) {
+                                Some(s) => date_spec = Some(String::from(*s)),
+                                None => {
+                                    self.fail("usage: touch -d SPEC <files>");
+                                    return;
+                                }
+                            }
+                            ai += 2;
+                        }
+                        a if a.starts_with("-d") && a.len() > 2 => {
+                            date_spec = Some(String::from(&a[2..]));
+                            ai += 1;
+                        }
+                        "-a" | "-m" | "-c" | "--no-create" => ai += 1,
+                        _ => {
+                            files.push(args[ai]);
+                            ai += 1;
+                        }
+                    }
+                }
+                if files.is_empty() {
+                    self.fail("usage: touch [-r ref] [-d spec] <file>...");
+                    return;
+                }
+                let set_mtime: Option<u64> = match (ref_mtime, date_spec) {
+                    (Some(m), _) => Some(m),
+                    (None, Some(spec)) => match parse_date_spec(&spec) {
+                        Some(s) => Some(s),
+                        None => {
+                            self.fail(&alloc::format!("touch: invalid date '{}'", spec));
+                            return;
+                        }
+                    },
+                    (None, None) => None,
+                };
+                for p in files {
                     // real touch must not truncate: rewrite existing bytes
                     // (bumps mtime), create empty only when absent
-                    match ustd::read_all(p) {
-                        Ok(d) => {
-                            if let Err(e) = ustd::write_all(p, &d) {
-                                self.fail(&alloc::format!("touch: err {}", e));
+                    if ustd::read_all(p).is_err() {
+                        if let Err(e) = ustd::write_all(p, b"") {
+                            self.fail(&alloc::format!("touch: {}: err {}", p, e));
+                            continue;
+                        }
+                    }
+                    match set_mtime {
+                        Some(secs) => {
+                            if let Err(e) = ustd::utime(p, secs) {
+                                self.fail(&alloc::format!("touch: {}: err {}", p, e));
                             }
                         }
-                        Err(_) => {
-                            if let Err(e) = ustd::write_all(p, b"") {
-                                self.fail(&alloc::format!("touch: err {}", e));
+                        None => match ustd::read_all(p) {
+                            Ok(d) => {
+                                if let Err(e) = ustd::write_all(p, &d) {
+                                    self.fail(&alloc::format!("touch: {}: err {}", p, e));
+                                }
+                            }
+                            Err(e) => {
+                                self.fail(&alloc::format!("touch: {}: err {}", p, e))
+                            }
+                        },
+                    }
+                }
+            }
+            "expr" => {
+                // expr A op B ... | expr STR : RE | expr match STR RE
+                // `:`/`match`: longest anchored glob-prefix of STR matching
+                // RE -> its length (0 when nothing matches). Otherwise the
+                // args join into one integer expression (vars resolve).
+                let mut a = args.to_vec();
+                if a.first() == Some(&"match") {
+                    a.remove(0);
+                    a.insert(1, ":");
+                }
+                if a.len() == 3 && a[1] == ":" {
+                    let (s, re) = (a[0], a[2]);
+                    let chars: Vec<char> = s.chars().collect();
+                    let mut best = 0usize;
+                    for k in 1..=chars.len() {
+                        let head: String = chars[..k].iter().collect();
+                        if wild_match(re, &head) {
+                            best = k;
+                        }
+                    }
+                    self.emit(&alloc::format!("{}", best));
+                    self.last_ok = best > 0;
+                    return;
+                }
+                let joined = a.join(" ");
+                match expr_eval(&self.arith_vars(&joined)) {
+                    Ok(v) => {
+                        self.emit(&alloc::format!("{}", v));
+                        self.last_ok = v != 0;
+                    }
+                    Err(e) => self.fail(&alloc::format!("expr: {}", e)),
+                }
+            }
+            "tty" => {
+                // the terminal window IS the tty; a piped line has none
+                if self.pipe_in.is_some() {
+                    self.emit("not a tty");
+                    self.last_ok = false;
+                } else {
+                    self.emit("/dev/console");
+                }
+            }
+            "unlink" => {
+                // unlink <file>: remove one name (FAT has no link counts —
+                // unlinking the sole name deletes the file)
+                match args.first() {
+                    Some(p) => {
+                        if let Err(e) = ustd::remove(p) {
+                            self.fail(&alloc::format!("unlink: {}: err {}", p, e));
+                        }
+                    }
+                    None => self.fail("usage: unlink <file>"),
+                }
+            }
+            "link" => {
+                // FAT32 has no hard links — report it like a real fs does
+                if args.len() < 2 {
+                    self.fail("usage: link <from> <to>");
+                } else {
+                    self.fail("link: operation not supported on FAT32");
+                }
+            }
+            "pstree" => {
+                // real process tree: pid -> ppid out of /proc/<pid>/status
+                let procs = ustd::proclist(64);
+                let mut kids: alloc::collections::BTreeMap<u32, Vec<(u32, String)>> =
+                    alloc::collections::BTreeMap::new();
+                let mut roots: Vec<(u32, String)> = Vec::new();
+                let pids: Vec<u32> = procs.iter().map(|p| p.pid).collect();
+                for p in &procs {
+                    let name = core::str::from_utf8(&p.name)
+                        .unwrap_or("?")
+                        .trim_end_matches('\0')
+                        .to_string();
+                    let mut ppid = 0u32;
+                    if let Ok(d) = ustd::read_all(&alloc::format!("/proc/{}/status", p.pid)) {
+                        for l in String::from_utf8_lossy(&d).lines() {
+                            if let Some(v) = l.strip_prefix("PPid:") {
+                                ppid = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    if ppid == 0 || !pids.contains(&ppid) {
+                        roots.push((p.pid, name));
+                    } else {
+                        kids.entry(ppid).or_default().push((p.pid, name));
+                    }
+                }
+                fn walk(
+                    t: &mut Term,
+                    kids: &alloc::collections::BTreeMap<u32, Vec<(u32, String)>>,
+                    pid: u32,
+                    name: &str,
+                    prefix: &str,
+                    last: bool,
+                ) {
+                    t.emit(&alloc::format!(
+                        "{}{}{}({})",
+                        prefix,
+                        if last { "`-" } else { "|-" },
+                        name,
+                        pid
+                    ));
+                    if let Some(ch) = kids.get(&pid) {
+                        let np = alloc::format!("{}{}", prefix, if last { "  " } else { "| " });
+                        for (i, (cpid, cn)) in ch.iter().enumerate() {
+                            walk(t, kids, *cpid, cn, &np, i + 1 == ch.len());
+                        }
+                    }
+                }
+                for (i, (pid, name)) in roots.iter().enumerate() {
+                    walk(self, &kids, *pid, name, "", i + 1 == roots.len());
+                }
+            }
+            "lsattr" => {
+                // lsattr [-R] path...: print FAT attribute flags per entry
+                let rec = args.iter().any(|a| *a == "-R");
+                let paths: Vec<&str> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .copied()
+                    .collect();
+                let paths = if paths.is_empty() { alloc::vec!["."] } else { paths };
+                fn flags(a: u32, dir: bool) -> String {
+                    alloc::format!(
+                        "{}{}{}{}{}",
+                        if a & 0x01 != 0 { "r" } else { "-" },
+                        if a & 0x02 != 0 { "h" } else { "-" },
+                        if a & 0x04 != 0 { "s" } else { "-" },
+                        if dir || a & 0x10 != 0 { "d" } else { "-" },
+                        if a & 0x20 != 0 { "a" } else { "-" }
+                    )
+                }
+                fn one(t: &mut Term, p: &str) {
+                    match ustd::stat(p) {
+                        Ok(st) => t.emit(&alloc::format!(
+                            "{} {}",
+                            flags(st.attr, st.is_dir != 0),
+                            p
+                        )),
+                        Err(e) => t.fail(&alloc::format!("lsattr: {}: err {}", p, e)),
+                    }
+                }
+                for p in paths {
+                    one(self, p);
+                    if rec {
+                        if let Ok(st) = ustd::stat(p) {
+                            if st.is_dir != 0 {
+                                if let Ok(ents) = ustd::readdir(p) {
+                                    for e in ents {
+                                        let n = core::str::from_utf8(
+                                            &e.name[..e.name_len as usize],
+                                        )
+                                        .unwrap_or("?");
+                                        if n == "." || n == ".." {
+                                            continue;
+                                        }
+                                        let sub = alloc::format!(
+                                            "{}/{}",
+                                            p.trim_end_matches('/'),
+                                            n
+                                        );
+                                        one(self, &sub);
+                                    }
+                                }
                             }
                         }
                     }
                 }
-                None => self.fail("usage: touch <file>"),
-            },
+            }
+            "chattr" => {
+                // chattr [+-=][rhsa] <files...>: sets/clears real FAT attrs
+                // (r=0x01 h=0x02 s=0x04 a=0x20) via SYS_SETATTR
+                let op = match args.first() {
+                    Some(a) if a.starts_with('+') || a.starts_with('-') || a.starts_with('=') => *a,
+                    _ => {
+                        self.fail("usage: chattr [+-=][rhsa] <file>...");
+                        return;
+                    }
+                };
+                let mode = op.as_bytes()[0];
+                let mut mask = 0u8;
+                for c in op[1..].bytes() {
+                    mask |= match c {
+                        b'r' => 0x01,
+                        b'h' => 0x02,
+                        b's' => 0x04,
+                        b'a' => 0x20,
+                        _ => {
+                            self.fail(&alloc::format!("chattr: bad flag '{}'", c as char));
+                            return;
+                        }
+                    };
+                }
+                let files = &args[1..];
+                if files.is_empty() {
+                    self.fail("usage: chattr [+-=][rhsa] <file>...");
+                    return;
+                }
+                for p in files {
+                    match ustd::stat(p) {
+                        Ok(st) => {
+                            let cur = st.attr as u8;
+                            let new = match mode {
+                                b'+' => cur | mask,
+                                b'-' => cur & !mask,
+                                _ => mask,
+                            };
+                            if let Err(e) = ustd::setattr(p, new) {
+                                self.fail(&alloc::format!("chattr: {}: err {}", p, e));
+                            }
+                        }
+                        Err(e) => self.fail(&alloc::format!("chattr: {}: err {}", p, e)),
+                    }
+                }
+            }
             "rm" => {
                 // rm [-r] [-f] [-i] <paths...>: -i confirms each file via a
                 // typed y/n modal at the prompt (or piped stdin answers)
@@ -4565,7 +5545,7 @@ impl Term {
                             self.emit_no_nl(&alloc::format!(
                                 "rm: remove '{}'? ", first
                             ));
-                            self.read_modal = Some((String::from("__RMI"), 0));
+                            self.read_modal = Some((String::from("__RMI"), 0, 0, false));
                         }
                     } else {
                         self.fail("rm: -i needs a terminal (or pipe y/n answers)");
@@ -4633,7 +5613,7 @@ impl Term {
                         // prompt first and rename on the next line via read var
                         self.emit_no_nl(&alloc::format!("mv: overwrite '{}'? ", t));
                         self.read_modal =
-                            Some((alloc::format!("__MVI:{}:{}", f, t), 0));
+                            Some((alloc::format!("__MVI:{}:{}", f, t), 0, 0, false));
                         return;
                     }
                 }
@@ -4722,8 +5702,12 @@ impl Term {
                                 self.emit_no_nl(&alloc::format!(
                                     "cp: overwrite '{}'? ", t
                                 ));
-                                self.read_modal =
-                                    Some((alloc::format!("__CPI:{}:{}:{}", f, t, rec as u8), 0));
+                                self.read_modal = Some((
+                                    alloc::format!("__CPI:{}:{}:{}", f, t, rec as u8),
+                                    0,
+                                    0,
+                                    false,
+                                ));
                                 return;
                             }
                         }
@@ -8778,6 +9762,12 @@ impl Term {
                         self.emit(&alloc::format!(
                             "  mtime {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, mo, d, h, mi, se
                         ));
+                        self.emit(&alloc::format!(
+                            "  attr {}{} (0x{:02x})",
+                            if st.attr & 0x01 != 0 { "readonly " } else { "" },
+                            if st.attr & 0x02 != 0 { "hidden" } else { "" },
+                            st.attr
+                        ));
                     }
                     Err(e) => self.fail(&alloc::format!("stat: {}: err {}", p, e)),
                 },
@@ -9479,10 +10469,13 @@ impl Term {
                 }
             }
             "read" => {
-                // read [-p prompt] [-n count] [-d delim] VAR: stdin line -> $VAR
+                // read [-p prompt] [-n/-N count] [-d delim] [-t s] [-s] [-r] VAR
                 let mut prompt = "";
                 let mut ncount: usize = 0;
                 let mut delim = '\n';
+                let mut timeout_ms: u64 = 0;
+                let mut silent = false;
+                let mut raw = false;
                 let mut ai = 0usize;
                 while ai < args.len() {
                     match args[ai] {
@@ -9490,9 +10483,27 @@ impl Term {
                             prompt = args.get(ai + 1).unwrap_or(&"");
                             ai += 2;
                         }
-                        "-n" => {
+                        "-n" | "-N" => {
                             ncount = args.get(ai + 1).and_then(|x| x.parse().ok()).unwrap_or(0);
                             ai += 2;
+                        }
+                        "-t" => {
+                            let s: f64 = args.get(ai + 1).and_then(|x| x.parse().ok()).unwrap_or(0.0);
+                            timeout_ms = (s * 1000.0) as u64;
+                            ai += 2;
+                        }
+                        a if a.starts_with("-t") && a.len() > 2 => {
+                            let s: f64 = a[2..].parse().unwrap_or(0.0);
+                            timeout_ms = (s * 1000.0) as u64;
+                            ai += 1;
+                        }
+                        "-s" => {
+                            silent = true;
+                            ai += 1;
+                        }
+                        "-r" => {
+                            raw = true;
+                            ai += 1;
                         }
                         "-d" => {
                             delim = args
@@ -9520,6 +10531,9 @@ impl Term {
                             if ncount > 0 && line.len() > ncount {
                                 line = &line[..ncount];
                             }
+                            // (-r: input is already literal — backslashes
+                            // need no unescaping pass here)
+                            let _ = raw;
                             // fields split on whitespace; the last var gets
                             // the remainder (bash `read a b c` semantics)
                             let mut words = line.split_whitespace();
@@ -9540,7 +10554,13 @@ impl Term {
                             // line the user types (script bodies have no tty)
                             if self.run_depth == 1 && self.script_depth == 0 {
                                 let names = rargs.join(" ");
-                                self.read_modal = Some((names, ncount));
+                                let deadline = if timeout_ms > 0 {
+                                    ustd::uptime_ms() + timeout_ms
+                                } else {
+                                    0
+                                };
+                                self.read_modal =
+                                    Some((names, ncount, deadline, silent));
                             } else {
                                 self.fail("read: no input (pipe lines in)");
                             }
@@ -10466,11 +11486,13 @@ impl Term {
             self.cur.insert(self.cx, k.chr as char);
             self.cx += 1;
             // `read -n N` completes the instant N chars are in — no Enter
-            if let Some((_, n)) = &self.read_modal {
+            if let Some((_, n, _, sil)) = &self.read_modal {
                 if *n > 0 && self.cur.len() >= *n {
                     let line = core::mem::take(&mut self.cur);
                     self.cx = 0;
-                    self.emit(&line);
+                    if !*sil {
+                        self.emit(&line);
+                    }
                     self.finish_read(line);
                 }
             }
@@ -10478,16 +11500,23 @@ impl Term {
             let line = core::mem::take(&mut self.cur);
             self.cx = 0;
             let prompt = self.prompt_str();
-            self.emit(&alloc::format!("{}{}", prompt, line));
             if self.read_modal.is_some() {
+                // read -s: typed line is not echoed back
+                if !self.read_modal.as_ref().map(|m| m.3).unwrap_or(false) {
+                    self.emit(&alloc::format!("{}{}", prompt, line));
+                } else {
+                    self.emit("");
+                }
                 self.finish_read(line);
             } else {
+                self.emit(&alloc::format!("{}{}", prompt, line));
                 self.run(&line);
             }
         } else if k.key == KeyCode::Escape as u32 && self.read_modal.is_some() {
             self.read_modal = None;
             self.cur.clear();
             self.cx = 0;
+            self.fail("read: cancelled");
         } else if k.key == KeyCode::Backspace as u32 {
             if self.cx > 0 {
                 self.cx -= 1;
@@ -10560,6 +11589,7 @@ impl Term {
         "local", "shift", "getopts", "trap", "timeout", "realpath", "pidof",
         "wmls", "wmfocus", "wmclose", "wmmove", "[[", "let", "bc", "csplit",
         "getent", "host", "usleep", "fc", "times",
+        "readonly", "expr", "tty", "link", "unlink", "pstree", "lsattr", "chattr",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -11380,6 +12410,38 @@ impl Term {
             if piece.is_empty() {
                 continue;
             }
+            // name++ / name-- / ++name / --name (no spaces inside the piece)
+            let incdec: Option<(String, i64)> = if let Some(n) = piece.strip_suffix("++") {
+                Some((String::from(n.trim()), 1))
+            } else if let Some(n) = piece.strip_suffix("--") {
+                Some((String::from(n.trim()), -1))
+            } else if let Some(n) = piece.strip_prefix("++") {
+                Some((String::from(n.trim()), 1))
+            } else {
+                piece
+                    .strip_prefix("--")
+                    .map(|n| (String::from(n.trim()), -1))
+            };
+            if let Some((name, delta)) = incdec {
+                if name.is_empty()
+                    || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    || name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(true)
+                {
+                    return Err("bad lvalue");
+                }
+                if self.ro_vars.contains(&name) {
+                    return Err("readonly variable");
+                }
+                let cur: i64 = self
+                    .vars
+                    .get(&name)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let v = cur.checked_add(delta).ok_or("overflow")?;
+                self.vars.insert(name, alloc::format!("{}", v));
+                last = v;
+                continue;
+            }
             // locate an assignment '=' -- the char must not be part of
             // == != <= >= and may carry a compound + - * / % prefix
             let b = piece.as_bytes();
@@ -11434,6 +12496,9 @@ impl Term {
                                 cur % v
                             }
                         };
+                    }
+                    if self.ro_vars.contains(name) {
+                        return Err("readonly variable");
                     }
                     self.vars.insert(String::from(name), alloc::format!("{}", v));
                     last = v;
@@ -11608,7 +12673,7 @@ impl Term {
         }
         if let Some(next) = self.rm_queue.first() {
             self.emit_no_nl(&alloc::format!("rm: remove '{}'? ", next));
-            self.read_modal = Some((String::from("__RMI"), 0));
+            self.read_modal = Some((String::from("__RMI"), 0, 0, false));
         }
     }
 
@@ -11756,6 +12821,13 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             .map(|d| String::from(String::from_utf8_lossy(&d).trim()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| String::from("cosmos")),
+        noclobber: false,
+        noglob: false,
+        nounset: false,
+        pipefail: false,
+        ro_vars: alloc::collections::BTreeSet::new(),
+        sub_err: None,
+        start_ms: ustd::uptime_ms(),
     };
     // push the persisted name into the kernel so uname -n / /proc agree
     ustd::set_hostname(&t.host);
@@ -11856,6 +12928,16 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             _ => {}
         }
         let now = ustd::uptime_ms();
+        // read -t deadline: completes with whatever was typed (fail status)
+        if let Some((_, _, dl, _)) = &t.read_modal {
+            if *dl > 0 && now >= *dl {
+                let line = core::mem::take(&mut t.cur);
+                t.cx = 0;
+                t.finish_read(line);
+                t.last_ok = false;
+                t.dirty_all = true;
+            }
+        }
         // httpd mode: poll for one accepted conn per loop turn
         if let Some((l, root)) = &t.httpd {
             if let Some((sock, rip, rport)) = l.accept(0) {
