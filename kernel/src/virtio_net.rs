@@ -55,6 +55,7 @@ pub struct VirtioNet {
     rx_bufs: u64,  // absolute region offset of RX_BUFS*PKT_SZ packet space
     tx_frame: u64, // absolute region offset of the single tx staging buffer
     rxq: u16, // device-advertised rx queue size (avail-ring wrap modulus)
+    txq: u16, // device-advertised tx queue size
     rx_last: AtomicU16,
     tx_last: AtomicU16,
     pub mac: [u8; 6],
@@ -160,6 +161,7 @@ pub fn init() -> bool {
             rx_bufs: rx_bufs_off,
             tx_frame: tx_frame_off,
             rxq: rxq as u16,
+            txq: txq as u16,
             rx_last: AtomicU16::new(0),
             tx_last: AtomicU16::new(0),
             mac,
@@ -311,7 +313,7 @@ impl VirtioNet {
             let ai = self.tx_avail_idx();
             self.wrq(
                 self.tx_base(),
-                self.tx_avail + 4 + ((ai as usize) % 2) as u64 * 2,
+                self.tx_avail + 4 + ((ai % self.txq) as u64) * 2,
                 0u16,
             );
             core::sync::atomic::fence(Ordering::SeqCst);
