@@ -1,0 +1,9 @@
+sh(1) - run a shell script
+NAME
+    sh - run a shell script
+SYNOPSIS
+    sh [-x] <file> [args...]
+DESCRIPTION
+    Runs a script with for/while/until/if/case, vars,
+    functions, heredocs. $0 is the script path, $1..$N the
+    args, $# the count. -x traces each statement.

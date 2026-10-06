@@ -1,0 +1,9 @@
+read(1) - read a line into a variable
+NAME
+    read - read a line into a shell variable
+SYNOPSIS
+    read [-p prompt] [-n count] VAR
+DESCRIPTION
+    Interactive: prints the prompt and captures the next
+    line typed into $VAR. -n completes after N chars.
+    In a pipeline consumes the next stdin line.

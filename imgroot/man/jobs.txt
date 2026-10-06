@@ -1,0 +1,11 @@
+jobs(1) - list background jobs
+NAME
+    jobs - list background jobs
+SYNOPSIS
+    jobs
+DESCRIPTION
+    Lists processes spawned with `cmd &`. State is read
+    live from the kernel via /proc/<pid>/status:
+    running, stopped, or done. %+ refers to the latest.
+SEE ALSO
+    bg(1), fg(1), kill(1), disown(1)

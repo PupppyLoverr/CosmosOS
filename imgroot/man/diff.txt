@@ -1,0 +1,10 @@
+diff(1) - compare files
+NAME
+    diff - compare two files line by line
+SYNOPSIS
+    diff [-u|-q|-i|-w|-B] <a> <b>
+DESCRIPTION
+    ed-style hunks by default, unified with -u.
+    -q brief report, -i fold case, -w ignore whitespace,
+    -B ignore blank lines. Exit status is nonzero on
+    differences (usable with && / ||).

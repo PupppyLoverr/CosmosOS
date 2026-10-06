@@ -1829,6 +1829,9 @@ struct GrepOpts {
     ci: bool,
     word: bool,
     exact: bool,
+    only: bool,  // -o: print just the matching spans
+    quiet: bool, // -q: status only
+    files: u8,   // 0 normal, 1 = -l (with matches), 2 = -L (without)
     before: usize,
     after: usize,
     maxm: usize,
@@ -1885,6 +1888,10 @@ struct Term {
     rs_saved: String,                                  // edit line saved when rsearch began
     run_depth: u8,                                     // nested run() calls don't record history
     read_modal: Option<(String, usize)>,               // interactive `read VAR` awaiting a typed line
+    funcs: Vec<(String, String)>,                      // user functions: name -> body source
+    func_collect: Option<String>,                      // function name while its multi-line body is collected
+    func_depth: u8,                                    // recursion guard for function calls
+    func_bdepth: i32,                                  // brace depth while collecting a func body
     block_buf: String,                                 // unfinished for/while/if/heredoc input awaiting its closer
     heredocs: Vec<String>,                             // heredoc bodies extracted by norm_stmts (`<<\x01N` markers)
     flow: u8,                                          // 0 none, 1 break, 2 continue, 3 script-exit
@@ -2181,6 +2188,18 @@ impl Term {
             } else if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'#' {
                 // $# -- script positional-argument count (0 outside scripts)
                 out.push_str(self.vars.get("#").map(|s| s.as_str()).unwrap_or("0"));
+                i += 2;
+            } else if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'@' {
+                // $@ -- all positional params space-joined
+                let n = self
+                    .vars
+                    .get("#")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let parts: Vec<String> = (1..=n)
+                    .filter_map(|k| self.vars.get(&alloc::format!("{}", k)).cloned())
+                    .collect();
+                out.push_str(&parts.join(" "));
                 i += 2;
             } else if b[i] == b'$' && i + 2 < b.len() && b[i + 1] == b'(' && b[i + 2] == b'(' {
                 // $((expr)) -- arithmetic via the real expression evaluator
@@ -2556,6 +2575,54 @@ impl Term {
     /// operands, script lines, watch ticks, !! expansions) don't pollute it.
     fn run(&mut self, input: &str) {
         let top = self.run_depth == 0;
+        // mid-collection of a multi-line function body: append until the
+        // unquoted braces balance
+        if top && self.func_collect.is_some() {
+            let (o, c) = brace_scan(input);
+            self.func_bdepth += o - c;
+            self.block_buf.push('\n');
+            self.block_buf.push_str(input);
+            if self.func_bdepth <= 0 {
+                let src = core::mem::take(&mut self.block_buf);
+                let name = self.func_collect.take().unwrap();
+                self.func_bdepth = 0;
+                match func_open(&src) {
+                    Some((_, Some(body), trailing)) => {
+                        self.funcs.retain(|(n, _)| n != &name);
+                        self.funcs.push((name.clone(), body));
+                        if !trailing.is_empty() {
+                            self.run(&trailing);
+                        }
+                    }
+                    _ => self.fail(&alloc::format!("{}: bad function body", name)),
+                }
+            } else {
+                self.emit("> ");
+            }
+            return;
+        }
+        // fresh function definition: name() { ... or `function name { ...`
+        if top && !input.trim_start().starts_with('!') {
+            if let Some((name, body, trailing)) = func_open(input) {
+                match body {
+                    Some(b) => {
+                        self.funcs.retain(|(n, _)| n != &name);
+                        self.funcs.push((name, b));
+                        if !trailing.is_empty() {
+                            self.run(&trailing);
+                        }
+                    }
+                    None => {
+                        let (o, c) = brace_scan(input);
+                        self.func_bdepth = o - c;
+                        self.block_buf = String::from(input.trim());
+                        self.func_collect = Some(name);
+                        self.emit("> ");
+                    }
+                }
+                return;
+            }
+        }
         // continuation of a multi-line block (for/while/until/if/case/heredoc)
         if top && !self.block_buf.is_empty() {
             let joined = alloc::format!("{}\n{}", core::mem::take(&mut self.block_buf), input);
@@ -3179,7 +3246,8 @@ impl Term {
         const GLOBBABLE: &[&str] = &[
             "ls", "cat", "rm", "cp", "mv", "du", "wc", "head", "tail", "hex", "stat",
             "sha256sum", "strings", "sort", "uniq", "cut", "more", "diff", "base64",
-            "show", "tar", "md5sum", "uuencode", "uudecode",
+            "show", "tar", "md5sum", "uuencode", "uudecode", "grep", "find", "file",
+            "sha1sum", "cksum", "comm", "zgrep", "zip", "unzip", "chmod", "touch",
         ];
         let gexp: Vec<String> = if GLOBBABLE.contains(&cmd)
             && toks[1.min(toks.len())..]
@@ -3251,6 +3319,50 @@ impl Term {
                 }
                 return;
             }
+        }
+        // user-defined function call: positional params $0..$9 $# $@ are
+        // scoped to the call and restored after (like the `sh` runner)
+        if let Some(body) = self
+            .funcs
+            .iter()
+            .find(|(n, _)| n == cmd)
+            .map(|(_, b)| b.clone())
+        {
+            if self.func_depth >= 16 {
+                self.fail("function: recursion too deep");
+                return;
+            }
+            let keys: Vec<String> = (0..args.len() + 1)
+                .map(|i| {
+                    if i == 0 {
+                        String::from("#")
+                    } else {
+                        alloc::format!("{}", i - 1)
+                    }
+                })
+                .collect();
+            let saved: Vec<Option<String>> =
+                keys.iter().map(|k| self.vars.get(k).cloned()).collect();
+            self.vars.insert(String::from("0"), String::from(cmd));
+            self.vars
+                .insert(String::from("#"), alloc::format!("{}", args.len()));
+            for (i, a) in args.iter().enumerate() {
+                self.vars.insert(alloc::format!("{}", i + 1), String::from(*a));
+            }
+            self.func_depth += 1;
+            self.run(&body);
+            self.func_depth -= 1;
+            for (k, v) in keys.iter().zip(saved) {
+                match v {
+                    Some(v) => {
+                        self.vars.insert(k.clone(), v);
+                    }
+                    None => {
+                        self.vars.remove(k);
+                    }
+                }
+            }
+            return;
         }
         // optimistic success -- fail() marks the statement failed; $? /
         // && / || read this after the command finishes
@@ -3448,17 +3560,92 @@ impl Term {
                 }
             }
             "unset" => {
-                if args.is_empty() {
-                    self.fail("usage: unset NAME...");
+                // unset [-f] NAME...: -f removes functions, plain removes vars
+                let mut fflag = false;
+                let names: Vec<&str> = args
+                    .iter()
+                    .filter(|a| {
+                        if **a == "-f" {
+                            fflag = true;
+                            false
+                        } else if **a == "-v" {
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                if names.is_empty() {
+                    self.fail("usage: unset [-f] NAME...");
                 }
-                for a in &args {
-                    self.vars.remove(*a);
+                for a in names {
+                    if fflag {
+                        self.funcs.retain(|(n, _)| n != a);
+                    } else {
+                        self.vars.remove(a);
+                    }
                 }
             }
-            "man" => match args.first() {
-                Some(a) => self.run(&alloc::format!("help {}", a)),
-                None => self.emit("man: what manual page do you want?"),
-            },
+            "function" | "declare" | "typeset" => {
+                // bare/`-f` lists defined functions; `function name { ... }`
+                // definitions are parsed by run() before we ever get here
+                let defs_only = args.iter().any(|a| *a == "-f");
+                let flist = self.funcs.clone();
+                for (n, b) in &flist {
+                    self.emit(&alloc::format!("{}() {{ {}; }}", n, b));
+                }
+                if self.funcs.is_empty() && !defs_only {
+                    self.emit("no functions defined");
+                }
+            }
+            "man" => {
+                // man [-k pat] <page>: real man pages from /man/<name>.txt
+                match args.first() {
+                    Some(&"-k") => {
+                        let pat = args.get(1).copied().unwrap_or("").to_lowercase();
+                        let mut any = false;
+                        if let Ok(ents) = ustd::readdir("/man") {
+                            for e in ents {
+                                let ename = core::str::from_utf8(
+                                    &e.name[..e.name_len as usize],
+                                )
+                                .unwrap_or("?");
+                                let p = alloc::format!("/man/{}", ename);
+                                if let Ok(d) = ustd::read_all(&p) {
+                                    let first = String::from_utf8_lossy(&d)
+                                        .lines()
+                                        .next()
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if pat.is_empty()
+                                        || first.to_lowercase().contains(&pat)
+                                        || ename.to_lowercase().contains(&pat)
+                                    {
+                                        self.emit(&alloc::format!(
+                                            "{} - {}",
+                                            ename.trim_end_matches(".txt"),
+                                            first
+                                        ));
+                                        any = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !any {
+                            self.emit(&alloc::format!("{}: nothing appropriate", pat));
+                        }
+                    }
+                    Some(a) => {
+                        let p = alloc::format!("/man/{}.txt", a);
+                        match ustd::read_all(&p) {
+                            Ok(d) => self.emit(&String::from_utf8_lossy(&d)),
+                            Err(_) => self.run(&alloc::format!("help {}", a)),
+                        }
+                    }
+                    None => self.emit("man: what manual page do you want?"),
+                }
+            }
             "env" => {
                 // env [-i] [cmd...]: -i runs the command with cleared vars
                 if args.first() == Some(&"-i") {
@@ -5089,13 +5276,6 @@ impl Term {
                 let mut skip: Vec<usize> = Vec::new();
                 for (i, a) in args.iter().enumerate() {
                     match *a {
-                        "-r" => o.rec = true,
-                        "-v" => o.inv = true,
-                        "-n" => o.num = true,
-                        "-c" => o.cnt = true,
-                        "-i" => o.ci = true,
-                        "-w" => o.word = true,
-                        "-x" => o.exact = true,
                         "-A" | "-B" | "-C" | "-m" => {
                             let v = args
                                 .get(i + 1)
@@ -5111,6 +5291,26 @@ impl Term {
                                 _ => o.maxm = v.max(1),
                             }
                             skip.push(i + 1);
+                        }
+                        // combined short flags: -rni works like -r -n -i
+                        s if s.starts_with('-') && s.len() > 1 => {
+                            for ch in s[1..].bytes() {
+                                match ch {
+                                    b'r' => o.rec = true,
+                                    b'v' => o.inv = true,
+                                    b'n' => o.num = true,
+                                    b'c' => o.cnt = true,
+                                    b'i' => o.ci = true,
+                                    b'w' => o.word = true,
+                                    b'x' => o.exact = true,
+                                    b'o' => o.only = true,
+                                    b'q' => o.quiet = true,
+                                    b'l' => o.files = 1,
+                                    b'L' => o.files = 2,
+                                    b'F' | b'E' | b'e' => {} // already literal
+                                    _ => {}
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -5128,9 +5328,17 @@ impl Term {
                         String::from(*p)
                     }
                 });
-                let path = pos.get(1).copied();
-                match (pat, path) {
-                    (Some(p), Some(path)) => self.grep_run(&p, path, &o),
+                match (pat, pos.get(1).copied()) {
+                    (Some(p), Some(_)) => {
+                        // every positional after the pattern is a file/dir operand
+                        let mut hits = 0usize;
+                        for path in &pos[1..] {
+                            hits += self.grep_run(&p, path, &o);
+                        }
+                        if o.quiet {
+                            self.last_ok = hits > 0;
+                        }
+                    }
                     (Some(p), None) => match self.pipe_in.clone() {
                         Some(s) => {
                             let lines: Vec<&str> = s.lines().collect();
@@ -5138,10 +5346,13 @@ impl Term {
                             if o.cnt {
                                 self.emit(&alloc::format!("{}", hits));
                             }
+                            if o.quiet {
+                                self.last_ok = hits > 0;
+                            }
                         }
-                        None => self.fail("usage: grep [-r] [-vnciwx] [-ABCmn] <pat> <file|dir>"),
+                        None => self.fail("usage: grep [-r] [-vnciwxoqlLFe] [-ABCmn] <pat> <file|dir>"),
                     },
-                    _ => self.fail("usage: grep [-r] [-vnciwx] [-ABCmn] <pat> <file|dir>"),
+                    _ => self.fail("usage: grep [-r] [-vnciwxoqlLFe] [-ABCmn] <pat> <file|dir>"),
                 }
             }
             "hex" => match args.first() {
@@ -5490,7 +5701,7 @@ impl Term {
                 // value-arg positions: -n, -k, -t each consume their next token
                 let mut valpos: Vec<usize> = Vec::new();
                 for (i, a) in args.iter().enumerate() {
-                    if *a == "-n" || *a == "-k" || *a == "-t" {
+                    if *a == "-n" || *a == "-k" || *a == "-t" || *a == "-o" {
                         valpos.push(i + 1);
                     }
                 }
@@ -5577,8 +5788,23 @@ impl Term {
                             if args.iter().any(|a| a == &"-r") {
                                 ls.reverse();
                             }
-                            for l in ls {
-                                self.emit(l);
+                            // -o FILE: write the sorted output to a file
+                            match args.iter().position(|a| a == &"-o") {
+                                Some(oi) => {
+                                    let f = args.get(oi + 1).copied().unwrap_or("");
+                                    let mut body = ls.join("\n");
+                                    if !body.is_empty() {
+                                        body.push('\n');
+                                    }
+                                    if let Err(e) = ustd::write_all(f, body.as_bytes()) {
+                                        self.fail(&alloc::format!("sort: {}: err {}", f, e));
+                                    }
+                                }
+                                None => {
+                                    for l in ls {
+                                        self.emit(l);
+                                    }
+                                }
                             }
                         } else if cmd == "head" {
                             for l in ls.iter().take(n) {
@@ -5846,25 +6072,33 @@ impl Term {
                             None => self.pipe_in.clone(),
                         };
                         if let Some(s) = content {
+                            // uniq [-cdui]: -c counts, -d only dup runs,
+                            // -u only singleton runs, -i case-insensitive
                             let count = args.iter().any(|a| a == &"-c");
-                            let mut prev: Option<&str> = None;
-                            let mut n = 1usize;
+                            let only_dup = args.iter().any(|a| a == &"-d");
+                            let only_uniq = args.iter().any(|a| a == &"-u");
+                            let ci = args.iter().any(|a| a == &"-i");
+                            // group consecutive runs (respecting -i)
+                            let mut runs: Vec<(&str, usize)> = Vec::new();
                             for l in s.lines() {
-                                if prev == Some(l) {
-                                    n += 1;
+                                let eq = match runs.last() {
+                                    Some((p, _)) if ci => p.eq_ignore_ascii_case(l),
+                                    Some((p, _)) => *p == l,
+                                    None => false,
+                                };
+                                if eq {
+                                    runs.last_mut().unwrap().1 += 1;
+                                } else {
+                                    runs.push((l, 1));
+                                }
+                            }
+                            for (p, n) in runs {
+                                if only_dup && n < 2 {
                                     continue;
                                 }
-                                if let Some(p) = prev {
-                                    if count {
-                                        self.emit(&alloc::format!("{:7} {}", n, p));
-                                    } else {
-                                        self.emit(p);
-                                    }
+                                if only_uniq && n > 1 {
+                                    continue;
                                 }
-                                prev = Some(l);
-                                n = 1;
-                            }
-                            if let Some(p) = prev {
                                 if count {
                                     self.emit(&alloc::format!("{:7} {}", n, p));
                                 } else {
@@ -5882,7 +6116,19 @@ impl Term {
                             let mut v = Vec::new();
                             let mut i = 0;
                             while i < b.len() {
-                                if i + 2 < b.len() && b[i + 1] == b'-' && b[i + 2] > b[i] {
+                                if b[i] == b'\\' && i + 1 < b.len() {
+                                    // real tr decodes escapes in the set args
+                                    let e = match b[i + 1] {
+                                        b'n' => b'\n',
+                                        b't' => b'\t',
+                                        b'r' => b'\r',
+                                        b'0' => 0u8,
+                                        b'\\' => b'\\',
+                                        c => c,
+                                    };
+                                    v.push(e);
+                                    i += 2;
+                                } else if i + 2 < b.len() && b[i + 1] == b'-' && b[i + 2] > b[i] {
                                     for c in b[i]..=b[i + 2] {
                                         v.push(c);
                                     }
@@ -6279,37 +6525,67 @@ impl Term {
                 }
             }
             "diff" => {
-                // diff [-u] a b — ed-style by default, unified with -u
+                // diff [-u|-q|-i|-w|-B] a b — ed-style by default; -q reports
+                // only that files differ; -i/-w/-B normalize before comparing
                 let unified = args.iter().any(|a| *a == "-u");
+                let brief = args.iter().any(|a| *a == "-q" || *a == "--brief");
+                let ci = args.iter().any(|a| *a == "-i");
+                let nows = args.iter().any(|a| *a == "-w");
+                let noblank = args.iter().any(|a| *a == "-B");
                 let paths: Vec<&&str> = args.iter().filter(|a| !a.starts_with('-')).collect();
                 match (paths.first(), paths.get(1)) {
                     (Some(pa), Some(pb)) => match (ustd::read_all(pa), ustd::read_all(pb)) {
                         (Ok(da), Ok(db)) => {
                             let sa = String::from_utf8_lossy(&da).into_owned();
                             let sb = String::from_utf8_lossy(&db).into_owned();
-                            let la: Vec<String> = sa.lines().take(1024).map(String::from).collect();
-                            let lb: Vec<String> = sb.lines().take(1024).map(String::from).collect();
+                            let norm = |l: &str| -> String {
+                                let mut r = String::from(l);
+                                if nows {
+                                    r = r.split_whitespace().collect();
+                                }
+                                if ci {
+                                    r = r.to_lowercase();
+                                }
+                                r
+                            };
+                            let mut la: Vec<String> = sa.lines().take(1024).map(norm).collect();
+                            let mut lb: Vec<String> = sb.lines().take(1024).map(norm).collect();
+                            if noblank {
+                                la.retain(|l| !l.is_empty());
+                                lb.retain(|l| !l.is_empty());
+                            }
                             let out = if unified {
                                 diff_unified(&la, &lb, 3)
                             } else {
                                 diff_lines(&la, &lb)
                             };
-                            if out.is_empty() {
-                                self.emit("(identical)");
-                            }
-                            if unified && !out.is_empty() {
-                                self.emit(&alloc::format!("--- {}", pa));
-                                self.emit(&alloc::format!("+++ {}", pb));
-                            }
-                            for l in out {
-                                self.emit(&l);
+                            if brief {
+                                if out.is_empty() {
+                                    self.emit(&alloc::format!("{} {} identical", pa, pb));
+                                } else {
+                                    self.emit(&alloc::format!("{} {} differ", pa, pb));
+                                    self.last_ok = false;
+                                }
+                            } else {
+                                if out.is_empty() {
+                                    self.emit("(identical)");
+                                } else {
+                                    self.last_ok = false; // diff exits nonzero on differences
+                                }
+                                if unified && !out.is_empty() {
+                                    self.emit(&alloc::format!("--- {}", pa));
+                                    self.emit(&alloc::format!("+++ {}", pb));
+                                }
+                                for l in out {
+                                    self.emit(&l);
+                                }
                             }
                         }
                         (Err(e), _) | (_, Err(e)) => {
                             self.fail(&alloc::format!("diff: err {}", e))
                         }
                     },
-                    _ => self.fail("usage: diff [-u] <fileA> <fileB>"),
+                    _ => self.fail("usage: diff [-u|-q|-i|-w|-B] <fileA> <fileB>"),
                 }
             }
             "patch" => {
@@ -7387,18 +7663,68 @@ impl Term {
                 }
             }
             "xargs" => {
-                // xargs <cmd> [args...]: run `<cmd args> <line>` per stdin line
-                if args.is_empty() {
-                    self.fail("usage: <cmd> | xargs <cmd> [args...]");
+                // xargs [-n N] [-0] [-I STR] [-t] <cmd> [args...]
+                // -n N batches N stdin items per run; -0 splits on NUL; -I
+                // substitutes STR in the command with the item; -t echoes.
+                let mut nbatch = 0usize;
+                let mut repl: Option<String> = None;
+                let mut trace = false;
+                let mut nul = false;
+                let mut ci = 0usize;
+                while ci < args.len() {
+                    match args[ci] {
+                        "-n" => {
+                            nbatch = args.get(ci + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                            ci += 2;
+                        }
+                        "-I" => {
+                            repl = args.get(ci + 1).map(|s| String::from(*s));
+                            ci += 2;
+                        }
+                        "-t" => {
+                            trace = true;
+                            ci += 1;
+                        }
+                        "-0" => {
+                            nul = true;
+                            ci += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                let rest = &args[ci..];
+                if rest.is_empty() {
+                    self.fail("usage: <cmd> | xargs [-n N] [-0] [-I STR] [-t] <cmd> [args...]");
                     return;
                 }
-                let base = args.join(" ");
+                let base = rest.join(" ");
                 if let Some(s) = self.pipe_in.clone() {
-                    for l in s.lines() {
-                        if l.is_empty() {
-                            continue;
+                    let items: Vec<&str> = if nul {
+                        s.split('\0').collect()
+                    } else {
+                        // real xargs splits items on blanks+newlines by default
+                        s.split_whitespace().collect()
+                    };
+                    let items: Vec<&str> = items
+                        .into_iter()
+                        .filter(|l| !l.trim().is_empty())
+                        .collect();
+                    let batch = if repl.is_some() {
+                        1 // -I runs once per item (each gets its own substitution)
+                    } else if nbatch > 0 {
+                        nbatch
+                    } else {
+                        1
+                    };
+                    for chunk in items.chunks(batch) {
+                        let line = match &repl {
+                            Some(r) => base.replace(r.as_str(), chunk[0].trim()),
+                            None => alloc::format!("{} {}", base, chunk.join(" ")),  
+                        };
+                        if trace {
+                            self.emit(&alloc::format!("+ {}", line));
                         }
-                        for o in self.run_captured(&alloc::format!("{} {}", base, l)) {
+                        for o in self.run_captured(&line) {
                             self.emit(&o);
                         }
                     }
@@ -8512,6 +8838,7 @@ impl Term {
         "fortune", "uuidgen", "logger", "whois", "fdisk", "vol", "blkid", "script",
         "nice", "renice", "pgrep", "pkill", "top", "dc", "vmstat", "free",
         "pcap", "ftp", "lsof", "fuser", "burn", "cron", "browse",
+        "function", "declare", "typeset",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -8557,6 +8884,8 @@ impl Term {
                     "          sort -k/-t  find -exec  $$ (own pid)",
                     "          pcap capture  ftp (anon PASV)  lsof/fuser",
                     "          burn  cron  browse (html->text)  sums -c",
+                    "          name() { cmds; }  function name { .. } -> $1..$9 $@ $#",
+                    "          declare -f/typeset -f  unset -f name  man [-k pat] <page>",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];
@@ -8977,10 +9306,33 @@ impl Term {
         let mut hits = 0usize;
         let mut printed_up_to = 0usize; // lines already emitted (exclusive)
         let mut after_left = 0usize;
+        let show = !o.cnt && !o.quiet && o.files == 0;
         for (i, l) in lines.iter().enumerate() {
             if is_match(l) != o.inv {
                 hits += 1;
-                if !o.cnt {
+                if o.only && !o.inv && !o.quiet {
+                    // -o: emit each matching span, one per line
+                    let hay = if o.ci {
+                        l.to_ascii_lowercase()
+                    } else {
+                        String::from(*l)
+                    };
+                    if o.word || o.exact {
+                        self.emit(pat);
+                    } else {
+                        let pb = pat.as_bytes();
+                        let hb = hay.as_bytes();
+                        let mut s = 0usize;
+                        while s + pb.len() <= hb.len() {
+                            if &hb[s..s + pb.len()] == pb {
+                                self.emit(&l[s..s + pb.len()]);
+                                s += pb.len();
+                            } else {
+                                s += 1;
+                            }
+                        }
+                    }
+                } else if show {
                     let from = i.saturating_sub(o.before).max(printed_up_to);
                     for j in from..i {
                         self.emit(&fmt(j, lines[j], true));
@@ -8993,7 +9345,7 @@ impl Term {
                     // flush the -A tail of the final match
                     let mut j = i + 1;
                     while after_left > 0 && j < lines.len() {
-                        if !o.cnt {
+                        if show {
                             self.emit(&fmt(j, lines[j], true));
                         }
                         after_left -= 1;
@@ -9002,7 +9354,7 @@ impl Term {
                     break;
                 }
             } else if after_left > 0 {
-                if !o.cnt {
+                if show {
                     self.emit(&fmt(i, l, true));
                     printed_up_to = i + 1;
                 }
@@ -9012,25 +9364,33 @@ impl Term {
         hits
     }
 
-    fn grep_file(&mut self, pat: &str, path: &str, o: &GrepOpts) {
+    fn grep_file(&mut self, pat: &str, path: &str, o: &GrepOpts) -> usize {
         match ustd::read_all(path) {
             Ok(d) => {
                 let s = String::from_utf8_lossy(&d).into_owned();
                 let lines: Vec<&str> = s.lines().collect();
                 let hits = self.grep_lines(pat, &lines, path, o);
-                if o.cnt {
+                if o.files == 1 && hits > 0 {
+                    self.emit(path);
+                } else if o.files == 2 && hits == 0 {
+                    self.emit(path);
+                } else if o.cnt {
                     self.emit(&alloc::format!("{}: {}", path, hits));
                 }
+                hits
             }
-            Err(e) => self.fail(&alloc::format!("grep: {}: err {}", path, e)),
+            Err(e) => {
+                self.fail(&alloc::format!("grep: {}: err {}", path, e));
+                0
+            }
         }
     }
 
-    fn grep_run(&mut self, pat: &str, path: &str, o: &GrepOpts) {
+    fn grep_run(&mut self, pat: &str, path: &str, o: &GrepOpts) -> usize {
         if !o.rec {
-            self.grep_file(pat, path, o);
-            return;
+            return self.grep_file(pat, path, o);
         }
+        let mut total = 0usize;
         let mut stack = alloc::vec::Vec::new();
         stack.push(String::from(path));
         while let Some(dir) = stack.pop() {
@@ -9042,13 +9402,14 @@ impl Term {
                         if e.is_dir != 0 {
                             stack.push(p);
                         } else {
-                            self.grep_file(pat, &p, o);
+                            total += self.grep_file(pat, &p, o);
                         }
                     }
                 }
-                Err(_) => self.grep_file(pat, &dir, o), // a plain file was passed
+                Err(_) => total += self.grep_file(pat, &dir, o), // a plain file was passed
             }
         }
+        total
     }
 
     /// find: recursive name-match walk printing full paths.
@@ -9217,6 +9578,10 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         subst_depth: 0,
         run_depth: 0,
         read_modal: None,
+        funcs: Vec::new(),
+        func_collect: None,
+        func_depth: 0,
+        func_bdepth: 0,
         block_buf: String::new(),
         heredocs: Vec::new(),
         flow: 0,
@@ -9697,32 +10062,67 @@ fn sys_name(nr: u64) -> &'static str {
         SYS_CLOSE => "close",
         SYS_STAT => "stat",
         SYS_SEEK => "seek",
+        SYS_READDIR => "readdir",
         SYS_MKDIR => "mkdir",
         SYS_REMOVE => "remove",
         SYS_RENAME => "rename",
-        SYS_LISTDIR => "listdir",
         SYS_SPAWN => "spawn",
         SYS_EXIT => "exit",
-        SYS_SLEEP_MS => "sleep",
-        SYS_UPTIME_MS => "uptime",
-        SYS_DATETIME => "datetime",
+        SYS_YIELD => "yield",
+        SYS_SLEEP_MS => "sleep_ms",
+        SYS_UPTIME_MS => "uptime_ms",
+        SYS_TIME => "datetime",
         SYS_MEMINFO => "meminfo",
         SYS_KILL => "kill",
+        SYS_KILL2 => "kill2",
         SYS_WAITPID => "waitpid",
         SYS_PROCLIST => "proclist",
+        SYS_GETPID => "getpid",
+        SYS_GETCWD => "getcwd",
+        SYS_CHDIR => "chdir",
+        SYS_NICE => "nice",
+        SYS_IPC_LISTEN => "ipc_listen",
+        SYS_IPC_CONNECT => "ipc_connect",
         SYS_IPC_SEND => "ipc_send",
         SYS_IPC_RECV => "ipc_recv",
+        SYS_IPC_CLOSE => "ipc_close",
+        SYS_IPC_OWNER => "ipc_owner",
         SYS_SHM_CREATE => "shm_create",
         SYS_SHM_MAP => "shm_map",
-        SYS_GETPID => "getpid",
-        SYS_NICE => "nice",
+        SYS_SHM_DROP => "shm_drop",
+        SYS_NET_PING => "net_ping",
+        SYS_NET_INFO => "net_info",
+        SYS_NET_DNS => "net_dns",
+        SYS_NET_DHCP => "net_dhcp",
+        SYS_NET_HTTP => "net_http",
+        SYS_NET_STAT => "net_stat",
+        SYS_NET_UDP_OPEN => "udp_open",
+        SYS_NET_UDP_SEND => "udp_send",
+        SYS_NET_UDP_RECV => "udp_recv",
+        SYS_NET_UDP_CLOSE => "udp_close",
+        SYS_NET_TCP_OPEN => "tcp_open",
+        SYS_NET_TCP_SEND => "tcp_send",
+        SYS_NET_TCP_RECV => "tcp_recv",
+        SYS_NET_TCP_CLOSE => "tcp_close",
+        SYS_NET_TCP_LISTEN => "tcp_listen",
+        SYS_NET_TCP_ACCEPT => "tcp_accept",
+        SYS_NET_TCP_UNLISTEN => "tcp_unlisten",
         SYS_PCAP => "pcap",
+        SYS_STRACE => "strace",
         SYS_KLOG => "klog",
         SYS_BEEP => "beep",
         SYS_DF => "df",
         SYS_RAND => "rand",
-        SYS_GETCWD => "getcwd",
-        SYS_CHDIR => "chdir",
+        SYS_ARP => "arp",
+        SYS_PCI_SCAN => "pci_scan",
+        SYS_FB_INFO => "fb_info",
+        SYS_SHOT => "shot",
+        SYS_CLIP_SET => "clip_set",
+        SYS_CLIP_GET => "clip_get",
+        SYS_POWEROFF => "poweroff",
+        SYS_REBOOT => "reboot",
+        SYS_DEBUG => "debug",
+        SYS_MMAP => "mmap",
         _ => "?",
     }
 }
@@ -9774,4 +10174,88 @@ fn b32_decode(t: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Parse a function-definition opener: `name() {`, `name(){`, or
+/// `function name [()] {`. Returns (name, body-if-closed-on-this-line,
+/// text-after-the-closing-brace). `body=None` means the `{` is still open —
+/// the caller keeps collecting lines. Unquoted braces only; `{` inside
+/// 'quotes' is literal text.
+fn func_open(s: &str) -> Option<(String, Option<String>, String)> {
+    let t = s.trim();
+    let rest = if let Some(r) = t.strip_prefix("function") {
+        r.trim_start()
+    } else {
+        t
+    };
+    // name = leading identifier; then optional `()`, then `{`
+    let nend = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    if nend == 0 {
+        return None;
+    }
+    let name = &rest[..nend];
+    if !name.chars().next().unwrap().is_ascii_alphabetic() && !name.starts_with('_') {
+        return None;
+    }
+    let mut r = rest[nend..].trim_start();
+    if let Some(rp) = r.strip_prefix("()") {
+        r = rp.trim_start();
+    } else if t.starts_with("function") {
+        // `function name {` form is fine without ()
+    } else {
+        return None; // `name {` without () is not a func def
+    }
+    if !r.starts_with('{') {
+        return None;
+    }
+    // scan for the matching unquoted `}` (nested braces count)
+    let b = r.as_bytes();
+    let (mut sq, mut dq) = (false, false);
+    let mut depth = 0i32;
+    let mut i = 0;
+    let mut close_at = None;
+    while i < b.len() {
+        match b[i] {
+            b'\'' if !dq => sq = !sq,
+            b'"' if !sq => dq = !dq,
+            b'{' if !sq && !dq => depth += 1,
+            b'}' if !sq && !dq => {
+                depth -= 1;
+                if depth == 0 {
+                    close_at = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    match close_at {
+        Some(c) => {
+            let body = r[1..c].trim().to_string();
+            let trailing = r[c + 1..].trim().to_string();
+            Some((String::from(name), Some(body), trailing))
+        }
+        None => Some((String::from(name), None, String::new())),
+    }
+}
+
+/// Count unquoted `{`/`}` braces in a line (for multi-line func collection).
+/// Returns (open, close) counts.
+fn brace_scan(s: &str) -> (i32, i32) {
+    let b = s.as_bytes();
+    let (mut sq, mut dq) = (false, false);
+    let (mut o, mut c) = (0i32, 0i32);
+    for &ch in b {
+        match ch {
+            b'\'' if !dq => sq = !sq,
+            b'"' if !sq => dq = !dq,
+            b'{' if !sq && !dq => o += 1,
+            b'}' if !sq && !dq => c += 1,
+            _ => {}
+        }
+    }
+    (o, c)
 }
