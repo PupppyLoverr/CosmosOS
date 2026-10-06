@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use shared::*;
 use ustd::draw::{self, Canvas};
@@ -16,6 +17,8 @@ struct Sysmon {
     c: Canvas,
     dirty: bool,
     mem_hist: Vec<u64>, // used_kb samples
+    prev_cpu: BTreeMap<u32, u64>, // pid -> cpu_ticks at last sample
+    prev_total: u64,             // total ticks at last sample
 }
 
 impl Sysmon {
@@ -52,6 +55,8 @@ impl Sysmon {
         c.fill(12, ty + 16, bw, 1, draw::EDGE);
         let procs = ustd::proclist(64);
         let mut yy = ty + 24;
+        let total_now = ustd::uptime_ms() / 10; // PIT ticks
+        let span = total_now.saturating_sub(self.prev_total).max(1);
         let mut sorted: Vec<_> = procs.iter().collect();
         sorted.sort_by_key(|p| p.pid);
         for p in sorted {
@@ -60,9 +65,13 @@ impl Sysmon {
             }
             let name = core::str::from_utf8(&p.name).unwrap_or("?").trim_end_matches('\0');
             let kind = if p.is_user != 0 { "user" } else { "kern" };
-            c.text(12, yy, &alloc::format!("{:>3}  {:<6} {:<20} {} KiB", p.pid, kind, name, p.mem_kb), draw::DIM, None);
+            let dcpu = p.cpu_ticks - self.prev_cpu.get(&p.pid).copied().unwrap_or(0).min(p.cpu_ticks);
+            let pct = dcpu * 100 / span;
+            c.text(12, yy, &alloc::format!("{:>3}  {:<6} {:<20} {:>6} KiB {:>2}%", p.pid, kind, name, p.mem_kb, pct), draw::DIM, None);
+            self.prev_cpu.insert(p.pid, p.cpu_ticks);
             yy += 18;
         }
+        self.prev_total = total_now;
         self.win.present_all();
     }
 }
@@ -79,7 +88,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
     let win = wm
         .create_window(240, 80, 480, 420, WIN_DECORATE | WIN_RESIZABLE, "System Monitor")
         .expect("create window");
-    let mut s = Sysmon { win, c: win.canvas(), dirty: true, mem_hist: Vec::new() };
+    let mut s = Sysmon { win, c: win.canvas(), dirty: true, mem_hist: Vec::new(), prev_cpu: BTreeMap::new(), prev_total: 0 };
     let mut last = 0u64;
     loop {
         match wm.next_event(500) {

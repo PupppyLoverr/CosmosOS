@@ -58,6 +58,7 @@ pub struct Task {
     pub arg_page: u64,   // vaddr of arg page (0 if none)
     pub sleep_deadline: u64, // SYS_SLEEP_MS restart target (0 = not sleeping)
     pub wait_timeout: u64,   // tick deadline for timed waits (0 = none)
+    pub cpu_ticks: u64,      // PIT ticks this task has run (per-task CPU time)
 }
 
 pub struct Sched {
@@ -97,6 +98,7 @@ pub fn init() {
         arg_page: 0,
         sleep_deadline: 0,
         wait_timeout: 0,
+        cpu_ticks: 0,
     };
     *SCHED.lock() = Some(Sched { tasks: vec![Box::new(boot)], cur: 0, next_pid: 1 });
 }
@@ -119,6 +121,7 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
     };
     let s = g.as_mut().unwrap();
     s.tasks[s.cur].saved_rsp = saved;
+    s.tasks[s.cur].cpu_ticks += 1; // the outgoing task owned this interval
     // wake sleepers (sleep + timed waits)
     for t in s.tasks.iter_mut() {
         if t.state == State::Blocked && t.wake_at <= ticks() && t.waiting_on == 0 {
@@ -330,6 +333,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         arg_page: USER_ARG_PAGE,
         sleep_deadline: 0,
         wait_timeout: 0,
+        cpu_ticks: 0,
     };
     s.tasks.push(Box::new(t));
     sprintln!("[task] spawned pid={} '{}' entry={:#x}", pid, name, entry);
@@ -381,6 +385,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         arg_page: 0,
         sleep_deadline: 0,
         wait_timeout: 0,
+        cpu_ticks: 0,
     }));
     pid
 }
@@ -593,6 +598,7 @@ pub fn proclist(buf: &mut [shared::ProcInfo]) -> usize {
         p.pid = t.id;
         p.is_user = t.is_user as u32;
         p.mem_kb = t.mem_bytes / 1024;
+        p.cpu_ticks = t.cpu_ticks;
         let nb = t.name.as_bytes();
         let l = nb.len().min(31);
         p.name[..l].copy_from_slice(&nb[..l]);

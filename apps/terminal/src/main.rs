@@ -251,10 +251,11 @@ impl Term {
                         .unwrap_or("?")
                         .trim_end_matches('\0');
                     self.push_line(&alloc::format!(
-                        "  pid={} {} mem={}KB",
+                        "  pid={} {} mem={}KB cpu={}ms",
                         p.pid,
                         name,
-                        p.mem_kb
+                        p.mem_kb,
+                        p.cpu_ticks * 10
                     ));
                 }
             }
