@@ -103,6 +103,23 @@ impl Term {
         out
     }
 
+    /// Persist history to /history.txt (last 100 commands).
+    fn save_hist(&self) {
+        let start = self.hist.len().saturating_sub(100);
+        let body = self.hist[start..].join("\n") + "\n";
+        let _ = ustd::write_all("/history.txt", body.as_bytes());
+    }
+
+    fn load_hist(&mut self) {
+        if let Ok(d) = ustd::read_all("/history.txt") {
+            let s = String::from_utf8_lossy(&d);
+            for l in s.lines().filter(|l| !l.is_empty()) {
+                self.hist.push(String::from(l));
+            }
+            self.hi = self.hist.len();
+        }
+    }
+
     fn prompt_str(&self) -> String {
         alloc::format!("{} $ ", ustd::getcwd())
     }
@@ -188,6 +205,7 @@ impl Term {
         }
         self.hist.push(String::from(input));
         self.hi = self.hist.len();
+        self.save_hist();
         let mut it = input.split_whitespace();
         let cmd = it.next().unwrap_or("");
         let args: Vec<&str> = it.collect();
@@ -253,13 +271,34 @@ impl Term {
                     None => self.emit("usage: cat <file>"),
                 },
             },
-            "mkdir" => match args.first() {
-                Some(p) => {
-                    if let Err(e) = ustd::mkdir(p) {
-                        self.emit(&alloc::format!("mkdir: err {}", e));
+            "mkdir" => {
+                let (mkpath, target) = if args.first() == Some(&"-p") {
+                    (true, args.get(1))
+                } else {
+                    (false, args.first())
+                };
+                match target {
+                    Some(p) if mkpath => {
+                        // mkdir -p: create each component, tolerate existing
+                        let mut acc = String::new();
+                        if p.starts_with('/') {
+                            acc.push('/');
+                        }
+                        for part in p.split('/').filter(|s| !s.is_empty()) {
+                            if !acc.is_empty() && !acc.ends_with('/') {
+                                acc.push('/');
+                            }
+                            acc.push_str(part);
+                            let _ = ustd::mkdir(&acc);
+                        }
                     }
+                    Some(p) => {
+                        if let Err(e) = ustd::mkdir(p) {
+                            self.emit(&alloc::format!("mkdir: err {}", e));
+                        }
+                    }
+                    None => self.emit("usage: mkdir [-p] <dir>"),
                 }
-                None => self.emit("usage: mkdir <dir>"),
             },
             "touch" => match args.first() {
                 Some(p) => {
@@ -393,14 +432,30 @@ impl Term {
             "httpget" => match args.first() {
                 Some(host) => match ustd::net_http(host) {
                     Some(body) => {
-                        let s = String::from_utf8_lossy(&body);
-                        for l in s.lines().take(12) {
-                            self.emit(l);
+                        let mut out = false;
+                        if let Some(i) = args.iter().position(|a| a == &"-o") {
+                            if let Some(f) = args.get(i + 1) {
+                                match ustd::write_all(f, &body) {
+                                    Ok(_) => self.emit(&alloc::format!(
+                                        "  saved {}B to {}",
+                                        body.len(),
+                                        f
+                                    )),
+                                    Err(e) => self.emit(&alloc::format!("httpget: {}: err {}", f, e)),
+                                }
+                                out = true;
+                            }
+                        }
+                        if !out {
+                            let s = String::from_utf8_lossy(&body);
+                            for l in s.lines().take(12) {
+                                self.emit(l);
+                            }
                         }
                     }
                     None => self.emit(&alloc::format!("httpget: {}: failed", host)),
                 },
-                None => self.emit("usage: httpget <host>  (real TCP/80 GET /)"),
+                None => self.emit("usage: httpget <host> [-o file]  (real TCP/80 GET /)"),
             },
             "grep" => {
                 // grep <pat> <file> | grep -r <pat> <dir>
@@ -566,6 +621,13 @@ impl Term {
 
     fn on_key(&mut self, k: &EvKey) {
         if k.down == 0 {
+            return;
+        }
+        // Ctrl+L clears the screen
+        if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 && (k.chr == b'l' || k.chr == b'L') {
+            self.lines.clear();
+            self.view = 0;
+            self.redraw();
             return;
         }
         // Ctrl+V pastes the kernel clipboard into the edit line
@@ -837,6 +899,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         capture: None,
         pipe_in: None,
     };
+    t.load_hist();
     t.push_line("CosmosOS terminal - type 'help'");
     t.push_line("");
     t.redraw();
