@@ -151,7 +151,7 @@ impl Editor {
         // header
         c.fill(0, 0, c.w as i32, 26, draw::PANEL);
         c.text(8, 5, &alloc::format!("{}{}", self.path, if self.dirty_text { " *" } else { "" }), draw::TEXT, None);
-        c.text(c.w as i32 - 244, 5, "Ctrl-S save  Ctrl-F/G find  Ctrl-H replace", draw::DIM, None); // header hint
+        c.text(c.w as i32 - 296, 5, "Ctrl-S save  Ctrl-F/G find  Ctrl-H replace  Ctrl-D dup", draw::DIM, None); // header hint
         // text area
         let lines = self.lines();
         let vis = ((c.h as i32 - 34) / 16) as usize;
@@ -458,6 +458,35 @@ impl Editor {
                 b'f' => {
                     self.find_q = Some(String::new());
                     self.dirty_ui = true;
+                    return;
+                }
+                b'd' => {
+                    // Ctrl-D: duplicate the current line below itself
+                    let (r, _c) = self.caret_rc();
+                    let lines = self.lines();
+                    if r < lines.len() {
+                        let start = self.idx_of(r, 0);
+                        let mut end = start + lines[r].len();
+                        if end < self.text.len() {
+                            end += 1; // include the newline when present
+                        }
+                        let chunk = String::from(&self.text[start..end]);
+                        if chunk.ends_with('\n') {
+                            self.rec(start, String::new(), chunk.clone());
+                            self.text.insert_str(start, &chunk);
+                            self.cx = start + chunk.len();
+                        } else {
+                            // last line has no trailing newline — append
+                            // "\n<line>" after it instead of gluing text
+                            let dup = alloc::format!("\n{}", chunk);
+                            self.rec(end, String::new(), dup.clone());
+                            self.text.insert_str(end, &dup);
+                            self.cx = end + 1;
+                        }
+                        self.status = String::from("line duplicated");
+                        self.dirty_text = true;
+                        self.dirty_ui = true;
+                    }
                     return;
                 }
                 b'g' => {

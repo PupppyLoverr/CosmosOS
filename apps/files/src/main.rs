@@ -325,6 +325,10 @@ impl Files {
             }
             x if x == KeyCode::Delete as u32 => self.delete_sel(),
             x if x == KeyCode::F2 as u32 => self.start_rename(),
+            x if x == KeyCode::Char as u32 && k.chr.to_ascii_lowercase() == b'r' => {
+                self.status = String::from("refreshed");
+                self.reload();
+            }
             x if x == KeyCode::Char as u32 && k.chr.to_ascii_lowercase() == b's' => {
                 self.sort_by_size = !self.sort_by_size;
                 self.status = alloc::format!(

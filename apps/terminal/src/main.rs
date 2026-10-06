@@ -683,14 +683,39 @@ impl Term {
     }
 
     /// Expand $NAME tokens from the shell var table (whole-word vars).
+    /// Single-quoted spans are literal (no expansion); double-quoted spans
+    /// still expand, matching real-shell quoting rules.
     fn expand_vars(&self, s: &str) -> String {
         let b = s.as_bytes();
         let mut out = String::with_capacity(s.len());
         let mut i = 0;
+        let mut squote = false;
+        let mut dquote = false;
         while i < b.len() {
+            if b[i] == b'\'' && !dquote {
+                squote = !squote;
+                out.push(b[i] as char);
+                i += 1;
+                continue;
+            }
+            if b[i] == b'"' && !squote {
+                dquote = !dquote;
+                out.push(b[i] as char);
+                i += 1;
+                continue;
+            }
+            if squote || b[i] != b'$' {
+                out.push(b[i] as char);
+                i += 1;
+                continue;
+            }
             if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'?' {
                 // $? — previous command's exit status (still in last_ok)
                 out.push(if self.last_ok { '0' } else { '1' });
+                i += 2;
+            } else if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'#' {
+                // $# — script positional-argument count (0 outside scripts)
+                out.push_str(self.vars.get("#").map(|s| s.as_str()).unwrap_or("0"));
                 i += 2;
             } else if b[i] == b'$' && i + 1 < b.len() && (b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_') {
                 let mut j = i + 1;
@@ -708,6 +733,61 @@ impl Term {
             }
         }
         out
+    }
+
+    /// `test`/`[` evaluator: unary file/string tests and three-token
+    /// comparisons. Returns the boolean; `last_ok` mirrors it.
+    fn eval_test(&mut self, a: &[&str]) -> bool {
+        if a.first() == Some(&"!") {
+            return !self.eval_test(&a[1..]);
+        }
+        match a.len() {
+            0 => false,
+            1 => !a[0].is_empty(),
+            2 => match a[0] {
+                "-e" => ustd::stat(a[1]).is_ok(),
+                "-f" => ustd::stat(a[1]).map(|s| s.is_dir == 0).unwrap_or(false),
+                "-d" => ustd::stat(a[1]).map(|s| s.is_dir != 0).unwrap_or(false),
+                "-r" | "-w" | "-x" => ustd::stat(a[1]).is_ok(), // single permissive fs
+                "-z" => a[1].is_empty(),
+                "-n" => !a[1].is_empty(),
+                _ => {
+                    self.fail(&alloc::format!("test: unknown unary '{}'", a[0]));
+                    false
+                }
+            },
+            3 => {
+                let (l, op, r) = (a[0], a[1], a[2]);
+                match op {
+                    "=" | "==" => l == r,
+                    "!=" => l != r,
+                    "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
+                        match (l.parse::<i64>(), r.parse::<i64>()) {
+                            (Ok(li), Ok(ri)) => match op {
+                                "-eq" => li == ri,
+                                "-ne" => li != ri,
+                                "-lt" => li < ri,
+                                "-le" => li <= ri,
+                                "-gt" => li > ri,
+                                _ => li >= ri,
+                            },
+                            _ => {
+                                self.fail("test: integer expression expected");
+                                false
+                            }
+                        }
+                    }
+                    _ => {
+                        self.fail(&alloc::format!("test: unknown op '{}'", op));
+                        false
+                    }
+                }
+            }
+            _ => {
+                self.fail("test: too many arguments");
+                false
+            }
+        }
     }
 
     /// Expand `$(cmd)` substitutions: runs the inner command with output
@@ -974,8 +1054,11 @@ impl Term {
             let spec = &input[1..];
             let idx = if spec == "!" {
                 self.hist.len().checked_sub(1)
+            } else if let Ok(n) = spec.parse::<usize>() {
+                n.checked_sub(1)
             } else {
-                spec.parse::<usize>().ok().and_then(|n| n.checked_sub(1))
+                // !prefix — most recent history entry starting with `spec`
+                self.hist.iter().rposition(|l| l.starts_with(spec))
             };
             match idx.and_then(|i| self.hist.get(i).cloned()) {
                 Some(line) => {
@@ -1150,6 +1233,9 @@ impl Term {
                     "          find -name/-type/-maxdepth  Ctrl-R history search  .cosmosrc",
                     "          at <secs> <cmd>  httpd <port> [root] serves real files",
                     "          nc -l <port> listens  file <path> magic type  du/df -h human",
+                    "          test/[ expr: -e -f -d -z -n = != -eq -ne -lt -le -gt -ge !",
+                    "          ls -a -S -r  rand [n] [-x]  mount  rmdir  uname -srmva",
+                    "          sh <file> args -> $0 $1..$N $#   !<prefix> reruns match",
                     "          more: Space/b page, / search, n next",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
@@ -1175,12 +1261,33 @@ impl Term {
                 }
             }
             "ls" => {
-                // ls [paths...]: files list inline; dirs get a `path:` header
-                // when several args were given (glob expansion passes many)
-                let paths: Vec<&str> = if args.is_empty() {
+                // ls [-aSlr] [paths...]: -a shows dotfiles (hidden by default),
+                // -S sorts by size descending, -r reverses, -l forces the long
+                // one-per-line form (the default layout already). Multiple dir
+                // args get a `path:` header each.
+                let mut show_all = false;
+                let mut by_size = false;
+                let mut rev = false;
+                let mut i = 0usize;
+                while i < args.len() && args[i].starts_with('-') && args[i].len() > 1 {
+                    for c in args[i][1..].chars() {
+                        match c {
+                            'a' => show_all = true,
+                            'S' => by_size = true,
+                            'r' => rev = true,
+                            'l' | '1' => {}
+                            _ => {
+                                self.fail(&alloc::format!("ls: bad flag -{}", c));
+                                return;
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+                let paths: Vec<&str> = if args.len() <= i {
                     alloc::vec!["."]
                 } else {
-                    args.clone()
+                    args[i..].to_vec()
                 };
                 let multi = paths.len() > 1;
                 for p in paths {
@@ -1197,6 +1304,23 @@ impl Term {
                     }
                     match ustd::readdir(&dir) {
                         Ok(ents) => {
+                            let mut ents = ents;
+                            if !show_all {
+                                ents.retain(|e| e.name[0] != b'.');
+                            }
+                            if by_size {
+                                ents.sort_by(|a, b| {
+                                    b.is_dir.cmp(&a.is_dir).then(b.size.cmp(&a.size))
+                                });
+                            } else {
+                                ents.sort_by(|a, b| {
+                                    a.name[..a.name_len as usize]
+                                        .cmp(&b.name[..b.name_len as usize])
+                                });
+                            }
+                            if rev {
+                                ents.reverse();
+                            }
                             if ents.is_empty() {
                                 self.emit("  (empty)");
                             }
@@ -1433,7 +1557,75 @@ impl Term {
                     mi.total_kb, mi.used_kb, mi.kernel_heap_kb, mi.tasks
                 ));
             }
-            "uname" => self.emit("CosmosOS 0.1 x86_64 (rust kernel)"),
+            "uname" => {
+                // uname [-srmva]: kernel name/release/machine — bare prints -s
+                let all = args.iter().any(|a| a.contains('a'));
+                let mut parts: Vec<&str> = Vec::new();
+                let f = args.first().copied().unwrap_or("");
+                if args.is_empty() || all || f.contains('s') {
+                    parts.push("CosmosOS");
+                }
+                if all || f.contains('r') {
+                    parts.push("0.1");
+                }
+                if all || f.contains('v') {
+                    parts.push("rust-kernel");
+                }
+                if all || f.contains('m') {
+                    parts.push("x86_64");
+                }
+                if all || f.contains('o') {
+                    parts.push("CosmosOS");
+                }
+                if parts.is_empty() {
+                    parts.push("CosmosOS");
+                }
+                self.emit(&parts.join(" "));
+            }
+            "test" | "[" => {
+                let mut a: Vec<&str> = args.clone();
+                if cmd == "[" {
+                    if a.last() == Some(&"]") {
+                        a.pop();
+                    } else {
+                        self.fail("[: missing ]");
+                        return;
+                    }
+                }
+                self.last_ok = self.eval_test(&a);
+            }
+            "rand" => {
+                // rand [n] [-x]: n random u64s (default 1), -x hex
+                let hex = args.iter().any(|a| *a == "-x");
+                let n = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .min(64);
+                for _ in 0..n {
+                    match ustd::rand_u64() {
+                        Some(v) if hex => self.emit(&alloc::format!("{:016x}", v)),
+                        Some(v) => self.emit(&alloc::format!("{}", v)),
+                        None => self.fail("rand: kernel rng unavailable"),
+                    }
+                }
+            }
+            "mount" => match ustd::df() {
+                Some((tot, free)) => self.emit(&alloc::format!(
+                    "cosmos-data.img on / type fat32 (rw) -- {} total, {} free",
+                    human_size(tot),
+                    human_size(free)
+                )),
+                None => self.emit("mount: no volumes mounted"),
+            },
+            "rmdir" => match args.first() {
+                Some(p) => match ustd::remove(p) {
+                    Ok(()) => {}
+                    Err(e) => self.fail(&alloc::format!("rmdir: {}: err {}", p, e)),
+                },
+                None => self.fail("usage: rmdir <dir>  (empty dirs only)"),
+            },
             "uptime" => {
                 let ms = ustd::uptime_ms();
                 self.emit(&alloc::format!(
@@ -1485,6 +1677,20 @@ impl Term {
             "sh" | "source" | "." => match args.first() {
                 Some(p) => match ustd::read_all(p) {
                     Ok(d) => {
+                        // positional params: $0 = script path, $1..$N = args,
+                        // $# = arg count — previous values restored after.
+                        let keys: Vec<String> = (0..args.len() + 1)
+                            .map(|i| {
+                                if i == 0 { String::from("#") } else { alloc::format!("{}", i - 1) }
+                            })
+                            .collect();
+                        let saved: Vec<Option<String>> =
+                            keys.iter().map(|k| self.vars.get(k).cloned()).collect();
+                        self.vars.insert(String::from("0"), String::from(*p));
+                        self.vars.insert(String::from("#"), alloc::format!("{}", args.len() - 1));
+                        for (i, a) in args[1..].iter().enumerate() {
+                            self.vars.insert(alloc::format!("{}", i + 1), String::from(*a));
+                        }
                         let s = String::from_utf8_lossy(&d).into_owned();
                         for line in s.lines() {
                             let line = line.trim();
@@ -1494,10 +1700,16 @@ impl Term {
                             self.emit(&alloc::format!("$ {}", line));
                             self.run(line);
                         }
+                        for (k, v) in keys.iter().zip(saved) {
+                            match v {
+                                Some(v) => { self.vars.insert(k.clone(), v); }
+                                None => { self.vars.remove(k); }
+                            }
+                        }
                     }
                     Err(e) => self.fail(&alloc::format!("sh: {}: err {}", p, e)),
                 },
-                None => self.fail("usage: sh <file>"),
+                None => self.fail("usage: sh <file> [args...]  ($0..$N, $# in script)"),
             },
             "cal" => {
                 // cal [month [year]] — real Gregorian calendar
@@ -3685,6 +3897,7 @@ impl Term {
         "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
         "alias", "unalias", "type", "hostname", "id", "printf", "dd", "split",
         "source", "comm", "join", "paste", "expand", "unexpand", "at", "file",
+        "test", "[", "rand", "mount", "rmdir",
     ];
 
     /// Tab-complete: command names before the first space, paths after.

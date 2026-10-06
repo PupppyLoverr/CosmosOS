@@ -290,6 +290,21 @@ pub fn arp_stat() -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// Fill `buf` with random bytes — RDRAND when the CPU has it, else the
+/// kernel's rdtsc-seeded PRNG. Returns bytes written.
+pub fn rand_fill(buf: &mut [u8]) -> usize {
+    sc2(shared::SYS_RAND, buf.as_mut_ptr() as u64, buf.len() as u64) as usize
+}
+/// One random u64, or None if the syscall failed.
+pub fn rand_u64() -> Option<u64> {
+    let mut b = [0u8; 8];
+    if rand_fill(&mut b) == 8 {
+        Some(u64::from_le_bytes(b))
+    } else {
+        None
+    }
+}
+
 /// Tail of the kernel log ring buffer (`dmesg`).
 pub fn klog() -> String {
     let mut buf = alloc::vec![0u8; 16 * 1024];
