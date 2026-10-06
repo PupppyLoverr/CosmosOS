@@ -199,6 +199,7 @@ struct Term {
     prev_cwd: String,                                  // for `cd -`
     pager: Option<(Vec<String>, usize)>,               // (all lines, page top) for `more`
     httpd: Option<ustd::TcpListener>,                  // `httpd <port>` server mode
+    nc: Option<ustd::TcpSock>,                         // `nc <ip> <port>` raw session
     last_ok: bool,                                     // success of the last statement (for && / ||)
 }
 
@@ -461,7 +462,7 @@ impl Term {
                     "          head/tail [-n N] <file> sort <file>",
                     "          a | b   cmd > file   cmd >> file   watch [-n s] cmd",
                     "          df  (volume usage)  more  cal  tree  seq  sleep  sh  calc  ntp",
-                    "          httpd <port>  arp  dmesg  true  false",
+                    "          httpd <port>  arp  dmesg  nc <ip> <port>  true  false",
                     "          ops: a ; b   a && b   a || b",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
@@ -954,6 +955,27 @@ impl Term {
                 },
                 None => self.fail("usage: httpd <port>  (serves a status page, Esc stops)"),
             },
+            "nc" => {
+                match (
+                    args.first().and_then(|s| parse_ipv4(s)),
+                    args.get(1).and_then(|s| s.parse::<u16>().ok()),
+                ) {
+                    (Some(ip), Some(port)) => {
+                        let lport = 40000u16 + (ustd::uptime_ms() % 2000) as u16;
+                        match ustd::TcpSock::connect(lport, ip, port) {
+                            Some(s) => {
+                                self.emit(&alloc::format!(
+                                    "nc: connected to {}.{}.{}.{}:{} — keystrokes send, Esc closes",
+                                    ip[0], ip[1], ip[2], ip[3], port
+                                ));
+                                self.nc = Some(s);
+                            }
+                            None => self.fail(&alloc::format!("nc: connect to :{} failed", port)),
+                        }
+                    }
+                    _ => self.fail("usage: nc <a.b.c.d> <port>  (raw TCP session, Esc closes)"),
+                }
+            }
             "watch" => {
                 // watch [-n secs] <cmd...>: re-run every N secs until Esc/Enter
                 let (mut ms, mut i) = (1000u64, 0usize);
@@ -1148,6 +1170,35 @@ impl Term {
             self.dirty_all = true;
             return;
         }
+        // nc mode: keystrokes are sent raw over the socket; Esc closes
+        if let Some(s) = &self.nc {
+            match k.key as u32 {
+                x if x == KeyCode::Escape as u32 => {
+                    self.nc = None;
+                    self.cur.clear();
+                    self.cx = 0;
+                    self.push_line("nc: closed");
+                }
+                x if x == KeyCode::Enter as u32 => {
+                    let _ = s.send(b"\r\n");
+                    self.cur.clear();
+                    self.cx = 0;
+                }
+                x if x == KeyCode::Backspace as u32 => {
+                    let _ = s.send(&[0x7f]);
+                    self.cur.pop();
+                    self.cx = self.cx.saturating_sub(1);
+                }
+                x if x == KeyCode::Char as u32 => {
+                    let _ = s.send(&[k.chr]);
+                    self.cur.push(k.chr as char);
+                    self.cx += 1;
+                }
+                _ => {}
+            }
+            self.dirty_all = true;
+            return;
+        }
         // httpd mode: Esc stops the listener (other keys keep working)
         if self.httpd.is_some() && k.key == KeyCode::Escape as u32 {
             self.httpd = None; // Drop -> SYS_NET_TCP_UNLISTEN
@@ -1259,7 +1310,7 @@ impl Term {
             "uptime", "reboot", "shutdown", "exit", "history", "time",
             "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
             "set", "env", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
-            "dmesg", "arp", "httpd", "ntp",
+            "dmesg", "arp", "httpd", "ntp", "nc", "true", "false",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
@@ -1454,6 +1505,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         pipe_in: None,
         watch: None,
         httpd: None,
+        nc: None,
         last_ok: true,
         vars: alloc::collections::BTreeMap::new(),
         prev_cwd: String::new(),
@@ -1516,6 +1568,39 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                     if first.is_empty() { "conn" } else { first },
                     rip[0], rip[1], rip[2], rip[3], rport
                 ));
+                t.dirty_all = true;
+            }
+        }
+        // nc mode: drain inbound bytes; detect remote close via netstat
+        if t.nc.is_some() {
+            let lport = t.nc.as_ref().unwrap().lport;
+            let mut got = false;
+            loop {
+                let d = t.nc.as_ref().unwrap().recv(0);
+                match d {
+                    Some(d) => {
+                        got = true;
+                        let txt = String::from_utf8_lossy(&d);
+                        for l in txt.split('\n') {
+                            t.push_line(l.trim_end_matches('\r'));
+                        }
+                    }
+                    None => break,
+                }
+            }
+            if got {
+                t.dirty_all = true;
+            }
+            let tag = alloc::format!("tcp  :{} ", lport);
+            let mut alive = false;
+            for l in ustd::net_stat().lines() {
+                if l.starts_with(&tag) && !l.ends_with("Closed") {
+                    alive = true;
+                }
+            }
+            if !alive {
+                t.nc = None;
+                t.push_line("nc: remote closed the connection");
                 t.dirty_all = true;
             }
         }
