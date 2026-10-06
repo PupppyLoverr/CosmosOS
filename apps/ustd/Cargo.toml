@@ -1,0 +1,8 @@
+[package]
+name = "ustd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared = { package = "cosmos-shared", path = "../../shared" }
+linked_list_allocator = "0.10"

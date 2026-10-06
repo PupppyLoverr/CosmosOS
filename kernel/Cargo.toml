@@ -1,0 +1,25 @@
+[package]
+name = "cosmos-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bootloader_api = "0.11"
+x86_64 = "0.15"
+spin = "0.9"
+uart_16550 = "0.3"
+linked_list_allocator = "0.10"
+fat32 = { package = "cosmos-fat32", path = "../fat32" }
+pic8259 = "0.10"
+bitflags = "2"
+shared = { package = "cosmos-shared", path = "../shared" }
+
+[workspace]
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 2
+debug = true
+lto = false

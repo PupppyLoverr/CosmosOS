@@ -1,0 +1,9 @@
+[package]
+name = "cosmos-sysmon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ustd = { path = "../ustd" }
+shared = { package = "cosmos-shared", path = "../../shared" }
+font8x8 = { version = "0.3", default-features = false, features = [] }

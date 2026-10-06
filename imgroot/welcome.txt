@@ -1,0 +1,3 @@
+Welcome to CosmosOS.
+This file lives on a real FAT32 data disk, written by imgtool at build time.
+Try: ls /, cat welcome.txt, mem, ps

@@ -1,0 +1,9 @@
+[package]
+name = "fat32-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cosmos-fat32 = { path = "../fat32" }
+
+[workspace]

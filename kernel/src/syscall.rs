@@ -1,0 +1,544 @@
+//! int 0x80 syscall dispatch. nr=rax, args rdi,rsi,rdx,r8,r9 → ret rax.
+//! Runs on the faulting task's kernel stack; may block via task::yield_ctx.
+use crate::idt::CpuContext;
+use crate::{elf, fb, ipc, mem, shm, task, timer, vfs};
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use x86_64::structures::paging::PhysFrame;
+
+const ERR: u64 = u64::MAX;
+
+/// Copy `len` bytes from user buffer `ptr` (current task's address space).
+fn copy_in(ptr: u64, len: u64) -> Option<Vec<u8>> {
+    if len > 1 << 20 {
+        return None;
+    }
+    let pml4 = current_pml4()?;
+    let mut out = Vec::with_capacity(len as usize);
+    let mut off = 0u64;
+    while off < len {
+        let va = ptr + off;
+        let phys = elf::translate(pml4, va)?;
+        let chunk = (0x1000 - (va & 0xFFF)).min(len - off);
+        unsafe {
+            let src = (mem::phys_to_virt(phys)) as *const u8;
+            out.extend_from_slice(core::slice::from_raw_parts(src, chunk as usize));
+        }
+        off += chunk;
+    }
+    Some(out)
+}
+
+/// Copy bytes to user buffer `ptr`.
+fn copy_out(ptr: u64, data: &[u8]) -> Option<()> {
+    let pml4 = current_pml4()?;
+    let mut off = 0u64;
+    while off < data.len() as u64 {
+        let va = ptr + off;
+        let phys = elf::translate(pml4, va)?;
+        let chunk = ((0x1000 - (va & 0xFFF)) as usize).min(data.len() - off as usize);
+        unsafe {
+            let dst = (mem::phys_to_virt(phys)) as *mut u8;
+            core::ptr::copy_nonoverlapping(data.as_ptr().add(off as usize), dst, chunk);
+        }
+        off += chunk as u64;
+    }
+    Some(())
+}
+
+fn copy_str(ptr: u64, len: u64) -> Option<String> {
+    let bytes = copy_in(ptr, len)?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn current_pml4() -> Option<PhysFrame> {
+    task::with_current(|t| t.pml4)
+}
+
+fn cur_id() -> u32 {
+    task::current_id()
+}
+
+pub fn dispatch(ctx: &mut CpuContext) {
+    let nr = ctx.rax;
+    let (a1, a2, a3, a4) = (ctx.rdi, ctx.rsi, ctx.rdx, ctx.r8);
+    let ret: u64 = match nr {
+        shared::SYS_EXIT => {
+            task::exit_current(ctx.rdi as i64);
+        }
+        shared::SYS_YIELD => {
+            ctx.rax = 0;
+            task::yield_ctx(ctx);
+        }
+        shared::SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
+        shared::SYS_SLEEP_MS => sys_sleep(ctx, a1),
+        shared::SYS_MMAP => sys_mmap(a1),
+        shared::SYS_DEBUG => sys_debug(a1, a2),
+        shared::SYS_OPEN => sys_open(a1, a2, a3),
+        shared::SYS_CLOSE => {
+            vfs::close(a1 as i64);
+            0
+        }
+        shared::SYS_READ => sys_read(a1, a2, a3),
+        shared::SYS_WRITE => sys_write(a1, a2, a3),
+        shared::SYS_SEEK => sys_seek(a1, a2, a3),
+        shared::SYS_STAT => sys_stat(a1, a2, a3),
+        shared::SYS_READDIR => sys_readdir(a1, a2, a3, a4),
+        shared::SYS_MKDIR => sys_mkdir(a1, a2),
+        shared::SYS_REMOVE => sys_remove(a1, a2),
+        shared::SYS_RENAME => sys_rename(a1, a2, a3, a4),
+        shared::SYS_SHM_CREATE => shm::create(a1, cur_id()).map(|i| i as u64).unwrap_or(ERR),
+        shared::SYS_SHM_MAP => sys_shm_map(a1),
+        shared::SYS_SHM_DROP => {
+            task::with_current(|t| shm::release(t, a1 as u32));
+            0
+        }
+        shared::SYS_IPC_LISTEN => sys_ipc_listen(a1, a2),
+        shared::SYS_IPC_CONNECT => sys_ipc_connect(a1, a2),
+        shared::SYS_IPC_SEND => sys_ipc_send(a1, a2, a3),
+        shared::SYS_IPC_RECV => sys_ipc_recv(ctx, a1, a2, a3, a4),
+        shared::SYS_IPC_CLOSE => {
+            ipc::close(a1 as u32, cur_id());
+            task::with_current(|t| t.ports.retain(|&p| p != a1 as u32));
+            0
+        }
+        shared::SYS_MEMINFO => {
+            let (total, used, heap) = mem::meminfo();
+            let tasks = task::task_count() as u64;
+            let mi = shared::MemInfo {
+                total_kb: total / 1024,
+                used_kb: used / 1024,
+                kernel_heap_kb: heap / 1024,
+                tasks,
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(&mi as *const _ as *const u8, core::mem::size_of::<shared::MemInfo>())
+            };
+            match copy_out(a1, bytes) {
+                Some(_) => 0,
+                None => ERR,
+            }
+        }
+        shared::SYS_TIME => {
+            let dt = timer::datetime();
+            let bytes = unsafe {
+                core::slice::from_raw_parts(&dt as *const _ as *const u8, core::mem::size_of::<shared::DateTime>())
+            };
+            match copy_out(a1, bytes) {
+                Some(_) => 0,
+                None => ERR,
+            }
+        }
+        shared::SYS_UPTIME_MS => task::uptime_ms(),
+        shared::SYS_PROCLIST => sys_proclist(a1, a2),
+        shared::SYS_POWEROFF => {
+            crate::sprint!("poweroff\n");
+            power_off();
+        }
+        shared::SYS_REBOOT => {
+            crate::sprint!("reboot\n");
+            reboot();
+        }
+        shared::SYS_FB_INFO => sys_fb_info(a1),
+        shared::SYS_CHDIR => sys_chdir(a1, a2),
+        shared::SYS_GETCWD => sys_getcwd(a1, a2),
+        shared::SYS_WAITPID => sys_waitpid(ctx, a1, a2),
+        shared::SYS_KILL => sys_kill(a1),
+        _ => {
+            crate::sprint!("[syscall] unknown nr\n");
+            ERR
+        }
+    };
+    ctx.rax = ret;
+}
+
+fn sys_spawn(pptr: u64, plen: u64, aptr: u64, alen: u64) -> u64 {
+    let Some(path) = copy_str(pptr, plen) else { return ERR };
+    let args = if aptr == 0 { String::new() } else {
+        match copy_str(aptr, alen) {
+            Some(a) => a,
+            None => return ERR,
+        }
+    };
+    let full = vfs::normalize(&task::with_current(|t| t.cwd.clone()), &path);
+    match task::spawn_user(&full, &args, cur_id()) {
+        Ok(pid) => pid as u64,
+        Err(_) => ERR,
+    }
+}
+
+fn sys_mmap(size: u64) -> u64 {
+    if size == 0 || size > 64 << 20 {
+        return 0;
+    }
+    task::with_current(|t| {
+        let Some(pml4) = t.pml4 else { return 0 };
+        let base = t.mmap_next;
+        if base == 0 {
+            return 0;
+        }
+        let pages = size.div_ceil(0x1000);
+        let mut scratch = Vec::new();
+        for i in 0..pages {
+            if elf::map_user_page(pml4, base + i * 0x1000, &mut scratch).is_none() {
+                return 0;
+            }
+        }
+        t.mem_bytes += pages * 0x1000;
+        t.mmap_next += pages * 0x1000 + 0x1000; // guard page
+        base
+    })
+}
+
+fn sys_debug(ptr: u64, len: u64) -> u64 {
+    let Some(bytes) = copy_in(ptr, len.min(4096)) else { return ERR };
+    // write raw bytes to serial — apps' stderr
+    for &b in &bytes {
+        crate::serial::write_byte(b);
+    }
+    bytes.len() as u64
+}
+
+fn sys_open(pptr: u64, plen: u64, flags: u64) -> u64 {
+    let Some(path) = copy_str(pptr, plen) else { return ERR };
+    match vfs::open(&path, flags) {
+        Ok(fd) => fd as u64,
+        Err(e) => e as u64,
+    }
+}
+
+fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
+    if len > 1 << 20 {
+        return ERR;
+    }
+    let mut tmp = vec![0u8; len as usize];
+    match vfs::read(fd as i64, &mut tmp) {
+        Ok(n) => match copy_out(buf, &tmp[..n as usize]) {
+            Some(_) => n as u64,
+            None => ERR,
+        },
+        Err(e) => e as u64,
+    }
+}
+
+fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
+    let Some(data) = copy_in(buf, len.min(1 << 20)) else { return ERR };
+    match vfs::write(fd as i64, &data) {
+        Ok(n) => n as u64,
+        Err(e) => e as u64,
+    }
+}
+
+fn sys_seek(fd: u64, off: u64, whence: u64) -> u64 {
+    let pos = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) => f.pos,
+        _ => return ERR,
+    });
+    let size = match task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) => f.path.clone(),
+        _ => String::new(),
+    }) {
+        p if p.is_empty() => return ERR,
+        p => {
+            let mut g = vfs::FS.lock();
+            match g.as_mut().and_then(|fs| fs.stat(&p).ok()) {
+                Some(s) => s.size,
+                None => return ERR,
+            }
+        }
+    };
+    let new = match whence {
+        shared::SEEK_SET => off,
+        shared::SEEK_CUR => pos + off,
+        shared::SEEK_END => size + off,
+        _ => return ERR,
+    };
+    match vfs::seek(fd as i64, new) {
+        Ok(v) => v as u64,
+        Err(e) => e as u64,
+    }
+}
+
+fn sys_stat(pptr: u64, plen: u64, out: u64) -> u64 {
+    let Some(path) = copy_str(pptr, plen) else { return ERR };
+    match vfs::stat_path(&path) {
+        Ok(st) => {
+            let bytes = unsafe {
+                core::slice::from_raw_parts(&st as *const _ as *const u8, core::mem::size_of::<shared::Stat>())
+            };
+            match copy_out(out, bytes) {
+                Some(_) => 0,
+                None => ERR,
+            }
+        }
+        Err(e) => e as u64,
+    }
+}
+
+fn sys_readdir(pptr: u64, plen: u64, buf: u64, max: u64) -> u64 {
+    let Some(path) = copy_str(pptr, plen) else { return ERR };
+    match vfs::listdir(&path) {
+        Ok(mut ents) => {
+            ents.truncate(max as usize);
+            let n = ents.len();
+            let bytes = unsafe {
+                core::slice::from_raw_parts(ents.as_ptr() as *const u8, n * core::mem::size_of::<shared::DirEntry>())
+            };
+            match copy_out(buf, bytes) {
+                Some(_) => n as u64,
+                None => ERR,
+            }
+        }
+        Err(e) => e as u64,
+    }
+}
+
+fn sys_mkdir(pptr: u64, plen: u64) -> u64 {
+    let Some(path) = copy_str(pptr, plen) else { return ERR };
+    vfs::mkdir(&path).map(|_| 0).unwrap_or_else(|e| e as u64)
+}
+
+fn sys_remove(pptr: u64, plen: u64) -> u64 {
+    let Some(path) = copy_str(pptr, plen) else { return ERR };
+    vfs::remove(&path).map(|_| 0).unwrap_or_else(|e| e as u64)
+}
+
+fn sys_rename(optr: u64, olen: u64, nptr: u64, nlen: u64) -> u64 {
+    let (Some(o), Some(n)) = (copy_str(optr, olen), copy_str(nptr, nlen)) else { return ERR };
+    vfs::rename(&o, &n).map(|_| 0).unwrap_or_else(|e| e as u64)
+}
+
+fn sys_shm_map(id: u64) -> u64 {
+    task::with_current(|t| {
+        let vaddr = t.mmap_next;
+        let n = shm::map_into(t, id as u32, vaddr);
+        if n == 0 {
+            return 0;
+        }
+        t.mmap_next += n + 0x1000;
+        t.mem_bytes += n;
+        vaddr
+    })
+}
+
+fn sys_ipc_listen(nptr: u64, nlen: u64) -> u64 {
+    let Some(name) = copy_str(nptr, nlen) else { return ERR };
+    let me = cur_id();
+    let id = ipc::listen(&name, me);
+    if id != 0 {
+        task::with_current(|t| t.ports.push(id));
+    }
+    id as u64
+}
+
+fn sys_ipc_connect(nptr: u64, nlen: u64) -> u64 {
+    let Some(name) = copy_str(nptr, nlen) else { return ERR };
+    match ipc::connect(&name) {
+        Some(id) => id as u64,
+        None => ERR,
+    }
+}
+
+fn sys_ipc_send(port: u64, buf: u64, len: u64) -> u64 {
+    let Some(data) = copy_in(buf, len) else { return ERR };
+    match ipc::send(port as u32, &data) {
+        Ok(_) => 0,
+        Err(e) => e as u64,
+    }
+}
+
+fn sys_ipc_recv(ctx: &mut CpuContext, port: u64, buf: u64, buflen: u64, timeout_ms: u64) -> u64 {
+    let me = cur_id();
+    // verify ownership
+    if ipc::owner_of(port as u32) != Some(me) {
+        return ERR;
+    }
+    // Deadline is fixed on FIRST entry and kept in wait_timeout so the
+    // int-0x80 restart doesn't push it forward forever.
+    let now = task::ticks();
+    let deadline = task::with_current(|t| {
+        if t.wait_timeout == 0 {
+            t.wait_timeout = if timeout_ms == u64::MAX { u64::MAX } else { now + timeout_ms.div_ceil(10) + 1 };
+        }
+        t.wait_timeout
+    });
+    if let Some(msg) = ipc::try_recv(port as u32, me) {
+        task::with_current(|t| {
+            t.wait_timeout = 0;
+            t.wait_port = 0;
+        });
+        let n = msg.len().min(buflen as usize);
+        if copy_out(buf, &msg[..n]).is_none() {
+            return ERR;
+        }
+        return n as u64;
+    }
+    if now >= deadline {
+        task::with_current(|t| {
+            t.wait_timeout = 0;
+            t.wait_port = 0;
+        });
+        return 0;
+    }
+    // block: rewind to re-execute int 0x80 on wake (rax still holds nr)
+    task::with_current(|t| {
+        t.state = task::State::Blocked;
+        t.wait_port = port as u32;
+        t.wake_at = deadline;
+    });
+    ctx.rip -= 2;
+    task::yield_ctx(ctx);
+}
+
+fn sys_sleep(ctx: &mut CpuContext, ms: u64) -> u64 {
+    let now = task::ticks();
+    let (dl, sleeping) = task::with_current(|t| (t.sleep_deadline, t.sleep_deadline != 0));
+    if !sleeping {
+        let dl = now + ms.div_ceil(10) + 1;
+        task::with_current(|t| t.sleep_deadline = dl);
+        if now < dl {
+            block_reenter(ctx, dl, 0);
+        }
+        task::with_current(|t| t.sleep_deadline = 0);
+        return 0;
+    }
+    if now < dl {
+        block_reenter(ctx, dl, 0);
+    }
+    task::with_current(|t| t.sleep_deadline = 0);
+    0
+}
+
+fn sys_waitpid(ctx: &mut CpuContext, pid: u64, timeout_ms: u64) -> u64 {
+    if !task::exists(pid as u32) {
+        return ERR;
+    }
+    let now = task::ticks();
+    if let Some(code) = task::child_exit(pid as u32) {
+        task::with_current(|t| t.wait_timeout = 0);
+        return code as u64;
+    }
+    let dl = task::with_current(|t| {
+        if t.wait_timeout == 0 {
+            t.wait_timeout = if timeout_ms == u64::MAX { u64::MAX } else { now + timeout_ms.div_ceil(10) + 1 };
+        }
+        t.wait_timeout
+    });
+    if now >= dl {
+        task::with_current(|t| {
+            t.wait_timeout = 0;
+            t.waiting_on = 0;
+        });
+        return ERR;
+    }
+    task::with_current(|t| {
+        t.state = task::State::Blocked;
+        t.waiting_on = pid as u32;
+        t.wake_at = dl;
+    });
+    ctx.rip -= 2;
+    task::yield_ctx(ctx);
+}
+
+fn sys_kill(pid: u64) -> u64 {
+    match task::kill_pid(pid as u32) {
+        true => 0,
+        false => ERR,
+    }
+}
+
+/// Mark current task blocked until `deadline` ticks, rewind rip so the syscall
+/// re-executes on wake, and yield to the scheduler.
+fn block_reenter(ctx: &mut CpuContext, deadline: u64, wait_port: u32) -> ! {
+    task::with_current(|t| {
+        t.state = task::State::Blocked;
+        t.wake_at = deadline;
+        t.wait_port = wait_port;
+    });
+    ctx.rip -= 2;
+    task::yield_ctx(ctx);
+}
+
+fn sys_proclist(buf: u64, max: u64) -> u64 {
+    let max = max.min(256);
+    let mut list = vec![shared::ProcInfo::default(); max as usize];
+    let n = task::proclist(&mut list);
+    let bytes = unsafe {
+        core::slice::from_raw_parts(list.as_ptr() as *const u8, n * core::mem::size_of::<shared::ProcInfo>())
+    };
+    match copy_out(buf, bytes) {
+        Some(_) => n as u64,
+        None => ERR,
+    }
+}
+
+fn sys_fb_info(out: u64) -> u64 {
+    let Some(pml4) = current_pml4() else { return ERR };
+    let me = cur_id();
+    match fb::claim_and_map(pml4, me) {
+        Ok(info) => {
+            let bytes = unsafe {
+                core::slice::from_raw_parts(&info as *const _ as *const u8, core::mem::size_of::<shared::FbInfo>())
+            };
+            match copy_out(out, bytes) {
+                Some(_) => 0,
+                None => ERR,
+            }
+        }
+        Err(_) => ERR,
+    }
+}
+
+fn sys_chdir(pptr: u64, plen: u64) -> u64 {
+    let Some(path) = copy_str(pptr, plen) else { return ERR };
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let full = vfs::normalize(&cwd, &path);
+    // verify it's a dir
+    let mut g = vfs::FS.lock();
+    let ok = match g.as_mut() {
+        Some(fs) => fs.stat(&full).map(|e| e.is_dir).unwrap_or(false),
+        None => false,
+    };
+    drop(g);
+    if !ok {
+        return ERR;
+    }
+    task::with_current(|t| t.cwd = full);
+    0
+}
+
+fn sys_getcwd(buf: u64, len: u64) -> u64 {
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let bytes = cwd.as_bytes();
+    let n = bytes.len().min(len as usize);
+    match copy_out(buf, &bytes[..n]) {
+        Some(_) => n as u64,
+        None => ERR,
+    }
+}
+
+fn power_off() -> ! {
+    // QEMU q35 ACPI shutdown
+    unsafe {
+        use x86_64::instructions::port::Port;
+        let mut p: Port<u16> = Port::new(0x604);
+        p.write(0x2000u16);
+        let mut p2: Port<u16> = Port::new(0xB004); // piix4 fallback
+        p2.write(0x2000u16);
+    }
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn reboot() -> ! {
+    unsafe {
+        use x86_64::instructions::port::Port;
+        let mut p: Port<u8> = Port::new(0x64);
+        p.write(0xFEu8);
+    }
+    loop {
+        x86_64::instructions::hlt();
+    }
+}

@@ -1,0 +1,7 @@
+[package]
+name = "cosmos-imgtool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fatfs = "0.3"
