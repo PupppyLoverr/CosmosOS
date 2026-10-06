@@ -160,6 +160,19 @@ pub fn dispatch(ctx: &mut CpuContext) {
             ];
             net::ping(ip, a2.min(10_000)).unwrap_or(ERR)
         }
+        shared::SYS_NET_DNS => {
+            let Some(name) = copy_str(a1, a2.min(253)) else {
+                ctx.rax = ERR;
+                return;
+            };
+            match net::dns_query(&name, 3000) {
+                Some(ip) => match copy_out(a3, &ip) {
+                    Some(_) => 0,
+                    None => ERR,
+                },
+                None => ERR,
+            }
+        }
         shared::SYS_NET_INFO => match net::info() {
             Some((mac, ip)) => {
                 let mut b = [0u8; 10];

@@ -136,10 +136,16 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         // ping the user-net gateway (10.0.2.2) — real ARP + ICMP round trip
         let gw = 0x0A000202u32; // 10.0.2.2
         check("ping-gw", ustd::net_ping(gw, 3000).is_some());
+        // real DNS over real UDP to slirp's resolver (10.0.2.3:53)
+        check(
+            "dns-resolve",
+            ustd::net_dns("example.com").is_some(),
+        );
     } else {
         check("net-mac", false);
         check("net-ip", false);
         check("ping-gw", false);
+        check("dns-resolve", false);
     }
 
     let (pass, fail) = unsafe { (PASS, FAIL) };

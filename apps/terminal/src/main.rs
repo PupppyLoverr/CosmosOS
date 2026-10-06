@@ -115,7 +115,7 @@ impl Term {
             "help" => {
                 for l in [
                     "commands: help ls cd pwd cat mkdir touch rm mv cp echo",
-                    "          clear ps mem uname whoami date ping ifconfig",
+                    "          clear ps mem uname whoami date ping resolve ifconfig",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -270,6 +270,16 @@ impl Term {
                     None => self.push_line(&alloc::format!("ping: bad ip '{}'", s)),
                 },
                 None => self.push_line("usage: ping <a.b.c.d>  (try 10.0.2.2)"),
+            },
+            "resolve" => match args.first() {
+                Some(host) => match ustd::net_dns(host) {
+                    Some(ip) => self.push_line(&alloc::format!(
+                        "{} -> {}.{}.{}.{}",
+                        host, ip[0], ip[1], ip[2], ip[3]
+                    )),
+                    None => self.push_line(&alloc::format!("resolve: {}: no answer", host)),
+                },
+                None => self.push_line("usage: resolve <hostname>  (real DNS over UDP/53)"),
             },
             "ifconfig" => match ustd::net_info() {
                 Some((mac, ip)) => {

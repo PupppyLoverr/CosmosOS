@@ -39,7 +39,8 @@ fn now_ms() -> u64 {
 
 /// Drain the device rx queue (and anything IRQ-drained) into the handlers.
 /// Net is polled, not interrupt-driven: virtio-net IRQs are not wired up.
-fn pump_rx() -> Vec<Vec<u8>> {
+/// Returns (ip_proto, transport_payload) for IPv4 frames addressed to us.
+fn pump_rx() -> Vec<(u8, Vec<u8>)> {
     let mut out = Vec::new();
     for f in virtio_net::take_rx() {
         if let Some(p) = handle_frame(&f) {
@@ -117,27 +118,13 @@ fn send_icmp_echo(dst_mac: [u8; 6], dst_ip: [u8; 4], id: u16, seq: u16, payload:
     icmp.extend_from_slice(payload);
     let c = csum(&icmp);
     put16(&mut icmp[2..], c);
-
-    let mut ip = Vec::with_capacity(20 + icmp.len());
-    ip.push(0x45); // v4, ihl 5
-    ip.push(0);
-    ip.extend_from_slice(&((20 + icmp.len()) as u16).to_be_bytes());
-    ip.extend_from_slice(&1u16.to_be_bytes()); // id
-    ip.extend_from_slice(&[0u8; 2]); // flags+frag
-    ip.push(64); // ttl
-    ip.push(1); // proto icmp
-    ip.extend_from_slice(&[0u8; 2]);
-    ip.extend_from_slice(&OUR_IP);
-    ip.extend_from_slice(&dst_ip);
-    let c = csum(&ip);
-    put16(&mut ip[10..], c);
-    ip.extend_from_slice(&icmp);
-    let _ = send_frame(dst_mac, 0x0800, &ip);
+    send_ip(dst_mac, dst_ip, 1, &icmp);
 }
 
-/// Handle one ethernet frame: ARP cache/reply, or deliver ICMP payload.
-/// Returns Some(ip_payload) when the frame carried IPv4 for our IP.
-fn handle_frame(f: &[u8]) -> Option<Vec<u8>> {
+/// Handle one ethernet frame: ARP cache/reply, or deliver an IPv4 payload.
+/// Returns Some((ip_proto, transport_payload)) when the frame carried IPv4
+/// addressed to our IP.
+fn handle_frame(f: &[u8]) -> Option<(u8, Vec<u8>)> {
     if f.len() < 14 {
         return None;
     }
@@ -178,7 +165,7 @@ fn handle_frame(f: &[u8]) -> Option<Vec<u8>> {
             if dst != OUR_IP {
                 return None;
             }
-            Some(ip[ihl..].to_vec())
+            Some((ip[9], ip[ihl..].to_vec()))
         }
         _ => None,
     }
@@ -228,9 +215,126 @@ pub fn ping(ip: [u8; 4], timeout_ms: u64) -> Option<u64> {
     let t0 = now_ms();
     send_icmp_echo(dst_mac, ip, id, seq, payload);
     loop {
-        for p in pump_rx() {
-            if p.len() >= 8 && p[0] == 0 && be16(&p[4..]) == id && be16(&p[6..]) == seq {
+        for (proto, p) in pump_rx() {
+            if proto == 1 && p.len() >= 8 && p[0] == 0 && be16(&p[4..]) == id && be16(&p[6..]) == seq {
                 return Some(now_ms() - t0);
+            }
+        }
+        if now_ms() - t0 >= timeout_ms {
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+fn send_ip(dst_mac: [u8; 6], dst_ip: [u8; 4], proto: u8, payload: &[u8]) {
+    let mut ip = Vec::with_capacity(20 + payload.len());
+    ip.push(0x45);
+    ip.push(0);
+    ip.extend_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
+    ip.extend_from_slice(&1u16.to_be_bytes());
+    ip.extend_from_slice(&[0u8; 2]);
+    ip.push(64);
+    ip.push(proto);
+    ip.extend_from_slice(&[0u8; 2]);
+    ip.extend_from_slice(&OUR_IP);
+    ip.extend_from_slice(&dst_ip);
+    let c = csum(&ip);
+    put16(&mut ip[10..], c);
+    ip.extend_from_slice(payload);
+    let _ = send_frame(dst_mac, 0x0800, &ip);
+}
+
+/// UDP send (IPv4 UDP checksum is optional — 0 means "none").
+fn send_udp(dst_mac: [u8; 6], dst_ip: [u8; 4], sport: u16, dport: u16, payload: &[u8]) {
+    let mut udp = Vec::with_capacity(8 + payload.len());
+    udp.extend_from_slice(&sport.to_be_bytes());
+    udp.extend_from_slice(&dport.to_be_bytes());
+    udp.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    udp.extend_from_slice(&[0u8; 2]); // checksum disabled (valid in IPv4)
+    udp.extend_from_slice(payload);
+    send_ip(dst_mac, dst_ip, 17, &udp);
+}
+
+/// Skip a DNS name (labels or a compression pointer) starting at `i`.
+/// Returns index just past it.
+fn dns_skip_name(m: &[u8], mut i: usize) -> Option<usize> {
+    loop {
+        let l = *m.get(i)?;
+        if l == 0 {
+            return Some(i + 1);
+        }
+        if l & 0xC0 == 0xC0 {
+            return Some(i + 2); // compression pointer
+        }
+        i += 1 + l as usize;
+    }
+}
+
+/// `resolve <hostname>`: real DNS A-record query to the slirp resolver
+/// (10.0.2.3:53) over real UDP. Returns the first A record.
+pub fn dns_query(name: &str, timeout_ms: u64) -> Option<[u8; 4]> {
+    const DNS: [u8; 4] = [10, 0, 2, 3];
+    const SPORT: u16 = 43210;
+    let txid = 0xC05Au16;
+    // build query: hdr + qname labels + qtype A + qclass IN
+    let mut q = Vec::new();
+    q.extend_from_slice(&txid.to_be_bytes());
+    q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+    q.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+    q.extend_from_slice(&[0u8; 6]); // an/ns/ar = 0
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0);
+    q.extend_from_slice(&1u16.to_be_bytes()); // A
+    q.extend_from_slice(&1u16.to_be_bytes()); // IN
+
+    let mac = arp_resolve(DNS, 1500)?;
+    send_udp(mac, DNS, SPORT, 53, &q);
+    sprintln!("[net] dns query '{}' -> 10.0.2.3:53", name);
+
+    let t0 = now_ms();
+    loop {
+        for (proto, p) in pump_rx() {
+            if proto != 17 || p.len() < 8 + 12 {
+                continue;
+            }
+            let sport = be16(&p[0..]);
+            let dport = be16(&p[2..]);
+            if sport != 53 || dport != SPORT {
+                continue;
+            }
+            let m = &p[8..];
+            if be16(&m[0..]) != txid || m[2] & 0x80 == 0 {
+                continue; // not our reply
+            }
+            let ancount = be16(&m[6..]) as usize;
+            let qdcount = be16(&m[4..]) as usize;
+            let mut i = 12;
+            for _ in 0..qdcount {
+                i = dns_skip_name(m, i)? + 4;
+            }
+            for _ in 0..ancount {
+                i = dns_skip_name(m, i)?;
+                if m.len() < i + 10 {
+                    return None;
+                }
+                let rtype = be16(&m[i..]);
+                let rdlen = be16(&m[i + 8..]) as usize;
+                if rtype == 1 && rdlen == 4 && m.len() >= i + 10 + 4 {
+                    let ip: [u8; 4] = m[i + 10..i + 14].try_into().ok()?;
+                    sprintln!(
+                        "[net] dns '{}' -> {}.{}.{}.{}",
+                        name, ip[0], ip[1], ip[2], ip[3]
+                    );
+                    return Some(ip);
+                }
+                i += 10 + rdlen;
             }
         }
         if now_ms() - t0 >= timeout_ms {
