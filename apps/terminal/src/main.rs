@@ -574,6 +574,37 @@ impl Term {
         out
     }
 
+    /// Expand one glob arg (`dir/pat` or bare `pat` against cwd).
+    /// Returns the matching paths (dir-prefixed when a dir part was given),
+    /// or the arg itself untouched when nothing matches — shell semantics.
+    fn glob_expand(&self, arg: &str) -> Vec<String> {
+        if !arg.contains('*') && !arg.contains('?') {
+            return alloc::vec![String::from(arg)];
+        }
+        let (dir, pat) = match arg.rfind('/') {
+            Some(i) => (&arg[..i + 1], &arg[i + 1..]),
+            None => ("", arg),
+        };
+        let read_dir = if dir.is_empty() {
+            ustd::getcwd()
+        } else {
+            String::from(dir.trim_end_matches('/'))
+        };
+        let mut out = Vec::new();
+        if let Ok(ents) = ustd::readdir(&read_dir) {
+            for e in &ents {
+                let name = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("");
+                if wild_match(pat, name) {
+                    out.push(alloc::format!("{}{}", dir, name));
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push(String::from(arg));
+        }
+        out
+    }
+
     /// Lines per `more` page. The scrollback region is rows_vis-1 (prompt
     /// row) and the --More-- status row eats another: h/16 - 3 so a full
     /// page fits without clipping its first line.
@@ -787,7 +818,20 @@ impl Term {
         let input = expanded.as_str();
         let mut it = input.split_whitespace();
         let cmd = it.next().unwrap_or("");
-        let args: Vec<&str> = it.collect();
+        let mut args: Vec<&str> = it.collect();
+        // glob expansion for filesystem commands: args containing * ? are
+        // expanded against the target dir's entries (unmatched args pass
+        // through literally, like a real shell)
+        const GLOBBABLE: &[&str] = &[
+            "ls", "cat", "rm", "cp", "mv", "du", "wc", "head", "tail", "hex", "stat",
+            "sha256sum", "strings", "sort", "uniq", "cut", "more", "diff", "base64",
+            "show", "tar",
+        ];
+        let mut gexp = Vec::new();
+        if GLOBBABLE.contains(&cmd) && args.iter().any(|a| a.contains('*') || a.contains('?')) {
+            gexp = args.iter().flat_map(|a| self.glob_expand(a)).collect();
+            args = gexp.iter().map(|s| s.as_str()).collect();
+        }
         // optimistic success — fail() marks the statement failed; $? /
         // && / || read this after the command finishes
         self.last_ok = true;
@@ -807,6 +851,7 @@ impl Term {
                     "          diff <a> <b>  stat <path>  sort -n/-r/-u  wc -l/-w/-c",
                     "          uniq [-c]  tr [-d] <a> <b>  cut -d X -f N  tee [-a] <file>",
                     "          base64 [-d] <file>  sha256sum <file..>  tar cf|tf|xf  echo -n",
+                    "          show <file.ppm> (image viewer)  globs: ls *.txt  cat *.ppm",
                     "          ops: a ; b   a && b   a || b   drag-select copies to clipboard",
                     "          more: Space/b page, / search, n next",
                     "          reboot shutdown exit",
@@ -818,6 +863,13 @@ impl Term {
             "ls" => {
                 let p = args.first().copied().unwrap_or(".");
                 let dir = if p == "." { ustd::getcwd() } else { String::from(p) };
+                // a file (not dir) arg lists the file itself
+                if let Ok(st) = ustd::stat(&dir) {
+                    if st.is_dir == 0 {
+                        self.emit(&alloc::format!("  {}  ({} B)", dir, st.size));
+                        return;
+                    }
+                }
                 match ustd::readdir(&dir) {
                     Ok(ents) => {
                         if ents.is_empty() {
@@ -1460,15 +1512,24 @@ impl Term {
                     .and_then(|i| args.get(i + 1))
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(10);
+                // keep the raw byte count for `wc -c` (lossy UTF-8 decode
+                // inflates binary files via U+FFFD replacements)
+                let mut blen = 0usize;
                 let content = match popt {
                     Some(p) => match ustd::read_all(p) {
-                        Ok(d) => Some(String::from_utf8_lossy(&d).into_owned()),
+                        Ok(d) => {
+                            blen = d.len();
+                            Some(String::from_utf8_lossy(&d).into_owned())
+                        }
                         Err(e) => {
                             self.fail(&alloc::format!("{}: {}: err {}", cmd, p, e));
                             None
                         }
                     },
-                    None => self.pipe_in.clone(),
+                    None => {
+                        blen = self.pipe_in.as_ref().map(|s| s.len()).unwrap_or(0);
+                        self.pipe_in.clone()
+                    }
                 };
                 match content {
                     Some(s) => {
@@ -1495,8 +1556,8 @@ impl Term {
                             match (fl, fw, fc) {
                                 (true, false, false) => self.emit(&alloc::format!("{}", l)),
                                 (false, true, false) => self.emit(&alloc::format!("{}", w)),
-                                (false, false, true) => self.emit(&alloc::format!("{}", s.len())),
-                                _ => self.emit(&alloc::format!("  {} lines {} words {} bytes", l, w, s.len())),
+                                (false, false, true) => self.emit(&alloc::format!("{}", blen)),
+                                _ => self.emit(&alloc::format!("  {} lines {} words {} bytes", l, w, blen)),
                             }
                         } else if cmd == "sort" {
                             if args.iter().any(|a| a == &"-n") {
@@ -2048,6 +2109,13 @@ impl Term {
             "reboot" => ustd::reboot(),
             "shutdown" | "poweroff" => ustd::poweroff(),
             "exit" => self.win.close(),
+            "show" => match args.first() {
+                Some(p) => match ustd::spawn("/bin/cosmos-view", p) {
+                    Ok(pid) => self.emit(&alloc::format!("spawned view (pid {})", pid)),
+                    Err(_) => self.fail("show: spawn failed"),
+                },
+                None => self.fail("usage: show <file.ppm>"),
+            },
             _ => {
                 // try running it as a binary
                 let path = alloc::format!("/bin/{}", cmd);
@@ -2304,7 +2372,7 @@ impl Term {
             "set", "env", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
             "dmesg", "arp", "httpd", "ntp", "nc", "fserve", "fget", "true", "false",
             "shot", "find", "killall", "basename", "dirname", "strings", "diff", "stat",
-            "uniq", "tr", "cut", "tee", "base64", "sha256sum", "tar",
+            "uniq", "tr", "cut", "tee", "base64", "sha256sum", "tar", "show",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];

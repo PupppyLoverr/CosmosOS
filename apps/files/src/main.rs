@@ -176,7 +176,12 @@ impl Files {
         let i = self.sel as usize;
         let name = Self::entry_name(&self.ents[i]);
         let path = alloc::format!("{}{}{}", self.cwd, if self.cwd.ends_with('/') { "" } else { "/" }, name);
-        match ustd::spawn("/bin/cosmos-editor", &path) {
+        let app = if name.to_ascii_lowercase().ends_with(".ppm") {
+            "/bin/cosmos-view"
+        } else {
+            "/bin/cosmos-editor"
+        };
+        match ustd::spawn(app, &path) {
             Ok(_) => self.status = alloc::format!("opened {}", name),
             Err(_) => self.status = alloc::format!("spawn failed"),
         }
