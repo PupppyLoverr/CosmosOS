@@ -53,6 +53,7 @@ struct Term {
     needs_cursor_flip: bool,
     capture: Option<Vec<String>>, // output capture for pipes/redirects
     pipe_in: Option<String>,     // stdin text delivered by the previous stage
+    watch: Option<(String, u64, u64)>, // (cmd, interval_ms, last_run_ms)
 }
 
 impl Term {
@@ -217,7 +218,7 @@ impl Term {
                     "          netstat kill <pid> grep <pat> <file> (or -r <dir>) uptime",
                     "          hex <file> wc <file> du <path> history time <cmd>",
                     "          head/tail [-n N] <file> sort <file>",
-                    "          a | b   cmd > file   cmd >> file",
+                    "          a | b   cmd > file   cmd >> file   watch [-n s] cmd",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -511,6 +512,25 @@ impl Term {
                 }
                 None => self.emit("usage: du <path>  (recursive bytes)"),
             },
+            "watch" => {
+                // watch [-n secs] <cmd...>: re-run every N secs until Esc/Enter
+                let (mut ms, mut i) = (1000u64, 0usize);
+                if args.first() == Some(&"-n") {
+                    ms = args
+                        .get(1)
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(1)
+                        .max(1)
+                        * 1000;
+                    i = 2;
+                }
+                if args.len() <= i {
+                    self.emit("usage: watch [-n secs] <cmd...>  (Esc/Enter exits)");
+                } else {
+                    self.watch = Some((args[i..].join(" "), ms, 0));
+                    self.emit(&alloc::format!("watching every {}ms — Esc/Enter to stop", ms));
+                }
+            }
             "history" => {
                 for i in 0..self.hist.len() {
                     let line = alloc::format!("  {:>3}  {}", i + 1, self.hist[i]);
@@ -623,6 +643,15 @@ impl Term {
         if k.down == 0 {
             return;
         }
+        // during watch mode, Esc or Enter stops it; other keys are ignored
+        if self.watch.is_some() {
+            if k.key == KeyCode::Escape as u32 || k.key == KeyCode::Enter as u32 {
+                self.watch = None;
+                self.push_line("watch stopped");
+                self.dirty_all = true;
+            }
+            return;
+        }
         // Ctrl+L clears the screen
         if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 && (k.chr == b'l' || k.chr == b'L') {
             self.lines.clear();
@@ -705,7 +734,7 @@ impl Term {
             "echo", "clear", "ps", "mem", "uname", "whoami", "date", "ping",
             "resolve", "httpget", "ifconfig", "dhcp", "netstat", "kill", "grep",
             "uptime", "reboot", "shutdown", "exit", "history", "time",
-            "head", "tail", "sort", "wc", "hex", "du",
+            "head", "tail", "sort", "wc", "hex", "du", "watch",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
@@ -898,6 +927,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         needs_cursor_flip: true,
         capture: None,
         pipe_in: None,
+        watch: None,
     };
     t.load_hist();
     t.push_line("CosmosOS terminal - type 'help'");
@@ -934,6 +964,21 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             _ => {}
         }
         let now = ustd::uptime_ms();
+        // watch mode: re-run the command, repaint with fresh output
+        if let Some((cmd, ms, last)) = t.watch.clone() {
+            if now - last >= ms {
+                let out = t.run_captured(&cmd);
+                let hdr = alloc::format!("$ {}   (every {}ms — Esc/Enter to stop)", cmd, ms);
+                t.lines.clear();
+                t.view = 0;
+                t.push_line(&hdr);
+                for l in out.iter().take(30) {
+                    t.push_line(l);
+                }
+                t.watch = Some((cmd, ms, now));
+                t.dirty_all = true;
+            }
+        }
         if now - last_blink >= 500 {
             last_blink = now;
             t.needs_cursor_flip = !t.needs_cursor_flip;
