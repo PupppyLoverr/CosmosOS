@@ -180,6 +180,7 @@ fn main_loop() -> ! {
                 ("System Monitor", "/bin/cosmos-sysmon"),
                 ("Demo", "/bin/cosmos-demo"),
                 ("Calculator", "/bin/cosmos-calc"),
+                ("Paint", "/bin/cosmos-paint"),
             ],
             sel: -1,
         },
@@ -317,6 +318,7 @@ fn on_key(s: &mut S, k: &InputKey) {
             x if x == KeyCode::F8 as u32 => Some("/bin/cosmos-sysmon"),
             x if x == KeyCode::F9 as u32 => Some("/bin/cosmos-demo"),
             x if x == KeyCode::F10 as u32 => Some("/bin/cosmos-calc"),
+            x if x == KeyCode::F11 as u32 => Some("/bin/cosmos-paint"),
             _ => None,
         };
         if let Some(p) = app {
