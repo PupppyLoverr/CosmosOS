@@ -203,14 +203,16 @@ fn main_loop() -> ! {
             progressed = true;
             handle_req(&mut s, &buf[..n]);
         }
-        // per-second taskbar refresh
+        // per-second taskbar refresh — mark dirty and let the single
+        // composite path below do the drawing (composite() itself draws
+        // taskbar + cursor). Never clear dirty without compositing: a
+        // dropped composite leaves stale window pixels ("ghost" windows).
         let up = ustd::uptime_ms();
         if up / 1000 != s.last_tick {
             s.last_tick = up / 1000;
-            draw_taskbar(&s);
-            blit_cursor(&s, unsafe { MX }, unsafe { MY });
-            s.dirty = false;
-        } else if s.dirty {
+            s.dirty = true;
+        }
+        if s.dirty {
             composite(&mut s);
             s.dirty = false;
         }
