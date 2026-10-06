@@ -9,6 +9,26 @@ use spin::Mutex;
 
 pub static FS: Mutex<Option<Fat32<crate::virtio::BlkDev>>> = Mutex::new(None);
 
+// ---- file-IO accounting for /proc/iostat ----
+// Counts user-visible read()/write() calls and requested byte counts,
+// not device sectors (that's the layer a real OS reports at /proc/diskstats).
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static RD_OPS: AtomicU64 = AtomicU64::new(0);
+static RD_BYTES: AtomicU64 = AtomicU64::new(0);
+static WR_OPS: AtomicU64 = AtomicU64::new(0);
+static WR_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub fn io_stats() -> (u64, u64, u64, u64) {
+    (
+        RD_OPS.load(Ordering::Relaxed),
+        RD_BYTES.load(Ordering::Relaxed),
+        WR_OPS.load(Ordering::Relaxed),
+        WR_BYTES.load(Ordering::Relaxed),
+    )
+}
+
 pub fn init() -> bool {
     let Some(dev) = crate::virtio::block_device() else {
         sprintln!("[vfs] no block device");
@@ -165,6 +185,8 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
 
 /// read up to buf.len() bytes at the fd's current position
 pub fn read(fd: i64, buf: &mut [u8]) -> Result<i64, i64> {
+    RD_OPS.fetch_add(1, Ordering::Relaxed);
+    RD_BYTES.fetch_add(buf.len() as u64, Ordering::Relaxed);
     let (path, pos) = task::with_current(|t| match t.fds.get(fd as usize) {
         Some(Some(f)) => (f.path.clone(), f.pos),
         _ => (String::new(), u64::MAX),
@@ -208,6 +230,8 @@ pub fn read(fd: i64, buf: &mut [u8]) -> Result<i64, i64> {
 }
 
 pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
+    WR_OPS.fetch_add(1, Ordering::Relaxed);
+    WR_BYTES.fetch_add(buf.len() as u64, Ordering::Relaxed);
     let (path, pos, flags) = task::with_current(|t| match t.fds.get(fd as usize) {
         Some(Some(f)) => (f.path.clone(), f.pos, f.flags),
         _ => (String::new(), u64::MAX, 0u64),

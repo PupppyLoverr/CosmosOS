@@ -76,6 +76,7 @@ pub const SYS_BEEP: u64 = 76;             // (freq_hz, ms) -> 0  PC speaker via 
 pub const SYS_GETPID: u64 = 77;           // () -> pid
 pub const SYS_NICE: u64 = 78;             // (pid, nice) -> stored nice | -3
 pub const SYS_PCAP: u64 = 79;             // (op, buf, cap) -> varies (see pcap.rs)
+pub const SYS_STRACE: u64 = 80;           // (op,pid,buf,cap): 0 start 1 stop 2 drain
 pub const SYS_ERR: u64 = u64::MAX;
 
 // open flags

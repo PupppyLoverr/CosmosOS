@@ -14,6 +14,7 @@ const FILES: &[&str] = &[
     "filesystems",
     "cmdline",
     "tasks",
+    "iostat",
     "netstat",
     "partitions",
 ];
@@ -188,6 +189,10 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/mounts" => alloc::format!("virtio-blk / fat32 rw 0 0\nproc /proc proc ro 0 0\n"),
         "/proc/filesystems" => alloc::format!("fat32\nproc\n"),
         "/proc/cmdline" => alloc::format!("BOOT=uefi\n"),
+        "/proc/iostat" => {
+            let (ro, rb, wo, wb) = crate::vfs::io_stats();
+            alloc::format!("reads {} {}\nwrites {} {}\n", ro, rb, wo, wb)
+        }
         "/proc/tasks" => {
             let mut buf = [shared::ProcInfo::default(); 64];
             let n = task::proclist(&mut buf);
