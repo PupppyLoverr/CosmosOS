@@ -60,6 +60,8 @@ pub struct Task {
     pub wait_timeout: u64,   // tick deadline for timed waits (0 = none)
     pub cpu_ticks: u64,      // PIT ticks this task has run (per-task CPU time)
     pub argv: String,        // spawn arg string (for /proc/<pid>/cmdline)
+    pub nice: i8,            // -20 (highest prio) ..= 19 (lowest); 0 = normal
+    pub vrun: u64,           // virtual runtime (scaled by nice) for fair scheduling
 }
 
 pub struct Sched {
@@ -101,6 +103,8 @@ pub fn init() {
         sleep_deadline: 0,
         wait_timeout: 0,
         cpu_ticks: 0,
+        nice: 0,
+        vrun: 0,
     };
     *SCHED.lock() = Some(Sched { tasks: vec![Box::new(boot)], cur: 0, next_pid: 1 });
 }
@@ -124,6 +128,11 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
     let s = g.as_mut().unwrap();
     s.tasks[s.cur].saved_rsp = saved;
     s.tasks[s.cur].cpu_ticks += 1; // the outgoing task owned this interval
+    // charge virtual runtime: weight = 40 - nice (-20..=19 -> 60..=21)
+    {
+        let t = &mut s.tasks[s.cur];
+        t.vrun += 4000 / (40 - t.nice as i64) as u64;
+    }
     // wake sleepers (sleep + timed waits)
     for t in s.tasks.iter_mut() {
         if t.state == State::Blocked && t.wake_at <= ticks() && t.waiting_on == 0 {
@@ -133,20 +142,26 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
     // wake port receivers whose queues filled
     crate::ipc::wake_receivers(s);
     let n = s.tasks.len();
-    let mut next = s.cur;
-    let mut found = false;
-    for i in 1..=n {
-        let t = &s.tasks[(s.cur + i) % n];
+    // CFS-lite: run the runnable task with the smallest virtual runtime.
+    // Scan starts just past `cur` so equal vruns still round-robin.
+    let mut best: Option<(u64, usize)> = None;
+    for off in 1..=n {
+        let i = (s.cur + off) % n;
+        let t = &s.tasks[i];
         if t.state == State::Running {
-            next = (s.cur + i) % n;
-            found = true;
-            break;
+            match best {
+                Some((v, _)) if t.vrun >= v => {}
+                _ => best = Some((t.vrun, i)),
+            }
         }
     }
-    if !found {
-        IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
-        return saved; // stay on current (idle) context
-    }
+    let next = match best {
+        Some((_, i)) => i,
+        None => {
+            IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
+            return saved; // stay on current (idle) context
+        }
+    };
     s.cur = next;
     activate(&s.tasks[next]);
     s.tasks[next].saved_rsp
@@ -337,6 +352,8 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         sleep_deadline: 0,
         wait_timeout: 0,
         cpu_ticks: 0,
+        nice: 0,
+        vrun: s.tasks[s.cur].vrun,
     };
     s.tasks.push(Box::new(t));
     sprintln!("[task] spawned pid={} '{}' entry={:#x}", pid, name, entry);
@@ -390,6 +407,8 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         sleep_deadline: 0,
         wait_timeout: 0,
         cpu_ticks: 0,
+        nice: 0,
+        vrun: s.tasks[s.cur].vrun,
     }));
     pid
 }
@@ -627,8 +646,8 @@ pub fn pids() -> Vec<u32> {
         .unwrap_or_default()
 }
 
-/// (name, argv, mem_bytes, cpu_ticks, is_user, state) for /proc/<pid>/*.
-pub fn pid_info(pid: u32) -> Option<(String, String, u64, u64, bool, &'static str)> {
+/// (name, argv, mem_bytes, cpu_ticks, is_user, state, nice, vrun) for /proc/<pid>/*.
+pub fn pid_info(pid: u32) -> Option<(String, String, u64, u64, bool, &'static str, i8, u64)> {
     let g = SCHED.lock();
     let s = g.as_ref()?;
     s.tasks.iter().find(|t| t.id == pid).map(|t| {
@@ -643,6 +662,8 @@ pub fn pid_info(pid: u32) -> Option<(String, String, u64, u64, bool, &'static st
                 State::Blocked => "S (sleeping)",
                 State::Dead => "Z (dead)",
             },
+            t.nice,
+            t.vrun,
         )
     })
 }
@@ -659,4 +680,24 @@ pub fn fd_list(pid: u32) -> Option<String> {
         }
     }
     Some(out)
+}
+
+
+/// SYS_NICE: set scheduling priority (-20 high ..= 19 low, clamped).
+/// pid 0 = caller. Returns the stored nice value or -1000 (no such pid).
+pub fn set_nice(pid: u32, nice: i64) -> i64 {
+    let pid = if pid == 0 { current_id() } else { pid };
+    let n = nice.clamp(-20, 19) as i8;
+    let mut g = SCHED.lock();
+    let s = match g.as_mut() {
+        Some(s) => s,
+        None => return -1000,
+    };
+    match s.tasks.iter_mut().find(|t| t.id == pid && t.state != State::Dead) {
+        Some(t) => {
+            t.nice = n;
+            n as i64
+        }
+        None => -1000,
+    }
 }

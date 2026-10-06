@@ -224,22 +224,24 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
 
 /// Render a `/proc/<pid>/<file>` — live task state each read.
 fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
-    let (name, argv, mem, ticks, is_user, state) = task::pid_info(pid)?;
+    let (name, argv, mem, ticks, is_user, state, nice, vrun) = task::pid_info(pid)?;
     let s = match file {
         "status" => alloc::format!(
-            "Name:\t{}\nPid:\t{}\nState:\t{}\nUser:\t{}\nVmSize:\t{} kB\nCpuTicks:\t{}\n",
-            name, pid, state, is_user, mem / 1024, ticks
+            "Name:\t{}\nPid:\t{}\nState:\t{}\nUser:\t{}\nVmSize:\t{} kB\nCpuTicks:\t{}\nNice:\t{}\nVrun:\t{}\n",
+            name, pid, state, is_user, mem / 1024, ticks, nice, vrun
         ),
         "cmdline" => alloc::format!("{} {}\n", name, argv).trim_end().to_string() + "\n",
         "stat" => alloc::format!(
-            "{} ({}) {} {} {} {} 0 0 0 {}\n",
+            "{} ({}) {} {} {} {} 0 0 0 {} {} {}\n",
             pid,
             name,
             state.chars().next().unwrap_or('?'),
             is_user as u8,
             mem / 1024,
             ticks,
-            ticks
+            ticks,
+            nice,
+            vrun
         ),
         "fds" => task::fd_list(pid).unwrap_or_default(),
         _ => return None,

@@ -73,6 +73,8 @@ pub const SYS_RAND: u64 = 74;             // (buf,cap<=4096) -> n | ERR  hardwar
 pub const SYS_PCI_SCAN: u64 = 75;         // (&mut PciEnt buf, max) -> n | ERR
 pub const SYS_BEEP: u64 = 76;             // (freq_hz, ms) -> 0  PC speaker via PIT ch2 + port 0x61
 
+pub const SYS_GETPID: u64 = 77;           // () -> pid
+pub const SYS_NICE: u64 = 78;             // (pid, nice) -> stored nice | -3
 pub const SYS_ERR: u64 = u64::MAX;
 
 // open flags

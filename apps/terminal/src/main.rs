@@ -1776,7 +1776,10 @@ struct Term {
     sel_drag: bool,                                    // left button currently held
     pq: String,                                        // pager search query
     pg_input: bool,                                    // pager `/` input active
-    tailf: Option<(String, u64)>,                      // `tail -f`: (path, next byte offset)
+    tailf: Option<(String, u64)>,
+    top: Option<u64>,           // top mode: refresh interval ms
+    top_last: u64,
+    top_prev: Vec<(u32, u64)>,  // (pid, cpu_ticks) snapshot for %CPU deltas                      // `tail -f`: (path, next byte offset)
     tailf_last: u64,                                   // last poll ms
     yesing: Option<String>,                            // `yes`: repeated line (mode)
     at_q: Vec<(u64, String)>,                          // `at`: (fire_ms, cmd) deferred commands
@@ -2071,7 +2074,11 @@ impl Term {
                 i += 1;
                 continue;
             }
-            if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'?' {
+            if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'$' {
+                // $$ -- own pid
+                out.push_str(&alloc::format!("{}", ustd::getpid()));
+                i += 2;
+            } else if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'?' {
                 // $? -- previous command's exit status (still in last_ok)
                 out.push(if self.last_ok { '0' } else { '1' });
                 i += 2;
@@ -3409,18 +3416,234 @@ impl Term {
             }
             "clear" => self.lines.clear(),
             "ps" => {
+                // real /proc-backed table: state+nice from /proc/<pid>/status,
+                // cpu/mem from the kernel proclist
+                self.emit("  PID  NI  STATE       VSZ_kB   CPU_ms  NAME");
                 for p in ustd::proclist(64) {
                     let name = core::str::from_utf8(&p.name)
                         .unwrap_or("?")
                         .trim_end_matches('\0');
+                    let (mut st, mut ni) = (String::from("?"), String::from("?"));
+                    if let Ok(d) = ustd::read_all(&alloc::format!("/proc/{}/status", p.pid)) {
+                        let s = String::from_utf8_lossy(&d).into_owned();
+                        for l in s.lines() {
+                            if let Some(v) = l.strip_prefix("State:\t") {
+                                st = String::from(v.split(' ').next().unwrap_or("?"));
+                            }
+                            if let Some(v) = l.strip_prefix("Nice:\t") {
+                                ni = String::from(v);
+                            }
+                        }
+                    }
                     self.emit(&alloc::format!(
-                        "  pid={} {} mem={}KB cpu={}ms",
+                        "  {:>3}  {:>2}  {:<11} {:>7}  {:>7}  {}",
                         p.pid,
-                        name,
+                        ni,
+                        &st,
                         p.mem_kb,
-                        p.cpu_ticks * 10
+                        p.cpu_ticks * 10,
+                        name
                     ));
                 }
+            }
+            "nice" => {
+                // nice [-n N] <cmd...>: run a command at lower/higher priority
+                let (mut ni, mut i) = (10i64, 1usize);
+                if args.first() == Some(&"-n") {
+                    ni = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+                    i = 2;
+                }
+                if args.len() <= i {
+                    // bare nice: show current priority from /proc status
+                    let pid = ustd::getpid();
+                    let s = ustd::read_all(&alloc::format!("/proc/{}/status", pid))
+                        .map(|d| String::from_utf8_lossy(&d).into_owned())
+                        .unwrap_or_default();
+                    let ni = s.lines()
+                        .find_map(|l| l.strip_prefix("Nice:\t"))
+                        .unwrap_or("0");
+                    self.emit(ni);
+                } else {
+                    let prev = ustd::set_nice(0, ni);
+                    self.emit(&alloc::format!("nice {}: {}", args[i..].join(" "), prev));
+                    for l in self.run_captured(&args[i..].join(" ")) {
+                        self.emit(&l);
+                    }
+                    ustd::set_nice(0, 0);
+                }
+            }
+            "renice" => {
+                // renice <nice> <pid...>
+                match args.first().and_then(|a| a.parse::<i64>().ok()) {
+                    None => self.fail("usage: renice <nice -20..19> <pid...>"),
+                    Some(ni) => {
+                        let mut ok = true;
+                        for a in &args[1..] {
+                            match a.parse::<u32>() {
+                                Ok(pid) => {
+                                    let r = ustd::set_nice(pid, ni);
+                                    if r == -1000 {
+                                        self.fail(&alloc::format!("renice: {}: no such pid", pid));
+                                        ok = false;
+                                    } else {
+                                        self.emit(&alloc::format!("{}: nice -> {}", pid, r));
+                                    }
+                                }
+                                Err(_) => {
+                                    self.fail(&alloc::format!("renice: '{}': bad pid", a));
+                                    ok = false;
+                                }
+                            }
+                        }
+                        if !ok {
+                            self.fail("");
+                        }
+                    }
+                }
+            }
+            "pgrep" | "pkill" => {
+                // pgrep [-x] <pat> / pkill [-x] <pat>: match process names
+                let exact = args.iter().any(|a| *a == "-x");
+                let pat = args.iter().find(|a| !a.starts_with('-')).copied().unwrap_or("");
+                let me = ustd::getpid();
+                let mut hits = 0usize;
+                for p in ustd::proclist(64) {
+                    if p.pid == me || p.is_user == 0 {
+                        continue;
+                    }
+                    let name = core::str::from_utf8(&p.name)
+                        .unwrap_or("?")
+                        .trim_end_matches('\0');
+                    let m = if exact { name == pat } else { name.contains(pat) };
+                    if m {
+                        hits += 1;
+                        if cmd == "pgrep" {
+                            self.emit(&alloc::format!("{}", p.pid));
+                        } else {
+                            let ok = ustd::kill(p.pid);
+                            self.emit(&alloc::format!(
+                                "pkill: {} {} {}",
+                                p.pid,
+                                name,
+                                if ok { "killed" } else { "failed" }
+                            ));
+                        }
+                    }
+                }
+                if hits == 0 {
+                    self.fail(&alloc::format!("{}: no process matched '{}'", cmd, pat));
+                }
+            }
+            "top" => {
+                // top [ms]: live process table sorted by %CPU; Esc/Enter/q stops
+                let ms = args
+                    .first()
+                    .and_then(|a| a.parse::<u64>().ok())
+                    .unwrap_or(1000)
+                    .max(200);
+                self.top = Some(ms);
+                self.top_last = 0;
+                self.top_prev.clear();
+            }
+            "dc" => {
+                // dc: real RPN desk calculator. tokens: nums, + - * / % p n d r c f
+                let expr = args.join(" ");
+                let src = if expr.is_empty() {
+                    self.pipe_in.clone().unwrap_or_default()
+                } else {
+                    expr
+                };
+                let mut stack: Vec<i64> = Vec::new();
+                let mut bad = false;
+                for tok in src.split_whitespace() {
+                    match tok.parse::<i64>() {
+                        Ok(v) => stack.push(v),
+                        Err(_) => match tok {
+                            "+" | "-" | "*" | "/" | "%" => {
+                                if stack.len() < 2 {
+                                    self.fail("dc: stack empty");
+                                    bad = true;
+                                    break;
+                                }
+                                let b = stack.pop().unwrap();
+                                let a = stack.pop().unwrap();
+                                let v = match tok {
+                                    "+" => a.wrapping_add(b),
+                                    "-" => a.wrapping_sub(b),
+                                    "*" => a.wrapping_mul(b),
+                                    "/" => {
+                                        if b == 0 {
+                                            self.fail("dc: div by zero");
+                                            bad = true;
+                                            break;
+                                        }
+                                        a / b
+                                    }
+                                    _ => a % b,
+                                };
+                                stack.push(v);
+                            }
+                            "p" => match stack.last() {
+                                Some(v) => self.emit(&alloc::format!("{}", v)),
+                                None => self.fail("dc: stack empty"),
+                            },
+                            "n" => match stack.pop() {
+                                Some(v) => self.emit(&alloc::format!("{}", v)),
+                                None => self.fail("dc: stack empty"),
+                            },
+                            "d" => match stack.last() {
+                                Some(v) => stack.push(*v),
+                                None => self.fail("dc: stack empty"),
+                            },
+                            "r" => {
+                                if stack.len() < 2 {
+                                    self.fail("dc: stack empty");
+                                    bad = true;
+                                    break;
+                                }
+                                let n = stack.len();
+                                stack.swap(n - 1, n - 2);
+                            }
+                            "c" => stack.clear(),
+                            "f" => {
+                                for v in stack.iter().rev() {
+                                    self.emit(&alloc::format!("{}", v));
+                                }
+                            }
+                            _ => {
+                                self.fail(&alloc::format!("dc: '{}': bad token", tok));
+                                bad = true;
+                                break;
+                            }
+                        },
+                    }
+                }
+                if bad {
+                    self.fail("");
+                }
+            }
+            "vmstat" => {
+                // real snapshot: procs/memory/cpu from kernel counters
+                let mi = ustd::meminfo();
+                let procs = ustd::proclist(64);
+                let total: u64 = procs.iter().map(|p| p.cpu_ticks).sum();
+                let user_ticks: u64 = procs.iter().filter(|p| p.is_user != 0).map(|p| p.cpu_ticks).sum();
+                let busy = if total > 0 { user_ticks * 100 / total } else { 0 };
+                self.emit("procs ---memory(KB)--- --cpu--");
+                self.emit(&alloc::format!(
+                    "  {:>3}  {:>9} {:>9}  {:>3}% {:>3}%",
+                    procs.len(), mi.used_kb, mi.total_kb - mi.used_kb, busy, 100 - busy
+                ));
+            }
+            "free" => {
+                let mi = ustd::meminfo();
+                self.emit("           total       used       free");
+                self.emit(&alloc::format!(
+                    "Mem:    {:>9} {:>9} {:>9} KB",
+                    mi.total_kb,
+                    mi.used_kb,
+                    mi.total_kb - mi.used_kb
+                ));
             }
             "mem" => {
                 let mi = ustd::meminfo();
@@ -4852,11 +5075,17 @@ impl Term {
             "head" | "tail" | "sort" => {
                 // -n N (value arg, skipped as a file) or -N numeric shorthand
                 let ni = args.iter().position(|a| a == &"-n");
-                let nskip = ni.map(|i| i + 1);
+                // value-arg positions: -n, -k, -t each consume their next token
+                let mut valpos: Vec<usize> = Vec::new();
+                for (i, a) in args.iter().enumerate() {
+                    if *a == "-n" || *a == "-k" || *a == "-t" {
+                        valpos.push(i + 1);
+                    }
+                }
                 let popt = args
                     .iter()
                     .enumerate()
-                    .find(|(i, a)| !a.starts_with('-') && Some(*i) != nskip)
+                    .find(|(i, a)| !a.starts_with('-') && !valpos.contains(i))
                     .map(|(_, a)| *a);
                 let n: usize = ni
                     .and_then(|i| args.get(i + 1))
@@ -4892,7 +5121,29 @@ impl Term {
                     Some(s) => {
                         let mut ls: Vec<&str> = s.lines().collect();
                         if cmd == "sort" {
-                            if args.iter().any(|a| a == &"-n") {
+                            // -t SEP field separator; -k N sorts by Nth field (1-based)
+                            let ti = args.iter().position(|a| a == &"-t");
+                            let sep: Option<char> = ti
+                                .and_then(|i| args.get(i + 1))
+                                .and_then(|s| s.chars().next());
+                            let ki = args.iter().position(|a| a == &"-k");
+                            let keyf: usize = ki
+                                .and_then(|i| args.get(i + 1))
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            if keyf > 0 || sep.is_some() {
+                                let field = |l: &&str| -> String {
+                                    let parts: Vec<&str> = match sep {
+                                        Some(c) => l.split(c).collect(),
+                                        None => l.split_whitespace().collect(),
+                                    };
+                                    parts
+                                        .get(keyf.saturating_sub(1))
+                                        .map(|s| String::from(*s))
+                                        .unwrap_or_default()
+                                };
+                                ls.sort_by_key(|l| field(l));
+                            } else if args.iter().any(|a| a == &"-n") {
                                 // numeric: compare leading signed-integer fields (0 if none)
                                 let num = |l: &&str| -> i64 {
                                     let t = l.trim_start();
@@ -5510,6 +5761,17 @@ impl Term {
                         _ => {}
                     }
                 }
+                // -exec's command template must not leak into positionals
+                if let Some(xi) = args.iter().position(|a| *a == "-exec") {
+                    let end = args[xi + 1..]
+                        .iter()
+                        .position(|a| *a == ";")
+                        .map(|p| xi + 1 + p)
+                        .unwrap_or(args.len());
+                    for i in xi + 1..=end {
+                        skip.push(i);
+                    }
+                }
                 let pos: Vec<&str> = args
                     .iter()
                     .enumerate()
@@ -5521,7 +5783,34 @@ impl Term {
                     pat = p2;
                 }
                 match ustd::stat(dir) {
-                    Ok(st) if st.is_dir != 0 => self.find_run(dir, pat, want_dir, maxd),
+                    Ok(st) if st.is_dir != 0 => {
+                        if let Some(xi) = args.iter().position(|a| *a == "-exec") {
+                            // find -exec cmd [args... {} ...] \; -- run per match
+                            let end = args[xi + 1..]
+                                .iter()
+                                .position(|a| *a == ";")
+                                .map(|p| xi + 1 + p)
+                                .unwrap_or(args.len());
+                            let tpl: Vec<&str> = args[xi + 1..end].to_vec();
+                            if tpl.is_empty() {
+                                self.fail("find: -exec needs a command ending in ;");
+                            } else {
+                                for m in self.find_collect(dir, pat, want_dir, maxd) {
+                                    let m = m.trim_end_matches('/');
+                                    let cmdline = tpl
+                                        .iter()
+                                        .map(|a| a.replace("{}", m))
+                                        .collect::<Vec<String>>()
+                                        .join(" ");
+                                    for l in self.run_captured(&cmdline) {
+                                        self.emit(&l);
+                                    }
+                                }
+                            }
+                        } else {
+                            self.find_run(dir, pat, want_dir, maxd);
+                        }
+                    }
                     Ok(_) => {
                         if wild_match(pat, dir) && want_dir != Some(true) {
                             self.emit(dir);
@@ -7183,8 +7472,11 @@ impl Term {
             return;
         }
         // during watch/tail -f/yes modes, Esc or Enter stops; other keys ignored
-        if self.watch.is_some() || self.tailf.is_some() || self.yesing.is_some() {
-            if k.key == KeyCode::Escape as u32 || k.key == KeyCode::Enter as u32 {
+        if self.watch.is_some() || self.tailf.is_some() || self.yesing.is_some() || self.top.is_some() {
+            if k.key == KeyCode::Escape as u32
+                || k.key == KeyCode::Enter as u32
+                || (self.top.is_some() && k.chr == b'q')
+            {
                 if self.watch.is_some() {
                     self.watch = None;
                     self.push_line("watch stopped");
@@ -7196,6 +7488,10 @@ impl Term {
                 if self.yesing.is_some() {
                     self.yesing = None;
                     self.push_line("yes: stopped");
+                }
+                if self.top.is_some() {
+                    self.top = None;
+                    self.push_line("top: stopped");
                 }
                 self.dirty_all = true;
             }
@@ -7379,6 +7675,7 @@ impl Term {
         "md5sum", "uuencode", "uudecode", "zgrep", "portscan", "dig",
         "sha1sum", "od", "xxd", "banner", "units", "pr", "apropos", "whereis",
         "fortune", "uuidgen", "logger", "whois", "fdisk", "vol", "blkid", "script",
+        "nice", "renice", "pgrep", "pkill", "top", "dc", "vmstat", "free",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -7420,6 +7717,8 @@ impl Term {
                     "          readline: Ctrl-A/E/K/U/W/Y",
                     "          sha1sum  od/xxd  banner  units  pr  apropos  whereis",
                     "          fortune  uuidgen  logger  whois  fdisk -l  vol  script",
+                    "          nice/renice  pgrep/pkill  top  dc  vmstat  free",
+                    "          sort -k/-t  find -exec  $$ (own pid)",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];
@@ -7801,7 +8100,10 @@ impl Term {
 
     /// find: recursive name-match walk printing full paths.
     /// `want_dir` filters by entry type; `maxd` bounds descent depth.
-    fn find_run(&mut self, dir: &str, pat: &str, want_dir: Option<bool>, maxd: usize) {
+    /// Iterative directory walk: paths matching (pat, want_dir, maxd).
+    /// Returns display strings (dirs carry a trailing '/').
+    fn find_collect(&mut self, dir: &str, pat: &str, want_dir: Option<bool>, maxd: usize) -> Vec<String> {
+        let mut out = Vec::new();
         let mut stack = alloc::vec::Vec::new();
         stack.push((String::from(dir), 0usize));
         while let Some((d, dep)) = stack.pop() {
@@ -7819,7 +8121,7 @@ impl Term {
                         if wild_match(pat, name)
                             && want_dir.map(|w| is_dir == w).unwrap_or(true)
                         {
-                            self.emit(&alloc::format!("{}{}", p, if is_dir { "/" } else { "" }));
+                            out.push(alloc::format!("{}{}", p, if is_dir { "/" } else { "" }));
                         }
                         if is_dir && dep < maxd {
                             stack.push((p, dep + 1));
@@ -7828,6 +8130,13 @@ impl Term {
                 }
                 Err(_) => self.fail(&alloc::format!("find: {}: can't open", d)),
             }
+        }
+        out
+    }
+
+    fn find_run(&mut self, dir: &str, pat: &str, want_dir: Option<bool>, maxd: usize) {
+        for p in self.find_collect(dir, pat, want_dir, maxd) {
+            self.emit(&p);
         }
     }
 
@@ -7933,6 +8242,9 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         pq: String::new(),
         pg_input: false,
         tailf: None,
+        top: None,
+        top_last: 0,
+        top_prev: Vec::new(),
         tailf_last: 0,
         at_q: Vec::new(),
         yank: String::new(),
@@ -8242,6 +8554,68 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                     t.push_line(l);
                 }
                 t.watch = Some((cmd, ms, now));
+                t.dirty_all = true;
+            }
+        }
+        // top mode: live process table; %CPU = cpu_ticks delta share
+        if let Some(ms) = t.top {
+            if now - t.top_last >= ms {
+                t.top_last = now;
+                let procs = ustd::proclist(64);
+                // delta vs previous snapshot -> %CPU
+                let mut dsum = 0u64;
+                let mut delta: Vec<(u32, u64)> = Vec::new();
+                for p in &procs {
+                    let prev = t
+                        .top_prev
+                        .iter()
+                        .find(|(id, _)| *id == p.pid)
+                        .map(|(_, c)| *c)
+                        .unwrap_or(0);
+                    let d = p.cpu_ticks.saturating_sub(prev);
+                    delta.push((p.pid, d));
+                    dsum += d;
+                }
+                t.top_prev = procs.iter().map(|p| (p.pid, p.cpu_ticks)).collect();
+                t.lines.clear();
+                t.view = 0;
+                let mi = ustd::meminfo();
+                t.push_line(&alloc::format!(
+                    "top - {}ms - {} procs, mem {}% used  (Esc/Enter/q stops)",
+                    ms,
+                    procs.len(),
+                    if mi.total_kb > 0 { mi.used_kb * 100 / mi.total_kb } else { 0 }
+                ));
+                t.push_line("  PID   NI  %CPU   VSZ_kB  STATE  NAME");
+                let mut scored: Vec<(u64, u32, u64, String, String, String)> = procs
+                    .iter()
+                    .map(|p| {
+                        let d = delta.iter().find(|(id, _)| *id == p.pid).map(|(_, v)| *v).unwrap_or(0);
+                        let name = core::str::from_utf8(&p.name).unwrap_or("?").trim_end_matches('\0');
+                        let (mut st, mut ni) = (String::from("?"), String::from("?"));
+                        if let Ok(dd) = ustd::read_all(&alloc::format!("/proc/{}/status", p.pid)) {
+                            let s = String::from_utf8_lossy(&dd).into_owned();
+                            for l in s.lines() {
+                                if let Some(v) = l.strip_prefix("State:\t") {
+                                    st = String::from(v.split(' ').next().unwrap_or("?"));
+                                }
+                                if let Some(v) = l.strip_prefix("Nice:\t") {
+                                    ni = String::from(v);
+                                }
+                            }
+                        }
+                        (d, p.pid, p.mem_kb, ni, String::from(st), String::from(name))
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.0.cmp(&a.0));
+                for (d, pid, mem, ni, st, name) in scored.iter().take(20) {
+                    let st: &str = st;
+                    let pct = if dsum > 0 { d * 100 / dsum } else { 0 };
+                    t.push_line(&alloc::format!(
+                        "  {:>3} {:>3}  {:>3}%  {:>7}  {:<5}  {}",
+                        pid, ni, pct, mem, st, name
+                    ));
+                }
                 t.dirty_all = true;
             }
         }

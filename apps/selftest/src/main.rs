@@ -351,6 +351,40 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             .unwrap_or(false)
     });
 
+    // ---- getpid + nice scheduling ----
+    check("getpid-real", {
+        let pid = ustd::getpid();
+        pid > 0 && ustd::read_all(&alloc::format!("/proc/{}/status", pid))
+            .map(|d| String::from_utf8_lossy(&d).contains("cosmos-selftest"))
+            .unwrap_or(false)
+    });
+    check("nice-clamp", {
+        // -20..19 clamp: 99 -> 19 stored, visible via /proc status
+        ustd::set_nice(0, 99);
+        let pid = ustd::getpid();
+        let ok = ustd::read_all(&alloc::format!("/proc/{}/status", pid))
+            .map(|d| String::from_utf8_lossy(&d).contains("Nice:\t19"))
+            .unwrap_or(false);
+        ustd::set_nice(0, 0);
+        ok
+    });
+    check("nice-bad-pid", ustd::set_nice(0xFFFF_FFFE, 0) == -1000);
+    check("vrun-charge", {
+        // scheduler charges virtual runtime while we burn cpu:
+        // stay Running for >=40ms so PIT ticks land between reads
+        let pid = ustd::getpid();
+        let v0 = vrun_of(pid);
+        let t0 = ustd::uptime_ms();
+        let mut acc = 0u64;
+        while ustd::uptime_ms() - t0 < 40 {
+            for i in 0..10_000u64 {
+                acc = acc.wrapping_add(i ^ (acc << 1));
+            }
+        }
+        core::hint::black_box(acc);
+        vrun_of(pid) > v0
+    });
+
     // ---- md5 known-answer ----
     check("md5-abc", {
         // RFC 1321 KAT: md5("abc") = 900150983cd24fb0d6963f7d28e17f72
@@ -362,4 +396,17 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64
+}
+
+
+fn vrun_of(pid: u32) -> u64 {
+    ustd::read_all(&alloc::format!("/proc/{}/status", pid))
+        .ok()
+        .and_then(|d| {
+            let s = String::from_utf8_lossy(&d).into_owned();
+            s.lines()
+                .find(|l| l.starts_with("Vrun:\t"))
+                .and_then(|l| l[6..].trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0)
 }
