@@ -234,6 +234,15 @@ impl Drop for TcpSock {
     }
 }
 
+/// (total_bytes, free_bytes) of the data volume.
+pub fn df() -> Option<(u64, u64)> {
+    let mut out = [0u64; 2];
+    if sc1(shared::SYS_DF, out.as_mut_ptr() as u64) == shared::SYS_ERR {
+        return None;
+    }
+    Some((out[0], out[1]))
+}
+
 /// `netstat` dump of the kernel socket tables.
 pub fn net_stat() -> String {
     let mut buf = alloc::vec![0u8; 4096];

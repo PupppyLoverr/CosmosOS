@@ -219,6 +219,7 @@ impl Term {
                     "          hex <file> wc <file> du <path> history time <cmd>",
                     "          head/tail [-n N] <file> sort <file>",
                     "          a | b   cmd > file   cmd >> file   watch [-n s] cmd",
+                    "          df  (volume usage)",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -512,6 +513,14 @@ impl Term {
                 }
                 None => self.emit("usage: du <path>  (recursive bytes)"),
             },
+            "df" => match ustd::df() {
+                Some((total, free)) => {
+                    let used = total - free;
+                    self.emit(&alloc::format!("  total {} MiB  used {} MiB  free {} MiB", total / (1024 * 1024), used / (1024 * 1024), free / (1024 * 1024)));
+                    self.emit(&alloc::format!("  ({} B / {} B used)", used, total));
+                }
+                None => self.emit("df: no volume mounted"),
+            },
             "watch" => {
                 // watch [-n secs] <cmd...>: re-run every N secs until Esc/Enter
                 let (mut ms, mut i) = (1000u64, 0usize);
@@ -734,7 +743,7 @@ impl Term {
             "echo", "clear", "ps", "mem", "uname", "whoami", "date", "ping",
             "resolve", "httpget", "ifconfig", "dhcp", "netstat", "kill", "grep",
             "uptime", "reboot", "shutdown", "exit", "history", "time",
-            "head", "tail", "sort", "wc", "hex", "du", "watch",
+            "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];

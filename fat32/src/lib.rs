@@ -109,6 +109,43 @@ impl<D: BlockDevice> Fat32<D> {
         })
     }
 
+    /// Bytes per cluster on this volume.
+    pub fn cluster_bytes(&self) -> u64 {
+        self.clus_bytes as u64
+    }
+
+    /// Total data clusters: sectors after reserved+FAT, floored to clusters.
+    pub fn total_clusters(&self) -> u64 {
+        let data_secs = self
+            .bpb
+            .total_secs
+            .saturating_sub(self.bpb.reserved as u32 + self.bpb.num_fats as u32 * self.bpb.fat_secs);
+        (data_secs / self.bpb.sec_per_clus as u32) as u64
+    }
+
+    /// Real free-cluster count: one sequential sector-walk of the FAT.
+    pub fn free_clusters(&mut self) -> Result<u64> {
+        let mut free = 0u64;
+        let mut sec = [0u8; SECTOR];
+        let nclusters = self.total_clusters();
+        for s in 0..self.bpb.fat_secs as u64 {
+            let lba = self.bpb.reserved as u64 + s;
+            self.dev.read_sector(lba, &mut sec)?;
+            for i in 0..SECTOR / 4 {
+                let idx = s * (SECTOR / 4) as u64 + i as u64;
+                if idx < 2 || idx >= 2 + nclusters {
+                    continue;
+                }
+                let v = u32::from_le_bytes([sec[i * 4], sec[i * 4 + 1], sec[i * 4 + 2], sec[i * 4 + 3]])
+                    & 0x0FFF_FFFF;
+                if v == FREE {
+                    free += 1;
+                }
+            }
+        }
+        Ok(free)
+    }
+
     pub fn set_time_fn(&mut self, f: fn() -> u64) {
         self.time_fn = f;
     }

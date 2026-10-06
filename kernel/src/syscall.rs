@@ -270,6 +270,18 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
+        shared::SYS_DF => match vfs::df() {
+            Some((total, free)) => {
+                let out = [total, free];
+                match copy_out(a1, unsafe {
+                    core::slice::from_raw_parts(out.as_ptr() as *const u8, 16)
+                }) {
+                    Some(()) => 0,
+                    None => ERR,
+                }
+            }
+            None => ERR,
+        }
         shared::SYS_CLIP_GET => {
             let c = CLIPBOARD.lock();
             let n = c.len().min(a2 as usize);

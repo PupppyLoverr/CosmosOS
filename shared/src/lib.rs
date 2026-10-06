@@ -62,6 +62,7 @@ pub const SYS_NET_TCP_CLOSE: u64 = 63; // (lport) -> 0 (FIN + drop)
 pub const SYS_CLIP_SET: u64 = 64;      // (ptr,len) -> 0 | ERR  (kernel clipboard)
 pub const SYS_CLIP_GET: u64 = 65;      // (buf,cap) -> n | ERR
 pub const SYS_NET_STAT: u64 = 66;      // (buf,cap) -> n | ERR  (socket table dump)
+pub const SYS_DF: u64 = 67;            // (ptr to [u64;2]) -> 0 | ERR  {total_bytes, free_bytes}
 
 pub const SYS_ERR: u64 = u64::MAX;
 
