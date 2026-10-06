@@ -17,6 +17,7 @@ mod mem;
 mod net;
 mod pci;
 mod dev;
+mod pcap;
 mod proc;
 mod serial;
 mod shm;

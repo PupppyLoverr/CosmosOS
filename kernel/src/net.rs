@@ -70,6 +70,7 @@ fn now_ms() -> u64 {
 fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
     let mut out = Vec::new();
     for f in virtio_net::take_rx() {
+        crate::pcap::log_frame(&f);
         if let Some(p) = handle_frame(&f) {
             out.push(p);
         }
@@ -78,6 +79,7 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
         let mut v = Vec::new();
         n.drain_rx(&mut v);
         for f in v {
+            crate::pcap::log_frame(&f);
             if let Some(p) = handle_frame(&f) {
                 out.push(p);
             }

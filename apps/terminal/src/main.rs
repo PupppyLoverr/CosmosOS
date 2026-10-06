@@ -1554,6 +1554,90 @@ const UNITS: &[(&str, u64, &str)] = &[
     ("w", 604_800_000_000, "time"),
 ];
 
+/// Real HTML->text: drop script/style, block tags -> newline, decode the
+/// common entities, collapse whitespace, wrap at ~72 cols.
+fn html_to_text(html: &[u8]) -> String {
+    let s = String::from_utf8_lossy(html).into_owned();
+    let mut out = String::with_capacity(s.len() / 2);
+    let b = s.as_bytes();
+    let (mut i, mut skip) = (0usize, 0u32);
+    while i < b.len() {
+        if b[i] == b'<' {
+            if let Some(end) = s[i..].find('>') {
+                let tag = s[i + 1..i + end].trim().to_lowercase();
+                let tn: &str = tag.trim_start_matches('/').split(|c: char| c == ' ' || c == '>').next().unwrap_or("");
+                if tn == "script" || tn == "style" || tn == "head" {
+                    skip += if tag.starts_with('/') { 0 } else { 1 };
+                    if tag.starts_with('/') && skip > 0 {
+                        skip -= 1;
+                    }
+                }
+                if skip == 0 && matches!(tn, "p" | "div" | "br" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "hr" | "title") {
+                    out.push('\n');
+                }
+                i += end + 1;
+                continue;
+            }
+            break;
+        }
+        if b[i] == b'&' {
+            if let Some(end) = s[i..].find(';') {
+                if end <= 10 {
+                    let ent = &s[i + 1..i + end];
+                    let rep = match ent {
+                        "amp" => "&",
+                        "lt" => "<",
+                        "gt" => ">",
+                        "quot" => "\"",
+                        "nbsp" => " ",
+                        "#39" | "apos" => "'",
+                        _ => "",
+                    };
+                    if !rep.is_empty() || ent.starts_with('#') && ent[1..].parse::<u32>().is_ok() {
+                        if rep.is_empty() {
+                            // numeric entity
+                            if let Ok(cp) = ent[1..].parse::<u32>() {
+                                out.push(char::from_u32(cp).unwrap_or(' '));
+                            }
+                        } else {
+                            out.push_str(rep);
+                        }
+                        i += end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        if skip == 0 {
+            let c = b[i] as char;
+            out.push(if c.is_whitespace() { ' ' } else { c });
+        }
+        i += 1;
+    }
+    // preserve block-tag newlines; wrap each paragraph to ~72 cols
+    let mut res = String::new();
+    for para in out.split('\n') {
+        let mut col = 0usize;
+        let mut any = false;
+        for word in para.split(' ').filter(|w| !w.is_empty()) {
+            if col + word.len() + 1 > 72 && col > 0 {
+                res.push('\n');
+                col = 0;
+            } else if col > 0 {
+                res.push(' ');
+                col += 1;
+            }
+            res.push_str(word);
+            col += word.len();
+            any = true;
+        }
+        if any {
+            res.push('\n');
+        }
+    }
+    res
+}
+
 fn now_str() -> String {
     let d = ustd::datetime();
     alloc::format!(
@@ -1783,6 +1867,7 @@ struct Term {
     tailf_last: u64,                                   // last poll ms
     yesing: Option<String>,                            // `yes`: repeated line (mode)
     at_q: Vec<(u64, String)>,                          // `at`: (fire_ms, cmd) deferred commands
+    cron_q: Vec<(u64, u64, String)>,                   // `cron`: (period_ms, next_fire_ms, cmd)
     yank: String,                                       // readline kill-ring (Ctrl-K/U/W -> Ctrl-Y)
     cap_bin: Option<Vec<u8>>,                           // binary capture channel (gzip -c etc.)
     last_cap_bin: Vec<u8>,                              // bin captured by the last run_captured
@@ -3645,6 +3730,204 @@ impl Term {
                     mi.total_kb - mi.used_kb
                 ));
             }
+            "pcap" => match args.first().copied() {
+                // pcap on|off|status|save <file> -- real ethernet frame capture
+                Some("on") => {
+                    ustd::pcap(0, &mut []);
+                    self.emit("pcap: capturing (256KiB ring, save cap 250KiB)");
+                }
+                Some("off") | None => {
+                    if args.first().is_none() {
+                        let st = ustd::pcap(2, &mut []);
+                        let (pkts, drop) = ((st >> 32) as u64, st & 0xFFFF_FFFF);
+                        self.emit(&alloc::format!(
+                            "pcap: {} pkts captured, {} dropped, {}",
+                            pkts,
+                            drop,
+                            if ustd::pcap(3, &mut[]) == 1 { "ON" } else { "OFF" }
+                        ));
+                    } else {
+                        ustd::pcap(1, &mut []);
+                        self.emit("pcap: stopped");
+                    }
+                }
+                Some("status") => {
+                    let st = ustd::pcap(2, &mut []);
+                    self.emit(&alloc::format!(
+                        "pcap: {} pkts, {} dropped, {}",
+                        (st >> 32) as u64,
+                        st & 0xFFFF_FFFF,
+                        if ustd::pcap(3, &mut[]) == 1 { "ON" } else { "OFF" }
+                    ));
+                }
+                Some("save") => match args.get(1) {
+                    Some(path) => {
+                        let mut buf = alloc::vec![0u8; 250 * 1024];
+                        let n = ustd::pcap(4, &mut buf);
+                        if n < 0 {
+                            self.fail(&alloc::format!("pcap: save: err {}", n));
+                        } else {
+                            match ustd::write_all(path, &buf[..n as usize]) {
+                                Ok(_) => self.emit(&alloc::format!(
+                                    "  wrote {}B pcap to {}", n, path
+                                )),
+                                Err(e) => self.fail(&alloc::format!("pcap: {}: err {}", path, e)),
+                            }
+                        }
+                    }
+                    None => self.fail("usage: pcap save <file>"),
+                },
+                Some(_) => self.fail("usage: pcap [on|off|status|save <file>]"),
+            },
+            "ftp" => {
+                // ftp <host[:port]> <remotefile> [localfile]: anonymous FTP RETR (PASV)
+                match (args.first(), args.get(1)) {
+                    (Some(h), Some(rp)) => {
+                        let lp = args.get(2).copied()
+                            .map(String::from)
+                            .unwrap_or_else(|| {
+                                rp.rsplit('/').next().unwrap_or("ftp.out").to_string()
+                            });
+                        match Self::ftp_get(h, rp) {
+                            Ok(d) => match ustd::write_all(&lp, &d) {
+                                Ok(_) => self.emit(&alloc::format!(
+                                    "ftp: {}B -> {}", d.len(), lp
+                                )),
+                                Err(e) => self.fail(&alloc::format!("ftp: {}: err {}", lp, e)),
+                            },
+                            Err(e) => self.fail(&e),
+                        }
+                    }
+                    _ => self.fail("usage: ftp <host[:port]> <remotepath> [localfile]"),
+                }
+            }
+            "lsof" => {
+                // real open-file table from /proc/<pid>/fds
+                self.emit("PID   FD  PATH");
+                for p in ustd::proclist(64) {
+                    if let Ok(d) = ustd::read_all(&alloc::format!("/proc/{}/fds", p.pid)) {
+                        for l in String::from_utf8_lossy(&d).lines() {
+                            if let Some((fd, path)) = l.split_once(": ") {
+                                self.emit(&alloc::format!("{:<5} {}  {}", p.pid, fd, path));
+                            }
+                        }
+                    }
+                }
+            }
+            "fuser" => match args.first() {
+                // fuser <path>: pids holding the file open
+                Some(path) => {
+                    let mut hits = 0;
+                    for p in ustd::proclist(64) {
+                        if let Ok(d) = ustd::read_all(&alloc::format!("/proc/{}/fds", p.pid)) {
+                            let hit = String::from_utf8_lossy(&d)
+                                .lines()
+                                .any(|l| l.split_once(": ").map(|(_, p2)| p2) == Some(*path));
+                            if hit {
+                                self.emit(&alloc::format!("{}", p.pid));
+                                hits += 1;
+                            }
+                        }
+                    }
+                    if hits == 0 {
+                        self.emit(&alloc::format!("{}: no users", path));
+                    }
+                }
+                None => self.fail("usage: fuser <path>"),
+            },
+            "burn" => {
+                // burn [ms]: real CPU hog for scheduler/nice/top demos
+                let ms = args.first().and_then(|a| a.parse::<u64>().ok()).unwrap_or(2000);
+                let t0 = ustd::uptime_ms();
+                let mut acc = 0u64;
+                while ustd::uptime_ms() - t0 < ms {
+                    for i in 0..10_000u64 {
+                        acc = acc.wrapping_add(i ^ (acc << 1));
+                    }
+                }
+                core::hint::black_box(acc);
+                self.emit(&alloc::format!("burned {}ms", ustd::uptime_ms() - t0));
+            }
+            "cron" => {
+                // cron [list|add <sec> <cmd...>|del <n>]: recurring commands in /crontab
+                match args.first().copied() {
+                    Some("add") => {
+                        match (args.get(1).and_then(|s| s.parse::<u64>().ok()), args.get(2)) {
+                            (Some(sec), Some(_)) => {
+                                let line = alloc::format!("{} {}", sec, args[2..].join(" "));
+                                let mut cur = ustd::read_all("/crontab")
+                                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                                    .unwrap_or_default();
+                                if !cur.is_empty() && !cur.ends_with('\n') {
+                                    cur.push('\n');
+                                }
+                                cur.push_str(&line);
+                                cur.push('\n');
+                                match ustd::write_all("/crontab", cur.as_bytes()) {
+                                    Ok(_) => {
+                                        self.cron_load();
+                                        self.emit(&alloc::format!("cron: +{}", line));
+                                    }
+                                    Err(e) => self.fail(&alloc::format!("cron: err {}", e)),
+                                }
+                            }
+                            _ => self.fail("usage: cron add <secs> <cmd...>"),
+                        }
+                    }
+                    Some("del") => {
+                        let n = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                        let cur = ustd::read_all("/crontab")
+                            .map(|d| String::from_utf8_lossy(&d).into_owned())
+                            .unwrap_or_default();
+                        let keep: Vec<&str> = cur
+                            .lines()
+                            .enumerate()
+                            .filter(|(i, _)| *i != n)
+                            .map(|(_, l)| l)
+                            .collect();
+                        match ustd::write_all("/crontab", keep.join("\n").as_bytes()) {
+                            Ok(_) => {
+                                self.cron_load();
+                                self.emit(&alloc::format!("cron: -line {}", n));
+                            }
+                            Err(e) => self.fail(&alloc::format!("cron: err {}", e)),
+                        }
+                    }
+                    _ => {
+                        let cur = ustd::read_all("/crontab")
+                            .map(|d| String::from_utf8_lossy(&d).into_owned())
+                            .unwrap_or_default();
+                        if cur.is_empty() {
+                            self.emit("cron: empty (cron add <sec> <cmd...>)");
+                        }
+                        for (i, l) in cur.lines().enumerate() {
+                            self.emit(&alloc::format!("  [{}] {}", i, l));
+                        }
+                        self.emit(&alloc::format!("cron: {} armed entries", self.cron_q.len()));
+                    }
+                }
+            }
+            "browse" => match args.first() {
+                // browse <url>: fetch + render HTML as text (real tag-strip)
+                Some(url) => {
+                    let (req, _) = Self::parse_url(url);
+                    match ustd::net_http(&req) {
+                        Some(body) => {
+                            // skip the HTTP header block
+                            let txt = String::from_utf8_lossy(&body).into_owned();
+                            let h = txt.find("\r\n\r\n")
+                                .map(|i| &txt[i + 4..])
+                                .or_else(|| txt.find("\n\n").map(|i| &txt[i + 2..]))
+                                .unwrap_or(&txt);
+                            for l in html_to_text(h.as_bytes()).lines() {
+                                self.emit(l);
+                            }
+                        }
+                        None => self.fail(&alloc::format!("browse: {}: failed", req)),
+                    }
+                }
+                None => self.fail("usage: browse <http://host/path>"),
+            },
             "mem" => {
                 let mi = ustd::meminfo();
                 self.emit(&alloc::format!(
@@ -5872,6 +6155,43 @@ impl Term {
                 }
                 self.run_patch(&text);
             }
+            "md5sum" | "sha256sum" | "sha1sum" if args.iter().any(|a| *a == "-c") => {
+                // sum -c <listfile>: lines "hash  name" -> verify each
+                match args.iter().find(|a| !a.starts_with('-')) {
+                    Some(listf) => match ustd::read_all(listf) {
+                        Ok(d) => {
+                            let mut bad = 0;
+                            for l in String::from_utf8_lossy(&d).lines() {
+                                let l = l.trim();
+                                if l.is_empty() {
+                                    continue;
+                                }
+                                let mut it = l.splitn(2, "  ");
+                                let want = it.next().unwrap_or("");
+                                let name = it.next().unwrap_or("").trim_start_matches('*');
+                                let got = ustd::read_all(name).map(|data| {
+                                    match cmd {
+                                        "md5sum" => hexs(&ustd::md5(&data)),
+                                        "sha1sum" => hexs(&ustd::sha1(&data)),
+                                        _ => hexs(&sha256(&data)),
+                                    }
+                                }).unwrap_or_default();
+                                if got == want {
+                                    self.emit(&alloc::format!("{}: OK", name));
+                                } else {
+                                    self.emit(&alloc::format!("{}: FAILED", name));
+                                    bad += 1;
+                                }
+                            }
+                            if bad > 0 {
+                                self.fail(&alloc::format!("{}: {} failed", cmd, bad));
+                            }
+                        }
+                        Err(e) => self.fail(&alloc::format!("{}: {}: err {}", cmd, listf, e)),
+                    },
+                    None => self.fail(&alloc::format!("usage: {} -c <listfile>", cmd)),
+                }
+            }
             "md5sum" => {
                 // real MD5 (RFC 1321) of each file or stdin
                 let mut any = false;
@@ -7676,6 +7996,7 @@ impl Term {
         "sha1sum", "od", "xxd", "banner", "units", "pr", "apropos", "whereis",
         "fortune", "uuidgen", "logger", "whois", "fdisk", "vol", "blkid", "script",
         "nice", "renice", "pgrep", "pkill", "top", "dc", "vmstat", "free",
+        "pcap", "ftp", "lsof", "fuser", "burn", "cron", "browse",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -7719,9 +8040,120 @@ impl Term {
                     "          fortune  uuidgen  logger  whois  fdisk -l  vol  script",
                     "          nice/renice  pgrep/pkill  top  dc  vmstat  free",
                     "          sort -k/-t  find -exec  $$ (own pid)",
+                    "          pcap capture  ftp (anon PASV)  lsof/fuser",
+                    "          burn  cron  browse (html->text)  sums -c",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];
+
+    /// Reload /crontab into cron_q; entries `period_s cmd...` fire every period.
+    fn cron_load(&mut self) {
+        self.cron_q.clear();
+        if let Ok(d) = ustd::read_all("/crontab") {
+            let now = ustd::uptime_ms();
+            for l in String::from_utf8_lossy(&d).lines() {
+                let l = l.trim();
+                if l.is_empty() || l.starts_with('#') {
+                    continue;
+                }
+                let mut it = l.splitn(2, ' ');
+                if let (Some(sec), Some(cmd)) = (it.next(), it.next()) {
+                    if let Ok(s) = sec.parse::<u64>() {
+                        if s > 0 {
+                            self.cron_q.push((s * 1000, now + s * 1000, String::from(cmd.trim())));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Anonymous FTP RETR over real TCP/21+PASV data channel.
+    /// ftp_get("ftp.example.org", "pub/file") -> Ok(bytes)
+    fn ftp_get(host: &str, rpath: &str) -> Result<Vec<u8>, String> {
+        fn read_reply(s: &ustd::TcpSock, want: u32) -> Result<String, String> {
+            let mut buf = Vec::new();
+            let deadline = ustd::uptime_ms() + 5000;
+            loop {
+                match s.recv(600) {
+                    Some(d) => {
+                        buf.extend_from_slice(&d);
+                        let txt = String::from_utf8_lossy(&buf).into_owned();
+                        // complete reply = last line "^NNN " (or single-line)
+                        for l in txt.lines() {
+                            if l.len() >= 4 && l.as_bytes()[3] == b' '
+                                && l[..3].chars().all(|c| c.is_ascii_digit())
+                            {
+                                let code: u32 = l[..3].parse().unwrap_or(0);
+                                if want != 0 && code / 100 != want / 100 {
+                                    return Err(alloc::format!("ftp: got {} want {}", code, want));
+                                }
+                                return Ok(txt);
+                            }
+                        }
+                        if ustd::uptime_ms() > deadline || buf.len() > 8192 {
+                            return Err(String::from("ftp: reply timeout"));
+                        }
+                    }
+                    None => return Err(String::from("ftp: connection closed")),
+                }
+            }
+        }
+        fn cmd(s: &ustd::TcpSock, c: &str, want: u32) -> Result<String, String> {
+            s.send(alloc::format!("{}\r\n", c).as_bytes())
+                .ok_or_else(|| String::from("ftp: send failed"))?;
+            read_reply(s, want)
+        }
+        let (host, port) = match host.split_once(':') {
+            Some((h, p)) => (h, p.parse().unwrap_or(21)),
+            None => (host, 21),
+        };
+        let ip = match ustd::net_dns(host) {
+            Some(i) => i,
+            None => parse_ipv4(host)
+                .ok_or_else(|| alloc::format!("ftp: {}: no DNS", host))?,
+        };
+        let ctl = (16810..16814)
+            .find_map(|lp| ustd::TcpSock::connect(lp, ip, port))
+            .ok_or_else(|| alloc::format!("ftp: {}:{}: connect failed", host, port))?;
+        read_reply(&ctl, 220)?;
+        cmd(&ctl, "USER anonymous", 330)?; // 331 or 230 (class 3)
+        cmd(&ctl, "PASS cosmos@", 230)?;
+        cmd(&ctl, "TYPE I", 200)?;
+        let pasv = cmd(&ctl, "PASV", 200)?;
+        // "227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)"
+        let nums: Vec<u32> = pasv
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if nums.len() < 6 {
+            return Err(alloc::format!("ftp: bad PASV: {}", pasv.trim()));
+        }
+        let n = nums.len();
+        let dip = [nums[n - 6] as u8, nums[n - 5] as u8, nums[n - 4] as u8, nums[n - 3] as u8];
+        let dport = (nums[n - 2] * 256 + nums[n - 1]) as u16;
+        let data = (16840..16844)
+            .find_map(|lp| ustd::TcpSock::connect(lp, dip, dport))
+            .ok_or_else(|| String::from("ftp: data connect failed"))?;
+        cmd(&ctl, &alloc::format!("RETR {}", rpath), 100)?; // 150/125
+        let mut out = Vec::new();
+        let deadline = ustd::uptime_ms() + 15000;
+        loop {
+            match data.recv(1000) {
+                Some(d) => {
+                    out.extend_from_slice(&d);
+                    if out.len() > 1 << 20 || ustd::uptime_ms() > deadline {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        let _ = read_reply(&ctl, 226);
+        let _ = cmd(&ctl, "QUIT", 200);
+        Ok(out)
+    }
 
     /// Real WHOIS over TCP/43: query whois.iana.org for the referral,
     /// then the registry server. Returns output lines.
@@ -8247,6 +8679,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         top_prev: Vec::new(),
         tailf_last: 0,
         at_q: Vec::new(),
+        cron_q: Vec::new(),
         yank: String::new(),
         cap_bin: None,
         last_cap_bin: Vec::new(),
@@ -8272,6 +8705,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
     t.vars
         .insert(String::from("HOSTNAME"), t.host.clone());
     t.load_hist();
+    t.cron_load();
     t.source_rc();
     t.push_line("CosmosOS terminal - type 'help'");
     t.push_line("");
@@ -8641,6 +9075,23 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 t.push_line(&text);
             }
             t.dirty_all = true;
+        }
+        // `cron`: recurring commands (period_s cmd) fire on their period
+        {
+            let mut fired: Vec<String> = Vec::new();
+            for e in t.cron_q.iter_mut() {
+                if e.1 <= now {
+                    e.1 = now + e.0;
+                    fired.push(e.2.clone());
+                }
+            }
+            for c in fired {
+                t.push_line(&alloc::format!("cron: {}", c));
+                t.run(&c);
+            }
+            if !t.cron_q.is_empty() {
+                t.dirty_all = true;
+            }
         }
         // `at` queue: run due deferred commands (in submission order)
         {
