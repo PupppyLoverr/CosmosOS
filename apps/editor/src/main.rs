@@ -131,11 +131,20 @@ impl Editor {
             Ok(_) => {
                 self.dirty_text = false;
                 self.status = alloc::format!("saved {}", self.path);
-                self.win.set_title(&alloc::format!("Editor  - {}", self.path));
+                self.refresh_title();
             }
             Err(e) => self.status = alloc::format!("save failed: {}", e),
         }
         self.dirty_ui = true;
+    }
+
+    /// Title shows a * while there are unsaved edits.
+    fn refresh_title(&self) {
+        self.win.set_title(&alloc::format!(
+            "Editor  - {}{}",
+            self.path,
+            if self.dirty_text { " *" } else { "" }
+        ));
     }
 
     fn on_key(&mut self, k: &EvKey) {
@@ -185,6 +194,24 @@ impl Editor {
                 }
                 _ => {}
             }
+        }
+        // Ctrl+Home/End: document start/end
+        if k.mods & 1 != 0 && k.key == KeyCode::Home as u32 {
+            self.cx = 0;
+            self.ensure_caret_visible();
+            self.dirty_ui = true;
+            return;
+        }
+        if k.mods & 1 != 0 && k.key == KeyCode::End as u32 {
+            self.cx = self.text.len();
+            self.ensure_caret_visible();
+            self.dirty_ui = true;
+            return;
+        }
+        // Ctrl+W closes the window
+        if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 && k.chr.to_ascii_lowercase() == b'w' {
+            self.win.close();
+            return;
         }
         if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 {
             match k.chr.to_ascii_lowercase() {
@@ -298,6 +325,7 @@ impl Editor {
             _ => {}
         }
         self.ensure_caret_visible();
+        self.refresh_title();
         self.dirty_ui = true;
     }
 }
