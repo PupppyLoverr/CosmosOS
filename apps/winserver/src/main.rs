@@ -642,16 +642,27 @@ fn reap_dead(s: &mut S) {
 
 fn close_win(s: &mut S, id: u32) {
     if let Some(i) = s.win_idx(id) {
+        let (wx, wy, ww, wh) = (s.wins[i].x, s.wins[i].y, s.wins[i].w, s.wins[i].h);
         let w = s.wins.remove(i);
         // tell the app to exit gracefully — it may ignore and keep running headless
-        let ev = EvFocus { window_id: id, focused: 0, _pad: [0; 3] };
-        let _ = ev;
         send_ev(w.owner, EV_CLOSE, &id.to_le_bytes());
         if w.shm_id != 0 {
             ustd::shm_drop(w.shm_id);
         }
         if s.focus == id {
             s.focus = top_id(s);
+        }
+        // repaint the vacated rect + the newly focused window's deco —
+        // without this the closed window's pixels ghost until an
+        // unrelated composite (x-close never marked anything dirty)
+        dmg(s, wx, wy, ww, wh);
+        if let Some(nf) = s
+            .wins
+            .iter()
+            .find(|w| w.id == s.focus && w.ws == s.workspace && !w.min)
+            .map(|w| (w.x, w.y, w.w, w.h))
+        {
+            dmg(s, nf.0, nf.1, nf.2, nf.3);
         }
     }
 }
