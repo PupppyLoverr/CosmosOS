@@ -181,6 +181,12 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     if i == 4 { Some(out) } else { None }
 }
 
+/// IPv4 literal or DNS name — tries the literal first, then a real
+/// DNS query (UDP/53).
+fn host_arg(s: &str) -> Option<[u8; 4]> {
+    parse_ipv4(s).or_else(|| ustd::net_dns(s))
+}
+
 struct Term {
     win: Window,
     c: Canvas,
@@ -264,7 +270,11 @@ impl Term {
         let mut out = String::with_capacity(s.len());
         let mut i = 0;
         while i < b.len() {
-            if b[i] == b'$' && i + 1 < b.len() && (b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_') {
+            if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'?' {
+                // $? — previous command's exit status (still in last_ok)
+                out.push(if self.last_ok { '0' } else { '1' });
+                i += 2;
+            } else if b[i] == b'$' && i + 1 < b.len() && (b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_') {
                 let mut j = i + 1;
                 while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
                     j += 1;
@@ -452,6 +462,9 @@ impl Term {
         let mut it = input.split_whitespace();
         let cmd = it.next().unwrap_or("");
         let args: Vec<&str> = it.collect();
+        // optimistic success — fail() marks the statement failed; $? /
+        // && / || read this after the command finishes
+        self.last_ok = true;
         match cmd {
             "help" => {
                 for l in [
@@ -761,7 +774,7 @@ impl Term {
                 ));
             }
             "ping" => match args.first() {
-                Some(s) => match parse_ipv4(s) {
+                Some(s) => match host_arg(s) {
                     Some(ip) => {
                         let (a, b, c, d) = (ip[0], ip[1], ip[2], ip[3]);
                         let packed = ((a as u32) << 24) | ((b as u32) << 16)
@@ -775,9 +788,9 @@ impl Term {
                             )),
                         }
                     }
-                    None => self.fail(&alloc::format!("ping: bad ip '{}'", s)),
+                    None => self.fail(&alloc::format!("ping: can't resolve '{}'", s)),
                 },
-                None => self.fail("usage: ping <a.b.c.d>  (try 10.0.2.2)"),
+                None => self.fail("usage: ping <host|a.b.c.d>  (try 10.0.2.2)"),
             },
             "ntp" => {
                 // real SNTP query (UDP/123) — epoch -> date, vs RTC
@@ -1007,7 +1020,7 @@ impl Term {
             "fget" => {
                 // fget <ip> <port> <out>: TCP-download whatever the peer sends
                 match (
-                    args.first().and_then(|s| parse_ipv4(s)),
+                    args.first().and_then(|s| host_arg(s)),
                     args.get(1).and_then(|s| s.parse::<u16>().ok()),
                     args.get(2),
                 ) {
@@ -1034,12 +1047,12 @@ impl Term {
                             None => self.fail(&alloc::format!("fget: connect to :{} failed", port)),
                         }
                     }
-                    _ => self.fail("usage: fget <a.b.c.d> <port> <out>  (TCP download to file)"),
+                    _ => self.fail("usage: fget <host|a.b.c.d> <port> <out>  (TCP download to file)"),
                 }
             }
             "nc" => {
                 match (
-                    args.first().and_then(|s| parse_ipv4(s)),
+                    args.first().and_then(|s| host_arg(s)),
                     args.get(1).and_then(|s| s.parse::<u16>().ok()),
                 ) {
                     (Some(ip), Some(port)) => {
@@ -1055,7 +1068,7 @@ impl Term {
                             None => self.fail(&alloc::format!("nc: connect to :{} failed", port)),
                         }
                     }
-                    _ => self.fail("usage: nc <a.b.c.d> <port>  (raw TCP session, Esc closes)"),
+                    _ => self.fail("usage: nc <host|a.b.c.d> <port>  (raw TCP session, Esc closes)"),
                 }
             }
             "watch" => {
