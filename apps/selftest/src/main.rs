@@ -286,6 +286,43 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         .map(|d| d == pat)
         .unwrap_or(false));
 
+    // ---- /dev pseudo-FS ----
+    {
+        check("dev-dir-list", ustd::readdir("/dev")
+            .map(|es| ["null", "zero", "full", "random", "urandom"]
+                .iter()
+                .all(|n| es.iter().any(|e| &e.name[..e.name_len as usize] == n.as_bytes())))
+            .unwrap_or(false));
+        check("dev-null-eof", ustd::read_all("/dev/null")
+            .map(|d| d.is_empty())
+            .unwrap_or(false));
+        check("dev-zero", ustd::read_all("/dev/zero")
+            .map(|d| !d.is_empty() && d.iter().all(|b| *b == 0))
+            .unwrap_or(false));
+        check("dev-random-bits", {
+            let a = ustd::read_all("/dev/urandom").unwrap_or_default();
+            !a.is_empty() && a.iter().any(|b| *b != 0)
+        });
+        check("dev-full-enospc", {
+            match ustd::open("/dev/full", ustd::O_RDWR) {
+                Ok(fd) => {
+                    let r = ustd::write(fd, b"x");
+                    ustd::close(fd);
+                    r.is_err()
+                }
+                Err(_) => false,
+            }
+        });
+    }
+
+    // ---- md5 known-answer ----
+    check("md5-abc", {
+        // RFC 1321 KAT: md5("abc") = 900150983cd24fb0d6963f7d28e17f72
+        let h = ustd::md5(b"abc");
+        h == [0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0,
+              0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72]
+    });
+
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64
