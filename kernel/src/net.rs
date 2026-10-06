@@ -506,13 +506,15 @@ pub fn http_get(dst_ip: [u8; 4], host: &str, path: &str) -> Option<Vec<u8>> {
                 continue;
             }
             if let Some(s) = parse_tcp(&p) {
-                if s.dport == SPORT && s.sport == 80
-                    && s.flags & TCP_SYN != 0
-                    && s.flags & TCP_ACK != 0
-                    && s.ack == isn + 1
-                {
-                    rseg = Some(s);
-                    break;
+                if s.dport == SPORT && s.sport == 80 {
+                    if s.flags & TCP_SYN != 0 && s.flags & TCP_ACK != 0 && s.ack == isn + 1 {
+                        rseg = Some(s);
+                        break;
+                    }
+                    if s.flags & TCP_RST != 0 {
+                        sprintln!("[net] tcp refused by {}.{}.{}.{}", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
+                        return None;
+                    }
                 }
             }
         }
@@ -532,7 +534,8 @@ pub fn http_get(dst_ip: [u8; 4], host: &str, path: &str) -> Option<Vec<u8>> {
         "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
         path, host
     );
-    send_tcp(mac, dst_ip, SPORT, 80, my_seq, their_seq, TCP_ACK | TCP_PSH, req.as_bytes());
+    let mut last_tx = 0u64;
+    let mut req_acked = false;
     my_seq += req.len() as u32;
 
     // --- receive until FIN (or idle deadline), ack each segment ---
@@ -540,6 +543,11 @@ pub fn http_get(dst_ip: [u8; 4], host: &str, path: &str) -> Option<Vec<u8>> {
     let deadline = now_ms() + 8000;
     let mut got_fin = false;
     while now_ms() < deadline && !got_fin {
+        // retransmit the request until the server ACKs it
+        if !req_acked && now_ms() - last_tx >= 800 {
+            send_tcp(mac, dst_ip, SPORT, 80, my_seq - req.len() as u32, their_seq, TCP_ACK | TCP_PSH, req.as_bytes());
+            last_tx = now_ms();
+        }
         let mut progressed = false;
         for (src_ip, proto, p) in pump_rx() {
             if proto != 6 || src_ip != dst_ip {
@@ -550,6 +558,9 @@ pub fn http_get(dst_ip: [u8; 4], host: &str, path: &str) -> Option<Vec<u8>> {
                     continue;
                 }
                 progressed = true;
+                if s.ack >= my_seq {
+                    req_acked = true;
+                }
                 if s.seq == their_seq && !s.payload.is_empty() {
                     out.extend_from_slice(&s.payload);
                     their_seq += s.payload.len() as u32;
