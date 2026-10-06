@@ -1,7 +1,7 @@
 //! int 0x80 syscall dispatch. nr=rax, args rdi,rsi,rdx,r8,r9 → ret rax.
 //! Runs on the faulting task's kernel stack; may block via task::yield_ctx.
 use crate::idt::CpuContext;
-use crate::{elf, fb, ipc, mem, net, shm, task, timer, vfs};
+use crate::{elf, fb, ipc, mem, net, pci, shm, task, timer, vfs};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -370,6 +370,36 @@ pub fn dispatch(ctx: &mut CpuContext) {
             rand_fill(&mut v);
             match copy_out(a1, &v) {
                 Some(()) => v.len() as u64,
+                None => ERR,
+            }
+        }
+        shared::SYS_PCI_SCAN => {
+            let max = (a2 as usize).min(64);
+            let mut devs = alloc::vec![pci::PciDev {
+                bus: 0, dev: 0, fun: 0, vendor: 0, device: 0, class: 0, subclass: 0,
+            }; max];
+            let n = pci::scan(&mut devs);
+            let mut out = alloc::vec![shared::PciEnt::default(); n];
+            for (i, d) in devs.iter().enumerate().take(n) {
+                out[i] = shared::PciEnt {
+                    bus: d.bus,
+                    dev: d.dev,
+                    fun: d.fun,
+                    class: d.class,
+                    subclass: d.subclass,
+                    _pad: 0,
+                    vendor: d.vendor,
+                    device: d.device,
+                };
+            }
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    out.as_ptr() as *const u8,
+                    n * core::mem::size_of::<shared::PciEnt>(),
+                )
+            };
+            match copy_out(a1, bytes) {
+                Some(()) => n as u64,
                 None => ERR,
             }
         }

@@ -390,6 +390,15 @@ pub fn mmap(size: u64) -> Option<*mut u8> {
         Some(p as *mut u8)
     }
 }
+/// Enumerate PCI functions into `buf` (kernel SYS_PCI_SCAN). Returns count.
+pub fn pci_scan(buf: &mut [shared::PciEnt]) -> usize {
+    sc2(
+        shared::SYS_PCI_SCAN,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    ) as usize
+}
+
 pub fn meminfo() -> shared::MemInfo {
     let mut mi = shared::MemInfo::default();
     sc1(shared::SYS_MEMINFO, &mut mi as *mut _ as u64);

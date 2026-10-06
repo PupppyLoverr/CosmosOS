@@ -266,7 +266,7 @@ impl Files {
             }
             self.sel = i as i32;
             let e = &self.ents[i];
-            self.status = alloc::format!("{} {} B   (F2 rename, Del delete, c/x/v clip)", Self::entry_name(e), e.size);
+            self.status = alloc::format!("{} {} B   (F2 rename, Del delete, c/x/v clip, n new, u up)", Self::entry_name(e), e.size);
             self.dirty = true;
         }
     }
@@ -350,6 +350,24 @@ impl Files {
             x if x == KeyCode::Char as u32 && k.chr.to_ascii_lowercase() == b'r' => {
                 self.status = String::from("refreshed");
                 self.reload();
+            }
+            x if x == KeyCode::Char as u32 && k.chr.to_ascii_lowercase() == b'n' => {
+                // new folder: same name prompt the toolbar button opens
+                self.editing = true;
+                self.new_name.clear();
+                self.rename_from = None;
+            }
+            x if x == KeyCode::Char as u32 && k.chr.to_ascii_lowercase() == b'u' => {
+                // parent dir (Backspace does the same)
+                if self.cwd != "/" {
+                    let mut parts: Vec<&str> = self.cwd.split('/').filter(|s| !s.is_empty()).collect();
+                    parts.pop();
+                    self.cwd = alloc::format!("/{}", parts.join("/"));
+                    if self.cwd.is_empty() {
+                        self.cwd = String::from("/");
+                    }
+                    self.reload();
+                }
             }
             x if x == KeyCode::Char as u32 && (k.chr.to_ascii_lowercase() == b'c' || k.chr.to_ascii_lowercase() == b'x') => {
                 // file clipboard: c copies, x marks for move; v pastes into cwd

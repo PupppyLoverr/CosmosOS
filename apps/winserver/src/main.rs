@@ -438,15 +438,26 @@ fn on_key(s: &mut S, k: &InputKey) {
             spawn_app(p);
             return;
         }
-        // Alt+Left/Right/Up: snap the focused window to a half or maximized
+        // Alt+Left/Right/Up/Down: snap focused window to a half / maximized,
+        // or restore its pre-snap rect
         if k.mods & 4 != 0
             && (k.key == KeyCode::Left as u32
                 || k.key == KeyCode::Right as u32
-                || k.key == KeyCode::Up as u32)
+                || k.key == KeyCode::Up as u32
+                || k.key == KeyCode::Down as u32)
         {
             let (fw, fh) = (s.fw, s.fh - TBAR_H);
             if let Some(wr) = s.wins.iter_mut().find(|w| w.id == s.focus && w.ws == s.workspace) {
-                if wr.resizable() {
+                if k.key == KeyCode::Down as u32 {
+                    // Alt-Down restores the rect saved by the last snap
+                    if wr.maxed && wr.saved.2 > 0 {
+                        (wr.x, wr.y, wr.w, wr.h) = wr.saved;
+                        wr.maxed = false;
+                        let id = wr.id;
+                        request_resize(s, id);
+                        s.dirty = true;
+                    }
+                } else if wr.resizable() {
                     wr.saved = (wr.x, wr.y, wr.w, wr.h);
                     if k.key == KeyCode::Left as u32 {
                         (wr.x, wr.y, wr.w, wr.h) = (0, 0, fw / 2, fh);
