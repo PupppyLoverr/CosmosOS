@@ -702,8 +702,22 @@ impl<D: BlockDevice> Fat32<D> {
                 if run >= need {
                     break;
                 }
-                // a 0x00 marker means everything after is free — enough space
+                // a 0x00 marker means everything after is free — enough
+                // space, but the dir block may not be materialized that far:
+                // grow the chain so `need` entries fit from free_start.
                 if data[i] == 0x00 {
+                    let required = free_start.unwrap_or(i) + need * 32;
+                    let mut ch = self.chain(dir_cluster)?;
+                    while ch.len() * self.clus_bytes < required {
+                        let c = self.alloc_cluster()?;
+                        let zeros = vec![0u8; self.clus_bytes];
+                        self.write_cluster(c, &zeros)?;
+                        self.fat_write(*ch.last().unwrap(), c)?;
+                        ch.push(c);
+                    }
+                    if data.len() < required {
+                        data.resize(required, 0);
+                    }
                     break;
                 }
             } else {

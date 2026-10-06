@@ -6,7 +6,8 @@
 #![no_main]
 
 extern crate alloc;
-use alloc::string::String;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use ustd::*;
 
 static mut PASS: u32 = 0;
@@ -248,6 +249,42 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
     }).unwrap_or(false));
     let ents = ustd::readdir("/proc").unwrap_or_default();
     check("proc-listdir", ents.iter().any(|e| &e.name[..e.name_len as usize] == b"meminfo"));
+
+    // codec roundtrips: our DEFLATE encoder -> our inflater must reproduce
+    // the exact bytes on patterned and high-entropy data
+    let mut pat = Vec::new();
+    for i in 0..3000u32 {
+        pat.extend_from_slice(alloc::format!("line {} ababab\n", i % 97).as_bytes());
+    }
+    let def = ustd::deflate::deflate(&pat);
+    check("deflate-shrink", def.len() * 3 < pat.len());
+    check("inflate-roundtrip", ustd::inflate::inflate(&def).map(|d| d == pat).unwrap_or(false));
+    let mut rnd = Vec::with_capacity(8192);
+    let mut s = 0x12345u64;
+    for _ in 0..8192 {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rnd.push((s >> 33) as u8);
+    }
+    check("inflate-entropy", ustd::inflate::inflate(&ustd::deflate::deflate(&rnd))
+        .map(|d| d == rnd).unwrap_or(false));
+    // gzip container roundtrip: body offset + inflate + CRC/ISIZE trailer
+    let gz = ustd::deflate::gzip_data(&pat);
+    check("gzip-roundtrip", ustd::inflate::gzip_body(&gz)
+        .and_then(|o| ustd::inflate::inflate(&gz[o..gz.len() - 8]))
+        .map(|d| {
+            d == pat
+                && u32::from_le_bytes([gz[gz.len()-8], gz[gz.len()-7], gz[gz.len()-6], gz[gz.len()-5]])
+                    == ustd::inflate::crc32(&pat)
+                && u32::from_le_bytes([gz[gz.len()-4], gz[gz.len()-3], gz[gz.len()-2], gz[gz.len()-1]])
+                    as usize == pat.len()
+        })
+        .unwrap_or(false));
+    // zlib container roundtrip
+    let zl = ustd::deflate::zlib_data(&pat);
+    check("zlib-roundtrip", ustd::inflate::zlib_body(&zl)
+        .and_then(|b| ustd::inflate::inflate(b))
+        .map(|d| d == pat)
+        .unwrap_or(false));
 
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
