@@ -155,11 +155,27 @@ impl Files {
                 self.reload();
                 return;
             }
+            if self.sel == i as i32 && self.ents[i].is_dir == 0 {
+                // second click on a file = open it in the editor
+                self.open_selected();
+                return;
+            }
             self.sel = i as i32;
             let e = &self.ents[i];
             self.status = alloc::format!("{} {} B", Self::entry_name(e), e.size);
             self.dirty = true;
         }
+    }
+
+    fn open_selected(&mut self) {
+        let i = self.sel as usize;
+        let name = Self::entry_name(&self.ents[i]);
+        let path = alloc::format!("{}{}{}", self.cwd, if self.cwd.ends_with('/') { "" } else { "/" }, name);
+        match ustd::spawn("/bin/cosmos-editor", &path) {
+            Ok(_) => self.status = alloc::format!("opened {}", name),
+            Err(_) => self.status = alloc::format!("spawn failed"),
+        }
+        self.dirty = true;
     }
 
     fn on_key(&mut self, k: &EvKey) {
@@ -205,6 +221,7 @@ impl Files {
                         self.reload();
                         return;
                     }
+                    self.open_selected();
                 }
             }
             x if x == KeyCode::Backspace as u32 => {
