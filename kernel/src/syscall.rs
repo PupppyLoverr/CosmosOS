@@ -756,7 +756,11 @@ fn sys_chdir(pptr: u64, plen: u64) -> u64 {
     let Some(path) = copy_str(pptr, plen) else { return ERR };
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = vfs::normalize(&cwd, &path);
-    // verify it's a dir
+    // verify it's a dir (procfs root is a dir too, though not on the fs)
+    if crate::proc::is_dir(&full) {
+        task::with_current(|t| t.cwd = full);
+        return 0;
+    }
     let mut g = vfs::FS.lock();
     let ok = match g.as_mut() {
         Some(fs) => fs.stat(&full).map(|e| e.is_dir).unwrap_or(false),

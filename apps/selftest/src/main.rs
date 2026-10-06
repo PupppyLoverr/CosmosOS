@@ -6,6 +6,7 @@
 #![no_main]
 
 extern crate alloc;
+use alloc::string::String;
 use ustd::*;
 
 static mut PASS: u32 = 0;
@@ -234,6 +235,19 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
     let payload = b"selftest-clipboard";
     ustd::clip_set(payload);
     check("clipboard", ustd::clip_get() == payload);
+
+    // procfs: live kernel data under /proc (read-only pseudo-files)
+    let mi = ustd::read_all("/proc/meminfo").unwrap_or_default();
+    check("proc-meminfo", mi.windows(8).any(|w| w == b"MemTotal"));
+    check("proc-meminfo-ro", ustd::write_all("/proc/x", b"no").is_err());
+    let up = ustd::read_all("/proc/uptime").unwrap_or_default();
+    let up = String::from_utf8_lossy(&up);
+    check("proc-uptime", up.trim_end().split(' ').next().map(|s| {
+        let mut it = s.split('.');
+        it.next().and_then(|v| v.parse::<u64>().ok()).is_some()
+    }).unwrap_or(false));
+    let ents = ustd::readdir("/proc").unwrap_or_default();
+    check("proc-listdir", ents.iter().any(|e| &e.name[..e.name_len as usize] == b"meminfo"));
 
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);

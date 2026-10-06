@@ -78,6 +78,13 @@ pub fn normalize(cwd: &str, path: &str) -> String {
 }
 
 pub fn read_all(path: &str) -> Result<Vec<u8>, i64> {
+    if crate::proc::handles(path) {
+        return if crate::proc::is_dir(path) {
+            Err(-4) // EISDIR
+        } else {
+            crate::proc::read_file(path).ok_or(-2)
+        };
+    }
     let mut g = FS.lock();
     match g.as_mut() {
         Some(fs) => fs.read_file(path).map_err(err_to_i64),
@@ -108,7 +115,16 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     let full = normalize(&cwd, path);
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
-    let exists = fs.exists(&full);
+    let is_proc = crate::proc::handles(&full);
+    let exists = if is_proc {
+        // procfs is read-only: opening a dir or creating is rejected
+        if crate::proc::is_dir(&full) || flags & shared::O_CREATE != 0 {
+            return Err(-4);
+        }
+        crate::proc::exists(&full)
+    } else {
+        fs.exists(&full)
+    };
     const O_CREAT: u64 = shared::O_CREATE;
     const O_TRUNC: u64 = shared::O_TRUNC;
     const O_APPEND: u64 = shared::O_APPEND;
@@ -121,8 +137,12 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     if exists && flags & O_TRUNC != 0 {
         fs.write_file(&full, &[]).map_err(err_to_i64)?;
     }
-    let st = fs.stat(&full).map_err(err_to_i64)?;
-    let pos = if flags & O_APPEND != 0 { st.size } else { 0 };
+    // procfs files stream live data; their size is per-read, not on disk
+    let pos = if flags & O_APPEND != 0 && !is_proc {
+        fs.stat(&full).map_err(err_to_i64)?.size
+    } else {
+        0
+    };
     let fd = alloc_fd() as i64;
     task::with_current(|t| {
         t.fds[fd as usize] = Some(FileDesc { path: full, pos, flags });
@@ -138,6 +158,18 @@ pub fn read(fd: i64, buf: &mut [u8]) -> Result<i64, i64> {
     });
     if pos == u64::MAX {
         return Err(-3);
+    }
+    if crate::proc::handles(&path) {
+        let data = crate::proc::read_file(&path).ok_or(-3i64)?;
+        let avail = if pos as usize >= data.len() { 0 } else { data.len() - pos as usize };
+        let n = avail.min(buf.len());
+        buf[..n].copy_from_slice(&data[pos as usize..pos as usize + n]);
+        task::with_current(|t| {
+            if let Some(Some(f)) = t.fds.get_mut(fd as usize) {
+                f.pos += n as u64;
+            }
+        });
+        return Ok(n as i64);
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
@@ -160,6 +192,9 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
     });
     if pos == u64::MAX {
         return Err(-3);
+    }
+    if crate::proc::handles(&path) {
+        return Err(-4); // procfs is read-only
     }
     const O_APPEND: u64 = shared::O_APPEND;
     let mut g = FS.lock();
@@ -201,6 +236,14 @@ pub fn seek(fd: i64, pos: u64) -> Result<i64, i64> {
 pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if crate::proc::handles(&full) {
+        if crate::proc::is_dir(&full) {
+            return Ok(shared::Stat { size: 0, is_dir: 1, mtime: 0 });
+        }
+        return crate::proc::read_file(&full)
+            .map(|d| shared::Stat { size: d.len() as u64, is_dir: 0, mtime: 0 })
+            .ok_or(-2);
+    }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     let e = fs.stat(&full).map_err(err_to_i64)?;
@@ -210,6 +253,13 @@ pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
 pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if crate::proc::handles(&full) {
+        return if crate::proc::is_dir(&full) {
+            Ok(crate::proc::entries())
+        } else {
+            Err(-4) // ENOTDIR
+        };
+    }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     let ents = fs.readdir(&full).map_err(err_to_i64)?;
@@ -234,6 +284,9 @@ pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
 pub fn mkdir(path: &str) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if crate::proc::handles(&full) {
+        return Err(-4);
+    }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     fs.mkdir(&full).map_err(err_to_i64)
@@ -242,6 +295,9 @@ pub fn mkdir(path: &str) -> Result<(), i64> {
 pub fn remove(path: &str) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if crate::proc::handles(&full) {
+        return Err(-4);
+    }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     fs.remove(&full).map_err(err_to_i64)
@@ -251,6 +307,9 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let f = normalize(&cwd, from);
     let t2 = normalize(&cwd, to);
+    if crate::proc::handles(&f) || crate::proc::handles(&t2) {
+        return Err(-4);
+    }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     fs.rename(&f, &t2).map_err(err_to_i64)
