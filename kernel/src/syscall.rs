@@ -68,7 +68,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
     // is picked up by the try_recv below.
     crate::input::pump();
     let nr = ctx.rax;
-    let (a1, a2, a3, a4) = (ctx.rdi, ctx.rsi, ctx.rdx, ctx.r8);
+    let (a1, a2, a3, a4, a5) = (ctx.rdi, ctx.rsi, ctx.rdx, ctx.r8, ctx.r9);
     let ret: u64 = match nr {
         shared::SYS_EXIT => {
             task::exit_current(ctx.rdi as i64);
@@ -192,6 +192,41 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 }
                 None => ERR,
             }
+        }
+        shared::SYS_NET_UDP_OPEN => net::udp_open(a1 as u16).map(|_| 0).unwrap_or(ERR),
+        shared::SYS_NET_UDP_SEND => {
+            let ip = [
+                (a2 >> 24) as u8,
+                (a2 >> 16) as u8,
+                (a2 >> 8) as u8,
+                a2 as u8,
+            ];
+            match copy_in(a4, a5.min(1400)) {
+                Some(payload) => net::udp_send(a1 as u16, ip, a3 as u16, &payload)
+                    .map(|_| 0)
+                    .unwrap_or(ERR),
+                None => ERR,
+            }
+        }
+        shared::SYS_NET_UDP_RECV => {
+            match net::udp_recv(a1 as u16, a4.min(10_000)) {
+                Some((src_ip, sport, payload)) => {
+                    let n = (6 + payload.len()).min(a3 as usize);
+                    let mut buf = Vec::with_capacity(n);
+                    buf.extend_from_slice(&src_ip);
+                    buf.extend_from_slice(&sport.to_be_bytes());
+                    buf.extend_from_slice(&payload[..n.saturating_sub(6)]);
+                    match copy_out(a2, &buf) {
+                        Some(_) => buf.len() as u64,
+                        None => ERR,
+                    }
+                }
+                None => ERR,
+            }
+        }
+        shared::SYS_NET_UDP_CLOSE => {
+            net::udp_close(a1 as u16);
+            0
         }
         shared::SYS_NET_INFO => match net::info() {
             Some((mac, ip)) => {

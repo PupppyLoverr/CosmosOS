@@ -48,6 +48,10 @@ pub const SYS_NET_PING: u64 = 51; // (ip u32 BE-packed, timeout_ms) -> rtt_ms | 
 pub const SYS_NET_INFO: u64 = 52; // (&mut [u8;10] {mac[6],ip[4]}) -> 0 | ERR
 pub const SYS_NET_DNS: u64 = 53; // (name_ptr,len, out [u8;4]) -> 0 | ERR (real UDP/53)
 pub const SYS_NET_HTTP: u64 = 54; // (host_ptr,len, out, outlen) -> n | ERR (real TCP/80 GET /)
+pub const SYS_NET_UDP_OPEN: u64 = 55; // (lport) -> 0 | ERR (bind local port)
+pub const SYS_NET_UDP_SEND: u64 = 56; // (lport, dst_ip u32 BE-packed, dport, ptr, len) -> 0 | ERR
+pub const SYS_NET_UDP_RECV: u64 = 57; // (lport, buf, cap, timeout_ms) -> n | ERR; buf=[srcip:4][sport:2][payload]
+pub const SYS_NET_UDP_CLOSE: u64 = 58; // (lport) -> 0
 
 pub const SYS_ERR: u64 = u64::MAX;
 

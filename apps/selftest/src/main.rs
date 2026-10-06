@@ -148,12 +148,41 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 .map(|b| b.windows(5).any(|w| w == b"HTTP/"))
                 .unwrap_or(false),
         );
+        // userspace UDP socket: hand-built DNS wire query through
+        // bind -> sendto -> recvfrom to slirp's real resolver
+        let sock_ok = (|| {
+            let s = ustd::UdpSock::open(54321)?;
+            let mut q = alloc::vec::Vec::new();
+            q.extend_from_slice(&0xBEEFu16.to_be_bytes()); // txid
+            q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+            q.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+            q.extend_from_slice(&[0u8; 6]);
+            for l in "example.org".split('.') {
+                q.push(l.len() as u8);
+                q.extend_from_slice(l.as_bytes());
+            }
+            q.push(0);
+            q.extend_from_slice(&1u16.to_be_bytes()); // A
+            q.extend_from_slice(&1u16.to_be_bytes()); // IN
+            s.send_to([10, 0, 2, 3], 53, &q)?;
+            let (_ip, sport, resp) = s.recv_from(3000)?;
+            if sport != 53 || resp.len() < 12 {
+                return None;
+            }
+            if u16::from_be_bytes([resp[0], resp[1]]) != 0xBEEF || resp[2] & 0x80 == 0 {
+                return None;
+            }
+            Some(())
+        })()
+        .is_some();
+        check("udp-socket", sock_ok);
     } else {
         check("net-mac", false);
         check("net-ip", false);
         check("ping-gw", false);
         check("dns-resolve", false);
         check("http-example", false);
+        check("udp-socket", false);
     }
 
     let (pass, fail) = unsafe { (PASS, FAIL) };

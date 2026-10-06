@@ -3,6 +3,7 @@
 //! `ping(ip)` performs a real ARP resolve + ICMP echo request/reply.
 use crate::sprintln;
 use crate::virtio_net::{self, NET};
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use spin::Mutex;
 
@@ -65,7 +66,7 @@ fn now_ms() -> u64 {
 /// Net is polled: virtio-net IRQs are not wired; wait loops `sti;hlt` so the
 /// PIT keeps ticking and deadlines stay real.
 /// Returns (ip_proto, transport_payload) for IPv4 frames addressed to us.
-fn pump_rx() -> Vec<(u8, Vec<u8>)> {
+fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
     let mut out = Vec::new();
     for f in virtio_net::take_rx() {
         if let Some(p) = handle_frame(&f) {
@@ -149,7 +150,7 @@ fn send_icmp_echo(dst_mac: [u8; 6], dst_ip: [u8; 4], id: u16, seq: u16, payload:
 /// Handle one ethernet frame: ARP cache/reply, or deliver an IPv4 payload.
 /// Returns Some((ip_proto, transport_payload)) when the frame carried IPv4
 /// addressed to our IP.
-fn handle_frame(f: &[u8]) -> Option<(u8, Vec<u8>)> {
+fn handle_frame(f: &[u8]) -> Option<([u8; 4], u8, Vec<u8>)> {
     if f.len() < 14 {
         return None;
     }
@@ -192,7 +193,8 @@ fn handle_frame(f: &[u8]) -> Option<(u8, Vec<u8>)> {
             if dst != our_ip() && dst != [255, 255, 255, 255] {
                 return None;
             }
-            Some((ip[9], ip[ihl..].to_vec()))
+            let src: [u8; 4] = ip[12..16].try_into().ok()?;
+            Some((src, ip[9], ip[ihl..].to_vec()))
         }
         _ => None,
     }
@@ -245,7 +247,7 @@ pub fn ping(ip: [u8; 4], timeout_ms: u64) -> Option<u64> {
     let t0 = now_ms();
     send_icmp_echo(dst_mac, ip, id, seq, payload);
     loop {
-        for (proto, p) in pump_rx() {
+        for (_src_ip, proto, p) in pump_rx() {
             if proto == 1 && p.len() >= 8 && p[0] == 0 && be16(&p[4..]) == id && be16(&p[6..]) == seq {
                 return Some(now_ms() - t0);
             }
@@ -328,54 +330,82 @@ pub fn dns_query(name: &str, timeout_ms: u64) -> Option<[u8; 4]> {
     q.extend_from_slice(&1u16.to_be_bytes()); // A
     q.extend_from_slice(&1u16.to_be_bytes()); // IN
 
-    let mac = next_hop(DNS, 1500)?;
-    send_udp(mac, DNS, SPORT, 53, &q);
+    // ride the socket abstraction: bind, sendto, recvfrom
+    udp_open(SPORT).ok()?;
+    udp_send(SPORT, DNS, 53, &q).ok()?;
     sprintln!("[net] dns query '{}' -> 10.0.2.3:53", name);
 
     let t0 = now_ms();
-    loop {
-        for (proto, p) in pump_rx() {
-            if proto != 17 || p.len() < 8 + 12 {
-                continue;
+    let out = loop {
+        let Some((_src_ip, sport, m)) = udp_recv(SPORT, timeout_ms) else {
+            break None;
+        };
+        let m = m.as_slice();
+        if sport != 53 || m.len() < 12 {
+            if now_ms() - t0 >= timeout_ms {
+                break None;
             }
-            let sport = be16(&p[0..]);
-            let dport = be16(&p[2..]);
-            if sport != 53 || dport != SPORT {
-                continue;
+            continue;
+        }
+        if be16(&m[0..]) != txid || m[2] & 0x80 == 0 {
+            if now_ms() - t0 >= timeout_ms {
+                break None;
             }
-            let m = &p[8..];
-            if be16(&m[0..]) != txid || m[2] & 0x80 == 0 {
-                continue; // not our reply
+            continue; // not our reply
+        }
+        let ancount = be16(&m[6..]) as usize;
+        let qdcount = be16(&m[4..]) as usize;
+        let mut i = 12;
+        let mut bad = false;
+        for _ in 0..qdcount {
+            match dns_skip_name(m, i) {
+                Some(ni) => i = ni + 4,
+                None => bad = true,
             }
-            let ancount = be16(&m[6..]) as usize;
-            let qdcount = be16(&m[4..]) as usize;
-            let mut i = 12;
-            for _ in 0..qdcount {
-                i = dns_skip_name(m, i)? + 4;
+            if bad {
+                break;
             }
-            for _ in 0..ancount {
-                i = dns_skip_name(m, i)?;
-                if m.len() < i + 10 {
-                    return None;
+        }
+        if bad {
+            break None;
+        }
+        let mut found: Option<[u8; 4]> = None;
+        for _ in 0..ancount {
+            match dns_skip_name(m, i) {
+                Some(ni) => i = ni,
+                None => {
+                    bad = true;
+                    break;
                 }
-                let rtype = be16(&m[i..]);
-                let rdlen = be16(&m[i + 8..]) as usize;
-                if rtype == 1 && rdlen == 4 && m.len() >= i + 10 + 4 {
-                    let ip: [u8; 4] = m[i + 10..i + 14].try_into().ok()?;
-                    sprintln!(
-                        "[net] dns '{}' -> {}.{}.{}.{}",
-                        name, ip[0], ip[1], ip[2], ip[3]
-                    );
-                    return Some(ip);
-                }
-                i += 10 + rdlen;
             }
+            if m.len() < i + 10 {
+                bad = true;
+                break;
+            }
+            let rtype = be16(&m[i..]);
+            let rdlen = be16(&m[i + 8..]) as usize;
+            if rtype == 1 && rdlen == 4 && m.len() >= i + 10 + 4 {
+                found = Some(m[i + 10..i + 14].try_into().unwrap());
+                break;
+            }
+            i += 10 + rdlen;
+        }
+        if bad {
+            break None;
+        }
+        if let Some(ip) = found {
+            sprintln!(
+                "[net] dns '{}' -> {}.{}.{}.{}",
+                name, ip[0], ip[1], ip[2], ip[3]
+            );
+            break Some(ip);
         }
         if now_ms() - t0 >= timeout_ms {
-            return None;
+            break None;
         }
-        wait_irq();
-    }
+    };
+    udp_close(SPORT);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -471,8 +501,8 @@ pub fn http_get(dst_ip: [u8; 4], host: &str, path: &str) -> Option<Vec<u8>> {
             send_tcp(mac, dst_ip, SPORT, 80, isn, 0, TCP_SYN, &[]);
             last_syn = now_ms();
         }
-        for (proto, p) in pump_rx() {
-            if proto != 6 {
+        for (src_ip, proto, p) in pump_rx() {
+            if proto != 6 || src_ip != dst_ip {
                 continue;
             }
             if let Some(s) = parse_tcp(&p) {
@@ -511,8 +541,8 @@ pub fn http_get(dst_ip: [u8; 4], host: &str, path: &str) -> Option<Vec<u8>> {
     let mut got_fin = false;
     while now_ms() < deadline && !got_fin {
         let mut progressed = false;
-        for (proto, p) in pump_rx() {
-            if proto != 6 {
+        for (src_ip, proto, p) in pump_rx() {
+            if proto != 6 || src_ip != dst_ip {
                 continue;
             }
             if let Some(s) = parse_tcp(&p) {
@@ -647,7 +677,7 @@ fn dhcp_parse(udp: &[u8]) -> Option<(u8, [u8; 4], Option<[u8; 4]>)> {
 
 fn dhcp_recv(want_type: u8, deadline: u64) -> Option<([u8; 4], Option<[u8; 4]>)> {
     while now_ms() < deadline {
-        for (proto, p) in pump_rx() {
+        for (_src_ip, proto, p) in pump_rx() {
             if proto != 17 || p.len() < 8 {
                 continue;
             }
@@ -683,6 +713,77 @@ pub fn dhcp() -> Option<[u8; 4]> {
         ack_ip[0], ack_ip[1], ack_ip[2], ack_ip[3]
     );
     Some(ack_ip)
+}
+
+// ---------------------------------------------------------------------------
+// UDP socket abstraction — spec's "basic socket abstraction". A socket is a
+// bound local port with a received-datagram queue; dns_query rides on it.
+// ---------------------------------------------------------------------------
+
+const MAX_SOCK_Q: usize = 32;
+static SOCKS: Mutex<BTreeMap<u16, VecDeque<([u8; 4], u16, Vec<u8>)>>> =
+    Mutex::new(BTreeMap::new());
+
+/// Bind a local UDP port. Err(-1) if already bound.
+pub fn udp_open(lport: u16) -> Result<(), i64> {
+    let mut s = SOCKS.lock();
+    if s.contains_key(&lport) {
+        return Err(-1);
+    }
+    s.insert(lport, VecDeque::new());
+    Ok(())
+}
+
+pub fn udp_close(lport: u16) {
+    SOCKS.lock().remove(&lport);
+}
+
+/// Send a datagram from `lport` to `dst_ip:dst_port` (real ARP next-hop).
+pub fn udp_send(lport: u16, dst_ip: [u8; 4], dport: u16, payload: &[u8]) -> Result<(), i64> {
+    if !SOCKS.lock().contains_key(&lport) {
+        return Err(-2); // not bound
+    }
+    let Some(mac) = next_hop(dst_ip, 1500) else {
+        return Err(-3);
+    };
+    send_udp(mac, dst_ip, lport, dport, payload);
+    Ok(())
+}
+
+/// Blocking recvfrom: returns (src_ip, src_port, payload). Datagrams for the
+/// bound port are consumed from the wire in order; others are dropped (the
+//  stack is cooperative — at most one task waits on packets at a time).
+pub fn udp_recv(lport: u16, timeout_ms: u64) -> Option<([u8; 4], u16, Vec<u8>)> {
+    // already-queued datagram first
+    if let Some(d) = SOCKS.lock().get_mut(&lport).and_then(|q| q.pop_front()) {
+        return Some(d);
+    }
+    let deadline = now_ms() + timeout_ms;
+    while now_ms() < deadline {
+        for (src_ip, proto, p) in pump_rx() {
+            if proto != 17 || p.len() < 8 {
+                continue;
+            }
+            let sport = be16(&p[0..]);
+            let dport = be16(&p[2..]);
+            let dgram = (src_ip, sport, p[8..].to_vec());
+            let mut socks = SOCKS.lock();
+            if let Some(q) = socks.get_mut(&dport) {
+                if q.len() < MAX_SOCK_Q {
+                    q.push_back(dgram);
+                }
+                if dport == lport {
+                    return q.pop_front();
+                }
+            }
+        }
+        wait_irq();
+    }
+    None
+}
+
+pub fn udp_bound(lport: u16) -> bool {
+    SOCKS.lock().contains_key(&lport)
 }
 
 pub fn init() {
