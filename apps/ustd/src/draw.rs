@@ -7,6 +7,7 @@ pub struct Canvas {
     pub w: u32,
     pub h: u32,
     pub stride: u32, // pixels per row
+    pub clip: (i32, i32, i32, i32), // (x,y,w,h) — primitives intersect it
 }
 
 // Palette (matches winserver chrome; monochrome-first).
@@ -20,12 +21,24 @@ pub const ACCENT: u32 = 0xFFD9D9DC;
 
 impl Canvas {
     pub fn new(ptr: *mut u32, w: u32, h: u32, stride: u32) -> Self {
-        Self { ptr, w, h, stride }
+        Self { ptr, w, h, stride, clip: (0, 0, w as i32, h as i32) }
+    }
+
+    /// Restrict drawing to a rect (all primitives intersect it). Reset with
+    /// `reset_clip` when done — callers that copy may outlive the set.
+    pub fn set_clip(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        self.clip = (x, y, w, h);
+    }
+    pub fn reset_clip(&mut self) {
+        self.clip = (0, 0, self.w as i32, self.h as i32);
     }
 
     #[inline]
     pub fn put(&self, x: i32, y: i32, c: u32) {
-        if x >= 0 && y >= 0 && (x as u32) < self.w && (y as u32) < self.h {
+        let (cx, cy, cw, ch) = self.clip;
+        if x >= 0 && y >= 0 && (x as u32) < self.w && (y as u32) < self.h
+            && x >= cx && x < cx + cw && y >= cy && y < cy + ch
+        {
             unsafe {
                 *self.ptr.add(y as usize * self.stride as usize + x as usize) = c;
             }
@@ -42,10 +55,11 @@ impl Canvas {
     }
 
     pub fn fill(&self, x: i32, y: i32, w: i32, h: i32, c: u32) {
-        let x0 = x.max(0);
-        let y0 = y.max(0);
-        let x1 = (x + w).min(self.w as i32);
-        let y1 = (y + h).min(self.h as i32);
+        let (cx, cy, cw, ch) = self.clip;
+        let x0 = x.max(0).max(cx);
+        let y0 = y.max(0).max(cy);
+        let x1 = (x + w).min(self.w as i32).min(cx + cw);
+        let y1 = (y + h).min(self.h as i32).min(cy + ch);
         if x1 <= x0 || y1 <= y0 {
             return;
         }
