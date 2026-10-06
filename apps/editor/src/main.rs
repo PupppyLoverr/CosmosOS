@@ -24,6 +24,8 @@ struct Editor {
     dirty_text: bool,
     dirty_ui: bool,
     status: String,
+    drag_anchor: Option<usize>, // byte idx where the mouse press started
+    ldown: bool,
 }
 
 impl Editor {
@@ -359,6 +361,8 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         dirty_text: false,
         dirty_ui: true,
         status: String::from("ready"),
+        drag_anchor: None,
+        ldown: false,
     };
     loop {
         match wm.next_event(250) {
@@ -368,16 +372,37 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
             }
             Some((EV_POINTER, pl)) if pl.len() >= 16 => {
                 let p: EvPointer = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
-                // left-press inside the text area moves the caret there
+                // wheel scrolls the text view
+                if p.wheel > 0 {
+                    e.scroll = e.scroll.saturating_sub(3);
+                    e.dirty_ui = true;
+                } else if p.wheel < 0 {
+                    let vis = ((e.c.h as usize - 34) / 16).max(1);
+                    let max = e.lines().len().saturating_sub(vis);
+                    e.scroll = (e.scroll + 3).min(max);
+                    e.dirty_ui = true;
+                }
+                // left-press inside the text area moves the caret there;
+                // holding the button and dragging extends a selection.
                 if p.buttons & 1 != 0 && p.y >= 30 && p.x >= 36 {
                     let row = e.scroll + ((p.y - 30) / 16).max(0) as usize;
                     let col = ((p.x - 36) / 8).max(0) as usize;
                     let lines = e.lines();
                     if row < lines.len() {
-                        e.cx = e.idx_of(row, col.min(lines[row].len()));
-                        e.sel = None;
+                        let idx = e.idx_of(row, col.min(lines[row].len()));
+                        e.cx = idx;
+                        if !e.ldown {
+                            e.drag_anchor = Some(idx);
+                            e.sel = None;
+                        } else if let Some(a) = e.drag_anchor {
+                            e.sel = if a == idx { None } else { Some((a.min(idx), a.max(idx))) };
+                        }
+                        e.ldown = true;
                         e.dirty_ui = true;
                     }
+                } else {
+                    e.ldown = false;
+                    e.drag_anchor = None;
                 }
             }
             Some((EV_CLOSE, _)) => return 0,
