@@ -37,7 +37,7 @@ fn pid_of(path: &str) -> Option<u32> {
     p.parse().ok()
 }
 
-const PID_FILES: &[&str] = &["status", "cmdline", "stat", "fds"];
+const PID_FILES: &[&str] = &["status", "cmdline", "stat", "fds", "cwd"];
 
 pub fn is_dir(path: &str) -> bool {
     path == "/proc"
@@ -289,6 +289,7 @@ fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
             vrun
         ),
         "fds" => task::fd_list(pid).unwrap_or_default(),
+        "cwd" => alloc::format!("{}\n", task::pid_cwd(pid).unwrap_or_default()),
         _ => return None,
     };
     Some(s.into_bytes())

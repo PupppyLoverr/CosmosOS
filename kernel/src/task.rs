@@ -699,6 +699,13 @@ pub fn pid_info(pid: u32) -> Option<(String, String, u64, u64, bool, &'static st
     })
 }
 
+/// `/proc/<pid>/cwd` body: the task's current working directory.
+pub fn pid_cwd(pid: u32) -> Option<String> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    s.tasks.iter().find(|t| t.id == pid).map(|t| t.cwd.clone())
+}
+
 /// `/proc/<pid>/fds` body: one line per open fd (fd: path).
 pub fn fd_list(pid: u32) -> Option<String> {
     let g = SCHED.lock();
