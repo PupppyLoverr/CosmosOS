@@ -37,6 +37,30 @@ fn cal_days(y: u16, m: u8, d: u8) -> u64 {
     n + d as u64 - 1
 }
 
+/// Unix epoch seconds -> (y, m, d, h, min, s) UTC.
+fn epoch_to_dt(secs: u64) -> (u16, u8, u8, u8, u8, u8) {
+    let mut d = secs / 86400;
+    let rem = secs % 86400;
+    let mut y = 1970u16;
+    loop {
+        let dy = if cal_leap(y) { 366 } else { 365 };
+        if d >= dy { d -= dy; y += 1; } else { break; }
+    }
+    let mut m = 1u8;
+    loop {
+        let dm = DIM_CAL[(m - 1) as usize] as u64 + if m == 2 && cal_leap(y) { 1 } else { 0 };
+        if d >= dm { d -= dm; m += 1; } else { break; }
+    }
+    (
+        y,
+        m,
+        d as u8 + 1,
+        (rem / 3600) as u8,
+        ((rem % 3600) / 60) as u8,
+        (rem % 60) as u8,
+    )
+}
+
 /// Render one month as text lines (Sunday-first), or mark today.
 fn cal_render(m: u8, y: u16) -> Vec<String> {
     let mut out = Vec::new();
@@ -394,7 +418,7 @@ impl Term {
                     "          hex <file> wc <file> du <path> history time <cmd>",
                     "          head/tail [-n N] <file> sort <file>",
                     "          a | b   cmd > file   cmd >> file   watch [-n s] cmd",
-                    "          df  (volume usage)  more  cal  tree  seq  sleep  sh  calc",
+                    "          df  (volume usage)  more  cal  tree  seq  sleep  sh  calc  ntp",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -707,6 +731,52 @@ impl Term {
                 },
                 None => self.emit("usage: ping <a.b.c.d>  (try 10.0.2.2)"),
             },
+            "ntp" => {
+                // real SNTP query (UDP/123) — epoch -> date, vs RTC
+                let host = args.first().copied().unwrap_or("pool.ntp.org");
+                match ustd::net_dns(host) {
+                    Some(ip) => {
+                        let got = (|| -> Option<(u64, u64)> {
+                            let sock = ustd::UdpSock::open(49123)?;
+                            let mut pkt = [0u8; 48];
+                            pkt[0] = 0x1B; // LI=0 VN=3 Mode=3 (client)
+                            sock.send_to(ip, 123, &pkt)?;
+                            let (_, _, resp) = sock.recv_from(4000)?;
+                            if resp.len() < 44 {
+                                return None;
+                            }
+                            let secs = u32::from_be_bytes([
+                                resp[40], resp[41], resp[42], resp[43],
+                            ]) as u64;
+                            let t0 = ustd::uptime_ms();
+                            Some((secs.saturating_sub(2208988800), t0))
+                        })();
+                        match got {
+                            Some((unix, _)) => {
+                                let (y, mo, d, h, mi, s) = epoch_to_dt(unix);
+                                self.emit(&alloc::format!(
+                                    "ntp: {}.{}.{}.{} -> {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                                    ip[0], ip[1], ip[2], ip[3], y, mo, d, h, mi, s
+                                ));
+                                let rtc = ustd::datetime();
+                                let now_s = (cal_days(rtc.year, rtc.month, rtc.day)) * 86400
+                                    + rtc.hour as u64 * 3600 + rtc.minute as u64 * 60 + rtc.second as u64;
+                                let drift = if unix >= now_s { unix - now_s } else { now_s - unix };
+                                self.emit(&alloc::format!(
+                                    "rtc is {}s {} ntp",
+                                    drift,
+                                    if unix >= now_s { "behind" } else { "ahead of" }
+                                ));
+                            }
+                            None => self.emit(&alloc::format!(
+                                "ntp: {}.{}.{}.{}: no response",
+                                ip[0], ip[1], ip[2], ip[3]
+                            )),
+                        }
+                    }
+                    None => self.emit(&alloc::format!("ntp: {}: DNS failed", host)),
+                }
+            }
             "resolve" => match args.first() {
                 Some(host) => match ustd::net_dns(host) {
                     Some(ip) => self.emit(&alloc::format!(
@@ -1143,7 +1213,7 @@ impl Term {
             "uptime", "reboot", "shutdown", "exit", "history", "time",
             "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
             "set", "env", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
-            "dmesg", "arp", "httpd",
+            "dmesg", "arp", "httpd", "ntp",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
