@@ -29,16 +29,18 @@ Requires: `rustup` toolchain `nightly` (`rust-src`, `llvm-tools-preview`,
 - Real networking: virtio-net + IPv4/ARP/ICMP/UDP/TCP with a real DHCP
   client (DISCOVER→ACK configures the guest IP), `ping`, `resolve` (DNS/UDP
   to slirp's resolver), `httpget` (real HTTP through slirp to the live
-  internet), `ifconfig`, and a userspace UDP socket API
-  (`SYS_NET_UDP_*` → `ustd::UdpSock` bind/sendto/recvfrom).
+  internet), `ifconfig`, `dhcp`, `netstat`, and userspace socket APIs
+  (`ustd::UdpSock` bind/sendto/recvfrom + `ustd::TcpSock` connect/send/recv).
 - Damage-region compositing: the compositor redraws only the damaged rect
   (cursor move ≈ two 16px cells, not a ~3MB full frame).
 
 ## Terminal commands
 
-`help ls cd pwd cat mkdir touch rm mv cp echo clear ps mem uname date`
-`ping <ip> resolve <host> httpget <host> ifconfig`
-`reboot shutdown exit`
+`help ls cd pwd cat mkdir touch rm [-r] mv cp echo clear ps mem uname whoami date uptime`
+`ping <ip> resolve <host> httpget <host> ifconfig dhcp netstat`
+`kill <pid> grep [-r] <pat> <path> hex <file> wc <file> du <path>`
+`reboot shutdown exit` — `Tab` completes commands + paths; `Ctrl-V` pastes
+from the kernel clipboard (editor has `Ctrl-A/C/X/V` selection + `Ctrl-F` find).
 
 ## Layout
 
@@ -47,7 +49,7 @@ Requires: `rustup` toolchain `nightly` (`rust-src`, `llvm-tools-preview`,
 | `boot/` | UEFI loader: claims framebuffer, loads kernel ELF, jumps in |
 | `kernel/` | x86_64 kernel: serial log, GDT/IDT, PIC+PIT, page/frame alloc, heap, virtio-blk, FAT32 (via `fatfs`), ELF loader, userspace tasks + preemptive scheduler, syscalls, IPC ports, shm surfaces, PS/2 input |
 | `apps/ustd` | userspace support lib: syscall wrappers, `wm` client (windows/events), Canvas drawing, VGA16 font |
-| `apps/*` | init, winserver (compositor + desktop shell), terminal, files, settings, editor, sysmon, demo, selftest |
+| `apps/*` | init, winserver (compositor + desktop shell), terminal, files, settings, editor, sysmon, calc, demo, selftest |
 | `shared/` | wire-format crate shared by kernel+apps: syscall numbers, `InputKey`/`EvKey`/`InputMouse`, window protocol constants |
 | `fat32/` | read/write FAT32 impl used by `imgtool` to bake the data disk |
 | `imgtool/` | host tool: builds `dist/cosmos-data.img` from `imgroot/` + built app ELFs |
