@@ -22,8 +22,9 @@ Requires: `rustup` toolchain `nightly` (`rust-src`, `llvm-tools-preview`,
   memory readout, pointer.
 - Windows: drag by titlebar, resize by edges, minimize/maximize/close,
   focus raise + Alt-Tab cycle, edge snapping (drag to screen edges).
-- Apps (F4–F9): Terminal, Files, Text Editor, Settings, System Monitor,
-  Demo (native Rust app on the app API: shm surface + input + file persistence).
+- Apps (F4–F10): Terminal, Files, Text Editor, Settings, System Monitor,
+  Calculator (clickable integer calc), Demo (native Rust app on the app API:
+  shm surface + input + file persistence). Launcher menu lists them all.
 - Real persistence: writes land on the FAT32 data disk and survive reboot.
 - Real networking: virtio-net + IPv4/ARP/ICMP/UDP/TCP with a real DHCP
   client (DISCOVER→ACK configures the guest IP), `ping`, `resolve` (DNS/UDP

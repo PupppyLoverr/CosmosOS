@@ -178,6 +178,7 @@ fn main_loop() -> ! {
                 ("Settings", "/bin/cosmos-settings"),
                 ("System Monitor", "/bin/cosmos-sysmon"),
                 ("Demo", "/bin/cosmos-demo"),
+                ("Calculator", "/bin/cosmos-calc"),
             ],
             sel: -1,
         },
@@ -294,7 +295,7 @@ fn spawn_app(path: &str) {
 }
 
 fn on_key(s: &mut S, k: &InputKey) {
-    // F4-F9 launch apps; F1/F2 switch workspaces
+    // F4-F10 launch apps; F1/F2 switch workspaces
     if k.down != 0 {
         let app = match k.key {
             x if x == KeyCode::F4 as u32 => Some("/bin/cosmos-terminal"),
@@ -303,6 +304,7 @@ fn on_key(s: &mut S, k: &InputKey) {
             x if x == KeyCode::F7 as u32 => Some("/bin/cosmos-settings"),
             x if x == KeyCode::F8 as u32 => Some("/bin/cosmos-sysmon"),
             x if x == KeyCode::F9 as u32 => Some("/bin/cosmos-demo"),
+            x if x == KeyCode::F10 as u32 => Some("/bin/cosmos-calc"),
             _ => None,
         };
         if let Some(p) = app {
