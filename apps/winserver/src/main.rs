@@ -111,6 +111,7 @@ struct S {
     workspace: u32,
     dirty: bool,
     last_tick: u64,
+    last_frame: u64,
     wall: Vec<u32>, // wallpaper cache (fh-TBAR_H rows)
 }
 
@@ -182,6 +183,7 @@ fn main_loop() -> ! {
         workspace: 0,
         dirty: true,
         last_tick: 0,
+        last_frame: 0,
     };
 
     composite(&mut s);
@@ -203,15 +205,18 @@ fn main_loop() -> ! {
             progressed = true;
             handle_req(&mut s, &buf[..n]);
         }
-        // per-second taskbar refresh
+        // per-second taskbar refresh + reap windows whose owner died
         let up = ustd::uptime_ms();
         if up / 1000 != s.last_tick {
             s.last_tick = up / 1000;
+            reap_dead(&mut s);
             draw_taskbar(&s);
             blit_cursor(&s, unsafe { MX }, unsafe { MY });
             s.dirty = false;
-        } else if s.dirty {
+        } else if s.dirty && up.wrapping_sub(s.last_frame) >= 20 {
+            // composite throttle: ~50fps max so input/ws-port drains keep up
             composite(&mut s);
+            s.last_frame = ustd::uptime_ms();
             s.dirty = false;
         }
         if !progressed {
@@ -576,6 +581,25 @@ fn top_id(s: &S) -> u32 {
         .find(|w| w.ws == s.workspace && !w.min)
         .map(|w| w.id)
         .unwrap_or(0)
+}
+
+/// Remove windows whose owning app died (port freed by kernel teardown).
+fn reap_dead(s: &mut S) {
+    let mut i = 0;
+    while i < s.wins.len() {
+        if ustd::ipc_owner(s.wins[i].owner) == 0 {
+            let w = s.wins.remove(i);
+            if w.shm_id != 0 {
+                ustd::shm_drop(w.shm_id);
+            }
+            if s.focus == w.id {
+                s.focus = top_id(s);
+            }
+            s.dirty = true;
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn close_win(s: &mut S, id: u32) {
