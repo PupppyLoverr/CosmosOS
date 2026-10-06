@@ -229,6 +229,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
             net::udp_close(a1 as u16);
             0
         }
+        shared::SYS_NET_DHCP => net::dhcp().map(|ip| u32::from_be_bytes(ip) as u64).unwrap_or(ERR),
         shared::SYS_NET_INFO => match net::info() {
             Some((mac, ip)) => {
                 let mut b = [0u8; 10];

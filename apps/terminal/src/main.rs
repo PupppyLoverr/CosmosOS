@@ -128,7 +128,7 @@ impl Term {
             "help" => {
                 for l in [
                     "commands: help ls cd pwd cat mkdir touch rm mv cp echo",
-                    "          clear ps mem uname whoami date ping resolve httpget ifconfig",
+                    "          clear ps mem uname whoami date ping resolve httpget ifconfig dhcp",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -305,6 +305,12 @@ impl Term {
                     None => self.push_line(&alloc::format!("httpget: {}: failed", host)),
                 },
                 None => self.push_line("usage: httpget <host>  (real TCP/80 GET /)"),
+            },
+            "dhcp" => match ustd::net_dhcp() {
+                Some(ip) => self.push_line(&alloc::format!(
+                    "dhcp: lease {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]
+                )),
+                None => self.push_line("dhcp: no response (net down or no server)"),
             },
             "ifconfig" => match ustd::net_info() {
                 Some((mac, ip)) => {
