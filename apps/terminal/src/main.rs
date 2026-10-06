@@ -57,6 +57,62 @@ fn cal_render(m: u8, y: u16) -> Vec<String> {
     out
 }
 
+/// Integer expression evaluator: + - * / % ( ) unary-minus.
+/// No floats (userspace has no SSE state switching).
+fn expr_eval(s: &str) -> Result<i64, &'static str> {
+    let mut p = ExprP { b: s.as_bytes(), i: 0 };
+    let v = p.expr()?;
+    p.ws();
+    if p.i != p.b.len() { return Err("trailing characters"); }
+    Ok(v)
+}
+
+struct ExprP<'a> { b: &'a [u8], i: usize }
+
+impl<'a> ExprP<'a> {
+    fn ws(&mut self) { while self.i < self.b.len() && self.b[self.i] == b' ' { self.i += 1; } }
+    fn peek(&mut self) -> Option<u8> { self.ws(); self.b.get(self.i).copied() }
+    fn eat(&mut self, c: u8) -> bool { if self.peek() == Some(c) { self.i += 1; true } else { false } }
+    fn expr(&mut self) -> Result<i64, &'static str> {
+        let mut v = self.term()?;
+        loop {
+            if self.eat(b'+') { v = v.checked_add(self.term()?).ok_or("overflow")?; }
+            else if self.eat(b'-') { v = v.checked_sub(self.term()?).ok_or("overflow")?; }
+            else { break; }
+        }
+        Ok(v)
+    }
+    fn term(&mut self) -> Result<i64, &'static str> {
+        let mut v = self.factor()?;
+        loop {
+            if self.eat(b'*') { v = v.checked_mul(self.factor()?).ok_or("overflow")?; }
+            else if self.eat(b'/') {
+                let d = self.factor()?;
+                if d == 0 { return Err("division by zero"); }
+                v /= d;
+            } else if self.eat(b'%') {
+                let d = self.factor()?;
+                if d == 0 { return Err("division by zero"); }
+                v %= d;
+            } else { break; }
+        }
+        Ok(v)
+    }
+    fn factor(&mut self) -> Result<i64, &'static str> {
+        if self.eat(b'(') {
+            let v = self.expr()?;
+            if !self.eat(b')') { return Err("missing )"); }
+            return Ok(v);
+        }
+        if self.eat(b'-') { return Ok(-self.factor()?); }
+        self.ws();
+        let s = self.i;
+        while self.i < self.b.len() && self.b[self.i].is_ascii_digit() { self.i += 1; }
+        if s == self.i { return Err("expected number"); }
+        core::str::from_utf8(&self.b[s..self.i]).unwrap_or("").parse::<i64>().map_err(|_| "bad number")
+    }
+}
+
 fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let mut out = [0u8; 4];
     let mut i = 0;
@@ -337,7 +393,7 @@ impl Term {
                     "          hex <file> wc <file> du <path> history time <cmd>",
                     "          head/tail [-n N] <file> sort <file>",
                     "          a | b   cmd > file   cmd >> file   watch [-n s] cmd",
-                    "          df  (volume usage)  more <file> (pager)  cal [m [y]]  tree  seq [s [st]] e",
+                    "          df  (volume usage)  more  cal  tree  seq  sleep  sh  calc",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -589,6 +645,30 @@ impl Term {
                     if n > b + 10_000 { break; } // guard runaway
                 }
             }
+            "calc" => {
+                let expr = args.join("");
+                match expr_eval(&expr) {
+                    Ok(v) => self.emit(&alloc::format!("{}", v)),
+                    Err(e) => self.emit(&alloc::format!("calc: {}", e)),
+                }
+            }
+            "sh" => match args.first() {
+                Some(p) => match ustd::read_all(p) {
+                    Ok(d) => {
+                        let s = String::from_utf8_lossy(&d).into_owned();
+                        for line in s.lines() {
+                            let line = line.trim();
+                            if line.is_empty() || line.starts_with('#') {
+                                continue;
+                            }
+                            self.emit(&alloc::format!("$ {}", line));
+                            self.run(line);
+                        }
+                    }
+                    Err(e) => self.emit(&alloc::format!("sh: {}: err {}", p, e)),
+                },
+                None => self.emit("usage: sh <file>"),
+            },
             "cal" => {
                 // cal [month [year]] — real Gregorian calendar
                 let now = ustd::datetime();
@@ -1028,7 +1108,7 @@ impl Term {
             "resolve", "httpget", "ifconfig", "dhcp", "netstat", "kill", "grep",
             "uptime", "reboot", "shutdown", "exit", "history", "time",
             "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
-            "set", "env", "which", "more", "cal", "tree", "seq", "sleep",
+            "set", "env", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
