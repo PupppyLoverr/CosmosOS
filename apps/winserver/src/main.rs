@@ -193,6 +193,8 @@ fn main_loop() -> ! {
     };
 
     composite(&mut s);
+    // autostart: boot lands on a terminal, like a real desktop
+    spawn_app("/bin/cosmos-terminal");
     loop {
         // drain input
         let mut buf = alloc::vec![0u8; WS_MSG_MAX + 16];

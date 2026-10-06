@@ -86,6 +86,31 @@ pub fn panic_screen(msg: &str) {
     }
 }
 
+/// Snapshot the live framebuffer as a binary PPM (P6), top-down rows.
+/// Kernel-side read via the HHDM map — captures whatever is on screen.
+pub fn snapshot_ppm() -> Option<Vec<u8>> {
+    let f = FB.lock();
+    let f = f.as_ref()?;
+    let (w, h, stride) = (f.width as usize, f.height as usize, f.stride as usize);
+    let bgr = f.format == 0;
+    let base = crate::mem::phys_to_virt(f.phys) as *const u32;
+    let mut out = Vec::with_capacity(16 + w * h * 3);
+    out.extend_from_slice(alloc::format!("P6\n{} {}\n255\n", w, h).as_bytes());
+    for y in 0..h {
+        for x in 0..w.min(stride) {
+            let p = unsafe { core::ptr::read_volatile(base.add(y * stride + x)) };
+            // u32 holds byte-order [b0,b1,b2,x]; Bgr has B in byte0
+            let (r, g, b) = if bgr {
+                ((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF)
+            } else {
+                (p & 0xFF, (p >> 8) & 0xFF, (p >> 16) & 0xFF)
+            };
+            out.extend_from_slice(&[r as u8, g as u8, b as u8]);
+        }
+    }
+    Some(out)
+}
+
 /// Map the framebuffer into `pml4`'s user space at FB_USER_VA.
 /// Returns FbInfo with user addr, or Err if already claimed by another task.
 pub fn claim_and_map(pml4: PhysFrame, owner: u32) -> Result<shared::FbInfo, ()> {
