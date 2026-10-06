@@ -1,0 +1,5 @@
+# CosmosOS shell rc — sourced by each new terminal
+alias h=history
+alias c=clear
+alias "..=cd .."
+set EDITOR=/bin/editor
