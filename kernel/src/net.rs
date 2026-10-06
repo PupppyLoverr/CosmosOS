@@ -507,12 +507,18 @@ fn parse_tcp(p: &[u8]) -> Option<TcpSeg> {
 /// slirp to the live internet.
 /// GET over a real TCP socket — now just a consumer of the socket layer,
 /// like dns_query rides UdpSock.
-pub fn http_get(dst_ip: [u8; 4], host: &str, path: &str) -> Option<Vec<u8>> {
+pub fn http_get(dst_ip: [u8; 4], host: &str, port: u16, path: &str) -> Option<Vec<u8>> {
     const SPORT: u16 = 49200;
-    tcp_open(SPORT, dst_ip, 80, 3000).ok()?;
+    tcp_open(SPORT, dst_ip, port, 3000).ok()?;
+    // Host header carries the port only when non-default (HTTP/1.0/1.1 rules)
+    let hosthdr = if port == 80 {
+        alloc::format!("{}", host)
+    } else {
+        alloc::format!("{}:{}", host, port)
+    };
     let req = alloc::format!(
         "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        path, host
+        path, hosthdr
     );
     if tcp_send(SPORT, req.as_bytes(), 4000).is_err() {
         tcp_close(SPORT);

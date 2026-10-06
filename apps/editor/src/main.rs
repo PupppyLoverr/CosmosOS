@@ -22,6 +22,8 @@ struct Editor {
     find_q: Option<String>, // Ctrl-F: live find query (None = not finding)
     goto_q: Option<String>, // Ctrl-G: line-number prompt
     saveas_q: Option<String>, // Ctrl-Shift-S: save-as path prompt
+    open_q: Option<String>,   // Ctrl-O: open-file path prompt
+    open_confirm: bool,       // dirty-buffer: Ctrl-O pressed once (confirm pending)
     scroll: usize, // first visible line
     dirty_text: bool,
     dirty_ui: bool,
@@ -118,6 +120,8 @@ impl Editor {
             c.text(8, c.h as i32 - 19, &alloc::format!("goto line: {}_", q), draw::TEXT, None);
         } else if let Some(q) = &self.saveas_q {
             c.text(8, c.h as i32 - 19, &alloc::format!("save as: {}_", q), draw::TEXT, None);
+        } else if let Some(q) = &self.open_q {
+            c.text(8, c.h as i32 - 19, &alloc::format!("open: {}_", q), draw::TEXT, None);
         } else {
             c.text(8, c.h as i32 - 19, &alloc::format!("{}:{}  {} bytes  {}", r + 1, col + 1, self.text.len(), self.status), draw::DIM, None);
         }
@@ -146,6 +150,24 @@ impl Editor {
         self.dirty_ui = true;
     }
 
+    /// Load `path` into the buffer (Ctrl-O): replaces the document.
+    fn load(&mut self, path: &str) {
+        match ustd::read_all(path) {
+            Ok(d) => {
+                self.text = String::from_utf8_lossy(&d).into_owned();
+                self.path = String::from(path);
+                self.cx = 0;
+                self.sel = None;
+                self.scroll = 0;
+                self.dirty_text = false;
+                self.status = alloc::format!("opened {} ({}B)", path, d.len());
+                self.refresh_title();
+            }
+            Err(e) => self.status = alloc::format!("open failed: {} ({})", path, e),
+        }
+        self.dirty_ui = true;
+    }
+
     /// Title shows a * while there are unsaved edits.
     fn refresh_title(&self) {
         self.win.set_title(&alloc::format!(
@@ -158,6 +180,14 @@ impl Editor {
     fn on_key(&mut self, k: &EvKey) {
         if k.down == 0 {
             return;
+        }
+        // the dirty-buffer Ctrl-O confirm arms for exactly one chord —
+        // any other key disarms it
+        let is_ctrlo = k.key == KeyCode::Char as u32
+            && k.mods & 1 != 0
+            && k.chr.to_ascii_lowercase() == b'o';
+        if !is_ctrlo {
+            self.open_confirm = false;
         }
         // save-as mode: keys go to the path prompt
         if self.saveas_q.is_some() {
@@ -177,6 +207,28 @@ impl Editor {
                     }
                 }
                 x if x == KeyCode::Escape as u32 => self.saveas_q = None,
+                _ => {}
+            }
+            self.dirty_ui = true;
+            return;
+        }
+        // open-file mode: keys go to the path prompt
+        if self.open_q.is_some() {
+            match k.key as u32 {
+                x if x == KeyCode::Char as u32 => {
+                    self.open_q.as_mut().unwrap().push(k.chr as char);
+                }
+                x if x == KeyCode::Backspace as u32 => {
+                    self.open_q.as_mut().unwrap().pop();
+                }
+                x if x == KeyCode::Enter as u32 => {
+                    let q = core::mem::take(&mut self.open_q).unwrap_or_default();
+                    let q = q.trim();
+                    if !q.is_empty() {
+                        self.load(q);
+                    }
+                }
+                x if x == KeyCode::Escape as u32 => self.open_q = None,
                 _ => {}
             }
             self.dirty_ui = true;
@@ -253,6 +305,19 @@ impl Editor {
                 }
                 b'g' => {
                     self.goto_q = Some(String::new());
+                    self.dirty_ui = true;
+                    return;
+                }
+                b'o' => {
+                    // Ctrl-O: open file — a dirty buffer needs one more
+                    // Ctrl-O to confirm discarding the edits
+                    if self.dirty_text && !self.open_confirm {
+                        self.open_confirm = true;
+                        self.status = String::from("unsaved changes - Ctrl-O again to discard");
+                    } else {
+                        self.open_confirm = false;
+                        self.open_q = Some(self.path.clone());
+                    }
                     self.dirty_ui = true;
                     return;
                 }
@@ -426,6 +491,8 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         find_q: None,
         goto_q: None,
         saveas_q: None,
+        open_q: None,
+        open_confirm: false,
         scroll: 0,
         dirty_text: false,
         dirty_ui: true,

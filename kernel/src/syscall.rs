@@ -178,15 +178,27 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
         }
         shared::SYS_NET_HTTP => {
-            let Some(host) = copy_str(a1, a2.min(253)) else {
+            let Some(url) = copy_str(a1, a2.min(253)) else {
                 ctx.rax = ERR;
                 return;
             };
-            let Some(ip) = net::dns_query(&host, 3000) else {
+            // url = "host[:port][/path]" — port defaults to 80, path to "/"
+            let (authority, path) = match url.find('/') {
+                Some(i) => (&url[..i], &url[i..]),
+                None => (url.as_str(), "/"),
+            };
+            let (host, port) = match authority.find(':') {
+                Some(i) => (
+                    &authority[..i],
+                    authority[i + 1..].parse::<u16>().unwrap_or(80),
+                ),
+                None => (authority, 80u16),
+            };
+            let Some(ip) = net::dns_query(host, 3000) else {
                 ctx.rax = ERR;
                 return;
             };
-            match net::http_get(ip, &host, "/") {
+            match net::http_get(ip, host, port, path) {
                 Some(body) => {
                     let n = body.len().min(a4 as usize);
                     match copy_out(a3, &body[..n]) {
