@@ -570,7 +570,7 @@ struct Term {
     vars: alloc::collections::BTreeMap<String, String>, // shell vars ($NAME)
     prev_cwd: String,                                  // for `cd -`
     pager: Option<(Vec<String>, usize)>,               // (all lines, page top) for `more`
-    httpd: Option<ustd::TcpListener>,                  // `httpd <port>` server mode
+    httpd: Option<(ustd::TcpListener, String)>,        // `httpd <port> [root]` server mode
     nc: Option<ustd::TcpSock>,                         // `nc <ip> <port>` raw session
     last_ok: bool,                                     // success of the last statement (for && / ||)
     sel: Option<((usize, usize), (usize, usize))>,     // scrollback selection (line,col)->(line,col)
@@ -580,6 +580,7 @@ struct Term {
     tailf: Option<(String, u64)>,                      // `tail -f`: (path, next byte offset)
     tailf_last: u64,                                   // last poll ms
     yesing: Option<String>,                            // `yes`: repeated line (mode)
+    at_q: Vec<(u64, String)>,                          // `at`: (fire_ms, cmd) deferred commands
     prev_buttons: u8,                                  // pointer buttons last event (edge detect)
     aliases: Vec<(String, String)>,                    // `alias` table (name -> expansion)
     subst_depth: u8,                                   // $(...) recursion guard
@@ -1133,6 +1134,7 @@ impl Term {
                     "          cmd < file  source/. <file>  comm join paste  cp -r",
                     "          grep -A/-B/-C/-m/-w/-x  sed -i / '2,4d' / 'Np'  expand -t N",
                     "          find -name/-type/-maxdepth  Ctrl-R history search  .cosmosrc",
+                    "          at <secs> <cmd>  httpd <port> [root] serves real files",
                     "          more: Space/b page, / search, n next",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
@@ -1747,17 +1749,34 @@ impl Term {
                 }
             }
             "httpd" => match args.first().and_then(|s| s.parse::<u16>().ok()) {
-                Some(port) => match ustd::TcpListener::bind(port) {
-                    Some(l) => {
-                        self.httpd = Some(l);
-                        self.emit(&alloc::format!(
-                            "httpd: listening on :{} — Esc to stop",
-                            port
-                        ));
+                Some(port) => {
+                    let root = args.get(1).copied().unwrap_or("/");
+                    match ustd::stat(root) {
+                        Ok(st) if st.is_dir != 0 => {}
+                        Ok(_) => {
+                            self.fail(&alloc::format!("httpd: {}: not a directory", root));
+                            return;
+                        }
+                        Err(e) => {
+                            self.fail(&alloc::format!("httpd: {}: err {}", root, e));
+                            return;
+                        }
                     }
-                    None => self.fail(&alloc::format!("httpd: :{} already in use", port)),
-                },
-                None => self.fail("usage: httpd <port>  (serves a status page, Esc stops)"),
+                    match ustd::TcpListener::bind(port) {
+                        Some(l) => {
+                            self.httpd = Some((l, String::from(root)));
+                            self.emit(&alloc::format!(
+                                "httpd: serving {} on :{} — Esc to stop",
+                                root,
+                                port
+                            ));
+                        }
+                        None => {
+                            self.fail(&alloc::format!("httpd: :{} already in use", port))
+                        }
+                    }
+                }
+                None => self.fail("usage: httpd <port> [root]  (real static files, Esc stops)"),
             },
             "fserve" => {
                 // fserve <port> <file>: serve the file to ONE client then stop
@@ -2529,6 +2548,19 @@ impl Term {
                 },
                 None => self.fail("usage: show <file.ppm>"),
             },
+            "at" => {
+                // at <secs> <cmd...>: run cmd after N seconds (non-blocking)
+                match args.first().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(secs) if args.len() > 1 => {
+                        let cmd = args[1..].join(" ");
+                        let when = ustd::uptime_ms() + secs * 1000;
+                        self.at_q.push((when, cmd.clone()));
+                        self.at_q.sort_by_key(|(t, _)| *t);
+                        self.emit(&alloc::format!("scheduled in {}s: {}", secs, cmd));
+                    }
+                    _ => self.fail("usage: at <seconds> <command>"),
+                }
+            }
             "yes" => {
                 self.yesing = Some(if args.is_empty() {
                     String::from("y")
@@ -3569,7 +3601,7 @@ impl Term {
         "uniq", "tr", "cut", "tee", "base64", "sha256sum", "tar", "show",
         "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
         "alias", "unalias", "type", "hostname", "id", "printf", "dd", "split",
-        "source", "comm", "join", "paste", "expand", "unexpand",
+        "source", "comm", "join", "paste", "expand", "unexpand", "at",
     ];
 
     /// Tab-complete: command names before the first space, paths after.
@@ -4023,6 +4055,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         pg_input: false,
         tailf: None,
         tailf_last: 0,
+        at_q: Vec::new(),
         yesing: None,
         prev_buttons: 0,
         aliases: Vec::new(),
@@ -4132,25 +4165,108 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         let now = ustd::uptime_ms();
         // httpd mode: poll for one accepted conn per loop turn
-        if let Some(l) = &t.httpd {
+        if let Some((l, root)) = &t.httpd {
             if let Some((sock, rip, rport)) = l.accept(0) {
                 let req = sock.recv(400).unwrap_or_default();
                 let line = String::from_utf8_lossy(&req);
                 let first = line.lines().next().unwrap_or("");
-                let up = ustd::uptime_ms() / 1000;
-                let body = alloc::format!(
-                    "<html><body><h1>CosmosOS</h1><p>real inbound TCP — this page is served from inside the guest</p><p>uptime {}s</p></body></html>",
-                    up
+                // GET /path — sanitize, map under the docroot, serve a real
+                // file or an autoindex listing
+                let path = first
+                    .strip_prefix("GET ")
+                    .unwrap_or("/")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("/")
+                    .split('?')
+                    .next()
+                    .unwrap_or("/");
+                let bad = path.contains("..") || path.bytes().any(|b| !(32..127).contains(&b));
+                let clean = path.trim_start_matches('/');
+                let mut full = alloc::format!(
+                    "{}{}",
+                    if root.ends_with('/') || clean.is_empty() {
+                        String::from(root.trim_end_matches('/'))
+                    } else {
+                        alloc::format!("{}/", root.trim_end_matches('/'))
+                    },
+                    clean
                 );
+                if full.is_empty() {
+                    full.push('/');
+                }
+                let is_dir = ustd::stat(&full).map(|s| s.is_dir != 0).unwrap_or(false);
+                if is_dir && !full.ends_with('/') {
+                    full.push('/');
+                }
+                let index = alloc::format!("{}index.html", full);
+                let (status, mime, body): (&str, &str, Vec<u8>) = if bad {
+                    ("400 Bad Request", "text/plain", Vec::from(&b"bad request"[..]))
+                } else if is_dir && ustd::stat(&index).is_ok() {
+                    match ustd::read_all(&index) {
+                        Ok(d) => ("200 OK", "text/html", d),
+                        Err(_) => ("404 Not Found", "text/html", Vec::from(&b"<h1>404</h1>"[..])),
+                    }
+                } else if is_dir {
+                    // autoindex: real directory listing with links
+                    let mut h = alloc::format!(
+                        "<html><body><h1>Index of /{}</h1><pre>",
+                        clean
+                    );
+                    if let Ok(ents) = ustd::readdir(&full) {
+                        for e in ents {
+                            let name = core::str::from_utf8(&e.name[..e.name_len as usize])
+                                .unwrap_or("?");
+                            let disp = alloc::format!(
+                                "{}{}",
+                                name,
+                                if e.is_dir != 0 { "/" } else { "" }
+                            );
+                            let dirpart = alloc::format!(
+                                "/{}",
+                                clean.trim_end_matches('/')
+                            );
+                            h.push_str(&alloc::format!(
+                                "<a href=\"{}{}{}\">{}</a>  {} B\n",
+                                dirpart,
+                                if dirpart == "/" { "" } else { "/" },
+                                disp,
+                                disp,
+                                e.size
+                            ));
+                        }
+                    }
+                    h.push_str("</pre></body></html>");
+                    ("200 OK", "text/html", h.into_bytes())
+                } else {
+                    match ustd::read_all(&full) {
+                        Ok(d) => {
+                            let mime = if full.ends_with(".html") || full.ends_with(".htm") {
+                                "text/html"
+                            } else if full.ends_with(".txt") {
+                                "text/plain"
+                            } else if full.ends_with(".ppm") {
+                                "image/x-portable-pixmap"
+                            } else {
+                                "application/octet-stream"
+                            };
+                            ("200 OK", mime, d)
+                        }
+                        Err(_) => ("404 Not Found", "text/html", Vec::from(&b"<h1>404 Not Found</h1>"[..])),
+                    }
+                };
                 let resp = alloc::format!(
-                    "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
+                    "HTTP/1.0 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status,
+                    mime,
+                    body.len()
                 );
                 let _ = sock.send(resp.as_bytes());
+                let _ = sock.send(&body);
                 t.push_line(&alloc::format!(
-                    "httpd: {} <- {}.{}.{}.{}:{}",
-                    if first.is_empty() { "conn" } else { first },
+                    "httpd: {} -> {} <- {}.{}.{}.{}:{}",
+                    first,
+                    status,
                     rip[0], rip[1], rip[2], rip[3], rport
                 ));
                 t.dirty_all = true;
@@ -4226,6 +4342,21 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 t.push_line(&text);
             }
             t.dirty_all = true;
+        }
+        // `at` queue: run due deferred commands (in submission order)
+        {
+            let mut due = 0usize;
+            while due < t.at_q.len() && t.at_q[due].0 <= now {
+                due += 1;
+            }
+            if due > 0 {
+                let fired: Vec<(u64, String)> = t.at_q.drain(..due).collect();
+                for (_, cmd) in fired {
+                    t.push_line(&alloc::format!("at: {}", cmd));
+                    t.run(&cmd);
+                }
+                t.dirty_all = true;
+            }
         }
         if now - last_blink >= 500 {
             last_blink = now;

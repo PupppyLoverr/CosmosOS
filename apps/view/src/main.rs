@@ -145,7 +145,7 @@ impl View {
             8,
             self.c.h as i32 - 17,
             &alloc::format!(
-                "{}  {}x{}  1/{}x   +/- zoom  arrows pan  f fit  q quit",
+                "{}  {}x{}  1/{}x   +/- zoom  arrows pan  f fit  n/p next  q quit",
                 self.path, self.img.w, self.img.h, s
             ),
             draw::DIM,
@@ -159,6 +159,53 @@ impl View {
             self.ox += dx;
             self.oy += dy;
             self.dirty = true;
+        }
+    }
+
+    /// Load `path` (a P6 PPM) into this window — `n`/`p` navigation.
+    fn open_file(&mut self, path: String) {
+        match ustd::read_all(&path).ok().and_then(|d| parse_ppm(&d)) {
+            Some(img) => {
+                self.img = img;
+                self.path = path;
+                self.zoom = 0;
+                self.dirty = true;
+            }
+            None => {
+                self.c.text(8, self.c.h as i32 - 17, &alloc::format!("cannot open {}", path), draw::TEXT, None);
+            }
+        }
+    }
+
+    /// Step to the next/prev sibling `.ppm` in the same directory (wraps).
+    fn nav(&mut self, dir: i32) {
+        let (dir_path, base) = match self.path.rfind('/') {
+            Some(0) => (String::from("/"), &self.path[1..]),
+            Some(i) => (String::from(&self.path[..i]), &self.path[i + 1..]),
+            None => (String::from("/"), &self.path[..]),
+        };
+        if let Ok(ents) = ustd::readdir(&dir_path) {
+            let mut names: Vec<String> = ents
+                .iter()
+                .filter(|e| e.is_dir == 0)
+                .map(|e| String::from(core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("")))
+                .filter(|n| n.ends_with(".ppm") || n.ends_with(".PPM"))
+                .collect();
+            names.sort();
+            if names.is_empty() {
+                return;
+            }
+            let cur = names.iter().position(|n| n == base);
+            let next = match cur {
+                Some(i) => (i as i32 + dir).rem_euclid(names.len() as i32) as usize,
+                None => 0,
+            };
+            let np = alloc::format!(
+                "{}{}",
+                if dir_path == "/" { String::from("/") } else { alloc::format!("{}/", dir_path) },
+                names[next]
+            );
+            self.open_file(np);
         }
     }
 }
@@ -250,6 +297,8 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
                         b'l' => v.pan(-24, 0),
                         b'k' => v.pan(0, 24),
                         b'j' => v.pan(0, -24),
+                        b'n' => v.nav(1),
+                        b'p' => v.nav(-1),
                         _ => {}
                     },
                     _ => {}

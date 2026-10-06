@@ -117,6 +117,79 @@ struct S {
     wall: Vec<u32>, // wallpaper cache (fh-TBAR_H rows)
     idle_since: u64, // ms of last input event — screensaver clock
     blanked: bool,   // screensaver active: fb is black
+    cfg: Cfg,
+    cfg_poll: u64, // last /etc/cosmos.conf re-read ms
+}
+
+/// Live settings from /etc/cosmos.conf (written by cosmos-settings).
+#[derive(Clone, Copy)]
+struct Cfg {
+    wall_top: u32,
+    wall_bot: u32,
+    cm_num: i32,     // cursor speed multiplier numerator
+    cm_den: i32,     // cursor speed multiplier denominator
+    clock_secs: bool, // taskbar clock shows seconds
+    saver_ms: u64,    // idle ms before the screensaver blanks (u64::MAX = off)
+}
+
+fn parse_cfg() -> Cfg {
+    let mut c = Cfg {
+        wall_top: WALL_TOP,
+        wall_bot: WALL_BOT,
+        cm_num: 1,
+        cm_den: 1,
+        clock_secs: true,
+        saver_ms: 90_000,
+    };
+    if let Ok(d) = ustd::read_all("/etc/cosmos.conf") {
+        let text = String::from_utf8_lossy(&d);
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                let (k, v) = (k.trim(), v.trim());
+                match k {
+                    "wallpaper" => match v {
+                        "darker" => {
+                            c.wall_top = 0xFF0A0B0D;
+                            c.wall_bot = 0xFF050607;
+                        }
+                        "graphite" => {
+                            c.wall_top = 0xFF2A2D33;
+                            c.wall_bot = 0xFF17181B;
+                        }
+                        _ => {
+                            c.wall_top = WALL_TOP;
+                            c.wall_bot = WALL_BOT;
+                        }
+                    },
+                    "cursor_speed" => match v {
+                        "slow" => {
+                            c.cm_num = 3;
+                            c.cm_den = 5;
+                        }
+                        "fast" => {
+                            c.cm_num = 8;
+                            c.cm_den = 5;
+                        }
+                        _ => {
+                            c.cm_num = 1;
+                            c.cm_den = 1;
+                        }
+                    },
+                    "clock_seconds" => c.clock_secs = v == "hh:mm:ss",
+                    "screensaver" => {
+                        c.saver_ms = match v {
+                            "30s" => 30_000,
+                            "5min" => 300_000,
+                            "off" => u64::MAX,
+                            _ => 90_000,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    c
 }
 
 impl S {
@@ -137,6 +210,11 @@ impl S {
     }
 }
 
+fn render_wall(wall: &mut [u32], w: u32, h: usize, top: u32, bot: u32) {
+    let cw = Canvas::new(wall.as_mut_ptr(), w, h as u32, w);
+    cw.fill_grad(0, 0, w as i32, h as i32, top, bot);
+}
+
 fn send_ev(port: u32, kind: u16, payload: &[u8]) {
     let mut v = Vec::with_capacity(8 + payload.len());
     v.extend_from_slice(&kind.to_le_bytes());
@@ -153,13 +231,12 @@ fn main_loop() -> ! {
     let in_port = ustd::ipc_listen(INPUT_PORT);
     println!("[winserver] up: fb={}x{} ws_port={} in_port={}", fbi.width, fbi.height, ws_port, in_port);
 
-    // pre-render wallpaper once into a cache buffer
+    // pre-render wallpaper once into a cache buffer (re-rendered live when
+    // the wallpaper setting changes)
+    let cfg0 = parse_cfg();
     let wall_h = (fbi.height as i32 - TBAR_H) as usize;
     let mut wall = alloc::vec![0u32; fbi.width as usize * wall_h];
-    {
-        let cw = Canvas::new(wall.as_mut_ptr(), fbi.width, wall_h as u32, fbi.width);
-        cw.fill_grad(0, 0, fbi.width as i32, fbi.height as i32 - TBAR_H, WALL_TOP, WALL_BOT);
-    }
+    render_wall(&mut wall, fbi.width, wall_h, cfg0.wall_top, cfg0.wall_bot);
 
     let mut s = S {
         fb,
@@ -194,6 +271,8 @@ fn main_loop() -> ! {
         last_tc: (0, 0),
         idle_since: ustd::uptime_ms(),
         blanked: false,
+        cfg: cfg0,
+        cfg_poll: 0,
     };
 
     composite(&mut s);
@@ -222,9 +301,22 @@ fn main_loop() -> ! {
         // it (never clear dirty without compositing — dropped composites
         // leave "ghost" windows).
         let up = ustd::uptime_ms();
-        // screensaver: blank after 90s idle; any input (handle_input)
-        // clears `blanked` and flags a full repaint
-        if !s.blanked && up.saturating_sub(s.idle_since) >= 90_000 {
+        // live settings: re-read /etc/cosmos.conf every ~2s; a wallpaper
+        // change re-renders the cache and damages the desktop
+        if up.saturating_sub(s.cfg_poll) >= 2000 {
+            s.cfg_poll = up;
+            let nc = parse_cfg();
+            if nc.wall_top != s.cfg.wall_top || nc.wall_bot != s.cfg.wall_bot {
+                let (fw_u, wh) = (s.fw as u32, (s.fh - TBAR_H) as usize);
+                render_wall(&mut s.wall, fw_u, wh, nc.wall_top, nc.wall_bot);
+                let (fw, fh) = (s.fw, s.fh);
+                dmg(&mut s, 0, 0, fw, fh - TBAR_H);
+            }
+            s.cfg = nc;
+        }
+        // screensaver: blank after the configured idle timeout; any input
+        // (handle_input) clears `blanked` and flags a full repaint
+        if !s.blanked && up.saturating_sub(s.idle_since) >= s.cfg.saver_ms {
             s.fb.reset_clip();
             s.fb.fill(0, 0, s.fw, s.fh, 0xFF000000);
             s.blanked = true;
@@ -386,7 +478,12 @@ fn on_key(s: &mut S, k: &InputKey) {
 }
 
 fn on_mouse(s: &mut S, m: &InputMouse) {
-    let (mut nx, mut ny) = unsafe { (MX + m.dx as i32, MY + m.dy as i32) };
+    let (mut nx, mut ny) = unsafe {
+        (
+            MX + m.dx as i32 * s.cfg.cm_num / s.cfg.cm_den,
+            MY + m.dy as i32 * s.cfg.cm_num / s.cfg.cm_den,
+        )
+    };
     nx = nx.clamp(0, s.fw - 1);
     ny = ny.clamp(0, s.fh - 1);
     let (px, py) = unsafe { (MX, MY) };
@@ -983,14 +1080,24 @@ fn draw_taskbar(s: &S) {
     // clock + mem on the right
     let dt = ustd::datetime();
     let mi = ustd::meminfo();
-    let txt = alloc::format!(
-        "{:02}:{:02}:{:02}  {}MiB/{}MiB",
-        dt.hour,
-        dt.minute,
-        dt.second,
-        mi.used_kb / 1024,
-        mi.total_kb / 1024
-    );
+    let txt = if s.cfg.clock_secs {
+        alloc::format!(
+            "{:02}:{:02}:{:02}  {}MiB/{}MiB",
+            dt.hour,
+            dt.minute,
+            dt.second,
+            mi.used_kb / 1024,
+            mi.total_kb / 1024
+        )
+    } else {
+        alloc::format!(
+            "{:02}:{:02}  {}MiB/{}MiB",
+            dt.hour,
+            dt.minute,
+            mi.used_kb / 1024,
+            mi.total_kb / 1024
+        )
+    };
     let tw = Canvas::text_w(&txt);
     fb.text(s.fw - tw - 12, y + (TBAR_H - 16) / 2, &txt, DIM, None);
 }
