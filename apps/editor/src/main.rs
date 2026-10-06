@@ -21,6 +21,7 @@ struct Editor {
     sel: Option<(usize, usize)>, // selected byte range [start,end)
     find_q: Option<String>, // Ctrl-F: live find query (None = not finding)
     goto_q: Option<String>, // Ctrl-G: line-number prompt
+    saveas_q: Option<String>, // Ctrl-Shift-S: save-as path prompt
     scroll: usize, // first visible line
     dirty_text: bool,
     dirty_ui: bool,
@@ -75,7 +76,7 @@ impl Editor {
         // header
         c.fill(0, 0, c.w as i32, 26, draw::PANEL);
         c.text(8, 5, &alloc::format!("{}{}", self.path, if self.dirty_text { " *" } else { "" }), draw::TEXT, None);
-        c.text(c.w as i32 - 228, 5, "Ctrl-S save  Ctrl-F/G find/goto", draw::DIM, None);
+        c.text(c.w as i32 - 228, 5, "Ctrl-S save  Ctrl-F/G find/goto", draw::DIM, None); // header hint
         // text area
         let lines = self.lines();
         let vis = ((c.h as i32 - 34) / 16) as usize;
@@ -115,6 +116,8 @@ impl Editor {
             c.text(8, c.h as i32 - 19, &alloc::format!("find: {}_", q), draw::TEXT, None);
         } else if let Some(q) = &self.goto_q {
             c.text(8, c.h as i32 - 19, &alloc::format!("goto line: {}_", q), draw::TEXT, None);
+        } else if let Some(q) = &self.saveas_q {
+            c.text(8, c.h as i32 - 19, &alloc::format!("save as: {}_", q), draw::TEXT, None);
         } else {
             c.text(8, c.h as i32 - 19, &alloc::format!("{}:{}  {} bytes  {}", r + 1, col + 1, self.text.len(), self.status), draw::DIM, None);
         }
@@ -154,6 +157,29 @@ impl Editor {
 
     fn on_key(&mut self, k: &EvKey) {
         if k.down == 0 {
+            return;
+        }
+        // save-as mode: keys go to the path prompt
+        if self.saveas_q.is_some() {
+            match k.key as u32 {
+                x if x == KeyCode::Char as u32 => {
+                    self.saveas_q.as_mut().unwrap().push(k.chr as char);
+                }
+                x if x == KeyCode::Backspace as u32 => {
+                    self.saveas_q.as_mut().unwrap().pop();
+                }
+                x if x == KeyCode::Enter as u32 => {
+                    let q = core::mem::take(&mut self.saveas_q).unwrap_or_default();
+                    let q = q.trim();
+                    if !q.is_empty() {
+                        self.path = String::from(q);
+                        self.save();
+                    }
+                }
+                x if x == KeyCode::Escape as u32 => self.saveas_q = None,
+                _ => {}
+            }
+            self.dirty_ui = true;
             return;
         }
         // goto-line mode: digits go to the line prompt
@@ -253,6 +279,11 @@ impl Editor {
         }
         if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 {
             match k.chr.to_ascii_lowercase() {
+                b's' if k.mods & 2 != 0 => {
+                    // Ctrl-Shift-S: save as...
+                    self.saveas_q = Some(self.path.clone());
+                    self.dirty_ui = true;
+                }
                 b's' => self.save(),
                 b'a' => {
                     self.sel = if self.text.is_empty() { None } else { Some((0, self.text.len())) };
@@ -394,6 +425,7 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         sel: None,
         find_q: None,
         goto_q: None,
+        saveas_q: None,
         scroll: 0,
         dirty_text: false,
         dirty_ui: true,

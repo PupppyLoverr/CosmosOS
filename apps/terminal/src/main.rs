@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use shared::*;
 use ustd::draw::{self, Canvas};
 use ustd::wm::{self, Window};
-use ustd::{print, println};
+use ustd::println;
 
 const COLS: usize = 90;
 const ROWS: usize = 40;
@@ -42,13 +42,16 @@ fn cal_days(y: u16, m: u8, d: u8) -> u64 {
 fn stmt_split(s: &str) -> Option<(&str, u8, &str)> {
     let b = s.as_bytes();
     let mut i = 0;
+    let (mut sq, mut dq) = (false, false);
     while i < b.len() {
         match b[i] {
-            b';' => return Some((&s[..i], b';', &s[i + 1..])),
-            b'&' if i + 1 < b.len() && b[i + 1] == b'&' => {
+            b'\'' if !dq => sq = !sq,
+            b'"' if !sq => dq = !dq,
+            b';' if !sq && !dq => return Some((&s[..i], b';', &s[i + 1..])),
+            b'&' if !sq && !dq && i + 1 < b.len() && b[i + 1] == b'&' => {
                 return Some((&s[..i], b'&', &s[i + 2..]));
             }
-            b'|' if i + 1 < b.len() && b[i + 1] == b'|' => {
+            b'|' if !sq && !dq && i + 1 < b.len() && b[i + 1] == b'|' => {
                 return Some((&s[..i], b'|', &s[i + 2..]));
             }
             _ => {}
@@ -56,6 +59,61 @@ fn stmt_split(s: &str) -> Option<(&str, u8, &str)> {
         i += 1;
     }
     None
+}
+
+/// First byte index of `want` that is NOT inside '...' or "..." quotes.
+fn find_unquoted(s: &str, want: u8) -> Option<usize> {
+    let b = s.as_bytes();
+    let (mut sq, mut dq) = (false, false);
+    for i in 0..b.len() {
+        match b[i] {
+            b'\'' if !dq => sq = !sq,
+            b'"' if !sq => dq = !dq,
+            x if x == want && !sq && !dq => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Shell word-splitting: whitespace separates, '...' and "..." group (and are
+/// stripped). Returns (word, was_quoted) per token — quoted words are exempt
+/// from glob expansion, like a real shell.
+fn tokenize(s: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut sq, mut dq) = (false, false);
+    let mut quoted = false;
+    let mut any = false;
+    for c in s.chars() {
+        match c {
+            '\'' if !dq => {
+                sq = !sq;
+                quoted = true;
+                any = true;
+            }
+            '"' if !sq => {
+                dq = !dq;
+                quoted = true;
+                any = true;
+            }
+            c if c.is_whitespace() && !sq && !dq => {
+                if any {
+                    out.push((core::mem::take(&mut cur), quoted));
+                    quoted = false;
+                    any = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                any = true;
+            }
+        }
+    }
+    if any {
+        out.push((cur, quoted));
+    }
+    out
 }
 
 /// Unix epoch seconds -> (y, m, d, h, min, s) UTC.
@@ -489,6 +547,10 @@ struct Term {
     sel_drag: bool,                                    // left button currently held
     pq: String,                                        // pager search query
     pg_input: bool,                                    // pager `/` input active
+    tailf: Option<(String, u64)>,                      // `tail -f`: (path, next byte offset)
+    tailf_last: u64,                                   // last poll ms
+    yesing: Option<String>,                            // `yes`: repeated line (mode)
+    prev_buttons: u8,                                  // pointer buttons last event (edge detect)
 }
 
 impl Term {
@@ -751,6 +813,24 @@ impl Term {
         if input.is_empty() {
             return;
         }
+        // history expansion: `!!` reruns the last command, `!n` reruns entry n
+        // (1-based, as `history` lists it). A lone `!` line is ignored.
+        if input.starts_with('!') {
+            let spec = &input[1..];
+            let idx = if spec == "!" {
+                self.hist.len().checked_sub(1)
+            } else {
+                spec.parse::<usize>().ok().and_then(|n| n.checked_sub(1))
+            };
+            match idx.and_then(|i| self.hist.get(i).cloned()) {
+                Some(line) => {
+                    self.push_line(&alloc::format!("$ {}", line));
+                    self.run(&line);
+                }
+                None => self.fail(&alloc::format!("!: no such history entry '{}'", spec)),
+            }
+            return;
+        }
         // statement operators: `a; b` (always), `a && b` (on ok), `a || b` (on fail)
         if let Some((l, op, r)) = stmt_split(input) {
             self.last_ok = true;
@@ -771,7 +851,7 @@ impl Term {
             return;
         }
         // pipe: left | right  (right may itself contain pipes/redirects)
-        if let Some(pi) = input.find('|') {
+        if let Some(pi) = find_unquoted(input, b'|') {
             let left = input[..pi].trim();
             let right = input[pi + 1..].trim();
             let out = self.run_captured(left);
@@ -781,7 +861,7 @@ impl Term {
             return;
         }
         // redirect: cmd > file  /  cmd >> file
-        if let Some(pi) = input.find('>') {
+        if let Some(pi) = find_unquoted(input, b'>') {
             let left = input[..pi].trim();
             let mut rest = input[pi + 1..].trim();
             let append = rest.starts_with('>');
@@ -793,9 +873,11 @@ impl Term {
                 self.fail("usage: <cmd> > file  (or >> to append)");
                 return;
             }
+            // `echo -n ... > f` suppresses the trailing newline
+            let nonl = left == "echo -n" || left.starts_with("echo -n ");
             let out = self.run_captured(left);
             let mut body = out.join("\n");
-            if !body.is_empty() {
+            if !body.is_empty() && !nonl {
                 body.push('\n');
             }
             let r = if append {
@@ -816,20 +898,41 @@ impl Term {
         // $VAR expansion (whole-token vars; $ followed by name chars)
         let expanded = self.expand_vars(input);
         let input = expanded.as_str();
-        let mut it = input.split_whitespace();
-        let cmd = it.next().unwrap_or("");
-        let mut args: Vec<&str> = it.collect();
-        // glob expansion for filesystem commands: args containing * ? are
-        // expanded against the target dir's entries (unmatched args pass
+        // quote-aware word-split; quoted words keep metachars literal and are
+        // exempt from glob expansion
+        let toks = tokenize(input);
+        let cmd = toks.first().map(|t| t.0.as_str()).unwrap_or("");
+        let mut args: Vec<&str> = toks[1.min(toks.len())..]
+            .iter()
+            .map(|t| t.0.as_str())
+            .collect();
+        // glob expansion for filesystem commands: UNQUOTED args containing * ?
+        // are expanded against the target dir's entries (unmatched args pass
         // through literally, like a real shell)
         const GLOBBABLE: &[&str] = &[
             "ls", "cat", "rm", "cp", "mv", "du", "wc", "head", "tail", "hex", "stat",
             "sha256sum", "strings", "sort", "uniq", "cut", "more", "diff", "base64",
             "show", "tar",
         ];
-        let mut gexp = Vec::new();
-        if GLOBBABLE.contains(&cmd) && args.iter().any(|a| a.contains('*') || a.contains('?')) {
-            gexp = args.iter().flat_map(|a| self.glob_expand(a)).collect();
+        let gexp: Vec<String> = if GLOBBABLE.contains(&cmd)
+            && toks[1.min(toks.len())..]
+                .iter()
+                .any(|t| !t.1 && (t.0.contains('*') || t.0.contains('?')))
+        {
+            toks[1.min(toks.len())..]
+                .iter()
+                .flat_map(|t| {
+                    if !t.1 && (t.0.contains('*') || t.0.contains('?')) {
+                        self.glob_expand(&t.0)
+                    } else {
+                        alloc::vec![t.0.clone()]
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !gexp.is_empty() {
             args = gexp.iter().map(|s| s.as_str()).collect();
         }
         // optimistic success — fail() marks the statement failed; $? /
@@ -852,6 +955,8 @@ impl Term {
                     "          uniq [-c]  tr [-d] <a> <b>  cut -d X -f N  tee [-a] <file>",
                     "          base64 [-d] <file>  sha256sum <file..>  tar cf|tf|xf  echo -n",
                     "          show <file.ppm> (image viewer)  globs: ls *.txt  cat *.ppm",
+                    "          grep -r/-v/-n/-c/-i  sed 's/a/b/g'  xargs  nl  rev  fmt [-w N]",
+                    "          cmp <a> <b>  tail -f <file>  yes  read VAR  wait <pid>  !! / !n",
                     "          ops: a ; b   a && b   a || b   drag-select copies to clipboard",
                     "          more: Space/b page, / search, n next",
                     "          reboot shutdown exit",
@@ -1038,26 +1143,14 @@ impl Term {
                 }
             }
             "echo" => {
-                // echo hello > file  |  echo hello
-                let nonl = args.first() == Some(&"-n");
-                let joined = if nonl {
+                // echo [-n] args... — printing only; `>` redirection is
+                // handled by the top-level quote-aware redirect splitter
+                let joined = if args.first() == Some(&"-n") {
                     args[1..].join(" ")
                 } else {
                     args.join(" ")
                 };
-                if let Some(i) = joined.find('>') {
-                    let (text, path) = joined.split_at(i);
-                    let path = path[1..].trim();
-                    let mut d = String::from(text.trim());
-                    if !nonl {
-                        d.push('\n');
-                    }
-                    if let Err(e) = ustd::write_all(path, d.as_bytes()) {
-                        self.fail(&alloc::format!("echo: err {}", e));
-                    }
-                } else {
-                    self.emit(&joined);
-                }
+                self.emit(&joined);
             }
             "clear" => self.lines.clear(),
             "ps" => {
@@ -1267,25 +1360,52 @@ impl Term {
                 None => self.fail("usage: httpget <host> [-o file]  (real TCP/80 GET /)"),
             },
             "grep" => {
-                // grep <pat> <file> | grep -r <pat> <dir>
-                let (rec, pat, path) = if args.first() == Some(&"-r") {
-                    (true, args.get(1).copied(), args.get(2).copied())
-                } else {
-                    (false, args.first().copied(), args.get(1).copied())
-                };
+                // grep [-r] [-v] [-n] [-c] [-i] <pat> [file|dir]
+                let flag = |f: &str| args.iter().any(|a| *a == f);
+                let (rec, inv, num, cnt, ci) =
+                    (flag("-r"), flag("-v"), flag("-n"), flag("-c"), flag("-i"));
+                let pos: Vec<&str> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .copied()
+                    .collect();
+                let pat = pos.first().map(|p| {
+                    if ci {
+                        p.to_ascii_lowercase()
+                    } else {
+                        String::from(*p)
+                    }
+                });
+                let path = pos.get(1).copied();
                 match (pat, path) {
-                    (Some(p), Some(path)) => self.grep_run(p, path, rec),
+                    (Some(p), Some(path)) => self.grep_run(&p, path, (ci, rec, inv, num, cnt)),
                     (Some(p), None) => match self.pipe_in.clone() {
                         Some(s) => {
-                            for l in s.lines() {
-                                if l.contains(p) {
-                                    self.emit(l);
+                            let mut hits = 0usize;
+                            for (i, l) in s.lines().enumerate() {
+                                let hay = if ci {
+                                    l.to_ascii_lowercase()
+                                } else {
+                                    String::from(l)
+                                };
+                                if hay.contains(&p) != inv {
+                                    hits += 1;
+                                    if !cnt {
+                                        if num {
+                                            self.emit(&alloc::format!("{}: {}", i + 1, l));
+                                        } else {
+                                            self.emit(l);
+                                        }
+                                    }
                                 }
                             }
+                            if cnt {
+                                self.emit(&alloc::format!("{}", hits));
+                            }
                         }
-                        None => self.fail("usage: grep <pat> <file> | grep -r <pat> <dir>"),
+                        None => self.fail("usage: grep [-r] [-vnci] <pat> <file|dir>"),
                     },
-                    _ => self.fail("usage: grep <pat> <file> | grep -r <pat> <dir>"),
+                    _ => self.fail("usage: grep [-r] [-vnci] <pat> <file|dir>"),
                 }
             }
             "hex" => match args.first() {
@@ -1504,7 +1624,8 @@ impl Term {
                     self.emit(&line);
                 }
             }
-            "head" | "tail" | "sort" | "wc" => {
+            "wc" => self.wc_run(&args),
+            "head" | "tail" | "sort" => {
                 let popt = args.iter().position(|a| !a.starts_with('-')).map(|i| args[i]);
                 let n: usize = args
                     .iter()
@@ -1512,8 +1633,6 @@ impl Term {
                     .and_then(|i| args.get(i + 1))
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(10);
-                // keep the raw byte count for `wc -c` (lossy UTF-8 decode
-                // inflates binary files via U+FFFD replacements)
                 let mut blen = 0usize;
                 let content = match popt {
                     Some(p) => match ustd::read_all(p) {
@@ -1534,32 +1653,7 @@ impl Term {
                 match content {
                     Some(s) => {
                         let mut ls: Vec<&str> = s.lines().collect();
-                        if cmd == "wc" {
-                            let (mut l, mut w) = (0usize, 0usize);
-                            let mut in_w = false;
-                            for ch in s.chars() {
-                                if ch == '\n' {
-                                    l += 1;
-                                }
-                                if ch.is_whitespace() {
-                                    in_w = false;
-                                } else if !in_w {
-                                    in_w = true;
-                                    w += 1;
-                                }
-                            }
-                            let (fl, fw, fc) = (
-                                args.iter().any(|a| a == &"-l"),
-                                args.iter().any(|a| a == &"-w"),
-                                args.iter().any(|a| a == &"-c"),
-                            );
-                            match (fl, fw, fc) {
-                                (true, false, false) => self.emit(&alloc::format!("{}", l)),
-                                (false, true, false) => self.emit(&alloc::format!("{}", w)),
-                                (false, false, true) => self.emit(&alloc::format!("{}", blen)),
-                                _ => self.emit(&alloc::format!("  {} lines {} words {} bytes", l, w, blen)),
-                            }
-                        } else if cmd == "sort" {
+                        if cmd == "sort" {
                             if args.iter().any(|a| a == &"-n") {
                                 // numeric: compare leading signed-integer fields (0 if none)
                                 let num = |l: &&str| -> i64 {
@@ -1592,6 +1686,16 @@ impl Term {
                         } else {
                             for l in ls.iter().skip(ls.len().saturating_sub(n)) {
                                 self.emit(l);
+                            }
+                            // tail -f: keep following new appended bytes
+                            if cmd == "tail" && args.iter().any(|a| *a == "-f") {
+                                if let Some(p) = popt {
+                                    self.tailf = Some((String::from(p), blen as u64));
+                                    self.tailf_last = 0;
+                                    self.emit("  (following — Esc/Enter to stop)");
+                                } else {
+                                    self.fail("tail: -f needs a file");
+                                }
                             }
                         }
                     }
@@ -2023,7 +2127,7 @@ impl Term {
                 Some(p) => match ustd::read_all(p) {
                     Ok(d) => {
                         let mut run = String::new();
-                        let mut emit_run = |term: &mut Self, run: &mut String| {
+                        let emit_run = |term: &mut Self, run: &mut String| {
                             if run.len() >= 4 {
                                 term.emit(run);
                             }
@@ -2115,6 +2219,184 @@ impl Term {
                     Err(_) => self.fail("show: spawn failed"),
                 },
                 None => self.fail("usage: show <file.ppm>"),
+            },
+            "yes" => {
+                self.yesing = Some(if args.is_empty() {
+                    String::from("y")
+                } else {
+                    args.join(" ")
+                });
+                self.emit("yes running — Esc/Enter to stop");
+            }
+            "sed" => {
+                // sed 's/old/new/[g]' [file] — per-line substitute
+                let spec = args.first().copied().unwrap_or("");
+                let b = spec.as_bytes();
+                let parsed = if b.len() >= 4 && b[0] == b's' {
+                    let d = b[1] as char;
+                    let parts: Vec<&str> = spec[2..].split(d).collect();
+                    if parts.len() >= 2 {
+                        Some((String::from(parts[0]), String::from(parts[1]), parts.get(2).map(|f| f.contains('g')).unwrap_or(false)))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let input_text = match args.get(1) {
+                    Some(p) => match ustd::read_all(p) {
+                        Ok(d) => Some(String::from_utf8_lossy(&d).into_owned()),
+                        Err(e) => {
+                            self.fail(&alloc::format!("sed: {}: err {}", p, e));
+                            None
+                        }
+                    },
+                    None => self.pipe_in.clone(),
+                };
+                match (parsed, input_text) {
+                    (Some((old, new, g)), Some(s)) => {
+                        if old.is_empty() {
+                            self.fail("sed: empty pattern");
+                            return;
+                        }
+                        for l in s.lines() {
+                            let r = if g { l.replace(&old, &new) } else { l.replacen(&old, &new, 1) };
+                            self.emit(&r);
+                        }
+                    }
+                    (None, _) => self.fail("usage: sed 's/old/new/[g]' [file]"),
+                    _ => {}
+                }
+            }
+            "xargs" => {
+                // xargs <cmd> [args...]: run `<cmd args> <line>` per stdin line
+                if args.is_empty() {
+                    self.fail("usage: <cmd> | xargs <cmd> [args...]");
+                    return;
+                }
+                let base = args.join(" ");
+                if let Some(s) = self.pipe_in.clone() {
+                    for l in s.lines() {
+                        if l.is_empty() {
+                            continue;
+                        }
+                        for o in self.run_captured(&alloc::format!("{} {}", base, l)) {
+                            self.emit(&o);
+                        }
+                    }
+                } else {
+                    self.fail("xargs: no input (pipe lines in)");
+                }
+            }
+            "nl" | "rev" | "fmt" => {
+                // nl numbers lines; rev reverses chars; fmt rewraps to -w cols
+                let wi = args.iter().position(|a| a == &"-w");
+                let width: usize = wi
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(72);
+                let skip = wi.map(|i| i + 1);
+                let popt = args
+                    .iter()
+                    .enumerate()
+                    .find(|(i, a)| !a.starts_with('-') && Some(*i) != skip)
+                    .map(|(_, a)| *a);
+                let content = match popt {
+                    Some(p) => match ustd::read_all(p) {
+                        Ok(d) => Some(String::from_utf8_lossy(&d).into_owned()),
+                        Err(e) => {
+                            self.fail(&alloc::format!("{}: {}: err {}", cmd, p, e));
+                            None
+                        }
+                    },
+                    None => self.pipe_in.clone(),
+                };
+                if let Some(s) = content {
+                    match cmd {
+                        "nl" => {
+                            for (i, l) in s.lines().enumerate() {
+                                self.emit(&alloc::format!("  {:>4}  {}", i + 1, l));
+                            }
+                        }
+                        "rev" => {
+                            for l in s.lines() {
+                                self.emit(&l.chars().rev().collect::<String>());
+                            }
+                        }
+                        _ => {
+                            // greedy word-wrap
+                            let mut cur = String::new();
+                            let flush = |c: &mut String, t: &mut Term| {
+                                if !c.is_empty() {
+                                    t.emit(c);
+                                    c.clear();
+                                }
+                            };
+                            for w in s.split_whitespace() {
+                                if !cur.is_empty() && cur.len() + 1 + w.len() > width {
+                                    flush(&mut cur, self);
+                                }
+                                if !cur.is_empty() {
+                                    cur.push(' ');
+                                }
+                                cur.push_str(w);
+                            }
+                            flush(&mut cur, self);
+                        }
+                    }
+                }
+            }
+            "cmp" => {
+                // byte-compare two files; reports first differing byte
+                match (args.first(), args.get(1)) {
+                    (Some(a), Some(b)) => {
+                        match (ustd::read_all(a), ustd::read_all(b)) {
+                            (Ok(da), Ok(db)) => {
+                                let n = da.len().min(db.len());
+                                let mut diff = None;
+                                for i in 0..n {
+                                    if da[i] != db[i] {
+                                        diff = Some(i);
+                                        break;
+                                    }
+                                }
+                                match diff {
+                                    Some(i) => self.emit(&alloc::format!("{} {} differ: byte {}", a, b, i)),
+                                    None if da.len() != db.len() => self.emit(&alloc::format!(
+                                        "{} {} differ: length ({} vs {} bytes)", a, b, da.len(), db.len()
+                                    )),
+                                    None => {}
+                                }
+                            }
+                            (Err(e), _) | (_, Err(e)) => self.fail(&alloc::format!("cmp: err {}", e)),
+                        }
+                    }
+                    _ => self.fail("usage: cmp <file1> <file2>"),
+                }
+            }
+            "read" => {
+                // read VAR: consume one stdin (pipe) line into $VAR
+                match args.first() {
+                    Some(v) => match self.pipe_in.clone() {
+                        Some(s) => {
+                            let mut it = s.splitn(2, '\n');
+                            let line = it.next().unwrap_or("");
+                            self.vars.insert(String::from(*v), String::from(line));
+                            // remaining lines stay in stdin for the next `read`
+                            self.pipe_in = it.next().map(|r| String::from(r));
+                            self.emit(&alloc::format!("{}='{}'", v, line));
+                        }
+                        None => self.fail("read: no input (pipe lines in)"),
+                    },
+                    None => self.fail("usage: <cmd> | read VAR"),
+                }
+            }
+            "wait" => match args.first().and_then(|a| a.parse::<u32>().ok()) {
+                Some(pid) => match ustd::waitpid(pid, 30_000) {
+                    Ok(code) => self.emit(&alloc::format!("pid {} exited (status {})", pid, code)),
+                    Err(_) => self.fail(&alloc::format!("wait: {}: timeout or no such task", pid)),
+                },
+                None => self.fail("usage: wait <pid>"),
             },
             _ => {
                 // try running it as a binary
@@ -2266,11 +2548,21 @@ impl Term {
             self.dirty_all = true;
             return;
         }
-        // during watch mode, Esc or Enter stops it; other keys are ignored
-        if self.watch.is_some() {
+        // during watch/tail -f/yes modes, Esc or Enter stops; other keys ignored
+        if self.watch.is_some() || self.tailf.is_some() || self.yesing.is_some() {
             if k.key == KeyCode::Escape as u32 || k.key == KeyCode::Enter as u32 {
-                self.watch = None;
-                self.push_line("watch stopped");
+                if self.watch.is_some() {
+                    self.watch = None;
+                    self.push_line("watch stopped");
+                }
+                if self.tailf.is_some() {
+                    self.tailf = None;
+                    self.push_line("tail: stopped");
+                }
+                if self.yesing.is_some() {
+                    self.yesing = None;
+                    self.push_line("yes: stopped");
+                }
                 self.dirty_all = true;
             }
             return;
@@ -2373,6 +2665,7 @@ impl Term {
             "dmesg", "arp", "httpd", "ntp", "nc", "fserve", "fget", "true", "false",
             "shot", "find", "killall", "basename", "dirname", "strings", "diff", "stat",
             "uniq", "tr", "cut", "tee", "base64", "sha256sum", "tar", "show",
+            "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
@@ -2500,23 +2793,113 @@ impl Term {
         }
     }
 
-    fn grep_file(&mut self, pat: &str, path: &str) {
+    /// wc [-l] [-w] [-c] [files...]: line/word/byte counts per file + a total
+    /// row when several files are given. Byte counts use raw file bytes
+    /// (not the lossy-decoded text). No files → counts stdin (pipe).
+    fn wc_run(&mut self, args: &[&str]) {
+        let (fl, fw, fc) = (
+            args.iter().any(|a| a == &"-l"),
+            args.iter().any(|a| a == &"-w"),
+            args.iter().any(|a| a == &"-c"),
+        );
+        let files: Vec<&str> = args
+            .iter()
+            .filter(|a| !a.starts_with('-'))
+            .copied()
+            .collect();
+        let counts = |raw: &[u8], s: &str| -> (usize, usize, usize) {
+            let (mut l, mut w) = (0usize, 0usize);
+            let mut in_w = false;
+            for ch in s.chars() {
+                if ch == '\n' {
+                    l += 1;
+                }
+                if ch.is_whitespace() {
+                    in_w = false;
+                } else if !in_w {
+                    in_w = true;
+                    w += 1;
+                }
+            }
+            (l, w, raw.len())
+        };
+        let show = |t: &mut Term, c: (usize, usize, usize), name: &str| {
+            let tag = if name.is_empty() {
+                String::new()
+            } else {
+                alloc::format!(" {}", name)
+            };
+            match (fl, fw, fc) {
+                (true, false, false) => t.emit(&alloc::format!("{}{}", c.0, tag)),
+                (false, true, false) => t.emit(&alloc::format!("{}{}", c.1, tag)),
+                (false, false, true) => t.emit(&alloc::format!("{}{}", c.2, tag)),
+                _ => t.emit(&alloc::format!("  {} {} {}{}", c.0, c.1, c.2, tag)),
+            }
+        };
+        if files.is_empty() {
+            if let Some(s) = self.pipe_in.clone() {
+                show(self, counts(s.as_bytes(), &s), "");
+                return;
+            }
+            self.fail("usage: wc [-lwc] <file..>");
+            return;
+        }
+        let multi = files.len() > 1;
+        let mut tot = (0usize, 0usize, 0usize);
+        for f in &files {
+            match ustd::read_all(f) {
+                Ok(d) => {
+                    let s = String::from_utf8_lossy(&d);
+                    let c = counts(&d, &s);
+                    tot.0 += c.0;
+                    tot.1 += c.1;
+                    tot.2 += c.2;
+                    show(self, c, if multi { f } else { "" });
+                }
+                Err(e) => self.fail(&alloc::format!("wc: {}: err {}", f, e)),
+            }
+        }
+        if multi {
+            show(self, tot, "total");
+        }
+    }
+
+    /// opts = (ci, rec, inv, num, cnt); `pat` is pre-lowered when ci.
+    fn grep_file(&mut self, pat: &str, path: &str, opts: (bool, bool, bool, bool, bool)) {
+        let (ci, _, inv, num, cnt) = opts;
         match ustd::read_all(path) {
             Ok(d) => {
                 let s = String::from_utf8_lossy(&d);
-                for l in s.lines() {
-                    if l.contains(pat) {
-                        self.emit(&alloc::format!("{}: {}", path, l));
+                let mut hits = 0usize;
+                for (i, l) in s.lines().enumerate() {
+                    let hay = if ci {
+                        l.to_ascii_lowercase()
+                    } else {
+                        String::from(l)
+                    };
+                    if hay.contains(pat) != inv {
+                        hits += 1;
+                        if !cnt {
+                            if num {
+                                self.emit(&alloc::format!("{}:{}: {}", path, i + 1, l));
+                            } else {
+                                self.emit(&alloc::format!("{}: {}", path, l));
+                            }
+                        }
                     }
+                }
+                if cnt {
+                    self.emit(&alloc::format!("{}: {}", path, hits));
                 }
             }
             Err(e) => self.fail(&alloc::format!("grep: {}: err {}", path, e)),
         }
     }
 
-    fn grep_run(&mut self, pat: &str, path: &str, rec: bool) {
+    fn grep_run(&mut self, pat: &str, path: &str, opts: (bool, bool, bool, bool, bool)) {
+        let rec = opts.1;
         if !rec {
-            self.grep_file(pat, path);
+            self.grep_file(pat, path, opts);
             return;
         }
         let mut stack = alloc::vec::Vec::new();
@@ -2530,11 +2913,11 @@ impl Term {
                         if e.is_dir != 0 {
                             stack.push(p);
                         } else {
-                            self.grep_file(pat, &p);
+                            self.grep_file(pat, &p, opts);
                         }
                     }
                 }
-                Err(_) => self.grep_file(pat, &dir), // a plain file was passed
+                Err(_) => self.grep_file(pat, &dir, opts), // a plain file was passed
             }
         }
     }
@@ -2608,6 +2991,10 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         sel_drag: false,
         pq: String::new(),
         pg_input: false,
+        tailf: None,
+        tailf_last: 0,
+        yesing: None,
+        prev_buttons: 0,
     };
     t.load_hist();
     t.push_line("CosmosOS terminal - type 'help'");
@@ -2622,6 +3009,18 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             }
             Some((EV_POINTER, pl)) if pl.len() >= 16 => {
                 let p: shared::EvPointer = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
+                // right-button press edge pastes the clipboard into the edit
+                // line (X11 middle-click style)
+                if p.buttons & 2 != 0 && t.prev_buttons & 2 == 0 {
+                    for b in ustd::clip_get() {
+                        if b.is_ascii() && b != b'\n' && b != b'\r' {
+                            t.cur.insert(t.cx, b as char);
+                            t.cx += 1;
+                        }
+                    }
+                    t.dirty_all = true;
+                }
+                t.prev_buttons = p.buttons;
                 if p.wheel > 0 {
                     let max = t.lines.len().saturating_sub(1);
                     t.view = (t.view + 3 * p.wheel as usize).min(max);
@@ -2762,6 +3161,29 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 t.watch = Some((cmd, ms, now));
                 t.dirty_all = true;
             }
+        }
+        // tail -f mode: poll the file, print bytes appended since last read
+        if let Some((path, off)) = t.tailf.clone() {
+            if now - t.tailf_last >= 400 {
+                t.tailf_last = now;
+                if let Ok(d) = ustd::read_all(&path) {
+                    if (d.len() as u64) > off {
+                        let s = String::from_utf8_lossy(&d[off as usize..]);
+                        for l in s.lines().take(20) {
+                            t.push_line(l);
+                        }
+                        t.tailf = Some((path, d.len() as u64));
+                        t.dirty_all = true;
+                    }
+                }
+            }
+        }
+        // yes mode: flood the scrollback with the line
+        if let Some(text) = t.yesing.clone() {
+            for _ in 0..4 {
+                t.push_line(&text);
+            }
+            t.dirty_all = true;
         }
         if now - last_blink >= 500 {
             last_blink = now;
