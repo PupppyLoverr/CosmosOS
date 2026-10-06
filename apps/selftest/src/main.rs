@@ -141,11 +141,19 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             "dns-resolve",
             ustd::net_dns("example.com").is_some(),
         );
+        // real TCP/80 HTTP GET to the live internet via slirp
+        check(
+            "http-example",
+            ustd::net_http("example.com")
+                .map(|b| b.windows(5).any(|w| w == b"HTTP/"))
+                .unwrap_or(false),
+        );
     } else {
         check("net-mac", false);
         check("net-ip", false);
         check("ping-gw", false);
         check("dns-resolve", false);
+        check("http-example", false);
     }
 
     let (pass, fail) = unsafe { (PASS, FAIL) };

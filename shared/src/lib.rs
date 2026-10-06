@@ -47,6 +47,7 @@ pub const SYS_KILL: u64 = 50; // (pid) -> 0 | ERR
 pub const SYS_NET_PING: u64 = 51; // (ip u32 BE-packed, timeout_ms) -> rtt_ms | ERR
 pub const SYS_NET_INFO: u64 = 52; // (&mut [u8;10] {mac[6],ip[4]}) -> 0 | ERR
 pub const SYS_NET_DNS: u64 = 53; // (name_ptr,len, out [u8;4]) -> 0 | ERR (real UDP/53)
+pub const SYS_NET_HTTP: u64 = 54; // (host_ptr,len, out, outlen) -> n | ERR (real TCP/80 GET /)
 
 pub const SYS_ERR: u64 = u64::MAX;
 

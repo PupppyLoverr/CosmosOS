@@ -118,6 +118,24 @@ pub fn net_dns(name: &str) -> Option<[u8; 4]> {
     );
     if r == u64::MAX { None } else { Some(ip) }
 }
+/// Real HTTP GET over real TCP: resolves `host` (DNS/UDP) then
+/// `GET / HTTP/1.0` on port 80. Returns up to 4 KiB of the response.
+pub fn net_http(host: &str) -> Option<alloc::vec::Vec<u8>> {
+    let mut buf = alloc::vec![0u8; 4096];
+    let n = sc4(
+        shared::SYS_NET_HTTP,
+        host.as_ptr() as u64,
+        host.len() as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    );
+    if n == u64::MAX {
+        None
+    } else {
+        buf.truncate(n as usize);
+        Some(buf)
+    }
+}
 /// (mac, ip) of the virtio-net device, if present.
 pub fn net_info() -> Option<([u8; 6], [u8; 4])> {
     let mut b = [0u8; 10];
