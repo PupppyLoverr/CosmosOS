@@ -144,6 +144,68 @@ fn is_leap(y: u16) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
+// Howard Hinnant's civil algorithms (public domain) — inverse of
+// days_from_civil so unix seconds can be written back to the RTC.
+fn civil_from_days(z: i64) -> (u16, u8, u8) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    ((if m <= 2 { y + 1 } else { y }) as u16, m as u8, d as u8)
+}
+
+fn cmos_write(reg: u8, val: u8) {
+    unsafe {
+        let mut a: Port<u8> = Port::new(0x70);
+        a.write(reg);
+        let mut d: Port<u8> = Port::new(0x71);
+        d.write(val);
+    }
+}
+
+/// Set the wall clock to unix `secs`: rebase the in-memory clock AND write
+/// the CMOS RTC registers (BCD-aware; updates held off via the SET bit).
+pub fn set_unix(secs: u64) {
+    // rebase so datetime() = base + uptime returns `secs` right now
+    let base = (secs as i64 - (uptime_ms() / 1000) as i64).max(0) as u64;
+    let (y, m, d) = civil_from_days((base / 86400) as i64);
+    let rem = base % 86400;
+    *BASE.lock() = Some(DateTime {
+        year: y,
+        month: m,
+        day: d,
+        hour: (rem / 3600) as u8,
+        minute: ((rem % 3600) / 60) as u8,
+        second: (rem % 60) as u8,
+    });
+    // persist to the hardware RTC (what a real `hwclock --systohc` does)
+    let (ty, tm, td) = civil_from_days((secs / 86400) as i64);
+    let trem = secs % 86400;
+    let regb = cmos(0x0B);
+    let is_bcd = regb & 0x04 == 0;
+    let enc = |v: u8| -> u8 {
+        if is_bcd {
+            ((v / 10) << 4) | (v % 10)
+        } else {
+            v
+        }
+    };
+    cmos_write(0x0B, regb | 0x80); // SET: hold updates during the write
+    cmos_write(0x00, enc((trem % 60) as u8));
+    cmos_write(0x02, enc(((trem % 3600) / 60) as u8));
+    cmos_write(0x04, enc((trem / 3600) as u8));
+    cmos_write(0x07, enc(td));
+    cmos_write(0x08, enc(tm));
+    cmos_write(0x09, enc((ty % 100) as u8));
+    cmos_write(0x0B, regb & !0x80);
+    sprintln!("[rtc] set to unix {}", secs);
+}
+
 /// Current wall clock = RTC base + uptime. Enough accuracy for a status clock.
 pub fn datetime() -> DateTime {
     let base = *BASE.lock();
