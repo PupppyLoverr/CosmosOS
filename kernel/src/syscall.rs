@@ -19,7 +19,7 @@ fn copy_in(ptr: u64, len: u64) -> Option<Vec<u8>> {
     let mut off = 0u64;
     while off < len {
         let va = ptr + off;
-        let phys = elf::translate(pml4, va)?;
+        let phys = elf::translate_user(pml4, va)?;
         let chunk = (0x1000 - (va & 0xFFF)).min(len - off);
         unsafe {
             let src = (mem::phys_to_virt(phys)) as *const u8;
@@ -36,7 +36,7 @@ fn copy_out(ptr: u64, data: &[u8]) -> Option<()> {
     let mut off = 0u64;
     while off < data.len() as u64 {
         let va = ptr + off;
-        let phys = elf::translate(pml4, va)?;
+        let phys = elf::translate_user(pml4, va)?;
         let chunk = ((0x1000 - (va & 0xFFF)) as usize).min(data.len() - off as usize);
         unsafe {
             let dst = (mem::phys_to_virt(phys)) as *mut u8;
