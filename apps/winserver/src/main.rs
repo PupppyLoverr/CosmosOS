@@ -115,6 +115,8 @@ struct S {
     last_frame: u64,
     last_tc: (u64, u32), // (time, win) of last titlebar press — dblclick detect
     wall: Vec<u32>, // wallpaper cache (fh-TBAR_H rows)
+    idle_since: u64, // ms of last input event — screensaver clock
+    blanked: bool,   // screensaver active: fb is black
 }
 
 impl S {
@@ -190,6 +192,8 @@ fn main_loop() -> ! {
         last_tick: 0,
         last_frame: 0,
         last_tc: (0, 0),
+        idle_since: ustd::uptime_ms(),
+        blanked: false,
     };
 
     composite(&mut s);
@@ -218,7 +222,15 @@ fn main_loop() -> ! {
         // it (never clear dirty without compositing — dropped composites
         // leave "ghost" windows).
         let up = ustd::uptime_ms();
-        if up / 1000 != s.last_tick {
+        // screensaver: blank after 90s idle; any input (handle_input)
+        // clears `blanked` and flags a full repaint
+        if !s.blanked && up.saturating_sub(s.idle_since) >= 90_000 {
+            s.fb.reset_clip();
+            s.fb.fill(0, 0, s.fw, s.fh, 0xFF000000);
+            s.blanked = true;
+            s.damage = None;
+        }
+        if !s.blanked && up / 1000 != s.last_tick {
             s.last_tick = up / 1000;
             reap_dead(&mut s);
             let (fh, fw) = (s.fh, s.fw);
@@ -226,7 +238,7 @@ fn main_loop() -> ! {
         }
         // composite throttle: ~50fps max so input/ws-port drains keep up
         // under floods (damage composites are cheap but share the gate).
-        if up.wrapping_sub(s.last_frame) >= 20 {
+        if !s.blanked && up.wrapping_sub(s.last_frame) >= 20 {
             if s.dirty {
                 s.fb.reset_clip();
                 composite(&mut s);
@@ -254,6 +266,13 @@ fn main_loop() -> ! {
 fn handle_input(s: &mut S, msg: &[u8]) -> bool {
     if msg.is_empty() {
         return false;
+    }
+    // any input event resets the screensaver clock and wakes a blanked
+    // screen with a full repaint
+    s.idle_since = ustd::uptime_ms();
+    if s.blanked {
+        s.blanked = false;
+        s.dirty = true;
     }
     match msg[0] {
         x if x == InputKind::Key as u8 => {
