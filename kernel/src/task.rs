@@ -71,6 +71,7 @@ pub struct Task {
     pub cpu_ticks: u64,      // PIT ticks this task has run (per-task CPU time)
     pub argv: String,        // spawn arg string (for /proc/<pid>/cmdline)
     pub nice: i8,            // -20 (highest prio) ..= 19 (lowest); 0 = normal
+    pub rt: bool,            // SCHED_RT: runnable rt tasks preempt all non-rt tasks
     pub vrun: u64,           // virtual runtime (scaled by nice) for fair scheduling
     pub trace: bool,         // syscall tracing on (strace -p)
     pub trbuf: Vec<u64>,     // packed trace records, 7 u64s each: nr,a1..a5,ret
@@ -121,6 +122,7 @@ pub fn init() {
         wait_timeout: 0,
         cpu_ticks: 0,
         nice: 0,
+        rt: false,
         vrun: 0,
         trace: false,
         trbuf: Vec::new(),
@@ -166,16 +168,18 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
     // wake port receivers whose queues filled
     crate::ipc::wake_receivers(s);
     let n = s.tasks.len();
-    // CFS-lite: run the runnable task with the smallest virtual runtime.
-    // Scan starts just past `cur` so equal vruns still round-robin.
-    let mut best: Option<(u64, usize)> = None;
+    // CFS-lite: run the runnable task with the smallest virtual runtime;
+    // runnable SCHED_RT tasks preempt every non-rt task first.
+    // Scan starts just past `cur` so equal keys still round-robin.
+    let mut best: Option<((u8, u64), usize)> = None;
     for off in 1..=n {
         let i = (s.cur + off) % n;
         let t = &s.tasks[i];
         if t.state == State::Running {
+            let key = (if t.rt { 0u8 } else { 1u8 }, t.vrun);
             match best {
-                Some((v, _)) if t.vrun >= v => {}
-                _ => best = Some((t.vrun, i)),
+                Some((k, _)) if key >= k => {}
+                _ => best = Some((key, i)),
             }
         }
     }
@@ -222,14 +226,17 @@ pub fn yield_ctx(ctx: *mut CpuContext) -> ! {
     let s = g.as_mut().unwrap();
     s.tasks[s.cur].saved_rsp = ctx as u64;
     let n = s.tasks.len();
-    for i in 1..=n {
-        let t = &s.tasks[(s.cur + i) % n];
-        if t.state == State::Running {
-            s.cur = (s.cur + i) % n;
-            activate(&s.tasks[s.cur]);
-            let rsp = s.tasks[s.cur].saved_rsp;
-            drop(g);
-            unsafe { switch_tail(rsp) }
+    // runnable rt tasks first, then anyone runnable
+    for want_rt in [true, false] {
+        for i in 1..=n {
+            let t = &s.tasks[(s.cur + i) % n];
+            if t.state == State::Running && t.rt == want_rt {
+                s.cur = (s.cur + i) % n;
+                activate(&s.tasks[s.cur]);
+                let rsp = s.tasks[s.cur].saved_rsp;
+                drop(g);
+                unsafe { switch_tail(rsp) }
+            }
         }
     }
     // nothing else to run — stay
@@ -393,6 +400,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         wait_timeout: 0,
         cpu_ticks: 0,
         nice: 0,
+        rt: false,
         vrun: s.tasks[s.cur].vrun,
         trace: false,
         trbuf: Vec::new(),
@@ -455,6 +463,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         wait_timeout: 0,
         cpu_ticks: 0,
         nice: 0,
+        rt: false,
         vrun: s.tasks[s.cur].vrun,
         trace: false,
         trbuf: Vec::new(),
@@ -985,4 +994,79 @@ pub fn loadavg() -> (usize, usize, u32) {
         }
         None => (0, 0, 0),
     }
+}
+
+/// Set/clear the SCHED_RT class on a task (SYS_CHRT).
+pub fn set_rt(pid: u32, rt: bool) -> bool {
+    let mut g = SCHED.lock();
+    match g.as_mut().and_then(|s| s.tasks.iter_mut().find(|t| t.id == pid)) {
+        Some(t) => {
+            t.rt = rt;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Whether a task runs in the rt class (/proc/<pid>/status).
+pub fn pid_rt(pid: u32) -> Option<bool> {
+    let g = SCHED.lock();
+    g.as_ref()?.tasks.iter().find(|t| t.id == pid).map(|t| t.rt)
+}
+
+/// `/proc/<pid>/wchan` — the kernel function the task sleeps in ("0" if running).
+pub fn pid_wchan(pid: u32) -> Option<String> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    let t = s.tasks.iter().find(|t| t.id == pid)?;
+    let w = match t.state {
+        State::Running => "run",
+        State::Stopped => "signal",
+        State::Dead => "exited",
+        State::Blocked => {
+            if t.waiting_on != 0 {
+                "waitpid"
+            } else if t.wait_port != 0 {
+                "port_recv"
+            } else if t.sleep_deadline != 0 {
+                "hrtimer_nanosleep"
+            } else {
+                "schedule_timeout"
+            }
+        }
+    };
+    Some(alloc::format!("{}\n", w))
+}
+
+/// `/proc/<pid>/children` — space-separated child pids.
+pub fn children_of(pid: u32) -> Vec<u32> {
+    let g = SCHED.lock();
+    match g.as_ref() {
+        Some(s) => s.tasks.iter().filter(|t| t.parent == pid).map(|t| t.id).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// `/proc/<pid>/smaps` — maps plus real per-region sizes.
+pub fn pid_smaps(pid: u32) -> Option<String> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    let t = s.tasks.iter().find(|t| t.id == pid)?;
+    let mut out = String::new();
+    for m in &t.maps {
+        let kb = (m.end - m.start) / 1024;
+        out.push_str(&alloc::format!(
+            "{:08x}-{:08x} {}{}{}p 00000000 00:00 0          {}\nSize:                {} kB\nRss:                 {} kB\nPss:                 {} kB\n",
+            m.start,
+            m.end,
+            if m.perm & 1 != 0 { 'r' } else { '-' },
+            if m.perm & 2 != 0 { 'w' } else { '-' },
+            if m.perm & 4 != 0 { 'x' } else { '-' },
+            m.name,
+            kb,
+            kb, // never paged out: rss == size
+            if m.name.starts_with("shm") { kb / 2 } else { kb },
+        ));
+    }
+    Some(out)
 }

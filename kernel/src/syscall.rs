@@ -434,6 +434,20 @@ pub fn dispatch(ctx: &mut CpuContext) {
             crate::klog::clear();
             0
         }
+        shared::SYS_MUNMAP => sys_munmap(a1, a2),
+        shared::SYS_MPROTECT => sys_mprotect(a1, a2, a3),
+        shared::SYS_CHRT => match task::set_rt(a1 as u32, a2 == shared::SCHED_RT) {
+            true => 0,
+            false => ERR,
+        },
+        shared::SYS_IPCS => {
+            let s = shm::ipcs_text();
+            let n = s.len().min(a2 as usize);
+            match copy_out(a1, &s.as_bytes()[..n]) {
+                Some(()) => n as u64,
+                None => ERR,
+            }
+        }
         shared::SYS_ARP => {
             let s = net::arp_stat();
             let n = s.len().min(a2 as usize);
@@ -600,7 +614,10 @@ fn sys_spawn(pptr: u64, plen: u64, aptr: u64, alen: u64) -> u64 {
     };
     let full = vfs::normalize(&task::with_current(|t| t.cwd.clone()), &path);
     match task::spawn_user(&full, &args, cur_id()) {
-        Ok(pid) => pid as u64,
+        Ok(pid) => {
+            vfs::utmp_log(pid, &full);
+            pid as u64
+        }
         Err(_) => ERR,
     }
 }
@@ -609,6 +626,7 @@ fn sys_mmap(size: u64) -> u64 {
     if size == 0 || size > 64 << 20 {
         return 0;
     }
+    // (real anon mmap — see SYS_MUNMAP/SYS_MPROTECT for the full lifecycle)
     task::with_current(|t| {
         let Some(pml4) = t.pml4 else { return 0 };
         let base = t.mmap_next;
@@ -631,6 +649,106 @@ fn sys_mmap(size: u64) -> u64 {
         });
         t.mmap_next += pages * 0x1000 + 0x1000; // guard page
         base
+    })
+}
+
+/// SYS_MUNMAP(addr,len): real unmap — PTEs cleared, owned frames freed,
+/// borrowed (shm/fb) frames just detached, tracked entries shrunk/split.
+fn sys_munmap(addr: u64, len: u64) -> u64 {
+    if len == 0 || addr & 0xFFF != 0 {
+        return ERR;
+    }
+    let end = addr.saturating_add(len.div_ceil(0x1000) * 0x1000);
+    task::with_current(|t| {
+        let Some(pml4) = t.pml4 else { return ERR };
+        let mut unmapped = 0u64;
+        let mut a = addr;
+        while a < end {
+            if let Some(phys) = elf::unmap_user_page(pml4, a) {
+                if !t.borrowed.contains(&phys) {
+                    mem::free_frame(phys);
+                }
+                unmapped += 1;
+            }
+            a += 0x1000;
+        }
+        if unmapped == 0 {
+            return ERR;
+        }
+        // release shm segments whose region is fully covered
+        let mut releases: Vec<u32> = Vec::new();
+        for m in t.maps.iter() {
+            if m.start >= addr && m.end <= end && m.name.starts_with("shm#") {
+                if let Ok(id) = m.name[4..].parse::<u32>() {
+                    releases.push(id);
+                }
+            }
+        }
+        for id in releases {
+            shm::release(t, id);
+            t.shm.retain(|&s| s != id);
+        }
+        // shrink, split or drop overlapping map entries
+        let mut out: Vec<task::MapEnt> = Vec::new();
+        for m in core::mem::take(&mut t.maps) {
+            if m.end <= addr || m.start >= end {
+                out.push(m);
+                continue;
+            }
+            if m.start < addr {
+                out.push(task::MapEnt {
+                    start: m.start,
+                    end: addr,
+                    perm: m.perm,
+                    name: m.name.clone(),
+                });
+            }
+            if m.end > end {
+                out.push(task::MapEnt {
+                    start: end,
+                    end: m.end,
+                    perm: m.perm,
+                    name: m.name,
+                });
+            }
+        }
+        t.maps = out;
+        t.mem_bytes = t.mem_bytes.saturating_sub(unmapped * 0x1000);
+        unsafe { x86_64::instructions::tlb::flush_all() };
+        0
+    })
+}
+
+/// SYS_MPROTECT(addr,len,prot R1W2X4): rewrites real PTE flags on the
+/// task's own mappings — a subsequent violating access page-faults for real.
+fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
+    if len == 0 || prot > 7 {
+        return ERR;
+    }
+    let w = prot & shared::PROT_WRITE != 0;
+    let x = prot & shared::PROT_EXEC != 0;
+    let end = addr.saturating_add(len.div_ceil(0x1000) * 0x1000);
+    task::with_current(|t| {
+        let Some(pml4) = t.pml4 else { return ERR };
+        let mut a = addr;
+        let mut changed = 0u64;
+        while a < end {
+            if elf::protect_user_page(pml4, a, w, x).is_some() {
+                changed += 1;
+            }
+            a += 0x1000;
+        }
+        if changed == 0 {
+            return ERR;
+        }
+        for m in t.maps.iter_mut() {
+            if m.end <= addr || m.start >= end {
+                continue;
+            }
+            m.perm = (prot & 7) as u8;
+        }
+        unsafe { x86_64::instructions::tlb::flush_all() };
+        0
     })
 }
 
@@ -701,27 +819,33 @@ fn sys_write(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
 }
 
 fn sys_seek(fd: u64, off: u64, whence: u64) -> u64 {
-    let pos = task::with_current(|t| match t.fds.get(fd as usize) {
-        Some(Some(f)) => f.pos,
-        _ => return ERR,
-    });
-    let size = match task::with_current(|t| match t.fds.get(fd as usize) {
-        Some(Some(f)) => f.path.clone(),
-        _ => String::new(),
-    }) {
-        p if p.is_empty() => return ERR,
-        p => {
-            let mut g = vfs::FS.lock();
-            match g.as_mut().and_then(|fs| fs.stat(&p).ok()) {
-                Some(s) => s.size,
-                None => return ERR,
-            }
-        }
+    let Some((pos, path)) = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) => Some((f.pos, f.path.clone())),
+        _ => None,
+    }) else {
+        return ERR;
     };
     let new = match whence {
         shared::SEEK_SET => off,
         shared::SEEK_CUR => pos + off,
-        shared::SEEK_END => size + off,
+        shared::SEEK_END => {
+            // only real filesystem files have a stat-able size; dev/proc/pipe
+            // fds support SET/CUR (the offset is the device byte address —
+            // /dev/port's port number, /dev/mem's physical address)
+            if path.is_empty()
+                || crate::dev::handles(&path)
+                || crate::proc::handles(&path)
+                || crate::pipes::handles(&path)
+            {
+                return ERR;
+            }
+            let mut g = vfs::FS.lock();
+            let size = match g.as_mut().and_then(|fs| fs.stat(&path).ok()) {
+                Some(s) => s.size,
+                None => return ERR,
+            };
+            size + off
+        }
         _ => return ERR,
     };
     match vfs::seek(fd as i64, new) {

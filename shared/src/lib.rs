@@ -95,6 +95,15 @@ pub const LOCK_SH: u64 = 1;
 pub const LOCK_EX: u64 = 2;
 pub const LOCK_NB: u64 = 4;
 pub const LOCK_UN: u64 = 8;
+pub const SYS_MUNMAP: u64 = 93;          // (addr,len) -> 0 | ERR   unmap tracked user mappings
+pub const SYS_MPROTECT: u64 = 94;        // (addr,len,prot R|W|X=1|2|4) -> 0 | ERR
+pub const SYS_CHRT: u64 = 95;            // (pid,class 0=other|1=rt) -> 0 | ERR  realtime class
+pub const SYS_IPCS: u64 = 96;            // (buf,cap) -> n | ERR    shm registry dump
+pub const PROT_READ: u64 = 1;
+pub const PROT_WRITE: u64 = 2;
+pub const PROT_EXEC: u64 = 4;
+pub const SCHED_OTHER: u64 = 0;
+pub const SCHED_RT: u64 = 1;
 pub const SYS_ERR: u64 = u64::MAX;
 
 // open flags

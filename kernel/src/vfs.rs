@@ -616,3 +616,12 @@ pub fn df() -> Option<(u64, u64)> {
     let free = fs.free_clusters().ok()? * cb;
     Some((total, free))
 }
+
+/// Append a spawn record to /utmp: "pid path unix_secs\n" per user task.
+/// Read-modify-write is fine here — the file stays small (one line per spawn).
+pub fn utmp_log(pid: u32, path: &str) {
+    let line = alloc::format!("{} {} {}\n", pid, path, now_unix());
+    let mut cur = read_all("/utmp").unwrap_or_default();
+    cur.extend_from_slice(line.as_bytes());
+    let _ = write_all_path("/utmp", &cur);
+}

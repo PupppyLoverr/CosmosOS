@@ -421,6 +421,34 @@ pub fn mmap(size: u64) -> Option<*mut u8> {
         Some(p as *mut u8)
     }
 }
+
+/// munmap(addr, len): unmap a tracked user mapping — PTEs cleared,
+/// owned frames freed, shm/fb borrowed pages detached.
+pub fn munmap(addr: *mut u8, len: u64) -> bool {
+    sc2(shared::SYS_MUNMAP, addr as u64, len) == 0
+}
+
+/// mprotect(addr, len, prot): change real page permissions
+/// (PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4). Violations fault for real.
+pub fn mprotect(addr: *mut u8, len: u64, prot: u64) -> bool {
+    sc3(shared::SYS_MPROTECT, addr as u64, len, prot) == 0
+}
+
+/// chrt(pid, class): set scheduler class — SCHED_OTHER=0, SCHED_RT=1.
+pub fn chrt(pid: u32, class: u64) -> bool {
+    sc2(shared::SYS_CHRT, pid as u64, class) == 0
+}
+
+/// Kernel shm registry dump ("id owner size refs" per line) for `ipcs -m`.
+pub fn ipcs() -> String {
+    let mut buf = [0u8; 4096];
+    let n = sc2(
+        shared::SYS_IPCS,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    ) as usize;
+    String::from_utf8_lossy(&buf[..n.min(4096)]).into_owned()
+}
 /// Enumerate PCI functions into `buf` (kernel SYS_PCI_SCAN). Returns count.
 pub fn pci_scan(buf: &mut [shared::PciEnt]) -> usize {
     sc2(

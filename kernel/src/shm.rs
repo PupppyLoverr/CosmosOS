@@ -4,6 +4,7 @@
 //! entries are marked "borrowed" so teardown doesn't double-free.
 use crate::task::Task;
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
 
@@ -110,4 +111,23 @@ pub fn drop_task_shm(t: &mut Task) {
     for id in ids {
         release(t, id);
     }
+}
+
+/// Text dump of the shm registry for SYS_IPCS:
+/// "id owner size refs" per line — rendered Linux-style by `ipcs -m`.
+pub fn ipcs_text() -> String {
+    let g = SHM.lock();
+    let mut s = String::new();
+    if let Some(r) = g.as_ref() {
+        for (id, seg) in r.map.iter() {
+            s.push_str(&alloc::format!(
+                "{} {} {} {}\n",
+                id,
+                seg.owner,
+                seg.frames.len() as u64 * 0x1000,
+                seg.refs
+            ));
+        }
+    }
+    s
 }
