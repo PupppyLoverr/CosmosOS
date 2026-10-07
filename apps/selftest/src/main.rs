@@ -985,6 +985,115 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         DEPTH.load(Ordering::SeqCst) >= 2 && PEND.load(Ordering::SeqCst) != 0
     });
+    check("ptrace-peek-poke", {
+        // child TRACEMEs, stops on SIGSTOP; parent PEEKs/POKEs a cell in
+        // the child's address space (same image -> same VA), CONTs, and
+        // the child exits with the poked value
+        use core::sync::atomic::Ordering;
+        static CELL: AtomicU64 = AtomicU64::new(0);
+        CELL.store(0, Ordering::SeqCst);
+        let cell_va = &CELL as *const AtomicU64 as u64;
+        match ustd::fork() {
+            0 => {
+                ustd::ptrace(ustd::PT_TRACEME, 0, 0, 0);
+                ustd::kill2(ustd::getpid(), 19); // SIGSTOP -> traced stop
+                ustd::exit(CELL.load(Ordering::SeqCst) as i64);
+            }
+            c if c > 0 => {
+                let mut ok = false;
+                // wait for the traced SIGSTOP (WUNTRACED status 0x7f|19<<8)
+                for _ in 0..60 {
+                    if let Ok(st) = ustd::waitpid_opt(c as u32, 1, 200) {
+                        if st == 0x7f | (19 << 8) {
+                            ok = true;
+                            break;
+                        }
+                    }
+                    ustd::sleep_ms(25);
+                }
+                let v = ustd::ptrace(ustd::PT_PEEK, c as u32, cell_va, 0);
+                let poked = ustd::ptrace(ustd::PT_POKE, c as u32, cell_va, 42);
+                ustd::ptrace(ustd::PT_CONT, c as u32, 0, 0);
+                let ex = ustd::waitpid(c as u32, 4000).unwrap_or(-1);
+                ok && v == 0 && poked == 0 && ex == 42
+            }
+            _ => false,
+        }
+    });
+    check("ptrace-singlestep", {
+        // PTRACE_SINGLESTEP runs exactly one user insn, then the tracee
+        // stops again with SIGTRAP (0x7f|5<<8) — observable via GETREGS
+        // rip movement
+        match ustd::fork() {
+            0 => {
+                ustd::ptrace(ustd::PT_TRACEME, 0, 0, 0);
+                ustd::kill2(ustd::getpid(), 19);
+                ustd::exit(7);
+            }
+            c if c > 0 => {
+                let mut stopped = false;
+                for _ in 0..60 {
+                    if let Ok(st) = ustd::waitpid_opt(c as u32, 1, 200) {
+                        if st == 0x7f | (19 << 8) {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                    ustd::sleep_ms(25);
+                }
+                let r0 = ustd::ptrace_getregs(c as u32);
+                ustd::ptrace(ustd::PT_STEP, c as u32, 0, 0);
+                let mut trapped = false;
+                for _ in 0..60 {
+                    if let Ok(st) = ustd::waitpid_opt(c as u32, 1, 200) {
+                        if st == 0x7f | (5 << 8) {
+                            trapped = true;
+                            break;
+                        }
+                    }
+                    ustd::sleep_ms(25);
+                }
+                let r1 = ustd::ptrace_getregs(c as u32);
+                ustd::ptrace(ustd::PT_CONT, c as u32, 0, 0);
+                let ex = ustd::waitpid(c as u32, 4000).unwrap_or(-1);
+                stopped
+                    && trapped
+                    && ex == 7
+                    && match (r0, r1) {
+                        (Some(a), Some(b)) => {
+                            a.rip != 0 && b.rip != a.rip
+                        }
+                        _ => false,
+                    }
+            }
+            _ => false,
+        }
+    });
+    check("ptrace-attach", {
+        // attach to a live spawned task: SIGTRAP stop, inspect, detach,
+        // then it can be killed normally
+        match ustd::spawn("/bin/cosmos-ucat", "/ptrace-target") {
+            Ok(c) => {
+                let att = ustd::ptrace(ustd::PT_ATTACH, c, 0, 0) == 0;
+                let mut stopped = false;
+                for _ in 0..60 {
+                    if let Ok(st) = ustd::waitpid_opt(c, 1, 200) {
+                        if st & 0xff == 0x7f {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                    ustd::sleep_ms(25);
+                }
+                let regs = ustd::ptrace_getregs(c);
+                let det = ustd::ptrace(ustd::PT_DETACH, c, 0, 0) == 0;
+                let _ = ustd::kill2(c, 9);
+                let _ = ustd::waitpid(c, 3000);
+                att && stopped && det && regs.map(|r| r.rip != 0).unwrap_or(false)
+            }
+            Err(_) => false,
+        }
+    });
     check("tls-fsbase", {
         // arch_prctl SET_FS/GET_FS: real FS segment per task
         static mut CELL: u64 = 0;

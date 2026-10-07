@@ -172,7 +172,47 @@ pub const SA_RESTART: u8 = 1; // interrupted slow syscalls restart (no EINTR)
 pub const SA_ONSTACK: u8 = 2; // run the handler on the sigaltstack stack
 pub const SA_NODEFER: u8 = 4; // don't block this signal inside its own handler
 // sigaltstack ss_flags
-pub const SS_DISABLE: u64 = 2;        // (pid, res, new_or_MAX, old_ptr)
+pub const SS_DISABLE: u64 = 2;
+
+pub const SYS_PTRACE: u64 = 157;
+
+// ptrace request ops
+pub const PT_TRACEME: u64 = 0;
+pub const PT_PEEK: u64 = 1;
+pub const PT_POKE: u64 = 4;
+pub const PT_CONT: u64 = 7;
+pub const PT_KILL: u64 = 8;
+pub const PT_STEP: u64 = 9;
+pub const PT_GETREGS: u64 = 12;
+pub const PT_SETREGS: u64 = 13;
+pub const PT_ATTACH: u64 = 16;
+pub const PT_DETACH: u64 = 17;
+
+/// Register file layout == the kernel's saved CpuContext (PTRACE_GETREGS).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PtRegs {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rax: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}        // (pid, res, new_or_MAX, old_ptr)
 pub const SOL_SOCKET: u64 = 1;
 pub const SO_REUSEADDR: u64 = 2;
 pub const SO_TYPE: u64 = 3;
