@@ -147,6 +147,7 @@ pub fn uptime_ms() -> u64 {
 extern "C" fn sched_tick(saved: u64) -> u64 {
     TICKS.fetch_add(1, Ordering::Relaxed);
     crate::timer::bump_ticks();
+    crate::timerfd::tick(); // expire /timerfd objects (~10ms per tick)
     let mut g = match SCHED.try_lock() {
         Some(g) => g,
         None => return saved, // scheduler busy in a syscall — defer
@@ -559,6 +560,14 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
     ipc::close_task_ports(&mut t);
     shm::drop_task_shm(&mut t);
     crate::locks::release_pid(t.id);
+    // release fd-table objects (pipe roles, inotify/timerfd objects) — a
+    // dead task must not pin e.g. a pipe's writer count, or readers block
+    // forever waiting for an EOF that can never come
+    for slot in t.fds.iter_mut() {
+        if let Some(f) = slot.take() {
+            crate::vfs::release_desc(&f);
+        }
+    }
     if let Some(pml4) = t.pml4 {
         // walk the user tree; free every leaf+PT frame except shm-borrowed ones
         let borrowed = core::mem::take(&mut t.borrowed);

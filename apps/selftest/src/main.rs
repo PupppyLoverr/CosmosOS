@@ -1022,6 +1022,79 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             })
             .unwrap_or(false)
     });
+    check("fsync", {
+        // fsync(fd) commits via the device; fsync(badfd) must fail
+        match ustd::open("/st-fsync", ustd::O_RDWR | ustd::O_CREATE) {
+            Ok(fd) => {
+                let _ = ustd::write(fd, b"x");
+                let ok = ustd::fsync(fd) == 0
+                    && ustd::fsync(0x7fff_ffff) < 0
+                    && ustd::sync_all() == 0;
+                ustd::close(fd);
+                let _ = ustd::remove("/st-fsync");
+                ok
+            }
+            Err(_) => false,
+        }
+    });
+    check("timerfd", {
+        // arm 30ms one-shot: poll must report readable, read yields count>=1
+        let fd = ustd::timerfd_create();
+        if fd < 0 {
+            false
+        } else {
+            ustd::timerfd_set(fd, 30, 0);
+            let rdy = ustd::poll(&[fd as u32], &[1], 2000) > 0;
+            let n = ustd::timerfd_read(fd).unwrap_or(0);
+            ustd::close(fd);
+            rdy && n >= 1
+        }
+    });
+    check("timerfd-periodic", {
+        // 20ms interval: after ~90ms the count should be >= 3
+        let fd = ustd::timerfd_create();
+        if fd < 0 {
+            false
+        } else {
+            ustd::timerfd_set(fd, 10, 20);
+            ustd::sleep_ms(95);
+            let n = ustd::timerfd_read(fd).unwrap_or(0);
+            ustd::close(fd);
+            n >= 3
+        }
+    });
+    check("inotify", {
+        // watch / for IN_ALL, create a file, read the event back
+        let ifd = ustd::inotify_init();
+        if ifd < 0 {
+            false
+        } else {
+            let wd = ustd::inotify_add(ifd, "/", ustd::IN_ALL);
+            let ok = wd >= 0
+                && ustd::write_all("/st-inot", b"e").is_ok()
+                && {
+                    let rdy = ustd::poll(&[ifd as u32], &[1], 2000) > 0;
+                    let mut b = [0u8; 512];
+                    match ustd::read(ifd, &mut b) {
+                        Ok(n) if n > 0 => {
+                            let s = String::from_utf8_lossy(&b[..n]);
+                            s.lines().any(|l| {
+                                let mut it = l.split_whitespace();
+                                it.next();
+                                let m: u64 =
+                                    it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                                let nm = it.next().unwrap_or("");
+                                nm == "st-inot" && m & 0x100 != 0
+                            })
+                        }
+                        _ => false,
+                    }
+                };
+            ustd::close(ifd);
+            let _ = ustd::remove("/st-inot");
+            ok
+        }
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

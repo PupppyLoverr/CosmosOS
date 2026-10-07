@@ -964,6 +964,37 @@ fn http_date_dt(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8) -> String {
     )
 }
 
+/// inotify mask bits -> readable event list (Linux order)
+fn inotify_mask_name(mask: u64) -> String {
+    const BITS: [(u64, &str); 12] = [
+        (0x1, "IN_ACCESS"),
+        (0x2, "IN_MODIFY"),
+        (0x4, "IN_ATTRIB"),
+        (0x8, "IN_CLOSE_WRITE"),
+        (0x40, "IN_MOVED_FROM"),
+        (0x80, "IN_MOVED_TO"),
+        (0x100, "IN_CREATE"),
+        (0x200, "IN_DELETE"),
+        (0x400, "IN_DELETE_SELF"),
+        (0x800, "IN_MOVE_SELF"),
+        (0x4000_0000, "IN_ISDIR"),
+        (0x8000, "IN_Q_OVERFLOW"),
+    ];
+    let mut out = String::new();
+    for (b, n) in BITS {
+        if mask & b != 0 {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(n);
+        }
+    }
+    if out.is_empty() {
+        out.push_str(&alloc::format!("{:#x}", mask));
+    }
+    out
+}
+
 fn epoch_to_dt(secs: u64) -> (u16, u8, u8, u8, u8, u8) {
     let mut d = secs / 86400;
     let rem = secs % 86400;
@@ -4929,7 +4960,10 @@ struct Term {
     sel_drag: bool,                                    // left button currently held
     pq: String,                                        // pager search query
     pg_input: bool,                                    // pager `/` input active
-    tailf: Option<(String, i64)>,
+    // `tail -f`/`tail -F`: (path, fd, inotify-fd or -1, file-missing)
+    tailf: Option<(String, i64, i64, bool)>,
+    // `inotifywait`/`inotifywatch`: (ifd, deadline_ms or MAX, counts, monitor)
+    inotw: Option<(i64, u64, alloc::collections::BTreeMap<String, u64>, bool)>,
     top: Option<u64>,           // top mode: refresh interval ms
     jobs: Vec<(u32, String)>,   // tracked spawned processes (jobs/fg/disown/$!)
     last_spawn: u32,            // pid of the most recent spawned process ($!)
@@ -14248,28 +14282,86 @@ impl Term {
                                 }
                             }
                             // tail -f: persistent fd followed via poll() —
-                            // works on regular files AND fifos
-                            if cmd == "tail" && args.iter().any(|a| *a == "-f") {
+                            // works on regular files AND fifos. -F adds a
+                            // real inotify watch on the parent dir so the
+                            // follow survives delete/move/recreate.
+                            let follow = args.iter().any(|a| *a == "-f" || *a == "-F");
+                            if cmd == "tail" && follow {
                                 if let Some(p) = popt {
+                                    let big_f = args.iter().any(|a| *a == "-F");
+                                    let mut fd: i64 = -1;
                                     match ustd::open(p, ustd::O_RDONLY) {
-                                        Ok(fd) => {
+                                        Ok(f) => {
                                             // jump to the end we already printed
-                                            let _ = ustd::seek(fd, blen as u64, 0);
-                                            self.tailf = Some((String::from(p), fd));
-                                            self.tailf_last = 0;
-                                            self.emit("  (following -- Esc/Enter to stop)");
+                                            let _ = ustd::seek(f, blen as u64, 0);
+                                            fd = f;
                                         }
-                                        Err(e) => self.fail(&alloc::format!(
-                                            "tail: {}: err {}", p, e
-                                        )),
+                                        Err(e) if !big_f => {
+                                            self.fail(&alloc::format!(
+                                                "tail: {}: err {}", p, e
+                                            ));
+                                            return;
+                                        }
+                                        Err(_) => {
+                                            // -F: file may appear later — the
+                                            // dir watch below catches CREATE
+                                            self.emit(&alloc::format!(
+                                                "tail: {}: not found — waiting", p
+                                            ));
+                                        }
                                     }
+                                    let mut ifd: i64 = -1;
+                                    if big_f {
+                                        let i = ustd::inotify_init();
+                                        if i >= 0 {
+                                            // watch the parent dir (or the
+                                            // file itself when at root name)
+                                            let dir = match p.rfind('/') {
+                                                Some(0) | None => "/",
+                                                Some(i2) => &p[..i2],
+                                            };
+                                            let _ = ustd::inotify_add(i, dir, ustd::IN_ALL);
+                                            ifd = i;
+                                        }
+                                    }
+                                    self.tailf =
+                                        Some((String::from(p), fd, ifd, fd < 0));
+                                    self.tailf_last = 0;
+                                    self.emit("  (following -- Esc/Enter to stop)");
                                 } else {
                                     self.fail("tail: -f needs a file");
                                 }
                             }
                         }
                     }
-                    None => self.fail(&alloc::format!("usage: {} [-n N] <file>", cmd)),
+                    None => {
+                        // tail -F tolerates a missing file: start the dir
+                        // watch now and begin following when it appears
+                        let follow_f = cmd == "tail" && args.iter().any(|a| *a == "-F");
+                        match (follow_f, popt) {
+                            (true, Some(p)) => {
+                                let mut ifd: i64 = -1;
+                                let i = ustd::inotify_init();
+                                if i >= 0 {
+                                    let dir = match p.rfind('/') {
+                                        Some(0) | None => "/",
+                                        Some(i2) => &p[..i2],
+                                    };
+                                    let _ = ustd::inotify_add(i, dir, ustd::IN_ALL);
+                                    ifd = i;
+                                }
+                                self.tailf = Some((String::from(p), -1, ifd, true));
+                                self.tailf_last = 0;
+                                self.emit(&alloc::format!(
+                                    "tail: {}: not found — waiting for it", p
+                                ));
+                                self.emit("  (following -- Esc/Enter to stop)");
+                            }
+                            _ => self.fail(&alloc::format!(
+                                "usage: {} [-n N] <file>", cmd
+                            )),
+                        }
+                    }
                 }
             }
             "uniq" | "tr" | "cut" | "tee" | "base64" | "sha256sum" | "tar" => {
@@ -14903,6 +14995,59 @@ impl Term {
                     }
                     self.emit(l);
                 }
+            }
+            "sync" => {
+                // sync(2): flush the whole volume to stable storage
+                match ustd::sync_all() {
+                    0 => self.emit("sync: data committed to disk"),
+                    e => self.fail(&alloc::format!("sync: err {}", e)),
+                }
+            }
+            "inotifywait" | "inotifywatch" => {
+                // inotifywait <path>: wait for the next event batch, print
+                // "name IN_*" lines, done (Esc cancels).
+                // inotifywatch <path> [secs]: count events for N seconds,
+                // print a per-event summary (default 10s).
+                let mut secs: u64 = if cmd == "inotifywatch" { 10 } else { 0 };
+                let mut target: Option<&str> = None;
+                for a in args.iter() {
+                    if let Ok(s) = a.parse::<u64>() {
+                        secs = s;
+                    } else if *a != "-m" {
+                        target = Some(a);
+                    }
+                }
+                let Some(p) = target else {
+                    self.fail(&alloc::format!("usage: {} <path> [secs]", cmd));
+                    return;
+                };
+                let ifd = ustd::inotify_init();
+                if ifd < 0 {
+                    self.fail(&alloc::format!("{}: init failed", cmd));
+                    return;
+                }
+                let wd = ustd::inotify_add(ifd, p, ustd::IN_ALL);
+                if wd < 0 {
+                    ustd::close(ifd);
+                    self.fail(&alloc::format!("{}: {}: err {}", cmd, p, wd));
+                    return;
+                }
+                let monitor = cmd == "inotifywatch";
+                let dl = if monitor {
+                    ustd::uptime_ms() + secs * 1000
+                } else {
+                    u64::MAX
+                };
+                self.inotw = Some((ifd, dl, alloc::collections::BTreeMap::new(), monitor));
+                self.emit(&alloc::format!(
+                    "{}: watching {} {}",
+                    cmd, p,
+                    if monitor {
+                        alloc::format!("({}s — Esc stops)", secs)
+                    } else {
+                        String::from("(Esc stops)")
+                    }
+                ));
             }
             "rusage" => {
                 // rusage [pid]: real per-task cpu ticks + mapped kib
@@ -19315,7 +19460,7 @@ impl Term {
             return;
         }
         // during watch/tail -f/yes modes, Esc or Enter stops; other keys ignored
-        if self.watch.is_some() || self.tailf.is_some() || self.yesing.is_some() || self.top.is_some() || self.strace_p.is_some() {
+        if self.watch.is_some() || self.tailf.is_some() || self.yesing.is_some() || self.top.is_some() || self.strace_p.is_some() || self.inotw.is_some() {
             if k.key == KeyCode::Escape as u32
                 || k.key == KeyCode::Enter as u32
                 || (self.top.is_some() && k.chr == b'q')
@@ -19330,10 +19475,19 @@ impl Term {
                     self.push_line("watch stopped");
                 }
                 if self.tailf.is_some() {
-                    if let Some((_, fd)) = self.tailf.take() {
-                        ustd::close(fd);
+                    if let Some((_, fd, ifd, _)) = self.tailf.take() {
+                        if fd >= 0 {
+                            ustd::close(fd);
+                        }
+                        if ifd >= 0 {
+                            ustd::close(ifd);
+                        }
                     }
                     self.push_line("tail: stopped");
+                }
+                if let Some((ifd, _, _, _)) = self.inotw.take() {
+                    ustd::close(ifd);
+                    self.push_line("inotify: stopped");
                 }
                 if self.yesing.is_some() {
                     self.yesing = None;
@@ -19578,7 +19732,7 @@ impl Term {
             "hostid", "who", "w", "users", "last", "sum", "sha224sum",
             "lsmod", "merge", "diff3", "compress", "uncompress", "sdiff",
             "egrep", "fgrep",
-        "rusage", "ts",
+        "rusage", "ts", "sync", "inotifywait", "inotifywatch",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -20858,6 +21012,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         pq: String::new(),
         pg_input: false,
         tailf: None,
+        inotw: None,
         top: None,
         top_last: 0,
         top_prev: Vec::new(),
@@ -21238,33 +21393,119 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 t.dirty_all = true;
             }
         }
-        // tail -f mode: poll the file, print bytes appended since last read
-        if let Some((path, fd)) = t.tailf.clone() {
+        // tail -f/-F mode: poll the file fd (and the inotify fd for -F),
+        // print bytes appended since last read
+        if let Some((path, fd, ifd, missing)) = t.tailf.clone() {
             if now - t.tailf_last >= 400 {
                 t.tailf_last = now;
-                // gate on poll(): an empty fifo reports not-ready so the
-                // read below never blocks the terminal task
-                if ustd::poll(&[fd as u32], &[1], 0) > 0 {
-                    let mut buf = [0u8; 8192];
-                    match ustd::read(fd, &mut buf) {
-                        Ok(n) if n > 0 => {
-                            let txt = String::from_utf8_lossy(&buf[..n]);
-                            for l in txt.lines().take(20) {
-                                t.push_line(l);
+                let mut fd2 = fd;
+                let mut missing2 = missing;
+                // -F: drain pending watch events for our basename
+                if ifd >= 0 && ustd::poll(&[ifd as u32], &[1], 0) > 0 {
+                    let mut ebuf = [0u8; 2048];
+                    if let Ok(n) = ustd::read(ifd, &mut ebuf) {
+                        let base = path.rsplit('/').next().unwrap_or(&path);
+                        for l in String::from_utf8_lossy(&ebuf[..n]).lines() {
+                            let mut it = l.split_whitespace();
+                            let _wd = it.next();
+                            let mask: u64 =
+                                it.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+                            let name = it.next().unwrap_or("");
+                            if name != base {
+                                continue;
                             }
-                            t.dirty_all = true;
-                        }
-                        _ => {
-                            // truncated? regular files: reseek to keep following
-                            if let Ok(st) = ustd::stat(&path) {
-                                let cur = ustd::seek(fd, 0, 1).unwrap_or(0);
-                                if st.size < cur {
-                                    let _ = ustd::seek(fd, 0, 0);
+                            const IN_DELETE: u64 = 0x200;
+                            const IN_MOVED_FROM: u64 = 0x40;
+                            const IN_CREATE: u64 = 0x100;
+                            const IN_MOVED_TO: u64 = 0x80;
+                            if mask & (IN_DELETE | IN_MOVED_FROM) != 0 {
+                                if fd2 >= 0 {
+                                    ustd::close(fd2);
+                                    fd2 = -1;
+                                }
+                                missing2 = true;
+                                t.push_line(&alloc::format!(
+                                    "tail: {}: file deleted — waiting", path
+                                ));
+                            } else if missing2
+                                && mask & (IN_CREATE | IN_MOVED_TO | 0x2) != 0
+                            {
+                                if let Ok(f) = ustd::open(&path, ustd::O_RDONLY) {
+                                    fd2 = f;
+                                    missing2 = false;
+                                    t.push_line(&alloc::format!(
+                                        "tail: {}: (re)created — following", path
+                                    ));
                                 }
                             }
                         }
                     }
                 }
+                // gate on poll(): an empty fifo reports not-ready so the
+                // read below never blocks the terminal task
+                if fd2 >= 0 && ustd::poll(&[fd2 as u32], &[1], 0) > 0 {
+                    let mut buf = [0u8; 8192];
+                    match ustd::read(fd2, &mut buf) {
+                        Ok(n) if n > 0 => {
+                            let txt = String::from_utf8_lossy(&buf[..n]);
+                            for l in txt.lines().take(20) {
+                                t.push_line(l);
+                            }
+                        }
+                        _ => {
+                            // truncated? regular files: reseek to keep following
+                            if let Ok(st) = ustd::stat(&path) {
+                                let cur = ustd::seek(fd2, 0, 1).unwrap_or(0);
+                                if st.size < cur {
+                                    let _ = ustd::seek(fd2, 0, 0);
+                                }
+                            }
+                        }
+                    }
+                }
+                t.tailf = Some((path, fd2, ifd, missing2));
+                t.dirty_all = true;
+            }
+        }
+        // inotifywait/inotifywatch: drain queued events; watch mode prints a
+        // summary at its deadline, wait mode stops after the first batch
+        if let Some((ifd, dl, mut counts, monitor)) = t.inotw.clone() {
+            let mut printed = false;
+            if ustd::poll(&[ifd as u32], &[1], 0) > 0 {
+                let mut ebuf = [0u8; 4096];
+                if let Ok(n) = ustd::read(ifd, &mut ebuf) {
+                    for l in String::from_utf8_lossy(&ebuf[..n]).lines() {
+                        let mut it = l.split_whitespace();
+                        let _wd = it.next();
+                        let mask: u64 =
+                            it.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+                        let name = it.next().unwrap_or("");
+                        let ev = inotify_mask_name(mask);
+                        *counts.entry(ev.clone()).or_default() += 1;
+                        if !monitor {
+                            t.push_line(&alloc::format!("{} {}", name, ev));
+                            printed = true;
+                        }
+                    }
+                }
+            }
+            if printed || (dl != u64::MAX && now >= dl) {
+                ustd::close(ifd);
+                if monitor {
+                    t.push_line("inotifywatch: summary");
+                    let mut tot = 0u64;
+                    for (ev, c) in counts.iter() {
+                        t.push_line(&alloc::format!("  {:>6} {}", c, ev));
+                        tot += c;
+                    }
+                    t.push_line(&alloc::format!("  {:>6} total", tot));
+                }
+                t.inotw = None;
+            } else {
+                t.inotw = Some((ifd, dl, counts, monitor));
+            }
+            if printed || dl != u64::MAX {
+                t.dirty_all = true;
             }
         }
         // yes mode: flood the scrollback with the line

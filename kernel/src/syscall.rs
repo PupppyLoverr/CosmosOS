@@ -469,6 +469,95 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
             None => ERR,
         },
+        shared::SYS_FSYNC => {
+            // fd == u64::MAX: sync() — commit the whole device. Otherwise the
+            // fd must be open; fsync on a pipe object is EINVAL. Writes are
+            // already synchronous per-sector, so the flush op is best-effort
+            // confirmation on top of a trivially-clean invariant.
+            if a1 == u64::MAX {
+                if crate::virtio::flush_disk() { 0 } else { ERR }
+            } else {
+                let ok = task::with_current(|t| match t.fds.get(a1 as usize) {
+                    Some(Some(f)) => !crate::pipes::handles(&f.path),
+                    _ => false,
+                });
+                if ok && crate::virtio::flush_disk() { 0 } else { ERR }
+            }
+        }
+        shared::SYS_INOTIFY_INIT => {
+            let Ok(path) = crate::notify::create() else {
+                ctx.rax = ERR;
+                return;
+            };
+            task::with_current(|t| {
+                let fd = alloc_slot(t);
+                t.fds[fd] = Some(task::FileDesc {
+                    path,
+                    pos: 0,
+                    flags: shared::O_RDONLY,
+                });
+                fd as u64
+            })
+        }
+        shared::SYS_INOTIFY_ADD => {
+            let fd_path = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) if crate::notify::handles(&f.path) => Some(f.path.clone()),
+                _ => None,
+            });
+            let Some(fd_path) = fd_path else {
+                ctx.rax = ERR;
+                return;
+            };
+            let Some(b) = copy_in(a2, a3.min(4096)) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let path = String::from_utf8_lossy(&b).into_owned();
+            let cwd = task::with_current(|t| t.cwd.clone());
+            let full = vfs::normalize(&cwd, &path);
+            match crate::notify::add_watch(&fd_path, &full, a4 as u32) {
+                Ok(wd) => wd as u64,
+                Err(e) => e as u64,
+            }
+        }
+        shared::SYS_INOTIFY_RM => {
+            let fd_path = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) if crate::notify::handles(&f.path) => Some(f.path.clone()),
+                _ => None,
+            });
+            match fd_path {
+                Some(p) if crate::notify::rm_watch(&p, a2 as u32) => 0,
+                _ => ERR,
+            }
+        }
+        shared::SYS_TIMERFD => {
+            let Ok(path) = crate::timerfd::create() else {
+                ctx.rax = ERR;
+                return;
+            };
+            task::with_current(|t| {
+                let fd = alloc_slot(t);
+                t.fds[fd] = Some(task::FileDesc {
+                    path,
+                    pos: 0,
+                    flags: shared::O_RDONLY,
+                });
+                fd as u64
+            })
+        }
+        shared::SYS_TFD_SET => {
+            let fd_path = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) if crate::timerfd::handles(&f.path) => Some(f.path.clone()),
+                _ => None,
+            });
+            match fd_path {
+                Some(p) => match crate::timerfd::settime(&p, a2, a3) {
+                    Ok(()) => 0,
+                    Err(e) => e as u64,
+                },
+                None => ERR,
+            }
+        }
         shared::SYS_ARP => {
             let s = net::arp_stat();
             let n = s.len().min(a2 as usize);
@@ -815,6 +904,30 @@ fn sys_read(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
             }
         }
     }
+    // inotify / timerfd objects: block while empty, drain when ready
+    let obj_path = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f))
+            if crate::notify::handles(&f.path) || crate::timerfd::handles(&f.path) =>
+        {
+            Some(f.path.clone())
+        }
+        _ => None,
+    });
+    if let Some(p) = obj_path {
+        let r = if crate::notify::handles(&p) {
+            crate::notify::try_read(&p, &mut tmp)
+        } else {
+            crate::timerfd::try_read(&p, &mut tmp)
+        };
+        return match r {
+            Err(-11) => block_reenter(ctx, task::ticks() + 2, 0),
+            Err(e) => e as u64,
+            Ok(n) => match copy_out(buf, &tmp[..n]) {
+                Some(_) => n as u64,
+                None => ERR,
+            },
+        };
+    }
     match vfs::read(fd as i64, &mut tmp) {
         Ok(n) => match copy_out(buf, &tmp[..n as usize]) {
             Some(_) => n as u64,
@@ -972,6 +1085,11 @@ fn sys_poll(ctx: &mut CpuContext, fds: u64, evs: u64, nfds: u64, timeout_ms: u64
         let ok = if crate::pipes::handles(path) {
             (ev & 1 != 0 && crate::pipes::ready(path, true))
                 || (ev & 2 != 0 && crate::pipes::ready(path, false))
+        } else if crate::notify::handles(path) {
+            // events queued = readable; never writable
+            ev & 1 != 0 && crate::notify::ready(path)
+        } else if crate::timerfd::handles(path) {
+            ev & 1 != 0 && crate::timerfd::ready(path)
         } else {
             true // fs/proc/dev fds are always readable+writable
         };
