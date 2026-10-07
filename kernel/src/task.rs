@@ -119,6 +119,10 @@ pub struct Task {
     pub sigsuspend_saved: u64,  // pre-suspend mask; u64::MAX = not in sigsuspend
     pub sigsuspend_seq: u64,    // sig_seq at arm time
     pub sig_seq: u64,           // bumped each time maybe_deliver consumes a pending bit
+    pub fs_base: u64,           // IA32_FS_BASE — userspace TLS pointer
+    pub rlim_nofile: u64,       // RLIMIT_NOFILE: fd-table bound
+    pub rlim_nproc: u64,        // RLIMIT_NPROC: live user-task bound
+    pub rlim_stack: u64,        // RLIMIT_STACK bytes (advisory for new spawns)
 }
 
 pub struct Sched {
@@ -215,6 +219,10 @@ pub fn init() {
         sigsuspend_saved: u64::MAX,
         sigsuspend_seq: 0,
         sig_seq: 0,
+        fs_base: 0,
+        rlim_nofile: 1024,
+        rlim_nproc: 512,
+        rlim_stack: 256 * 1024,
     };
     *SCHED.lock() = Some(Sched { tasks: vec![Box::new(boot)], cur: 0, next_pid: 1 });
 }
@@ -315,6 +323,12 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
 
 fn activate(t: &Task) {
     if t.is_user {
+        // TLS: every user task owns its FS base; CR4.FSGSBASE stays off
+        // so the only writer is arch_prctl and this field stays true
+        unsafe {
+            x86_64::registers::model_specific::Msr::new(0xC000_0100)
+                .write(t.fs_base);
+        }
         gdt::set_rsp0(t.kstack_top);
         if let Some(p) = t.pml4 {
             unsafe {
@@ -422,6 +436,20 @@ fn alloc_kstack(frames_out: &mut Vec<u64>) -> (u64, u64) {
 
 /// Spawn a userspace process from an ELF executable path.
 pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
+    {
+        let g = SCHED.lock();
+        let s = g.as_ref().unwrap();
+        let lim = s.tasks[s.cur].rlim_nproc;
+        if lim != u64::MAX
+            && s.tasks
+                .iter()
+                .filter(|t| t.is_user && t.state != State::Dead)
+                .count() as u64
+                >= lim
+        {
+            return Err(!0u64 - 10); // -11 EAGAIN
+        }
+    }
     // demand-loading reads only the header window up front — PT_LOAD
     // contents page in lazily from the image file on first touch
     let mut hdr = vec![0u8; 96 * 1024];
@@ -624,6 +652,10 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         sigsuspend_saved: u64::MAX,
         sigsuspend_seq: 0,
         sig_seq: 0,
+        fs_base: 0,
+        rlim_nofile: 1024,
+        rlim_nproc: 512,
+        rlim_stack: 256 * 1024,
     };
     mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -707,6 +739,10 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         sigsuspend_saved: u64::MAX,
         sigsuspend_seq: 0,
         sig_seq: 0,
+        fs_base: 0,
+        rlim_nofile: 1024,
+        rlim_nproc: 512,
+        rlim_stack: 256 * 1024,
     }));
     pid
 }
@@ -715,7 +751,22 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
 /// the pml4 (mm refcount +1) but gets its own kernel stack and a private
 /// 256KiB user-stack slot in the thread arena, demand-grown on fault.
 /// (entry, arg): the thread starts at `entry` with `arg` in rdi.
-pub fn clone_user(entry: u64, arg: u64) -> Option<u32> {
+pub fn clone_user(entry: u64, arg: u64, tls: u64) -> Option<u32> {
+    // RLIMIT_NPROC: live user-task count against the caller's limit
+    {
+        let g = SCHED.lock();
+        let s = g.as_ref().unwrap();
+        let lim = s.tasks[s.cur].rlim_nproc;
+        if lim != u64::MAX
+            && s.tasks
+                .iter()
+                .filter(|t| t.is_user && t.state != State::Dead)
+                .count() as u64
+                >= lim
+        {
+            return None;
+        }
+    }
     // entry must be a plausible user text address (below the thread arena)
     if entry == 0 || entry >= THREAD_STK_MIN || entry & 0xFFFF_8000_0000_0000 != 0 {
         return None;
@@ -779,7 +830,17 @@ pub fn clone_user(entry: u64, arg: u64) -> Option<u32> {
     let cwd = cur.cwd.clone();
     let borrowed = cur.borrowed.clone();
     let shm_ids = cur.shm.clone();
-    let (nice, rt, vrun, umask, exe) = (cur.nice, cur.rt, cur.vrun, cur.umask, cur.exe.clone());
+    let (nice, rt, vrun, umask, exe, pfs, rnf, rnp, rstk) = (
+        cur.nice,
+        cur.rt,
+        cur.vrun,
+        cur.umask,
+        cur.exe.clone(),
+        cur.fs_base,
+        cur.rlim_nofile,
+        cur.rlim_nproc,
+        cur.rlim_stack,
+    );
     for id in &shm_ids {
         shm::acquire(*id);
     }
@@ -839,9 +900,25 @@ pub fn clone_user(entry: u64, arg: u64) -> Option<u32> {
         sigsuspend_saved: u64::MAX,
         sigsuspend_seq: 0,
         sig_seq: 0,
+        fs_base: if tls != 0 { tls } else { pfs },
+        rlim_nofile: rnf,
+        rlim_nproc: rnp,
+        rlim_stack: rstk,
     };
     mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
+    if tls != 0 {
+        // CLONE_SETTLS contract: store the child tid at fs:8 — same mm,
+        // so translate through the shared page table and write the frame
+        if let Some(pp) = crate::elf::translate_user(pml4, tls + 8) {
+            unsafe {
+                core::ptr::write_unaligned(
+                    mem::phys_to_virt(pp) as *mut u64,
+                    pid as u64,
+                );
+            }
+        }
+    }
     sprintln!("[task] cloned pid={} entry={:#x} stk={:#x}", pid, entry, stack_top);
     Some(pid)
 }
@@ -1131,6 +1208,20 @@ pub fn cow_split(pml4: PhysFrame, page: u64, phys: u64) -> bool {
 /// shared outright (refcounted, never promoted). Borrowed (shm/fb)
 /// frames stay genuinely shared. Returns Some(pid) to the parent.
 pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
+    {
+        let g = SCHED.lock();
+        let s = g.as_ref().unwrap();
+        let lim = s.tasks[s.cur].rlim_nproc;
+        if lim != u64::MAX
+            && s.tasks
+                .iter()
+                .filter(|t| t.is_user && t.state != State::Dead)
+                .count() as u64
+                >= lim
+        {
+            return None;
+        }
+    }
     // kernel stack FIRST so the new pml4 inherits the kernel PDPT with it
     let mut kframes = Vec::new();
     let (kbase, ktop) = alloc_kstack(&mut kframes);
@@ -1281,6 +1372,10 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         sigsuspend_saved: u64::MAX,
         sigsuspend_seq: 0,
         sig_seq: 0,
+        fs_base: s.tasks[s.cur].fs_base,
+        rlim_nofile: s.tasks[s.cur].rlim_nofile,
+        rlim_nproc: s.tasks[s.cur].rlim_nproc,
+        rlim_stack: s.tasks[s.cur].rlim_stack,
     };
     mm_inc(cpml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -2513,4 +2608,82 @@ pub fn demand_page(va: u64) -> bool {
 /// a preempted lock holder gets rescheduled instead of deadlocking us.
 pub fn wait_irq() {
     unsafe { core::arch::asm!("sti; hlt; cli", options(nomem, nostack)) };
+}
+
+
+fn rlim_get(pid: u32, res: u64) -> Option<u64> {
+    let g = SCHED.lock();
+    let s = g.as_ref().unwrap();
+    s.tasks
+        .iter()
+        .find(|t| t.id == pid && t.state != State::Dead)
+        .and_then(|t| match res {
+            3 => Some(t.rlim_stack),
+            6 => Some(t.rlim_nproc),
+            7 => Some(t.rlim_nofile),
+            _ => None,
+        })
+}
+
+fn rlim_set(pid: u32, res: u64, v: u64) -> i64 {
+    let mut g = SCHED.lock();
+    let s = g.as_mut().unwrap();
+    match s
+        .tasks
+        .iter_mut()
+        .find(|t| t.id == pid && t.state != State::Dead)
+    {
+        Some(t) => {
+            match res {
+                3 => t.rlim_stack = v,
+                6 => t.rlim_nproc = v,
+                7 => t.rlim_nofile = v,
+                _ => return -22,
+            }
+            0
+        }
+        None => -3, // ESRCH
+    }
+}
+
+/// prlimit(pid, res, new_or_MAX, old_ptr_or_0): real get/set of a task's
+/// resource limits. pid 0 = caller. res: 3=STACK(bytes), 6=NPROC, 7=NOFILE.
+/// `new` is a value (u64::MAX = no change); `old_ptr` copies out the
+/// previous limit when nonzero.
+pub fn sys_prlimit(pid: u32, res: u64, new: u64, old_ptr: u64) -> i64 {
+    let me = current_id();
+    let who = if pid == 0 { me } else { pid };
+    if old_ptr != 0 {
+        let Some(v) = rlim_get(who, res) else { return -22 };
+        // copy_out may fault pages in — do it after dropping SCHED
+        if crate::syscall::copy_out_pub(old_ptr, &v.to_le_bytes()).is_none() {
+            return -14;
+        }
+    }
+    if new == u64::MAX {
+        return 0;
+    }
+    rlim_set(who, res, new.min(1 << 20))
+}
+
+/// arch_prctl(op, val): op 2 = ARCH_SET_FS (validate user range),
+/// op 3 = ARCH_GET_FS. TLS pointer per task — restored on activate.
+pub fn sys_arch_prctl(op: u64, val: u64) -> i64 {
+    match op {
+        2 => {
+            if val >= 0x8000_0000_0000 {
+                return -22;
+            }
+            with_current(|t| t.fs_base = val);
+            // the field only re-arms on activate; the calling task is
+            // running NOW so program the MSR immediately or fs:0 faults
+            unsafe {
+                x86_64::registers::model_specific::Msr::new(0xC000_0100)
+                    .write(val);
+            }
+            0
+        }
+        3 => with_current(|t| t.fs_base as i64),
+        _ => -22,
+    }
 }

@@ -172,15 +172,21 @@ fn err_to_i64(e: fat32::Error) -> i64 {
 
 // ---- fd ops on the current task ----
 
-fn alloc_fd() -> usize {
+/// First free fd index below RLIMIT_NOFILE; None = EMFILE. POSIX bounds
+/// the fd INDEX — slots at or above the limit are never handed out,
+/// even when the vec has holes there.
+fn alloc_fd() -> Option<usize> {
     task::with_current(|t| {
         for (i, f) in t.fds.iter().enumerate() {
-            if f.is_none() {
-                return i;
+            if f.is_none() && (i as u64) < t.rlim_nofile {
+                return Some(i);
             }
         }
+        if t.fds.len() as u64 >= t.rlim_nofile {
+            return None;
+        }
         t.fds.push(None);
-        t.fds.len() - 1
+        Some(t.fds.len() - 1)
     })
 }
 
@@ -261,7 +267,8 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
         // `>` / `>>` opens; plain readers take the reader slot
         let writer = flags & (shared::O_WRONLY | shared::O_TRUNC | shared::O_APPEND) != 0;
         crate::pipes::open_role(&full, writer);
-        let fd = alloc_fd() as i64;
+        let Some(fdi) = alloc_fd() else { return Err(-24) }; // EMFILE
+        let fd = fdi as i64;
         task::with_current(|t| {
             t.fds[fd as usize] = Some(FileDesc { path: full, pos: 0, flags });
         });
@@ -314,7 +321,8 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     } else {
         0
     };
-    let fd = alloc_fd() as i64;
+    let Some(fdi) = alloc_fd() else { return Err(-24) }; // EMFILE
+    let fd = fdi as i64;
     task::with_current(|t| {
         t.fds[fd as usize] = Some(FileDesc { path: full, pos, flags });
     });

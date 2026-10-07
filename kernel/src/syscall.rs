@@ -60,6 +60,11 @@ fn copy_in(ptr: u64, len: u64) -> Option<Vec<u8>> {
 
 /// Copy bytes to user buffer `ptr`.
 fn copy_out(ptr: u64, data: &[u8]) -> Option<()> {
+    copy_out_pub(ptr, data)
+}
+
+/// task.rs needs copy_out for prlimit's old-value; keep the real one here
+pub fn copy_out_pub(ptr: u64, data: &[u8]) -> Option<()> {
     let pml4 = current_pml4()?;
     let mut off = 0u64;
     while off < data.len() as u64 {
@@ -119,7 +124,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_SLEEP_MS => sys_sleep(ctx, a1),
         shared::SYS_MMAP => sys_mmap(a1),
         shared::SYS_MMAP_FILE => sys_mmap_file(a1, a2, a3),
-        shared::SYS_CLONE => match task::clone_user(a1, a2) {
+        shared::SYS_CLONE => match task::clone_user(a1, a2, a3) {
             Some(pid) => pid as u64,
             None => ERR,
         },
@@ -136,7 +141,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 return;
             };
             task::with_current(|t| {
-                let fd = alloc_slot(t);
+                let Some(fd) = alloc_slot(t) else { return ERR; };
                 t.fds[fd] = Some(task::FileDesc {
                     path,
                     pos: 0,
@@ -171,6 +176,8 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_GETPPID => task::with_current(|t| t.parent as u64),
         shared::SYS_SIGPENDING => task::with_current(|t| t.sigpending),
         shared::SYS_SIGSUSPEND => sys_sigsuspend(ctx, a1),
+        shared::SYS_ARCH_PRCTL => task::sys_arch_prctl(a1, a2) as u64,
+        shared::SYS_PRLIMIT => task::sys_prlimit(a1 as u32, a2, a3, a4) as u64,
         shared::SYS_ALARM => task::with_current(|t| {
             let left = if t.alarm_at == 0 {
                 0
@@ -569,7 +576,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 return;
             };
             task::with_current(|t| {
-                let fd = alloc_slot(t);
+                let Some(fd) = alloc_slot(t) else { return ERR; };
                 t.fds[fd] = Some(task::FileDesc {
                     path,
                     pos: 0,
@@ -615,7 +622,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 return;
             };
             task::with_current(|t| {
-                let fd = alloc_slot(t);
+                let Some(fd) = alloc_slot(t) else { return ERR; };
                 t.fds[fd] = Some(task::FileDesc {
                     path,
                     pos: 0,
@@ -643,7 +650,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 return;
             };
             task::with_current(|t| {
-                let fd = alloc_slot(t);
+                let Some(fd) = alloc_slot(t) else { return ERR; };
                 t.fds[fd] = Some(task::FileDesc {
                     path,
                     pos: 0,
@@ -658,7 +665,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 return;
             };
             task::with_current(|t| {
-                let fd = alloc_slot(t);
+                let Some(fd) = alloc_slot(t) else { return ERR; };
                 t.fds[fd] = Some(task::FileDesc {
                     path,
                     pos: 0,
@@ -696,9 +703,9 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 crate::sockpair::create()
             } {
                 Some((pa, pb)) => task::with_current(|t| {
-                    let sa = alloc_slot(t);
+                    let Some(sa) = alloc_slot(t) else { return ERR; };
                     t.fds[sa] = Some(task::FileDesc { path: pa, pos: 0, flags: shared::O_RDWR });
-                    let sb = alloc_slot(t);
+                    let Some(sb) = alloc_slot(t) else { return ERR; };
                     t.fds[sb] = Some(task::FileDesc { path: pb, pos: 0, flags: shared::O_RDWR });
                     sa as u64 | (sb as u64) << 32
                 }),
@@ -709,7 +716,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
             // (pid) -> fd readable when the task dies; read = 8B status
             match crate::pidfd::create(a1 as u32) {
                 Some(p) => task::with_current(|t| {
-                    let s = alloc_slot(t);
+                    let Some(s) = alloc_slot(t) else { return ERR; };
                     t.fds[s] = Some(task::FileDesc { path: p, pos: 0, flags: shared::O_RDONLY });
                     s as u64
                 }),
@@ -728,15 +735,16 @@ pub fn dispatch(ctx: &mut CpuContext) {
                     while s < t.fds.len() && t.fds[s].is_some() {
                         s += 1;
                     }
-                    if s > 4096 {
+                    // POSIX: result must be >= arg AND below RLIMIT_NOFILE;
+                    // grow the vec with None holes when arg is past the end
+                    if s as u64 >= t.rlim_nofile || s > 4096 {
                         return ERR;
                     }
                     vfs::acquire_desc(&nf);
-                    if s == t.fds.len() {
-                        t.fds.push(Some(nf));
-                    } else {
-                        t.fds[s] = Some(nf);
+                    while t.fds.len() <= s {
+                        t.fds.push(None);
                     }
+                    t.fds[s] = Some(nf);
                     s as u64
                 }
                 shared::F_GETFL => match t.fds.get(i) {
@@ -823,7 +831,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                     return;
                 }
                 Ok(path) => task::with_current(|t| {
-                    let s = alloc_slot(t);
+                    let Some(s) = alloc_slot(t) else { return ERR; };
                     t.fds[s] = Some(task::FileDesc { path, pos: 0, flags: shared::O_RDWR });
                     s as u64
                 }),
@@ -907,7 +915,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                         let _ = copy_out(a2, &peer);
                     }
                     ctx.rax = task::with_current(|t| {
-                        let s = alloc_slot(t);
+                        let Some(s) = alloc_slot(t) else { return ERR; };
                         t.fds[s] = Some(task::FileDesc {
                             path: cpath,
                             pos: 0,
@@ -1099,7 +1107,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 Ok((n, got)) => {
                     let newfd: i64 = match got {
                         Some(p) if a4 != 0 => task::with_current(|t| {
-                            let s = alloc_slot(t);
+                            let Some(s) = alloc_slot(t) else { return -1; };
                             let nf = task::FileDesc {
                                 path: p,
                                 pos: 0,
@@ -2013,14 +2021,20 @@ fn sys_seek(fd: u64, off: u64, whence: u64) -> u64 {
     }
 }
 
-fn alloc_slot(t: &mut task::Task) -> usize {
+/// First free fd slot below RLIMIT_NOFILE; None = EMFILE. POSIX bounds
+/// the fd INDEX — slots at or above the limit are never handed out,
+/// even when the vec has holes there.
+fn alloc_slot(t: &mut task::Task) -> Option<usize> {
     for (i, f) in t.fds.iter().enumerate() {
-        if f.is_none() {
-            return i;
+        if f.is_none() && (i as u64) < t.rlim_nofile {
+            return Some(i);
         }
     }
+    if t.fds.len() as u64 >= t.rlim_nofile {
+        return None;
+    }
     t.fds.push(None);
-    t.fds.len() - 1
+    Some(t.fds.len() - 1)
 }
 
 /// SYS_PIPE: an anonymous pipe bound to two fresh fds in the caller's
@@ -2030,13 +2044,13 @@ fn sys_pipe() -> u64 {
         return ERR;
     };
     let packed = task::with_current(|t| {
-        let rfd = alloc_slot(t);
+        let Some(rfd) = alloc_slot(t) else { return ERR; };
         t.fds[rfd] = Some(task::FileDesc {
             path: path.clone(),
             pos: 0,
             flags: shared::O_RDONLY,
         });
-        let wfd = alloc_slot(t);
+        let Some(wfd) = alloc_slot(t) else { return ERR; };
         t.fds[wfd] = Some(task::FileDesc {
             path: path.clone(),
             pos: 0,
