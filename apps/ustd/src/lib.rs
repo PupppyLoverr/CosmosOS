@@ -1418,6 +1418,56 @@ pub fn recvmsg(fd: i64, buf: &mut [u8]) -> Result<(usize, Option<i64>), i64> {
     }
     Ok((r as usize, if out >= 0 { Some(out) } else { None }))
 }
+/// sendto_path: AF_UNIX datagram send to a bound path name. An unbound
+/// socket auto-binds `/tmp/udg-{id}` first (like Linux autobind).
+pub fn sendto_path(fd: i64, name: &str, data: &[u8]) -> i64 {
+    sc5(
+        shared::SYS_SENDTO_PATH,
+        fd as u64,
+        data.as_ptr() as u64,
+        data.len() as u64,
+        name.as_ptr() as u64,
+        name.len() as u64,
+    ) as i64
+}
+/// recvfrom_path: pop one AF_UNIX datagram + the sender's path name.
+pub fn recvfrom_path(
+    fd: i64,
+    buf: &mut [u8],
+    name_out: &mut [u8],
+) -> Result<(usize, usize), i64> {
+    let r = sc5(
+        shared::SYS_RECVFROM_PATH,
+        fd as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        name_out.as_mut_ptr() as u64,
+        name_out.len() as u64,
+    ) as i64;
+    if r < 0 {
+        return Err(r);
+    }
+    // kernel writes the sender name NUL-terminated
+    let nl = name_out.iter().position(|&c| c == 0).unwrap_or(name_out.len());
+    Ok((r as usize, nl))
+}
+/// getsockopt: SOL_SOCKET queries (SO_TYPE/SO_DOMAIN/SO_ACCEPTCONN/
+/// SO_SNDBUF/SO_RCVBUF/SO_ERROR). Returns the option value.
+pub fn getsockopt(fd: i64, level: u64, opt: u64) -> Result<u32, i64> {
+    let mut out = [0u8; 4];
+    let r = sc5(
+        shared::SYS_GETSOCKOPT,
+        fd as u64,
+        level,
+        opt,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+    ) as i64;
+    if r < 0 {
+        return Err(r);
+    }
+    Ok(u32::from_le_bytes(out))
+}
 
 /// fd-based TCP socket — poll/read/write/close all work on it.
 pub struct TcpFd(pub i64);

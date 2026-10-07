@@ -17,6 +17,7 @@ enum Kind {
     TcpListener,  // listen()ed stream
     Unix,         // AF_UNIX stream (data plane = a /sockpair object)
     UnixListener, // AF_UNIX stream bound+listen()ed on a path name
+    UnixDgram,    // AF_UNIX datagram (mailbox registry in udgram.rs)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -35,9 +36,10 @@ struct Sock {
     bound: bool,
     chan: Option<String>,         // Unix: backing "/sockpair/{id}/N" path
     uname: Option<String>,        // Unix: bound path name
-    peer_name: Option<String>,    // Unix client: the path it connect()ed to
+    peer_name: Option<String>,    // Unix client/dgram: the path it connect()ed to
     rd_off: bool,                 // shutdown(SHUT_RD)
     wr_off: bool,                 // shutdown(SHUT_WR)
+    last_err: i64,                // last connect/send errno (SO_ERROR)
 }
 
 /// AF_UNIX named-socket registry: path -> listener state. `queue` holds
@@ -109,7 +111,7 @@ pub fn create(stream: bool, domain: u64) -> Result<String, i64> {
         (Dom::Inet, true) => Kind::Tcp,
         (Dom::Inet, false) => Kind::Udp,
         (Dom::Unix, true) => Kind::Unix,
-        (Dom::Unix, false) => return Err(-95), // no unix-dgram yet
+        (Dom::Unix, false) => Kind::UnixDgram,
     };
     let mut n = NEXT.lock();
     let id = *n;
@@ -128,6 +130,7 @@ pub fn create(stream: bool, domain: u64) -> Result<String, i64> {
             peer_name: None,
             rd_off: false,
             wr_off: false,
+            last_err: 0,
         },
     );
     Ok(format!("/socket/{}", id))
@@ -169,6 +172,9 @@ pub fn bind(id: u64, port: u16, name: &[u8]) -> i64 {
 }
 
 /// AF_UNIX bind: register the name (filesystem-visible, purely in-memory).
+/// Stream sockets claim an entry in UNIX_NAMES (the listen/accept table);
+/// datagram sockets claim a mailbox in udgram.rs. Either way the name is
+/// taken in both namespaces — like POSIX where a socket path is one name.
 fn bind_unix(id: u64, name: &[u8]) -> i64 {
     if name.len() < 2 || name.len() > 63 || name[0] != b'/' {
         return -22;
@@ -177,8 +183,30 @@ fn bind_unix(id: u64, name: &[u8]) -> i64 {
         return -22;
     };
     let name = String::from(name);
+    let dgram = {
+        let m = SOCKS.lock();
+        let Some(s) = m.get(&id) else { return -9 };
+        s.kind == Kind::UnixDgram
+    };
+    if dgram {
+        if UNIX_NAMES.lock().contains_key(&name) || !crate::udgram::register(&name) {
+            return -98;
+        }
+        let mut m = SOCKS.lock();
+        let Some(s) = m.get_mut(&id) else {
+            crate::udgram::unregister(&name);
+            return -9;
+        };
+        if s.bound {
+            crate::udgram::unregister(&name);
+            return -22;
+        }
+        s.uname = Some(name);
+        s.bound = true;
+        return 0;
+    }
     let mut names = UNIX_NAMES.lock();
-    if names.contains_key(&name) {
+    if names.contains_key(&name) || crate::udgram::exists(&name) {
         return -98;
     }
     let mut m = SOCKS.lock();
@@ -260,33 +288,53 @@ pub fn connect(id: u64, rip_u32: u32, rport: u16, name: &[u8]) -> i64 {
     }
 }
 
-/// AF_UNIX connect: the name must be bound AND listening (else -2/-111);
-/// a fresh sockpair links client (side 0) to the accept queue (side 1).
+/// AF_UNIX connect. Stream: the name must be bound AND listening (else
+/// -2/-111); a fresh sockpair links client (side 0) to the accept queue
+/// (side 1). Datagram: the name must be a live mailbox (else -2) and the
+/// connect just sets the default destination — re-connect repoints it.
+/// Failures land in s.last_err for SO_ERROR.
 fn connect_unix(id: u64, name: &[u8]) -> i64 {
     let Ok(name) = core::str::from_utf8(name) else {
         return -22;
     };
-    {
+    let kind = {
         let m = SOCKS.lock();
         let Some(s) = m.get(&id) else { return -9 };
-        if s.kind != Kind::Unix {
+        if s.kind != Kind::Unix && s.kind != Kind::UnixDgram {
             return -95;
         }
-        if s.chan.is_some() {
+        if s.kind == Kind::Unix && s.chan.is_some() {
             return -106;
         }
+        s.kind
+    };
+    if kind == Kind::UnixDgram {
+        if !crate::udgram::exists(name) {
+            set_err(id, -2);
+            return -2; // ENOENT
+        }
+        let mut m = SOCKS.lock();
+        if let Some(s) = m.get_mut(&id) {
+            s.peer_name = Some(String::from(name));
+            s.bound = true;
+        }
+        return 0;
     }
     let mut names = UNIX_NAMES.lock();
     let Some(l) = names.get_mut(name) else {
+        set_err(id, -2);
         return -2; // ENOENT
     };
     if !l.listening {
+        set_err(id, -111);
         return -111; // ECONNREFUSED
     }
     if l.backlog > 0 && l.queue.len() >= l.backlog {
+        set_err(id, -11);
         return -11; // would block
     }
     let Some((side0, side1)) = crate::sockpair::create() else {
+        set_err(id, -24);
         return -24;
     };
     l.queue.push_back(side1);
@@ -297,6 +345,37 @@ fn connect_unix(id: u64, name: &[u8]) -> i64 {
         s.bound = true;
     }
     0
+}
+
+/// Record a connect/send failure for SO_ERROR readout.
+fn set_err(id: u64, e: i64) {
+    if let Some(s) = SOCKS.lock().get_mut(&id) {
+        s.last_err = e;
+    }
+}
+
+/// Ensure a unix-dgram socket owns a mailbox: auto-bind to
+/// `/tmp/udg-{id}` on first use (Linux autobind). Returns the name.
+fn ensure_bound(id: u64) -> Result<String, i64> {
+    let (have, auto) = {
+        let m = SOCKS.lock();
+        let Some(s) = m.get(&id) else { return Err(-9) };
+        (s.uname.clone(), format!("/tmp/udg-{}", id))
+    };
+    if let Some(u) = have {
+        return Ok(u);
+    }
+    if UNIX_NAMES.lock().contains_key(&auto) || !crate::udgram::register(&auto) {
+        return Err(-98);
+    }
+    let mut m = SOCKS.lock();
+    let Some(s) = m.get_mut(&id) else {
+        crate::udgram::unregister(&auto);
+        return Err(-9);
+    };
+    s.uname = Some(auto.clone());
+    s.bound = true;
+    Ok(auto)
 }
 
 /// listen(fd, backlog): inet marks a bound/ephemeral TCP port accepting;
@@ -316,6 +395,7 @@ pub fn listen(id: u64, backlog: usize) -> i64 {
                     return -95; // UDP listen: EOPNOTSUPP
                 }
             }
+            Kind::UnixDgram => return -95, // EOPNOTSUPP: dgrams don't listen
             Kind::TcpListener | Kind::UnixListener => return 0,
             Kind::Tcp => {}
         }
@@ -377,6 +457,7 @@ pub fn accept(id: u64) -> Result<(String, [u8; 4], u16), i64> {
                         peer_name: None,
                         rd_off: false,
                         wr_off: false,
+                        last_err: 0,
                     },
                 );
                 Ok((format!("/socket/{}", nid), rip, rport))
@@ -437,6 +518,10 @@ pub fn try_read(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
             Some(c) => crate::sockpair::try_read(c, buf),
             None => Err(-107), // ENOTCONN
         },
+        Kind::UnixDgram => match &s.uname {
+            Some(u) => crate::udgram::recv(u, buf).map(|(n, _)| n),
+            None => Err(-22), // EINVAL: recvfrom on an unbound mailbox
+        },
         Kind::TcpListener | Kind::UnixListener => Err(-11),
     }
 }
@@ -476,6 +561,26 @@ pub fn try_write(path: &str, data: &[u8], nonblock: bool) -> Result<usize, i64> 
             Some(c) => crate::sockpair::try_write(c, data),
             None => Err(-107),
         },
+        Kind::UnixDgram => {
+            let Some(dst) = &s.peer_name else {
+                return Err(-89); // EDESTADDRREQ: no default destination
+            };
+            let dst = dst.clone();
+            match ensure_bound(id).and_then(|src| {
+                let r = crate::udgram::send(&dst, &src, data);
+                if r < 0 {
+                    Err(r)
+                } else {
+                    Ok(data.len())
+                }
+            }) {
+                Ok(n) => Ok(n),
+                Err(e) => {
+                    set_err(id, e);
+                    Err(e)
+                }
+            }
+        }
         Kind::TcpListener | Kind::UnixListener => Err(-107),
     }
 }
@@ -505,9 +610,45 @@ pub fn sendto(path: &str, data: &[u8], ip: u32, port: u16) -> Result<usize, i64>
     match s.kind {
         Kind::Udp => crate::net::udp_send(s.lport, ip.to_be_bytes(), port, data)
             .map(|_| data.len()),
-        Kind::Tcp | Kind::Unix => try_write(path, data, false), // addr ignored
+        // addr ignored (unix-dgram uses sendto_path for a named dest)
+        Kind::Tcp | Kind::Unix | Kind::UnixDgram => try_write(path, data, false),
         Kind::TcpListener | Kind::UnixListener => Err(-107),
     }
+}
+
+/// sendto_path(fd, buf, name): AF_UNIX datagram send — `name` is the
+/// destination mailbox. Unbound senders auto-bind `/tmp/udg-{id}` first.
+pub fn sendto_path(id: u64, name: &str, data: &[u8]) -> Result<usize, i64> {
+    let s = fields(id).ok_or(-9i64)?;
+    if s.kind != Kind::UnixDgram {
+        return Err(-95); // EOPNOTSUPP: only unix dgrams take a path dest
+    }
+    if s.wr_off {
+        return Err(-32);
+    }
+    let src = ensure_bound(id)?;
+    let r = crate::udgram::send(name, &src, data);
+    if r < 0 {
+        set_err(id, r);
+        return Err(r);
+    }
+    Ok(data.len())
+}
+
+/// recvfrom_path(fd, buf): AF_UNIX datagram receive — pops one packet and
+/// the sender's bound/auto-bound name. Err(-22) if this sock isn't bound.
+pub fn recvfrom_path(id: u64, buf: &mut [u8]) -> Result<(usize, String), i64> {
+    let s = fields(id).ok_or(-9i64)?;
+    if s.kind != Kind::UnixDgram {
+        return Err(-95);
+    }
+    if s.rd_off {
+        return Ok((0, String::new()));
+    }
+    let Some(u) = &s.uname else {
+        return Err(-22); // EINVAL: nothing bound to receive into
+    };
+    crate::udgram::recv(u, buf)
 }
 
 /// recvfrom(fd, buf): like read() but the sender's (ip, port) comes back —
@@ -549,9 +690,9 @@ pub fn sendmsg(path: &str, data: &[u8], pass: Option<String>) -> Result<usize, i
             Some(c) => crate::sockpair::send_msg(c, data, pass),
             None => Err(-107), // ENOTCONN
         },
-        Kind::Tcp | Kind::Udp => {
+        Kind::Tcp | Kind::Udp | Kind::UnixDgram => {
             if pass.is_some() {
-                return Err(-95); // EOPNOTSUPP: SCM_RIGHTS is AF_UNIX only
+                return Err(-95); // EOPNOTSUPP: SCM_RIGHTS is stream-only
             }
             try_write(path, data, false)
         }
@@ -586,20 +727,26 @@ pub fn net_unix() -> String {
         if s.domain != Dom::Unix {
             continue;
         }
-        let (st, p) = match s.kind {
-            Kind::UnixListener => ("02", s.uname.clone().unwrap_or_default()),
+        let (st, p, ty) = match s.kind {
+            Kind::UnixListener => ("02", s.uname.clone().unwrap_or_default(), "0001"),
             Kind::Unix => (
                 "03",
                 s.uname
                     .clone()
                     .or_else(|| s.peer_name.clone())
                     .unwrap_or_default(),
+                "0001",
+            ),
+            Kind::UnixDgram => (
+                if s.peer_name.is_some() { "03" } else { "01" },
+                s.uname.clone().unwrap_or_default(),
+                "0002",
             ),
             _ => continue,
         };
         out.push_str(&format!(
             "{:>10} {:>8} {:>8} {:>8} {:>4} {} {:>10} {}\n",
-            id, 1, 0, "00010000", "0001", st, id, p
+            id, 1, 0, "00010000", ty, st, id, p
         ));
     }
     out
@@ -633,6 +780,10 @@ pub fn ready(path: &str, for_read: bool) -> bool {
                     .unwrap_or(false),
                 None => false,
             },
+            Kind::UnixDgram => match &s.uname {
+                Some(u) => crate::udgram::ready(u),
+                None => false,
+            },
         }
     } else {
         if s.wr_off {
@@ -646,6 +797,7 @@ pub fn ready(path: &str, for_read: bool) -> bool {
                 .as_deref()
                 .map(|c| crate::sockpair::ready(c, false))
                 .unwrap_or(false),
+            Kind::UnixDgram => s.peer_name.is_some(),
             Kind::TcpListener | Kind::UnixListener => false,
         }
     }
@@ -668,6 +820,7 @@ pub fn shutdown(id: u64, how: u64) -> i64 {
             Kind::Tcp if s.cid == 0 => return -107,
             Kind::Udp if s.peer.is_none() => return -107,
             Kind::Unix if s.chan.is_none() => return -107,
+            Kind::UnixDgram if s.peer_name.is_none() => return -107,
             _ => {}
         }
         if rd {
@@ -713,7 +866,7 @@ pub fn peername(id: u64) -> Result<(Dom, [u8; 4], u16, Option<String>), i64> {
             Some((ip, pt)) => Ok((Dom::Inet, ip, pt, None)),
             None => Err(-107),
         },
-        Kind::Unix => match &s.peer_name {
+        Kind::Unix | Kind::UnixDgram => match &s.peer_name {
             Some(n) => Ok((Dom::Unix, [0; 4], 0, Some(n.clone()))),
             None => Err(-107),
         },
@@ -738,6 +891,9 @@ pub fn close_obj(path: &str) {
         crate::sockpair::close_obj(&c);
     }
     if let Some(uname) = s.uname {
+        if s.kind == Kind::UnixDgram {
+            crate::udgram::unregister(&uname); // queued packets die with it
+        }
         let mut names = UNIX_NAMES.lock();
         if let Some(l) = names.remove(&uname) {
             for p in l.queue {
@@ -755,6 +911,43 @@ pub fn kind_name(path: &str) -> &'static str {
         Some(Kind::TcpListener) => "tcp-listen",
         Some(Kind::Unix) => "unix",
         Some(Kind::UnixListener) => "unix-listen",
+        Some(Kind::UnixDgram) => "unix-dgram",
         None => "?",
+    }
+}
+
+/// getsockopt(fd, level, opt): SOL_SOCKET queries with real answers —
+/// SO_TYPE/SO_DOMAIN/SO_PROTOCOL/SO_ACCEPTCONN/SO_SNDBUF/SO_RCVBUF/
+/// SO_ERROR (read-and-clear of the last recorded connect/send errno).
+/// Returns the u32-le value bytes. Err(-92) ENOPROTOOPT for the rest.
+pub fn getsockopt(id: u64, level: u64, opt: u64) -> Result<u32, i64> {
+    const SOL_SOCKET: u64 = 1;
+    if level != SOL_SOCKET {
+        return Err(-92); // ENOPROTOOPT
+    }
+    let s = fields(id).ok_or(-9i64)?;
+    match opt {
+        3 => Ok(match s.kind {
+            // SO_TYPE
+            Kind::Unix | Kind::UnixListener | Kind::Tcp | Kind::TcpListener => 1,
+            Kind::Udp | Kind::UnixDgram => 2,
+        }),
+        39 => Ok(match s.domain {
+            // SO_DOMAIN
+            Dom::Unix => 1,
+            Dom::Inet => 2,
+        }),
+        38 => Ok(0), // SO_PROTOCOL
+        30 => Ok(matches!(s.kind, Kind::UnixListener | Kind::TcpListener) as u32),
+        7 | 8 => Ok(65536), // SO_SNDBUF/SO_RCVBUF — the sockpair CAP
+        4 => {
+            // SO_ERROR: report + clear
+            let e = s.last_err;
+            if let Some(s2) = SOCKS.lock().get_mut(&id) {
+                s2.last_err = 0;
+            }
+            Ok(e as u32)
+        }
+        _ => Err(-92),
     }
 }

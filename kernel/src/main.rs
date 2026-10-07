@@ -21,6 +21,7 @@ mod epoll;
 mod eventfd;
 mod sockpair;
 mod sockfd;
+mod udgram;
 mod pidfd;
 mod pci;
 mod dev;
