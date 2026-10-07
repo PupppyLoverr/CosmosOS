@@ -571,6 +571,22 @@ pub fn klog_clear() {
 }
 
 /// Create a named pipe at `path` (absolute). 0 | <0 (EEXIST=-5).
+/// Raw symlink target, or None when `path` isn't a symlink.
+pub fn readlink(path: &str) -> Option<String> {
+    let mut buf = [0u8; 4096];
+    let n = sc4(
+        shared::SYS_READLINK,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    ) as i64;
+    if n < 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
 pub fn mkfifo(path: &str) -> i64 {
     sc2(shared::SYS_MKFIFO, path.as_ptr() as u64, path.len() as u64) as i64
 }

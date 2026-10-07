@@ -2,7 +2,7 @@
 //! Per-task fd tables live in task.rs; this module owns the FS and path logic.
 use crate::sprintln;
 use crate::task::{self, FileDesc};
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use fat32::Fat32;
 use spin::Mutex;
@@ -156,11 +156,64 @@ fn alloc_fd() -> usize {
     })
 }
 
-pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
+/// Transparent symlinks: a regular file carrying FAT attr bit 0x40 whose
+/// body starts with "LNK>" is a symlink; the rest of the body is the target
+/// (relative targets resolve against the link's directory, POSIX-style).
+/// `full` is rewritten to the final target path. ELOOP after 8 hops.
+fn resolve_links(
+    fs: &mut Fat32<crate::virtio::BlkDev>,
+    full: &mut String,
+) -> Result<(), i64> {
+    for _ in 0..8 {
+        let st = match fs.stat(full) {
+            Ok(s) => s,
+            Err(_) => return Ok(()), // dangling: open/stat report ENOENT on the link itself
+        };
+        if st.is_dir || st.attr & 0x40 == 0 || st.size > 4096 {
+            return Ok(());
+        }
+        let data = fs.read_file(full).unwrap_or_default();
+        if !data.starts_with(b"LNK>") {
+            return Ok(());
+        }
+        let tgt = String::from_utf8_lossy(&data[4..]).trim().to_string();
+        if tgt.is_empty() {
+            return Ok(());
+        }
+        let base = match full.rfind('/') {
+            Some(i) => String::from(&full[..i + 1]),
+            None => String::from("/"),
+        };
+        *full = normalize(&base, &tgt);
+    }
+    Err(-40) // ELOOP
+}
+
+/// Raw read of a symlink body: target string iff `path` is a 0x40 attr file
+/// with a "LNK>" body, else Err(-22) EINVAL (not a symlink).
+pub fn readlink(path: &str) -> Result<String, i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
+    let st = fs.stat(&full).map_err(err_to_i64)?;
+    if st.attr & 0x40 == 0 {
+        return Err(-22);
+    }
+    let data = fs.read_file(&full).map_err(err_to_i64)?;
+    if !data.starts_with(b"LNK>") {
+        return Err(-22);
+    }
+    Ok(String::from_utf8_lossy(&data[4..]).trim().to_string())
+}
+
+pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let mut full = normalize(&cwd, path);
+    let mut g = FS.lock();
+    let fs = g.as_mut().ok_or(-1i64)?;
+    // links are fully transparent: resolve first, then classify the target
+    resolve_links(fs, &mut full)?;
     let is_proc = crate::proc::handles(&full);
     let is_dev = crate::dev::handles(&full);
     let is_pipe = crate::pipes::handles(&full);
@@ -399,6 +452,8 @@ pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
+    let mut full = full;
+    resolve_links(fs, &mut full)?;
     let e = fs.stat(&full).map_err(err_to_i64)?;
     Ok(shared::Stat { size: e.size, is_dir: e.is_dir as u32, mtime: e.mtime, attr: e.attr as u32 })
 }

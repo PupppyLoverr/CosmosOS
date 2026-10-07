@@ -372,6 +372,26 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
             old
         }),
+        shared::SYS_READLINK => {
+            // (path_ptr,len,out,cap): raw symlink target (no resolution);
+            // -22 when the path isn't a 0x40/LNK> link
+            match copy_in(a1, a2.min(4096)) {
+                Some(b) => {
+                    let path = String::from_utf8_lossy(&b).into_owned();
+                    match crate::vfs::readlink(&path) {
+                        Ok(t) => {
+                            let n = (t.len() as u64).min(a4);
+                            match copy_out(a3, &t.as_bytes()[..n as usize]) {
+                                Some(_) => n,
+                                None => ERR,
+                            }
+                        }
+                        Err(e) => e as u64,
+                    }
+                }
+                None => ERR,
+            }
+        }
         shared::SYS_MKFIFO => {
             // (ptr,len): mkfifo — create a named pipe at any canonical path
             match copy_in(a1, a2.min(4096)) {

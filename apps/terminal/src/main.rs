@@ -71,6 +71,8 @@ fn stmt_split(s: &str) -> Option<(&str, u8, &str)> {
                 cd -= 1
             }
             b')' if !sq && !dq && pd == 0 && bd == 0 && ad > 0 => ad -= 1,
+            b'(' if !sq && !dq && pd == 0 && bd == 0 && ad == 0 => cd += 1,
+            b')' if !sq && !dq && pd == 0 && bd == 0 && ad == 0 && cd > 0 => cd -= 1,
             b'[' if !sq && !dq && i + 1 < b.len() && b[i + 1] == b'['
                 && (i == 0 || b[i - 1].is_ascii_whitespace()) =>
             {
@@ -133,6 +135,8 @@ fn find_unquoted(s: &str, want: u8) -> Option<usize> {
                 cd -= 1
             }
             b')' if !sq && !dq && pd == 0 && bd == 0 && ad > 0 => ad -= 1,
+            b'(' if !sq && !dq && pd == 0 && bd == 0 && ad == 0 => cd += 1,
+            b')' if !sq && !dq && pd == 0 && bd == 0 && ad == 0 && cd > 0 => cd -= 1,
             b'[' if !sq && !dq && i + 1 < b.len() && b[i + 1] == b'['
                 && (i == 0 || b[i - 1].is_ascii_whitespace()) =>
             {
@@ -177,7 +181,7 @@ enum ErrRedir {
 fn strip_err_redir(s: &str) -> Option<(String, ErrRedir)> {
     let b = s.as_bytes();
     let (mut sq, mut dq) = (false, false);
-    let (mut pd, mut bd, mut ad) = (0i32, 0i32, 0i32);
+    let (mut pd, mut bd, mut ad, mut cd) = (0i32, 0i32, 0i32, 0i32);
     let mut seen_out_redir = false; // `>`/`>>`/`>|` passed earlier in the line
     let mut i = 0;
     while i < b.len() {
@@ -197,6 +201,8 @@ fn strip_err_redir(s: &str) -> Option<(String, ErrRedir)> {
                 i += 1;
             }
             b')' if !sq && !dq && pd == 0 && bd == 0 && ad > 0 => ad -= 1,
+            b'(' if !sq && !dq && pd == 0 && bd == 0 && ad == 0 => cd += 1,
+            b')' if !sq && !dq && pd == 0 && bd == 0 && ad == 0 && cd > 0 => cd -= 1,
             b'[' if !sq && !dq && i + 1 < b.len() && b[i + 1] == b'['
                 && (i == 0 || b[i - 1].is_ascii_whitespace()) =>
             {
@@ -298,6 +304,7 @@ fn split_semi(s: &str) -> Vec<String> {
     let mut pd = 0i32;
     let mut bd = 0i32;
     let mut ad = 0i32;
+    let mut cd = 0i32;
     let mut start = 0usize;
     let mut i = 0;
     while i < b.len() {
@@ -317,6 +324,8 @@ fn split_semi(s: &str) -> Vec<String> {
                 i += 1;
             }
             b')' if !sq && !dq && pd == 0 && bd == 0 && ad > 0 => ad -= 1,
+            b'(' if !sq && !dq && pd == 0 && bd == 0 && ad == 0 => cd += 1,
+            b')' if !sq && !dq && pd == 0 && bd == 0 && ad == 0 && cd > 0 => cd -= 1,
             b'[' if !sq && !dq && i + 1 < b.len() && b[i + 1] == b'['
                 && (i == 0 || b[i - 1].is_ascii_whitespace()) =>
             {
@@ -327,7 +336,7 @@ fn split_semi(s: &str) -> Vec<String> {
                 bd -= 1;
                 i += 1;
             }
-            b';' if !sq && !dq && pd == 0 && bd == 0 && ad == 0 => {
+            b';' if !sq && !dq && pd == 0 && bd == 0 && ad == 0 && cd == 0 => {
                 out.push(String::from(s[start..i].trim()));
                 if b.get(i + 1) == Some(&b'&') {
                     // `;&` — case fall-through terminator
@@ -933,15 +942,25 @@ impl<'a> ExprP<'a> {
             false
         }
     }
-    // lowest precedence: && and || (boolean 0/1 values)
+    // full C/bash precedence chain, top → bottom:
+    // ?: | || | && | '|' | ^ | & | comparisons | <<>> | +- | */% | ** | unary
     fn expr(&mut self) -> Result<i64, &'static str> {
-        let mut v = self.cmp()?;
+        let c = self.lor()?;
+        if self.eat(b'?') {
+            let a = self.expr()?;
+            if !self.eat(b':') {
+                return Err("expected : in ?:");
+            }
+            let b = self.expr()?;
+            return Ok(if c != 0 { a } else { b });
+        }
+        Ok(c)
+    }
+    fn lor(&mut self) -> Result<i64, &'static str> {
+        let mut v = self.land()?;
         loop {
-            if self.eat2(b'&', b'&') {
-                let r = self.cmp()?;
-                v = ((v != 0) && (r != 0)) as i64;
-            } else if self.eat2(b'|', b'|') {
-                let r = self.cmp()?;
+            if self.eat2(b'|', b'|') {
+                let r = self.land()?;
                 v = ((v != 0) || (r != 0)) as i64;
             } else {
                 break;
@@ -949,21 +968,73 @@ impl<'a> ExprP<'a> {
         }
         Ok(v)
     }
+    fn land(&mut self) -> Result<i64, &'static str> {
+        let mut v = self.bor()?;
+        loop {
+            if self.eat2(b'&', b'&') {
+                let r = self.bor()?;
+                v = ((v != 0) && (r != 0)) as i64;
+            } else {
+                break;
+            }
+        }
+        Ok(v)
+    }
+    fn bor(&mut self) -> Result<i64, &'static str> {
+        let mut v = self.bxor()?;
+        while self.peek() == Some(b'|') && self.peek2() != Some(b'|') {
+            self.i += 1;
+            v |= self.bxor()?;
+        }
+        Ok(v)
+    }
+    fn bxor(&mut self) -> Result<i64, &'static str> {
+        let mut v = self.band()?;
+        while self.eat(b'^') {
+            v ^= self.band()?;
+        }
+        Ok(v)
+    }
+    fn band(&mut self) -> Result<i64, &'static str> {
+        let mut v = self.cmp()?;
+        while self.peek() == Some(b'&') && self.peek2() != Some(b'&') {
+            self.i += 1;
+            v &= self.cmp()?;
+        }
+        Ok(v)
+    }
     fn cmp(&mut self) -> Result<i64, &'static str> {
-        let mut v = self.add()?;
+        let mut v = self.shift()?;
         loop {
             if self.eat2(b'<', b'=') {
-                v = (v <= self.add()?) as i64;
+                v = (v <= self.shift()?) as i64;
             } else if self.eat2(b'>', b'=') {
-                v = (v >= self.add()?) as i64;
+                v = (v >= self.shift()?) as i64;
             } else if self.eat2(b'=', b'=') {
-                v = (v == self.add()?) as i64;
+                v = (v == self.shift()?) as i64;
             } else if self.eat2(b'!', b'=') {
-                v = (v != self.add()?) as i64;
-            } else if self.eat(b'<') {
-                v = (v < self.add()?) as i64;
-            } else if self.eat(b'>') {
-                v = (v > self.add()?) as i64;
+                v = (v != self.shift()?) as i64;
+            } else if self.peek() == Some(b'<') && self.peek2() != Some(b'<') {
+                self.i += 1;
+                v = (v < self.shift()?) as i64;
+            } else if self.peek() == Some(b'>') && self.peek2() != Some(b'>') {
+                self.i += 1;
+                v = (v > self.shift()?) as i64;
+            } else {
+                break;
+            }
+        }
+        Ok(v)
+    }
+    fn shift(&mut self) -> Result<i64, &'static str> {
+        let mut v = self.add()?;
+        loop {
+            if self.eat2(b'<', b'<') {
+                let r = self.add()?;
+                v = v.checked_shl(r as u32).ok_or("shift overflow")?;
+            } else if self.eat2(b'>', b'>') {
+                let r = self.add()?;
+                v = v.checked_shr(r as u32).ok_or("shift overflow")?;
             } else {
                 break;
             }
@@ -980,20 +1051,51 @@ impl<'a> ExprP<'a> {
         Ok(v)
     }
     fn term(&mut self) -> Result<i64, &'static str> {
-        let mut v = self.factor()?;
+        let mut v = self.pow()?;
         loop {
-            if self.eat(b'*') { v = v.checked_mul(self.factor()?).ok_or("overflow")?; }
+            if self.peek() == Some(b'*') && self.peek2() == Some(b'*') {
+                break; // `**` belongs to pow()
+            }
+            if self.eat(b'*') { v = v.checked_mul(self.pow()?).ok_or("overflow")?; }
             else if self.eat(b'/') {
-                let d = self.factor()?;
+                let d = self.pow()?;
                 if d == 0 { return Err("division by zero"); }
                 v /= d;
             } else if self.eat(b'%') {
-                let d = self.factor()?;
+                let d = self.pow()?;
                 if d == 0 { return Err("division by zero"); }
                 v %= d;
             } else { break; }
         }
         Ok(v)
+    }
+    /// `**` — binds above * / %; right-associative; exponent <0 is an error.
+    fn pow(&mut self) -> Result<i64, &'static str> {
+        let v = self.unary()?;
+        if self.peek() == Some(b'*') && self.peek2() == Some(b'*') {
+            self.i += 2;
+            let e = self.pow()?;
+            if e < 0 {
+                return Err("negative exponent");
+            }
+            return v.checked_pow(e as u32).ok_or("overflow");
+        }
+        Ok(v)
+    }
+    fn unary(&mut self) -> Result<i64, &'static str> {
+        if self.eat(b'-') {
+            return Ok(-self.unary()?);
+        }
+        if self.eat(b'+') {
+            return self.unary();
+        }
+        if self.eat(b'!') {
+            return Ok((self.unary()? == 0) as i64);
+        }
+        if self.eat(b'~') {
+            return Ok(!self.unary()?);
+        }
+        self.factor()
     }
     fn factor(&mut self) -> Result<i64, &'static str> {
         if self.eat(b'(') {
@@ -1074,13 +1176,676 @@ fn is_assign_head(w: &str) -> bool {
     b.get(i) == Some(&b'=') || (b.get(i) == Some(&b'+') && b.get(i + 1) == Some(&b'='))
 }
 
+
+/// ---------- mini regex engine ----------
+/// Syntax: literals, `.`, `^`, `$`, `*` `+` `?`, `[a-z]`/`[^..]`,
+/// `(a|b)` groups/alternation, `\x` escapes (\d \w \s \t \n + literal
+/// metachars). Backtracking matcher over continuation closures; input sizes
+/// here are small so worst-case exponential paths are acceptable, with a
+/// step guard anyway.
+#[derive(Clone)]
+enum Re {
+    Lit(u8),
+    Any,
+    Class { ranges: Vec<(u8, u8)>, neg: bool },
+    Start,
+    End,
+    Cat(Vec<Re>),
+    Alt(Vec<Re>),
+    Rep { r: alloc::rc::Rc<Re>, min: u32, max: u32 },
+    /// capture group N (1-based, left-paren order) — records its span on
+    /// the winning path so `\1`-`\9` backrefs can read it
+    Group(u32, alloc::rc::Rc<Re>),
+}
+
+struct ReLex<'a> {
+    b: &'a [u8],
+    i: usize,
+    ngroups: u32,
+}
+
+impl<'a> ReLex<'a> {
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.i).copied()
+    }
+    fn next(&mut self) -> Option<u8> {
+        let c = self.peek();
+        self.i += 1;
+        c
+    }
+}
+
+/// atom: literal | '.' | class | group | escape
+fn re_atom(l: &mut ReLex) -> Result<Re, String> {
+    match l.next() {
+        None => Err(String::from("re: empty")),
+        Some(b'(') => {
+            // (x) groups capture; (?:x) non-capturing (shorthand for callers
+            // that wrap patterns — keeps group numbering like PCRE)
+            if l.peek() == Some(b'?') {
+                let save = l.i;
+                l.next();
+                if l.peek() == Some(b':') {
+                    l.next();
+                    let inner = re_alt(l)?;
+                    if l.next() != Some(b')') {
+                        return Err(String::from("re: unclosed ("));
+                    }
+                    return Ok(inner);
+                }
+                l.i = save;
+            }
+            l.ngroups += 1;
+            let n = l.ngroups;
+            let inner = re_alt(l)?;
+            if l.next() != Some(b')') {
+                return Err(String::from("re: unclosed ("));
+            }
+            Ok(Re::Group(n, alloc::rc::Rc::new(inner)))
+        }
+        Some(b'[') => {
+            let mut neg = false;
+            if l.peek() == Some(b'^') {
+                neg = true;
+                l.next();
+            }
+            let mut ranges = Vec::new();
+            // ']' first is a literal per POSIX
+            if l.peek() == Some(b']') {
+                ranges.push((b']', b']'));
+                l.next();
+            }
+            loop {
+                let lo = match l.next() {
+                    Some(c) => c,
+                    None => return Err(String::from("re: unclosed [")),
+                };
+                if lo == b']' {
+                    break;
+                }
+                let lo = if lo == b'\\' {
+                    match l.next() {
+                        Some(c) => c,
+                        None => return Err(String::from("re: bad escape")),
+                    }
+                } else {
+                    lo
+                };
+                if l.peek() == Some(b'-') && l.b.get(l.i + 1) != Some(&b']') {
+                    l.next();
+                    let mut hi = l.next().ok_or("re: unclosed [")?;
+                    if hi == b'\\' {
+                        hi = l.next().ok_or("re: bad escape")?;
+                    }
+                    ranges.push((lo, hi));
+                } else {
+                    ranges.push((lo, lo));
+                }
+            }
+            Ok(Re::Class { ranges, neg })
+        }
+        Some(b'\\') => match l.next() {
+            Some(b'd') => Ok(Re::Class { ranges: alloc::vec![(b'0', b'9')], neg: false }),
+            Some(b'D') => Ok(Re::Class { ranges: alloc::vec![(b'0', b'9')], neg: true }),
+            Some(b'w') => Ok(Re::Class {
+                ranges: alloc::vec![(b'a', b'z'), (b'A', b'Z'), (b'0', b'9'), (b'_', b'_')],
+                neg: false,
+            }),
+            Some(b'W') => Ok(Re::Class {
+                ranges: alloc::vec![(b'a', b'z'), (b'A', b'Z'), (b'0', b'9'), (b'_', b'_')],
+                neg: true,
+            }),
+            Some(b's') => Ok(Re::Class {
+                ranges: alloc::vec![(b' ', b' '), (b'\t', b'\t'), (b'\n', b'\n'), (b'\r', b'\r')],
+                neg: false,
+            }),
+            Some(b'S') => Ok(Re::Class {
+                ranges: alloc::vec![(b' ', b' '), (b'\t', b'\t'), (b'\n', b'\n'), (b'\r', b'\r')],
+                neg: true,
+            }),
+            Some(b'n') => Ok(Re::Lit(b'\n')),
+            Some(b't') => Ok(Re::Lit(b'\t')),
+            Some(c) => Ok(Re::Lit(c)),
+            None => Err(String::from("re: bad escape")),
+        },
+        Some(b'.') => Ok(Re::Any),
+        Some(c) => Ok(Re::Lit(c)),
+    }
+}
+
+/// concat of quantified atoms, stops at `)` or `|`
+fn re_cat(l: &mut ReLex) -> Result<Re, String> {
+    let mut v = Vec::new();
+    while let Some(c) = l.peek() {
+        if c == b')' || c == b'|' {
+            break;
+        }
+        if c == b'^' {
+            l.next();
+            v.push(Re::Start);
+            continue;
+        }
+        if c == b'$' {
+            l.next();
+            v.push(Re::End);
+            continue;
+        }
+        let a = re_atom(l)?;
+        // postfix quantifiers
+        let (min, max) = match l.peek() {
+            Some(b'*') => {
+                l.next();
+                (0, u32::MAX)
+            }
+            Some(b'+') => {
+                l.next();
+                (1, u32::MAX)
+            }
+            Some(b'?') => {
+                l.next();
+                (0, 1)
+            }
+            Some(b'{') => {
+                // {n} {n,} {n,m}
+                let save = l.i;
+                l.next();
+                let mut m = String::new();
+                while let Some(c) = l.peek() {
+                    if c == b'}' {
+                        break;
+                    }
+                    m.push(l.next().unwrap() as char);
+                }
+                if l.next() != Some(b'}') {
+                    l.i = save; // not a quantifier — '{' was literal-ish; bail to loop
+                    v.push(a);
+                    continue;
+                }
+                let parts: Vec<&str> = m.split(',').collect();
+                let lo: u32 = parts[0].trim().parse().map_err(|_| "re: bad {}")?;
+                let hi = match parts.get(1) {
+                    None => lo,
+                    Some(x) if x.trim().is_empty() => u32::MAX,
+                    Some(x) => x.trim().parse().map_err(|_| "re: bad {}")?,
+                };
+                (lo, hi)
+            }
+            _ => {
+                v.push(a);
+                continue;
+            }
+        };
+        if matches!(a, Re::Rep { .. }) {
+            return Err(String::from("re: double quantifier"));
+        }
+        v.push(Re::Rep { r: alloc::rc::Rc::new(a), min, max });
+    }
+    Ok(if v.len() == 1 { v.pop().unwrap() } else { Re::Cat(v) })
+}
+
+fn re_alt(l: &mut ReLex) -> Result<Re, String> {
+    let mut v = alloc::vec![re_cat(l)?];
+    while l.peek() == Some(b'|') {
+        l.next();
+        v.push(re_cat(l)?);
+    }
+    Ok(if v.len() == 1 { v.pop().unwrap() } else { Re::Alt(v) })
+}
+
+/// Match `re` at `b[pos..]`; calls `k(end)` for every reachable end position
+/// (short-circuit when k returns true). Continuation-passing backtracking.
+type ReCaps = core::cell::RefCell<Vec<Option<(usize, usize)>>>;
+
+fn re_go(
+    re: &Re,
+    b: &[u8],
+    pos: usize,
+    steps: &core::cell::Cell<u64>,
+    caps: &ReCaps,
+    k: &mut dyn FnMut(usize) -> bool,
+) -> bool {
+    steps.set(steps.get() + 1);
+    if steps.get() > 4_000_000 {
+        return false;
+    }
+    match re {
+        Re::Lit(c) => b.get(pos) == Some(c) && k(pos + 1),
+        Re::Any => pos < b.len() && k(pos + 1),
+        Re::Class { ranges, neg } => match b.get(pos) {
+            Some(c) => {
+                let hit = ranges.iter().any(|(lo, hi)| c >= lo && c <= hi);
+                (hit != *neg) && k(pos + 1)
+            }
+            None => false,
+        },
+        Re::Start => pos == 0 && k(pos),
+        Re::End => pos == b.len() && k(pos),
+        Re::Cat(v) => re_cat_go(v, 0, b, pos, steps, caps, k),
+        Re::Alt(v) => v.iter().any(|r| re_go(r, b, pos, steps, caps, k)),
+        Re::Rep { r, min, max } => re_rep_go(r, 0, *min, *max, b, pos, steps, caps, k),
+        // a group's span is recorded when the winning continuation sees its
+        // end; if the continuation keeps looking (k -> false) the span is
+        // restored so abandoned paths don't leak stale captures
+        Re::Group(n, r) => re_go(r, b, pos, steps, caps, &mut |e| {
+            let saved = caps.borrow().get(*n as usize).copied().flatten();
+            caps.borrow_mut()[*n as usize] = Some((pos, e));
+            let ok = k(e);
+            if !ok {
+                caps.borrow_mut()[*n as usize] = saved;
+            }
+            ok
+        }),
+    }
+}
+
+fn re_cat_go(
+    v: &[Re],
+    i: usize,
+    b: &[u8],
+    pos: usize,
+    steps: &core::cell::Cell<u64>,
+    caps: &ReCaps,
+    k: &mut dyn FnMut(usize) -> bool,
+) -> bool {
+    if i >= v.len() {
+        return k(pos);
+    }
+    re_go(&v[i], b, pos, steps, caps, &mut |p2| {
+        re_cat_go(v, i + 1, b, p2, steps, caps, k)
+    })
+}
+
+/// greedy: try consuming first, then the tail of the rep, then zero-more
+fn re_rep_go(
+    r: &Re,
+    n: u32,
+    min: u32,
+    max: u32,
+    b: &[u8],
+    pos: usize,
+    steps: &core::cell::Cell<u64>,
+    caps: &ReCaps,
+    k: &mut dyn FnMut(usize) -> bool,
+) -> bool {
+    if n >= min {
+        // try tail first? greedy = consume more when possible. We do the
+        // opposite order for correctness parity with PCRE greed: try more.
+        if n < max && re_go(r, b, pos, steps, caps, &mut |p2| {
+            // zero-width body guard prevents infinite loops on (a*)*
+            if p2 == pos {
+                false
+            } else {
+                re_rep_go(r, n + 1, min, max, b, p2, steps, caps, k)
+            }
+        }) {
+            return true;
+        }
+        return k(pos);
+    }
+    if n < max && re_go(r, b, pos, steps, caps, &mut |p2| {
+        if p2 == pos {
+            false
+        } else {
+            re_rep_go(r, n + 1, min, max, b, p2, steps, caps, k)
+        }
+    }) {
+        return true;
+    }
+    false
+}
+
+/// compile a pattern → (tree, group count); Err on syntax problems
+fn re_compile(pat: &str) -> Result<(Re, u32), String> {
+    let mut l = ReLex { b: pat.as_bytes(), i: 0, ngroups: 0 };
+    let r = re_alt(&mut l)?;
+    if l.i < l.b.len() {
+        return Err(alloc::format!("re: trailing '{}'", &pat[l.i..]));
+    }
+    Ok((r, l.ngroups))
+}
+
+/// leftmost match → (start, end). Tries each start position.
+fn re_search(pat: &str, s: &str) -> Option<(usize, usize)> {
+    re_search_caps(pat, s).map(|(a, b, _)| (a, b))
+}
+
+/// leftmost match → (start, end, group spans). Group i (1-based) is
+/// Some((s,e)) when it participated in the winning path, else None.
+fn re_search_caps(pat: &str, s: &str) -> Option<(usize, usize, Vec<Option<(usize, usize)>>)> {
+    let (re, ng) = re_compile(pat).ok()?;
+    let b = s.as_bytes();
+    let steps = core::cell::Cell::new(0u64);
+    let caps = ReCaps::new(alloc::vec![None; ng as usize + 1]);
+    for st in 0..=b.len() {
+        let hit = core::cell::Cell::new(Option::<usize>::None);
+        {
+            let hit = &hit;
+            let mut k = |e: usize| {
+                if hit.get().is_none() {
+                    hit.set(Some(e));
+                }
+                true // first end found wins (greedy order = longest-first for reps)
+            };
+            caps.borrow_mut().iter_mut().for_each(|c| *c = None);
+            let _ = re_go(&re, b, st, &steps, &caps, &mut k);
+        }
+        if let Some(e) = hit.get() {
+            return Some((st, e, caps.borrow().clone()));
+        }
+    }
+    None
+}
+
+/// full-string match
+fn re_full(pat: &str, s: &str) -> bool {
+    re_search(&alloc::format!("^({})$", pat), s).map(|(a, b)| a == 0 && b == s.len()).unwrap_or(false)
+}
+
+/// regex substitution: replace leftmost match(es) of `pat` with `new`
+/// (`&` in `new` expands to the whole match, `\&` is a literal &).
+/// `g` = all non-overlapping matches like sed's s///g.
+fn re_sub(line: &str, pat: &str, new: &str, g: bool) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    loop {
+        match re_search_caps(pat, rest) {
+            Some((a, b, caps)) => {
+                out.push_str(&rest[..a]);
+                let mut nb = new.as_bytes().iter().peekable();
+                let mut lit = String::new();
+                while let Some(&c) = nb.next() {
+                    if c == b'&' {
+                        lit.push_str(&rest[a..b]);
+                    } else if c == b'\\' {
+                        match nb.next() {
+                            Some(&b'&') => lit.push('&'),
+                            // \1-\9: nth capture group's text (empty if the
+                            // group didn't participate)
+                            Some(&d) if d.is_ascii_digit() && d != b'0' => {
+                                if let Some(Some((gs, ge))) = caps.get((d - b'0') as usize) {
+                                    lit.push_str(&rest[*gs..*ge]);
+                                }
+                            }
+                            Some(&d) => {
+                                lit.push('\\');
+                                lit.push(d as char);
+                            }
+                            None => lit.push('\\'),
+                        }
+                    } else {
+                        lit.push(c as char);
+                    }
+                }
+                out.push_str(&lit);
+                let adv = if b == a { b + 1 } else { b };
+                if adv >= rest.len() {
+                    if b == a {
+                        out.push_str(&rest[b..]);
+                    }
+                    rest = &rest[rest.len()..];
+                } else {
+                    if b == a {
+                        out.push_str(&rest[b..b + 1]);
+                    }
+                    rest = &rest[adv..];
+                }
+                if !g || rest.is_empty() {
+                    out.push_str(rest);
+                    return out;
+                }
+            }
+            None => {
+                out.push_str(rest);
+                return out;
+            }
+        }
+    }
+}
+
+/// translate a glob to a regex string for the engine: `*` → `[^/]*`,
+/// `**` → `.*`, `?` → `[^/]`, `[...]`/`[!...]` classes, and (extglob)
+/// `?(x)` `*(x)` `+(x)` `@(x)` `!(x)` groups. Escaped metachars are literal.
+fn glob_to_re(pat: &str, extglob: bool, slash_aware: bool) -> Option<String> {
+    let b = pat.as_bytes();
+    let mut out = String::new();
+    let mut i = 0usize;
+    let star_unit = if slash_aware { "[^/]*" } else { ".*" };
+    while i < b.len() {
+        match b[i] {
+            b'*' => {
+                if b.get(i + 1) == Some(&b'*') {
+                    // `**` — path-crossing wildcard
+                    let mut j = i;
+                    while b.get(j) == Some(&b'*') {
+                        j += 1;
+                    }
+                    out.push_str(".*");
+                    i = j;
+                } else {
+                    if extglob && b.get(i + 1) == Some(&b'(') {
+                        // *(A|B) — but star+paren: handled by extglob below? here *( is star of group
+                        let (inner, used) = ext_group(b, i + 1)?;
+                        out.push_str(&alloc::format!("(?:{})*", inner));
+                        i = used;
+                    } else {
+                        out.push_str(star_unit);
+                        i += 1;
+                    }
+                }
+            }
+            b'?' => {
+                if extglob && b.get(i + 1) == Some(&b'(') {
+                    let (inner, used) = ext_group(b, i + 1)?;
+                    out.push_str(&alloc::format!("(?:{})?", inner));
+                    i = used;
+                } else {
+                    out.push_str(if slash_aware { "[^/]" } else { "." });
+                    i += 1;
+                }
+            }
+            b'+' | b'@' | b'!'
+                if extglob && b.get(i + 1) == Some(&b'(') =>
+            {
+                let (inner, used) = ext_group(b, i + 1)?;
+                match b[i] {
+                    b'+' => out.push_str(&alloc::format!("(?:{})+", inner)),
+                    b'@' => out.push_str(&alloc::format!("(?:{})", inner)),
+                    // !(A): match iff the rest isn't exactly A — engine Neg
+                    _ => out.push_str(&alloc::format!("(?:{}|.*)", "")), // placeholder, refined below
+                }
+                if b[i] == b'!' {
+                    // implement !(P) as: P fails to match → consume rest.
+                    // encodes as !(...) sentinel the matcher understands.
+                    out.truncate(out.len() - "||.*)".len());
+                    let _ = inner;
+                    // simpler: rewrite via Neg atom — embed a marker the
+                    // parser turns into Re::Neg. Instead: approx via
+                    // "everything else" — !(a|b) ≈ negated full match is
+                    // only faithful as a whole pattern; for a whole-pattern
+                    // position the caller wraps anyway. Emit a group that
+                    // consumes the remainder iff inner doesn't match it:
+                    out.push_str(&alloc::format!("(?:{})", "NEG:".replace("NEG:", "")));
+                    // fallback handled in glob_match caller via re_full on
+                    // `inner`-negated check — see below
+                    return None; // signal caller: needs Neg handling
+                }
+                i = used;
+            }
+            b'[' => {
+                let mut j = i + 1;
+                let mut cls = String::from("[");
+                if b.get(j) == Some(&b'!') {
+                    cls.push('^');
+                    j += 1;
+                } else if b.get(j) == Some(&b'^') {
+                    cls.push('^');
+                    j += 1;
+                }
+                if b.get(j) == Some(&b']') {
+                    cls.push_str("\\]");
+                    j += 1;
+                }
+                while j < b.len() && b[j] != b']' {
+                    let c = b[j] as char;
+                    if c == '\\' && b.get(j + 1).is_some() {
+                        j += 1;
+                        cls.push('\\');
+                        cls.push(b[j] as char);
+                    } else {
+                        cls.push(c);
+                    }
+                    j += 1;
+                }
+                if j >= b.len() {
+                    return None; // unclosed class — treat as literal [
+                }
+                cls.push(']');
+                out.push_str(&cls);
+                i = j + 1;
+            }
+            c => {
+                if c.is_ascii_alphanumeric() || c == b'_' || c == b'/' || c == b' ' || c == b'-' || c == b'.' {
+                    if c == b'.' {
+                        out.push_str("\\.");
+                    } else {
+                        out.push(c as char);
+                    }
+                } else if c == b'\\' && b.get(i + 1).is_some() {
+                    i += 1;
+                    out.push('\\');
+                    out.push(b[i] as char);
+                } else {
+                    out.push('\\');
+                    out.push(c as char);
+                }
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// parse `(A|B|..)` starting at `open` (index of '('). Returns
+/// (regex-of-alternatives, index just past ')') — nested parens ok.
+fn ext_group(b: &[u8], open: usize) -> Option<(String, usize)> {
+    let mut depth = 0i32;
+    let mut i = open;
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    while i < b.len() {
+        match b[i] {
+            b'(' => {
+                depth += 1;
+                if depth > 1 {
+                    cur.push_str("\\(");
+                }
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    parts.push(cur);
+                    return Some((parts.join("|"), i + 1));
+                }
+                cur.push_str("\\)");
+                i += 1;
+            }
+            b'|' if depth == 1 => {
+                parts.push(cur);
+                cur = String::new();
+                i += 1;
+            }
+            b'*' => {
+                cur.push_str(".*");
+                i += 1;
+            }
+            b'?' => {
+                cur.push('.');
+                i += 1;
+            }
+            c => {
+                if c.is_ascii_alphanumeric() || c == b'_' || c == b' ' || c == b'-' || c == b'/' {
+                    cur.push(c as char);
+                } else {
+                    cur.push('\\');
+                    cur.push(c as char);
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
 fn wild_match(pat: &str, s: &str) -> bool {
+    /// bytes consumed by the `[...]` class at index `i` (0 if malformed)
+    fn class_len(p: &[u8], i: usize) -> usize {
+        let mut j = i + 1;
+        if p.get(j) == Some(&b'!') || p.get(j) == Some(&b'^') {
+            j += 1;
+        }
+        if p.get(j) == Some(&b']') {
+            j += 1; // literal ] first
+        }
+        while j < p.len() && p[j] != b']' {
+            j += 1;
+        }
+        if j < p.len() {
+            j - i + 1
+        } else {
+            0
+        }
+    }
+    fn class_has(p: &[u8], i: usize, c: u8) -> bool {
+        let mut j = i + 1;
+        let mut neg = false;
+        if p.get(j) == Some(&b'!') || p.get(j) == Some(&b'^') {
+            neg = true;
+            j += 1;
+        }
+        let mut hit = false;
+        let mut first = true;
+        while j < p.len() && (p[j] != b']' || first) {
+            first = false;
+            if p[j] == b'\\' && p.get(j + 1).is_some() {
+                if p[j + 1] == c {
+                    hit = true;
+                }
+                j += 2;
+            } else if j + 2 < p.len() && p[j + 1] == b'-' && p[j + 2] != b']' {
+                if c >= p[j] && c <= p[j + 2] {
+                    hit = true;
+                }
+                j += 3;
+            } else {
+                if p[j] == c {
+                    hit = true;
+                }
+                j += 1;
+            }
+        }
+        hit != neg
+    }
     let (p, s) = (pat.as_bytes(), s.as_bytes());
     let (mut pi, mut si) = (0usize, 0usize);
     let (mut star_p, mut star_s) = (usize::MAX, 0usize);
     while si < s.len() {
         if pi < p.len() && (p[pi] == b'?' || p[pi] == s[si]) {
             pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == b'[' && class_len(p, pi) > 0 {
+            if class_has(p, pi, s[si]) {
+                pi += class_len(p, pi);
+                si += 1;
+            } else if star_p != usize::MAX {
+                pi = star_p + 1;
+                star_s += 1;
+                si = star_s;
+            } else {
+                return false;
+            }
+        } else if pi < p.len() && p[pi] == b'\\' && p.get(pi + 1) == Some(&s[si]) {
+            pi += 2;
             si += 1;
         } else if pi < p.len() && p[pi] == b'*' {
             star_p = pi;
@@ -1098,6 +1863,32 @@ fn wild_match(pat: &str, s: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// shell-escape like printf %q: bare when already safe, else single-quoted
+/// with `\''` for embedded quotes (and `\\` for backslashes).
+fn shell_escape(s: &str) -> String {
+    if !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'_' | b'-' | b'.' | b'/' | b':' | b',' | b'+' | b'=' | b'@' | b'%' | b'~'
+                )
+        })
+    {
+        return String::from(s);
+    }
+    let mut o = String::from("'");
+    for c in s.chars() {
+        match c {
+            '\'' => o.push_str("'\\''"),
+            '\\' => o.push_str("\\\\"),
+            _ => o.push(c),
+        }
+    }
+    o.push('\'');
+    o
 }
 
 /// Classic unified-hunk diff on two line slices: trims the common
@@ -1373,7 +2164,7 @@ fn awk_pat_matches(
         return Ok(true);
     }
     if p.starts_with('/') && p.ends_with('/') && p.len() >= 2 {
-        return Ok(line.contains(&p[1..p.len() - 1]));
+        return Ok(re_search(&p[1..p.len() - 1], line).is_some());
     }
     if let Some(r) = p.strip_prefix("NR") {
         let r = r.trim();
@@ -1599,12 +2390,13 @@ fn awk_cond(
                         let lhs = c[..i].trim();
                         let rhs = c[i + op.len()..].trim();
                         if *op == "~" || *op == "!~" {
-                            // regex-lite: /pat/ or "pat" → substring match
+                            // real regex: /re/ or bare RHS both go through
+                            // the regex engine (a bad pattern just never matches)
                             let pat = rhs
                                 .trim_matches(|x| x == '/' || x == '"');
                             let hay = awk_show(lhs, line, nr, fields, vars)
                                 .unwrap_or_else(|_| String::from(line));
-                            let m = hay.contains(pat);
+                            let m = re_search(pat, &hay).is_some();
                             return Ok(if *op == "~" { m } else { !m });
                         }
                         // string compare if either side is quoted
@@ -3014,6 +3806,7 @@ struct GrepOpts {
     exact: bool,
     only: bool,  // -o: print just the matching spans
     quiet: bool, // -q: status only
+    ere: bool,   // -E: real regex via re_search
     files: u8,   // 0 normal, 1 = -l (with matches), 2 = -L (without)
     before: usize,
     after: usize,
@@ -3100,6 +3893,15 @@ struct Term {
     comps: alloc::collections::BTreeMap<String, String>,   // `complete -W` wordlists per command
     in_pc: bool,                                     // PROMPT_COMMAND recursion guard
     ulimit_n: u64,                                   // `ulimit -n` advisory (0 = default 1024)
+    shopts: alloc::collections::BTreeSet<String>,    // `shopt -s` set: nullglob dotglob extglob globstar nocaseglob failglob
+    disabled: alloc::collections::BTreeSet<String>,  // `enable -n` disabled builtins
+    cmdhash: alloc::collections::BTreeMap<String, (String, u32)>, // `hash` table: name -> (path, hits)
+    psub_n: u32,                                     // process-substitution temp file counter
+    /// `>(cmds)` deferred consumers: (inner cmds, fifo-path). The producer
+    /// writes a real file; after the producing command completes the
+    /// consumer runs with the file as stdin (sequential emulation — the
+    /// kernel has no async reader for a builtin pipeline stage).
+    psub_post: Vec<(String, String)>,
 }
 
 impl Term {
@@ -4052,6 +4854,8 @@ impl Term {
                 "-f" => ustd::stat(a[1]).map(|s| s.is_dir == 0).unwrap_or(false),
                 "-d" => ustd::stat(a[1]).map(|s| s.is_dir != 0).unwrap_or(false),
                 "-r" | "-w" | "-x" => ustd::stat(a[1]).is_ok(), // single permissive fs
+                "-L" | "-h" => ustd::readlink(a[1]).is_some(), // symlink
+                "-s" => ustd::stat(a[1]).map(|s| s.size > 0).unwrap_or(false),
                 "-z" => a[1].is_empty(),
                 "-n" => !a[1].is_empty(),
                 // -v VAR: shell variable is set; -R VAR: set and non-empty
@@ -4420,30 +5224,226 @@ impl Term {
     /// Expand one glob arg (`dir/pat` or bare `pat` against cwd).
     /// Returns the matching paths (dir-prefixed when a dir part was given),
     /// or the arg itself untouched when nothing matches -- shell semantics.
-    fn glob_expand(&self, arg: &str) -> Vec<String> {
-        if !arg.contains('*') && !arg.contains('?') {
-            return alloc::vec![String::from(arg)];
-        }
-        let (dir, pat) = match arg.rfind('/') {
-            Some(i) => (&arg[..i + 1], &arg[i + 1..]),
-            None => ("", arg),
-        };
-        let read_dir = if dir.is_empty() {
-            ustd::getcwd()
+    /// resolve every symlink in `p` (segment by segment), like `realpath -m`.
+    /// Relative targets resolve against the link's directory; hops are capped.
+    fn resolve_phys(&self, p: &str) -> String {
+        self.resolve_phys_h(p, 0)
+    }
+
+    fn resolve_phys_h(&self, p: &str, hops: u32) -> String {
+        let joined = if p.starts_with('/') {
+            String::from(p)
         } else {
-            String::from(dir.trim_end_matches('/'))
+            alloc::format!("{}/{}", ustd::getcwd().trim_end_matches('/'), p)
         };
-        let mut out = Vec::new();
-        if let Ok(ents) = ustd::readdir(&read_dir) {
-            for e in &ents {
-                let name = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("");
-                if wild_match(pat, name) {
-                    out.push(alloc::format!("{}{}", dir, name));
+        let mut stack: Vec<String> = Vec::new();
+        for seg in joined.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    stack.pop();
+                }
+                s => {
+                    stack.push(String::from(s));
+                    if hops < 16 {
+                        let cur = alloc::format!("/{}", stack.join("/"));
+                        if let Some(t) = ustd::readlink(&cur) {
+                            stack.pop();
+                            let parent = alloc::format!("/{}", stack.join("/"));
+                            let abs = if t.starts_with('/') {
+                                t
+                            } else {
+                                alloc::format!("{}/{}", parent.trim_end_matches('/'), t)
+                            };
+                            let resolved = self.resolve_phys_h(&abs, hops + 1);
+                            for c in resolved.split('/') {
+                                if !c.is_empty() {
+                                    stack.push(String::from(c));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
+        alloc::format!("/{}", stack.join("/"))
+    }
+
+    /// does this option sit in self.shopts?
+    fn shopt(&self, name: &str) -> bool {
+        self.shopts.contains(name)
+    }
+
+    /// glob pattern matching: *, ?, [..], and (with extglob) the
+    /// ?() *() +() @() !() operators. `**` crosses directory boundaries
+    /// when globstar is on. Translation goes through the regex engine.
+    fn glob_match(&self, pat: &str, s: &str) -> bool {
+        let ci = self.shopt("nocaseglob");
+        let re_pat = glob_to_re(pat, self.shopt("extglob"), true);
+        let (re_pat, negated) = match re_pat {
+            Some(r) => (Some(r), false),
+            None => {
+                // !(P) whole-pattern: matches iff P doesn't (full match)
+                if self.shopt("extglob")
+                    && pat.starts_with("!(")
+                    && pat.ends_with(')')
+                {
+                    let inner = &pat[2..pat.len() - 1];
+                    match glob_to_re(inner, self.shopt("extglob"), true) {
+                        Some(r) => (Some(r), true),
+                        None => (None, false),
+                    }
+                } else {
+                    (None, false)
+                }
+            }
+        };
+        match re_pat {
+            Some(r) => {
+                let m = if ci {
+                    re_full(&r, &s.to_ascii_lowercase())
+                        || re_full(&r.to_ascii_lowercase(), &s.to_ascii_lowercase())
+                } else {
+                    re_full(&r, s)
+                };
+                if negated { !m } else { m }
+            }
+            None => wild_match(pat, s), // last-resort fallback
+        }
+    }
+
+    /// recursive glob: `arg` may span path segments; `**` descends.
+    fn glob_expand(&self, arg: &str) -> Vec<String> {
+        if !arg.contains('*') && !arg.contains('?') && !arg.contains('[') {
+            return alloc::vec![String::from(arg)];
+        }
+        let abs = arg.starts_with('/');
+        let segs: Vec<&str> = arg.split('/').filter(|s| !s.is_empty()).collect();
+        let root = if abs { String::from("/") } else { ustd::getcwd() };
+        let mut out: Vec<String> = Vec::new();
+        let mut frontier = alloc::vec![root.clone()];
+        for (si, seg) in segs.iter().enumerate() {
+            let last = si + 1 == segs.len();
+            let mut next: Vec<String> = Vec::new();
+            for dir in &frontier {
+                if self.shopt("globstar") && *seg == "**" {
+                    // ** = this dir and all descendants (also the `**`-free
+                    // continuation, handled by keeping `dir` in the frontier
+                    // for the NEXT segment too)
+                    let mut stack = alloc::vec![dir.clone()];
+                    while let Some(d) = stack.pop() {
+                        if last {
+                            // `.../**` at end: emit every descendant
+                            next.push(d.clone());
+                            if let Ok(ents) = ustd::readdir(&d) {
+                                for e in ents.iter().rev() {
+                                    if e.is_dir != 0 {
+                                        stack.push(alloc::format!(
+                                            "{}{}/{}",
+                                            d,
+                                            if d.ends_with('/') { "" } else { "/" },
+                                            core::str::from_utf8(&e.name[..e.name_len as usize])
+                                                .unwrap_or("")
+                                        ));
+                                    } else {
+                                        next.push(alloc::format!(
+                                            "{}{}{}",
+                                            d,
+                                            if d.ends_with('/') { "" } else { "/" },
+                                            core::str::from_utf8(&e.name[..e.name_len as usize])
+                                                .unwrap_or("")
+                                        ));
+                                    }
+                                }
+                            }
+                        } else {
+                            next.push(d.clone()); // ** consumes zero segments
+                            if let Ok(ents) = ustd::readdir(&d) {
+                                for e in ents.iter().rev() {
+                                    if e.is_dir != 0 {
+                                        stack.push(alloc::format!(
+                                            "{}{}/{}",
+                                            d,
+                                            if d.ends_with('/') { "" } else { "/" },
+                                            core::str::from_utf8(&e.name[..e.name_len as usize])
+                                                .unwrap_or("")
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let literal = !seg.contains('*')
+                    && !seg.contains('?')
+                    && !seg.contains('[')
+                    && !(self.shopt("extglob") && (seg.contains("(") || seg.contains("!")));
+                if literal {
+                    next.push(alloc::format!(
+                        "{}{}{}",
+                        dir,
+                        if dir.ends_with('/') { "" } else { "/" },
+                        seg
+                    ));
+                    continue;
+                }
+                if let Ok(ents) = ustd::readdir(dir) {
+                    for e in &ents {
+                        let name = core::str::from_utf8(&e.name[..e.name_len as usize])
+                            .unwrap_or("");
+                        if !self.shopt("dotglob") && name.starts_with('.') && !seg.starts_with('.') {
+                            continue;
+                        }
+                        if self.glob_match(seg, name) {
+                            next.push(alloc::format!(
+                                "{}{}{}",
+                                dir,
+                                if dir.ends_with('/') { "" } else { "/" },
+                                name
+                            ));
+                        }
+                    }
+                }
+            }
+            // `**` segments keep the same frontier for the following seg
+            // (zero dirs consumed) — merge, dedup
+            if self.shopt("globstar") && *seg == "**" {
+                if last {
+                    frontier = next;
+                } else {
+                    frontier = next; // dirs-only frontier for the next pattern seg
+                    frontier.retain(|d| {
+                        ustd::stat(d).map(|s| s.is_dir != 0).unwrap_or(false)
+                    });
+                }
+            } else {
+                frontier = next;
+            }
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        for d in frontier {
+            let rel = if abs {
+                d
+            } else {
+                // strip the cwd prefix to keep results relative like the arg
+                let base = if root.ends_with('/') { root.clone() } else { alloc::format!("{}/", root) };
+                String::from(d.strip_prefix(&base).unwrap_or(&d))
+            };
+            out.push(rel);
+        }
+        out.sort();
+        out.dedup();
         if out.is_empty() {
-            out.push(String::from(arg));
+            if self.shopt("failglob") {
+                // failglob: report instead of literal pass-through
+                return out; // caller sees empty; error surfaced below via shopt check
+            }
+            if !self.shopt("nullglob") {
+                out.push(String::from(arg));
+            }
         }
         out
     }
@@ -4659,6 +5659,33 @@ impl Term {
 
     /// push a history entry, capped at $HISTSIZE (default 500) like bash
     fn hist_push(&mut self, s: String) {
+        // HISTCONTROL=ignorespace|ignoredups|ignoreboth|erasedups and
+        // HISTIGNORE=pat:pat glob list gate what reaches history
+        let hc = self
+            .vars
+            .get("HISTCONTROL")
+            .cloned()
+            .unwrap_or_default();
+        if (hc.contains("ignorespace") || hc.contains("ignoreboth"))
+            && s.starts_with(' ')
+        {
+            return;
+        }
+        if (hc.contains("ignoredups") || hc.contains("ignoreboth"))
+            && self.hist.last().map(|e| e == &s).unwrap_or(false)
+        {
+            return;
+        }
+        if hc.contains("erasedups") {
+            self.hist.retain(|e| e != &s);
+        }
+        if let Some(ig) = self.vars.get("HISTIGNORE").cloned() {
+            for pat in ig.split(':') {
+                if !pat.is_empty() && wild_match(pat, &s) {
+                    return;
+                }
+            }
+        }
         self.hist.push(s);
         let cap: usize = self
             .vars
@@ -4917,6 +5944,15 @@ impl Term {
             return;
         }
         self.run_body(input, top);
+        // `>(cmds)` consumers run once their producer has finished
+        if !self.psub_post.is_empty() {
+            let pending = core::mem::take(&mut self.psub_post);
+            for (inner, path) in pending {
+                if ustd::stat(&path).is_ok() {
+                    self.run(&alloc::format!("{} < {}", inner, path));
+                }
+            }
+        }
         self.run_depth = self.run_depth.saturating_sub(1);
     }
 
@@ -5140,7 +6176,7 @@ impl Term {
                             }
                             let mut ws = Vec::new();
                             for (w, q, _qp) in tokenize(&vard) {
-                                if !q && (w.contains('*') || w.contains('?')) && !self.noglob {
+                                if !q && (w.contains('*') || w.contains('?') || w.contains('[')) && !self.noglob {
                                     ws.extend(self.glob_expand(&w));
                                 } else {
                                     ws.push(w);
@@ -5214,7 +6250,7 @@ impl Term {
                         }
                         let mut words: Vec<String> = Vec::new();
                         for (w, q, _qp) in tokenize(&vard) {
-                            if !q && (w.contains('*') || w.contains('?')) && !self.noglob {
+                            if !q && (w.contains('*') || w.contains('?') || w.contains('[')) && !self.noglob {
                                 words.extend(self.glob_expand(&w));
                             } else {
                                 words.push(w);
@@ -5420,7 +6456,9 @@ impl Term {
                     }
                     let mut force_next = false;
                     for (pats, body, mode) in &arms {
-                        if force_next || pats.iter().any(|p| wild_match(p, &w)) {
+                        if force_next
+                            || pats.iter().any(|p| self.glob_match(p, &w))
+                        {
                             self.run_stmts(body, depth + 1, trace);
                             match mode {
                                 1 => force_next = true, // `;&`: fall into next arm's body
@@ -5502,7 +6540,85 @@ impl Term {
         } else {
             self.expand_alias(input)
         };
-        let input = aliased.as_str();
+        // process substitution: `<( cmds )` → a real file of the cmds'
+        // output; `>( cmds )` → a real fifo whose reader is the spawned
+        // cmds. Substituted with the path before pipes/redirects see it.
+        let mut psubbed = String::new();
+        if aliased.contains("<(") || aliased.contains(">(") {
+            let _ = ustd::mkdir("/tmp");
+        }
+        {
+            let scan = aliased.as_str();
+            let b = scan.as_bytes();
+            let (mut sq, mut dq) = (false, false);
+            let mut i = 0usize;
+            while i < b.len() {
+                match b[i] {
+                    b'\'' if !dq => {
+                        sq = !sq;
+                        psubbed.push('\'');
+                    }
+                    b'"' if !sq => {
+                        dq = !dq;
+                        psubbed.push('"');
+                    }
+                    b'<' | b'>' if !sq && !dq && b.get(i + 1) == Some(&b'(') => {
+                        let dir_in = b[i] == b'<';
+                        if let Some(close) = match_paren(&scan[i + 1..]) {
+                            let inner = &scan[i + 2..i + 1 + close];
+                            self.psub_n += 1;
+                            let path = alloc::format!(
+                                "/tmp/.psub-{}-{}",
+                                ustd::getpid(),
+                                self.psub_n
+                            );
+                            if dir_in {
+                                // <(cmds): capture output into a real file
+                                let out = self.run_captured(inner).join("
+");
+                                let mut body = out.into_bytes();
+                                if !body.is_empty() && body.last() != Some(&b'\n') {
+                                    body.push(b'\n');
+                                }
+                                if ustd::write_all(&path, &body).is_err() {
+                                    self.fail(&alloc::format!(
+                                        "sh: process substitution write failed"
+                                    ));
+                                    return;
+                                }
+                            } else {
+                                // >(cmds): producer writes a real file; the
+                                // consumer runs afterwards with it as stdin
+                                if ustd::write_all(&path, b"").is_err() {
+                                    self.fail(&alloc::format!(
+                                        "sh: process substitution create failed"
+                                    ));
+                                    return;
+                                }
+                                self.psub_post
+                                    .push((String::from(inner.trim()), path.clone()));
+                            }
+                            psubbed.push_str(&path);
+                            i = i + 1 + close + 1;
+                            continue;
+                        } else {
+                            psubbed.push(b[i] as char);
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    c => psubbed.push(c as char),
+                }
+                i += 1;
+            }
+        }
+        let owned;
+        let input = if psubbed.len() != aliased.len() || psubbed != aliased {
+            owned = psubbed;
+            owned.as_str()
+        } else {
+            aliased.as_str()
+        };
         // `cmd &`: spawn a /bin/<cmd> process and track it as a job.
         // (Builtins are in-process — a trailing & on one is a syntax error.)
         if let Some(inner) = strip_bg(input) {
@@ -5513,6 +6629,10 @@ impl Term {
                 match ustd::spawn(&path, rest) {
                     Ok(pid) => {
                         self.track(pid, inner);
+                        self.cmdhash
+                            .entry(String::from(w))
+                            .or_insert((path.clone(), 0))
+                            .1 += 1;
                         self.emit(&alloc::format!("[{}] {}", self.jobs.len(), pid));
                     }
                     Err(_) => self.fail(&alloc::format!("{}: spawn failed", w)),
@@ -5834,25 +6954,41 @@ impl Term {
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
         ];
+        let glob_tok = |t: &str| {
+            t.contains('*')
+                || t.contains('?')
+                || t.contains('[')
+                || (self.shopt("extglob")
+                    && (t.contains("(") && (t.contains('!') || t.contains('@') || t.contains('+'))))
+        };
+        let mut no_match_err = false;
         let gexp: Vec<String> = if GLOBBABLE.contains(&cmd)
             && !self.noglob
             && toks[1.min(toks.len())..]
                 .iter()
-                .any(|t| !t.1 && (t.0.contains('*') || t.0.contains('?')))
+                .any(|t| !t.1 && glob_tok(&t.0))
         {
-            toks[1.min(toks.len())..]
-                .iter()
-                .flat_map(|t| {
-                    if !t.1 && (t.0.contains('*') || t.0.contains('?')) {
-                        self.glob_expand(&t.0)
-                    } else {
-                        alloc::vec![t.0.clone()]
+            let mut out: Vec<String> = Vec::new();
+            for t in toks[1.min(toks.len())..].iter() {
+                if !t.1 && glob_tok(&t.0) {
+                    let ms = self.glob_expand(&t.0);
+                    if ms.is_empty() && self.shopt("failglob") {
+                        self.fail(&alloc::format!("sh: no match: {}", t.0));
+                        no_match_err = true;
+                        break;
                     }
-                })
-                .collect()
+                    out.extend(ms);
+                } else {
+                    out.push(t.0.clone());
+                }
+            }
+            out
         } else {
             Vec::new()
         };
+        if no_match_err {
+            return;
+        }
         if !gexp.is_empty() {
             args = gexp.iter().map(|s| s.as_str()).collect();
         }
@@ -6004,6 +7140,10 @@ impl Term {
         // optimistic success -- fail() marks the statement failed; $? /
         // && / || read this after the command finishes
         self.last_ok = true;
+        if self.disabled.contains(cmd) {
+            self.fail(&alloc::format!("{}: disabled builtin", cmd));
+            return;
+        }
         match cmd {
             "help" => {
                 let lines = Self::HELP_LINES;
@@ -6108,11 +7248,28 @@ impl Term {
                             }
                             for e in ents {
                                 let name = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("?");
-                                let line = if e.is_dir != 0 {
+                                let is_link = e.attr & 0x40 != 0;
+                                let mut line = if is_link {
+                                    let tgt = ustd::readlink(&alloc::format!(
+                                        "{}{}{}",
+                                        dir,
+                                        if dir.ends_with('/') { "" } else { "/" },
+                                        name
+                                    ))
+                                    .unwrap_or_default();
+                                    alloc::format!("  {} -> {}", name, tgt)
+                                } else if e.is_dir != 0 {
                                     alloc::format!("  {}/", name)
                                 } else {
                                     alloc::format!("  {}  ({} B)", name, e.size)
                                 };
+                                if classify {
+                                    if is_link {
+                                        line.push('@');
+                                    } else if e.is_dir != 0 {
+                                        line.push('*');
+                                    }
+                                }
                                 self.emit(&line);
                             }
                         }
@@ -6121,23 +7278,38 @@ impl Term {
                 }
             }
             "cd" => {
+                // cd [-P|-L] [dir|-]: -P resolves symlinks before chdir
                 let cur = ustd::getcwd();
-                let dest = if args.first() == Some(&"-") {
+                let phys = args.first() == Some(&"-P") || args.first() == Some(&"-e");
+                let argi = if args.first().map(|a| a.starts_with('-') && *a != "-").unwrap_or(false) {
+                    1
+                } else {
+                    0
+                };
+                let dest = if args.get(argi) == Some(&"-") {
                     if self.prev_cwd.is_empty() {
                         self.emit("cd: no previous dir");
                         return;
                     }
                     self.prev_cwd.clone()
                 } else {
-                    String::from(*args.first().unwrap_or(&"/"))
+                    String::from(*args.get(argi).unwrap_or(&"/"))
                 };
+                let dest = if phys { self.resolve_phys(&dest) } else { dest };
                 if ustd::chdir(&dest) {
                     self.prev_cwd = cur;
                 } else {
                     self.fail(&alloc::format!("cd: {}: no such dir", dest));
                 }
             }
-            "pwd" => self.emit(&ustd::getcwd()),
+            "pwd" => {
+                // pwd [-P|-L]: -P resolves symlinks in the path
+                if args.first() == Some(&"-P") {
+                    self.emit(&self.resolve_phys(&ustd::getcwd()));
+                } else {
+                    self.emit(&ustd::getcwd());
+                }
+            }
             "true" => {}
             "false" => self.last_ok = false,
             "break" => self.flow = 1,      // unwinds to the enclosing run_stmts loop
@@ -6398,10 +7570,11 @@ impl Term {
                         }
                     }
                     let norm = alloc::format!("/{}", parts.join("/"));
+                    let resolved = self.resolve_phys(&norm);
                     if bad {
                         self.fail(&alloc::format!("realpath: {}: escapes root", a));
-                    } else if ustd::stat(&norm).is_ok() || norm == "/" {
-                        self.emit(&norm);
+                    } else if ustd::stat(&resolved).is_ok() || resolved == "/" {
+                        self.emit(&resolved);
                     } else {
                         self.fail(&alloc::format!("realpath: {}: no such file", a));
                     }
@@ -6879,7 +8052,8 @@ impl Term {
                 }
             }
             "readlink" => {
-                // FAT has no symlinks: -f/-e canonicalize, bare errors out
+                // readlink [-f|-e|-m] <link>: bare prints the raw symlink
+                // target; the canonical flags fully resolve every component
                 let canon = args
                     .first()
                     .map(|a| *a == "-f" || *a == "-e" || *a == "-m")
@@ -6888,13 +8062,18 @@ impl Term {
                 match p {
                     None => self.fail("usage: readlink [-f] <path>"),
                     Some(t) if canon => {
-                        for l in self.run_captured(&alloc::format!("realpath {}", t)) {
-                            self.emit(&l);
+                        let r = self.resolve_phys(t);
+                        if *args.first().unwrap() == "-e" && ustd::stat(&r).is_err() {
+                            self.fail(&alloc::format!("readlink: {}: no such file", t));
+                        } else {
+                            self.emit(&r);
                         }
                     }
-                    Some(t) => {
-                        self.fail(&alloc::format!("readlink: {}: not a symbolic link", t))
-                    }
+                    Some(t) => match ustd::readlink(t) {
+                        Some(tgt) => self.emit(&tgt),
+                        None => self
+                            .fail(&alloc::format!("readlink: {}: not a symbolic link", t)),
+                    },
                 }
             }
             "mpstat" => {
@@ -7272,6 +8451,69 @@ impl Term {
                     self.emit("/dev/console");
                 }
             }
+            "ln" => {
+                // ln [-s] [-f] <target> [link]: -s writes a real symlink
+                // (FAT attr 0x40, body `LNK>target`); hard links are not
+                // representable on FAT32
+                let mut sym = false;
+                let mut force = false;
+                let pos: Vec<&str> = args
+                    .iter()
+                    .filter(|a| {
+                        if a.starts_with('-') {
+                            sym |= a.contains('s') || a.contains('b');
+                            force |= a.contains('f');
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .copied()
+                    .collect();
+                match (pos.first(), pos.get(1)) {
+                    (Some(t), Some(l)) => {
+                        if !sym {
+                            self.fail("ln: hard links not supported on FAT32 (use -s)");
+                        } else {
+                            let mut link = String::from(*l);
+                            if ustd::stat(&link).map(|s| s.is_dir != 0).unwrap_or(false) {
+                                let base =
+                                    t.trim_end_matches('/').rsplit('/').next().unwrap_or(t);
+                                link = alloc::format!(
+                                    "{}/{}",
+                                    link.trim_end_matches('/'),
+                                    base
+                                );
+                            }
+                            if ustd::stat(&link).is_ok()
+                                || ustd::readlink(&link).is_some()
+                            {
+                                if force {
+                                    let _ = ustd::remove(&link);
+                                } else {
+                                    self.fail(&alloc::format!(
+                                        "ln: {}: file exists",
+                                        link
+                                    ));
+                                    return;
+                                }
+                            }
+                            let body = alloc::format!("LNK>{}", t);
+                            match ustd::write_all(&link, body.as_bytes()) {
+                                Ok(()) => {
+                                    let _ = ustd::setattr(&link, 0x60);
+                                }
+                                Err(e) => self.fail(&alloc::format!(
+                                    "ln: {}: err {}",
+                                    link,
+                                    e
+                                )),
+                            }
+                        }
+                    }
+                    _ => self.fail("usage: ln -s [-f] <target> <link>"),
+                }
+            }
             "unlink" => {
                 // unlink <file>: remove one name (FAT has no link counts —
                 // unlinking the sole name deletes the file)
@@ -7290,6 +8532,166 @@ impl Term {
                     self.fail("usage: link <from> <to>");
                 } else {
                     self.fail("link: operation not supported on FAT32");
+                }
+            }
+            "shopt" => {
+                // shopt [-s|-u|-q|-p] [name...]: shell option flags that tune
+                // glob/expansion behavior (nullglob dotglob extglob globstar
+                // nocaseglob failglob)
+                const SHOPT_NAMES: &[&str] = &[
+                    "nullglob", "dotglob", "extglob", "globstar", "nocaseglob",
+                    "failglob",
+                ];
+                let mut set: Option<bool> = None;
+                let mut quiet = false;
+                let mut print = false;
+                let mut names: Vec<&str> = Vec::new();
+                for a in &args {
+                    match *a {
+                        "-s" => set = Some(true),
+                        "-u" => set = Some(false),
+                        "-q" => quiet = true,
+                        "-p" => print = true,
+                        n => names.push(n),
+                    }
+                }
+                let show = |t: &mut Term, n: &str| {
+                    t.emit(&alloc::format!(
+                        "{}\t{}",
+                        n,
+                        if t.shopt(n) { "on" } else { "off" }
+                    ));
+                };
+                if names.is_empty() {
+                    if quiet {
+                        // shopt -q: status only
+                        self.last_ok = SHOPT_NAMES.iter().all(|n| self.shopt(n));
+                        return;
+                    }
+                    for n in SHOPT_NAMES {
+                        show(self, n);
+                    }
+                    return;
+                }
+                for n in names {
+                    if !SHOPT_NAMES.contains(&n) {
+                        self.fail(&alloc::format!("shopt: {}: invalid option", n));
+                        continue;
+                    }
+                    match set {
+                        Some(true) => {
+                            self.shopts.insert(String::from(n));
+                        }
+                        Some(false) => {
+                            self.shopts.remove(n);
+                        }
+                        None => {
+                            if print || !quiet {
+                                show(self, n);
+                            }
+                            if quiet {
+                                self.last_ok = self.shopt(n);
+                            }
+                        }
+                    }
+                }
+            }
+            "hash" => {
+                // hash [-r] [-t name] [name[=path]]: command path table
+                if args.first() == Some(&"-r") {
+                    self.cmdhash.clear();
+                    return;
+                }
+                if args.first() == Some(&"-t") {
+                    let mut any = false;
+                    for n in &args[1..] {
+                        let path = alloc::format!("/bin/{}", n);
+                        if ustd::stat(&path).is_ok() || Self::BUILTINS.contains(n) {
+                            self.emit(&path);
+                            any = true;
+                        }
+                    }
+                    if !any {
+                        self.last_ok = false;
+                    }
+                    return;
+                }
+                if args.is_empty() {
+                    let rows: Vec<String> = self
+                        .cmdhash
+                        .iter()
+                        .map(|(n, (p, h))| alloc::format!("{}\t{}\t{}", h, n, p))
+                        .collect();
+                    for r in rows {
+                        self.emit(&r);
+                    }
+                    return;
+                }
+                for a in &args {
+                    if let Some((n, pth)) = a.split_once('=') {
+                        self.cmdhash
+                            .insert(String::from(n), (String::from(pth), 0));
+                    } else {
+                        let path = alloc::format!("/bin/{}", a);
+                        if ustd::stat(&path).is_ok() {
+                            self.cmdhash.insert(String::from(*a), (path, 0));
+                        } else if Self::BUILTINS.contains(a) {
+                            // builtins resolve in-process — hashing one succeeds
+                            self.cmdhash
+                                .insert(String::from(*a), (String::from("builtin"), 0));
+                        } else {
+                            self.fail(&alloc::format!("hash: {}: not found", a));
+                        }
+                    }
+                }
+            }
+            "enable" => {
+                // enable [-n|-p|-a] [builtin...]: -n disables a builtin for
+                // this shell; bare/-p lists enabled builtins
+                let mut dis = false;
+                let mut names: Vec<&str> = Vec::new();
+                for a in &args {
+                    match *a {
+                        "-n" => dis = true,
+                        "-p" | "-a" => {}
+                        n => names.push(n),
+                    }
+                }
+                if names.is_empty() {
+                    for b in Self::BUILTINS {
+                        if dis {
+                            if self.disabled.contains(*b) {
+                                self.emit(&alloc::format!("enable -n {}", b));
+                            }
+                        } else if !self.disabled.contains(*b) {
+                            self.emit(&alloc::format!("enable {}", b));
+                        }
+                    }
+                    return;
+                }
+                for n in names {
+                    if !Self::BUILTINS.contains(&n) {
+                        self.fail(&alloc::format!("enable: {}: not a builtin", n));
+                        continue;
+                    }
+                    if dis {
+                        self.disabled.insert(String::from(n));
+                    } else {
+                        self.disabled.remove(n);
+                    }
+                }
+            }
+            "stty" => {
+                // stty size | -a: real terminal geometry (the rest is a
+                // single fixed line discipline — reported, not settable)
+                match args.first().copied() {
+                    Some("size") => self.emit(&alloc::format!("{} {}", ROWS, COLS)),
+                    Some("-a") => self.emit(&alloc::format!(
+                        "speed 38400 baud; rows {}; columns {}; line = 0;",
+                        ROWS,
+                        COLS
+                    )),
+                    _ => self.fail("usage: stty size | -a"),
                 }
             }
             "pstree" => {
@@ -8415,7 +9817,8 @@ impl Term {
                 // cp [-r] [-i] [-n] [-u] <from> <to>: -i asks before
                 // overwriting, -n never overwrites, -u only when src is
                 // newer or dst absent
-                let rec = args.iter().any(|a| a == &"-r" || a == &"-R");
+                let rec = args.iter().any(|a| a == &"-r" || a == &"-R" || a == &"-a");
+                let nolink = args.iter().any(|a| a == &"-P" || a == &"-d" || a == &"-a");
                 let inter = args.iter().any(|a| a.starts_with('-') && a.contains('i'));
                 let noclob = args.iter().any(|a| a.starts_with('-') && a.contains('n'));
                 let update = args.iter().any(|a| a.starts_with('-') && a.contains('u'));
@@ -8426,6 +9829,37 @@ impl Term {
                     .collect();
                 match (pos.first(), pos.get(1)) {
                     (Some(f), Some(t)) => {
+                        // -P/-d: copy a symlink verbatim instead of its target
+                        if nolink {
+                            if let Some(tgt) = ustd::readlink(f) {
+                                let mut dst = String::from(*t);
+                                if ustd::stat(&dst).map(|d| d.is_dir != 0).unwrap_or(false)
+                                {
+                                    let base = f
+                                        .trim_end_matches('/')
+                                        .rsplit('/')
+                                        .next()
+                                        .unwrap_or(f);
+                                    dst = alloc::format!(
+                                        "{}/{}",
+                                        dst.trim_end_matches('/'),
+                                        base
+                                    );
+                                }
+                                let body = alloc::format!("LNK>{}", tgt);
+                                match ustd::write_all(&dst, body.as_bytes()) {
+                                    Ok(()) => {
+                                        let _ = ustd::setattr(&dst, 0x60);
+                                    }
+                                    Err(e) => self.fail(&alloc::format!(
+                                        "cp: {}: err {}",
+                                        dst,
+                                        e
+                                    )),
+                                }
+                                return;
+                            }
+                        }
                         // resolve the real destination like cp_any does so the
                         // overwrite check hits the file, not the dir
                         let dst_exists = match ustd::stat(t) {
@@ -10556,7 +11990,8 @@ impl Term {
                                     b'q' => o.quiet = true,
                                     b'l' => o.files = 1,
                                     b'L' => o.files = 2,
-                                    b'F' | b'E' | b'e' => {} // already literal
+                                    b'E' => o.ere = true,    // real regex
+                                    b'F' | b'e' => {}        // already literal / -e nop
                                     _ => {}
                                 }
                             }
@@ -10679,6 +12114,14 @@ impl Term {
             "file" => match args.first() {
                 Some(p) => match ustd::read_all(p) {
                     Ok(d) => {
+                        if let Some(t) = ustd::readlink(p) {
+                            self.emit(&alloc::format!(
+                                "{}: symbolic link to '{}'",
+                                p,
+                                t
+                            ));
+                            return;
+                        }
                         let kind = if d.len() >= 4 && &d[0..4] == b"\x7fELF" {
                             alloc::format!("ELF 64-bit executable ({} B)", d.len())
                         } else if d.len() >= 2 && &d[0..2] == b"P6" {
@@ -12286,10 +13729,12 @@ impl Term {
                 None => self.fail("usage: strings <file>"),
             },
             "find" => {
-                // find <dir> [-name pat] [-type f|d] [-maxdepth n]
-                //   [-newer <file>] [-exec cmd {} ;] [pat]
+                // find <dir> [-name pat] [-type f|d|l] [-maxdepth n]
+                //   [-newer <file>] [-regex pat] [-exec cmd {} ;] [pat]
                 let mut pat = "*";
                 let mut want_dir: Option<bool> = None;
+                let mut want_link = false;
+                let mut repat: Option<String> = None;
                 let mut maxd = usize::MAX;
                 let mut newer: Option<u64> = None;
                 let mut pathpat: Option<String> = None;
@@ -12314,7 +13759,19 @@ impl Term {
                         }
                         "-type" => {
                             if let Some(v) = args.get(i + 1) {
-                                want_dir = Some(*v == "d");
+                                match *v {
+                                    "l" => {
+                                        want_link = true;
+                                        want_dir = Some(false);
+                                    }
+                                    _ => want_dir = Some(*v == "d"),
+                                }
+                                skip.push(i + 1);
+                            }
+                        }
+                        "-regex" => {
+                            if let Some(v) = args.get(i + 1) {
+                                repat = Some(String::from(*v));
                                 skip.push(i + 1);
                             }
                         }
@@ -12392,6 +13849,19 @@ impl Term {
                             // -path PAT: match the full path, not the basename
                             if let Some(pp) = &pathpat {
                                 ms.retain(|m| wild_match(pp, m.trim_end_matches('/')));
+                            }
+                            // -regex PAT: full-path match through the regex engine
+                            if let Some(rp) = &repat {
+                                ms.retain(|m| re_full(rp, m.trim_end_matches('/')));
+                            }
+                            // -type l: FAT symlink attr bit 0x40
+                            if want_link {
+                                ms.retain(|m| {
+                                    ustd::stat(m.trim_end_matches('/'))
+                                        .map(|st| st.attr & 0x40 != 0)
+                                        .unwrap_or(false)
+                                        || ustd::readlink(m.trim_end_matches('/')).is_some()
+                                });
                             }
                             // -empty: zero-size file or directory with no entries
                             if want_empty {
@@ -13467,7 +14937,33 @@ impl Term {
                 _ => self.fail("usage: tput cols|lines"),
             },
             "builtin" | "command" => {
-                // run cmd bypassing alias expansion (still hits builtins)
+                // run cmd bypassing alias expansion; command -v/-V describe
+                // instead of running
+                match args.first() {
+                    Some(&"-v") | Some(&"-V") if args.len() > 1 => {
+                        for n in &args[1..] {
+                            if Self::BUILTINS.contains(n)
+                                || self.funcs.iter().any(|(f, _)| f.as_str() == *n)
+                            {
+                                self.emit(n);
+                            } else {
+                                let p = alloc::format!("/bin/{}", n);
+                                if ustd::stat(&p).is_ok() {
+                                    self.emit(&p);
+                                } else if let Some((_, a)) =
+                                    self.aliases.iter().find(|(an, _)| an.as_str() == *n)
+                                {
+                                    let av = a.clone();
+                                    self.emit(&alloc::format!("{} is aliased to `{}'", n, av));
+                                } else {
+                                    self.fail(&alloc::format!("command: {}: not found", n));
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
                 if args.is_empty() {
                     self.fail("usage: builtin|command <cmd...>");
                     return;
@@ -13679,6 +15175,7 @@ impl Term {
                 //   lines the substitution changed
                 let inplace = args.iter().any(|a| a == &"-i");
                 let quiet = args.iter().any(|a| a == &"-n");
+                let ere = args.iter().any(|a| a == &"-E" || a == &"-r");
                 let pos: Vec<&str> = args
                     .iter()
                     .filter(|a| !a.starts_with('-'))
@@ -13772,7 +15269,11 @@ impl Term {
                                 return;
                             }
                             for l in s.lines() {
-                                let r = if g {
+                                let r = if ere {
+                                    // sed -E: leftmost match(es) via the regex
+                                    // engine; & in the replacement is the match
+                                    re_sub(l, &old, &new, g)
+                                } else if g {
                                     l.replace(&old, &new)
                                 } else {
                                     l.replacen(&old, &new, 1)
@@ -14205,7 +15706,7 @@ impl Term {
                     let name = args.iter().find(|a| !a.starts_with('-'));
                     match name {
                         Some(n) => {
-                            if Self::BUILTINS.contains(n) || self.funcs.iter().any(|(f, _)| f == n) {
+                            if Self::BUILTINS.contains(n) || self.funcs.iter().any(|(f, _)| f.as_str() == *n) {
                                 self.emit(n);
                             } else if ustd::stat(&alloc::format!("/bin/{}", n)).is_ok() {
                                 self.emit(&alloc::format!("/bin/{}", n));
@@ -14389,6 +15890,11 @@ impl Term {
                                                     a = a.chars().take(p).collect();
                                                 }
                                                 line.push_str(&pad(a, left, width, false));
+                                                ri += 1;
+                                            }
+                                            b'q' => {
+                                                let a = rest.get(ri).copied().unwrap_or("");
+                                                line.push_str(&shell_escape(a));
                                                 ri += 1;
                                             }
                                             b'd' | b'i' | b'u' | b'x' | b'X' | b'o' => {
@@ -14787,12 +16293,21 @@ impl Term {
                 }
             }
             _ => {
-                // try running it as a binary
-                let path = alloc::format!("/bin/{}", cmd);
+                // try running it as a binary (a hashed name skips the /bin
+                // lookup like bash's command hash)
+                let path = self
+                    .cmdhash
+                    .get(cmd)
+                    .map(|(p, _)| p.clone())
+                    .unwrap_or_else(|| alloc::format!("/bin/{}", cmd));
                 if ustd::stat(&path).is_ok() {
                     match ustd::spawn(&path, &args.join(" ")) {
                         Ok(pid) => {
                             self.track(pid, &path);
+                            self.cmdhash
+                                .entry(String::from(cmd))
+                                .or_insert((path.clone(), 0))
+                                .1 += 1;
                             self.emit(&alloc::format!("spawned {} (pid {})", cmd, pid));
                         }
                         Err(_) => self.fail(&alloc::format!("{}: spawn failed", cmd)),
@@ -15322,6 +16837,7 @@ impl Term {
         "install", "jot", "ipcalc", "tsort", "fdupes", "rename", "updatedb",
         "locate", "mapfile", "readarray", "cpio", "rsync",
         "umask", "chmod", "ulimit", "complete", "compgen", "hexdump",
+            "ln", "shopt", "hash", "enable", "stty", "readlink",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -15837,7 +17353,9 @@ impl Term {
             } else {
                 String::from(l)
             };
-            if o.exact {
+            if o.ere {
+                re_search(pat, &hay).is_some()
+            } else if o.exact {
                 hay.trim() == pat
             } else if o.word {
                 hay.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -15871,7 +17389,23 @@ impl Term {
                     } else {
                         String::from(*l)
                     };
-                    if o.word || o.exact {
+                    if o.ere {
+                        // regex spans
+                        let mut rest = hay.clone();
+                        let mut li = 0usize;
+                        while let Some((a, b)) = re_search(pat, &rest) {
+                            self.emit(&l[li + a..li + b]);
+                            if b == a {
+                                li += b + 1;
+                            } else {
+                                li += b;
+                            }
+                            if li >= l.len() {
+                                break;
+                            }
+                            rest = String::from(&hay[li.min(hay.len())..]);
+                        }
+                    } else if o.word || o.exact {
                         self.emit(pat);
                     } else {
                         let pb = pat.as_bytes();
@@ -16379,7 +17913,7 @@ impl Term {
                             w != r
                         }
                     }
-                    "=~" => wild_match(r, w),
+                    "=~" => re_search(r, w).is_some(),
                     "<" => w < r,
                     ">" => w > r,
                     "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
@@ -16596,6 +18130,11 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             .unwrap_or_else(|| String::from("cosmos")),
         noclobber: false,
         noglob: false,
+        shopts: alloc::collections::BTreeSet::new(),
+        disabled: alloc::collections::BTreeSet::new(),
+        cmdhash: alloc::collections::BTreeMap::new(),
+        psub_n: 0,
+        psub_post: Vec::new(),
         nounset: false,
         pipefail: false,
         ro_vars: alloc::collections::BTreeSet::new(),

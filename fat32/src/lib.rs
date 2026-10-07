@@ -507,7 +507,8 @@ impl<D: BlockDevice> Fat32<D> {
             raw[24..26].copy_from_slice(&d.to_le_bytes());
         }
         if let Some(a) = attr {
-            raw[11] = (raw[11] & 0x38) | (a & 0x07);
+            // user-settable: 0x01 ro, 0x02 hidden, 0x04 sys + 0x40 symlink
+            raw[11] = (raw[11] & 0x38) | (a & 0x47);
         }
         self.write_dir_entry(e.slot_cluster, e.slot_offset, &raw)
     }
