@@ -473,6 +473,7 @@ pub fn acquire_desc(f: &task::FileDesc) {
         crate::pipes::open_role(&f.path, writer);
     }
     crate::sockpair::acquire(&f.path);
+    crate::mqueue::acquire(&f.path);
 }
 
 /// Release one desc's hold on its kernel object. Pipe roles and socketpair
@@ -487,6 +488,9 @@ fn release_desc_obj(f: &task::FileDesc, still_open: bool) {
     }
     // sockpair sides are counted — close decrements, drops at zero
     crate::sockpair::close_obj(&f.path);
+    // mqueue fds are refcounted too — a named queue survives until
+    // unlink + last close, so release runs on every desc
+    crate::mqueue::release(&f.path);
     if still_open {
         return;
     }

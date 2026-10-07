@@ -162,7 +162,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
         }
         shared::SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
         shared::SYS_SLEEP_MS => sys_sleep(ctx, a1),
-        shared::SYS_MMAP => sys_mmap(a1),
+        shared::SYS_MMAP => sys_mmap(a1, a2, a3),
         shared::SYS_MMAP_FILE => sys_mmap_file(a1, a2, a3),
         shared::SYS_CLONE => match task::clone_user(a1, a2, a3) {
             Some(pid) => pid as u64,
@@ -305,6 +305,104 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_EXIT_GROUP => task::exit_group(ctx.rdi as i64),
         shared::SYS_GETTID => task::with_current(|t| t.id as u64),
         shared::SYS_TGKILL => task::sys_tgkill(a1 as u32, a2 as u32, a3) as u64,
+        shared::SYS_SETITIMER => {
+            // (which 0..3, init_ms, interval_ms) -> 0 | err
+            if a1 > 2 {
+                ERR
+            } else {
+                task::with_current(|t| {
+                    t.itimers[a1 as usize] =
+                        [a2.div_ceil(10).min(u64::MAX / 2), a3 / 10];
+                });
+                0
+            }
+        }
+        shared::SYS_GETITIMER => {
+            if a1 > 2 {
+                ERR
+            } else {
+                let it = task::with_current(|t| t.itimers[a1 as usize]);
+                ((it[0] * 10) << 32) | (it[1] * 10)
+            }
+        }
+        shared::SYS_MQ_OPEN => {
+            let Some(nb) = copy_in(a1, a2.min(64)) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let name = String::from_utf8_lossy(&nb).into_owned();
+            let Ok(path) = crate::mqueue::open(&name, a3 as usize, a4 as usize) else {
+                ctx.rax = ERR;
+                return;
+            };
+            task::with_current(|t| {
+                let Some(fd) = alloc_slot(t) else { return ERR; };
+                t.fds[fd] = Some(task::FileDesc {
+                    path,
+                    pos: 0,
+                    flags: 0,
+                });
+                fd as u64
+            })
+        }
+        shared::SYS_MQ_SEND => {
+            let path = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) if crate::mqueue::handles(&f.path) => Some(f.path.clone()),
+                _ => None,
+            });
+            let Some(path) = path else {
+                ctx.rax = ERR;
+                return;
+            };
+            let Some(data) = copy_in(a2, a3.min(1 << 16)) else {
+                ctx.rax = ERR;
+                return;
+            };
+            match crate::mqueue::send(&path, &data, a4 as u32) {
+                Ok(_) => 0, // POSIX mq_send returns 0
+                Err(-11) => {
+                    if fd_nonblock(a1 as usize) {
+                        (-11i64) as u64
+                    } else {
+                        block_reenter(ctx, task::ticks() + 2, 0)
+                    }
+                }
+                Err(e) => e as u64,
+            }
+        }
+        shared::SYS_MQ_RECV => {
+            let path = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) if crate::mqueue::handles(&f.path) => Some(f.path.clone()),
+                _ => None,
+            });
+            let Some(path) = path else {
+                ctx.rax = ERR;
+                return;
+            };
+            let mut buf = vec![0u8; a3.min(1 << 16) as usize];
+            match crate::mqueue::recv(&path, &mut buf) {
+                Ok((n, prio)) => match copy_out(a2, &buf[..n]) {
+                    Some(_) => ((prio as u64) << 32) | (n as u64),
+                    None => ERR,
+                },
+                Err(-11) => {
+                    if fd_nonblock(a1 as usize) {
+                        (-11i64) as u64
+                    } else {
+                        block_reenter(ctx, task::ticks() + 2, 0)
+                    }
+                }
+                Err(e) => e as u64,
+            }
+        }
+        shared::SYS_MQ_UNLINK => {
+            let Some(nb) = copy_in(a1, a2.min(64)) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let name = String::from_utf8_lossy(&nb).into_owned();
+            crate::mqueue::unlink(&name) as u64
+        }
         shared::SYS_KILL => sys_kill(a1),
         shared::SYS_NET_PING => {
             let ip = [
@@ -1516,8 +1614,17 @@ fn sys_spawn(pptr: u64, plen: u64, aptr: u64, alen: u64) -> u64 {
     }
 }
 
-fn sys_mmap(size: u64) -> u64 {
+/// SYS_MMAP(size, flags, addr): anonymous demand map. flags bit0 =
+/// MAP_FIXED: place at `addr` (4k-aligned, user range), evicting any
+/// overlapping maps first — POSIX MAP_FIXED replace semantics.
+fn sys_mmap(size: u64, flags: u64, addr: u64) -> u64 {
     if size == 0 || size > 64 << 20 {
+        return 0;
+    }
+    let fixed = flags & 1 != 0;
+    // MAP_FIXED bound: inside the user mmap region — below the stack/argv
+    // zone (USER_STACK region sits at ~0x7e00_0000+)
+    if fixed && (addr & 0xfff != 0 || addr >= 0x7e00_0000 || addr < 0x10_0000) {
         return 0;
     }
     // RLIMIT_AS (res 9): the new range must fit the task's total mapped
@@ -1529,14 +1636,30 @@ fn sys_mmap(size: u64) -> u64 {
     if over {
         return 0;
     }
+    let pages = size.div_ceil(0x1000);
+    if fixed {
+        // POSIX MAP_FIXED: evict overlapping maps first (real munmap —
+        // unmaps frames, releases COW/shm bookkeeping, propagates to
+        // thread peers) before the fresh map lands on the range
+        let end = addr + pages * 0x1000;
+        let overlaps: Vec<(u64, u64)> = task::with_current(|t| {
+            t.maps
+                .iter()
+                .filter(|m| m.start < end && m.end > addr)
+                .map(|m| (m.start, m.end))
+                .collect()
+        });
+        for (s0, e0) in overlaps {
+            sys_munmap(s0, e0 - s0);
+        }
+    }
     // (real anon mmap — see SYS_MUNMAP/SYS_MPROTECT for the full lifecycle)
     task::with_current(|t| {
         let Some(pml4) = t.pml4 else { return 0 };
-        let base = t.mmap_next;
+        let base = if fixed { addr } else { t.mmap_next };
         if base == 0 {
             return 0;
         }
-        let pages = size.div_ceil(0x1000);
         let mut scratch = Vec::new();
         for i in 0..pages {
             if elf::map_user_page(pml4, base + i * 0x1000, &mut scratch).is_none() {
@@ -1550,7 +1673,9 @@ fn sys_mmap(size: u64) -> u64 {
             perm: 1 | 2,
             name: alloc::string::String::from("[anon]"),
         });
-        t.mmap_next += pages * 0x1000 + 0x1000; // guard page
+        if !fixed {
+            t.mmap_next += pages * 0x1000 + 0x1000; // guard page
+        }
         base
     })
 }
@@ -2206,6 +2331,10 @@ pub fn fd_ready(path: &str, ev: u32) -> bool {
     } else if crate::sockfd::handles(path) {
         (ev & 1 != 0 && crate::sockfd::ready(path, true))
             || (ev & 2 != 0 && crate::sockfd::ready(path, false))
+    } else if crate::mqueue::handles(path) {
+        // readable while a message is queued; writable while under maxmsg
+        (ev & 1 != 0 && crate::mqueue::ready(path))
+            || (ev & 2 != 0 && crate::mqueue::exists(path))
     } else {
         true
     }

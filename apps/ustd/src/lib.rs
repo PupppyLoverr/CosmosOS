@@ -397,6 +397,54 @@ pub fn ptrace_siginfo(pid: u32) -> Option<u32> {
     }
 }
 
+/// setitimer(which, init_ms, interval_ms): which 0=REAL(wall),1=VIRTUAL
+/// (cpu),2=PROF — arms a real kernel timer that pends SIGALRM/SIGVTALRM/
+/// SIGPROF. init_ms 0 disarms.
+pub fn setitimer(which: u64, init_ms: u64, interval_ms: u64) -> i64 {
+    sc3(shared::SYS_SETITIMER, which, init_ms, interval_ms) as i64
+}
+
+/// getitimer(which) -> (cur_ms, interval_ms)
+pub fn getitimer(which: u64) -> (u64, u64) {
+    let v = sc1(shared::SYS_GETITIMER, which);
+    (v >> 32, v & 0xffff_ffff)
+}
+
+/// POSIX mq_open: name/caps -> queue fd (use send/recv, not read/write)
+pub fn mq_open(name: &str, maxmsg: u64, msgsize: u64) -> i64 {
+    sc4(shared::SYS_MQ_OPEN, name.as_ptr() as u64, name.len() as u64,
+        maxmsg, msgsize) as i64
+}
+
+/// mq_send(fd, data, prio) -> 0 | err (prio orders delivery, highest first)
+pub fn mq_send(fd: i64, data: &[u8], prio: u32) -> i64 {
+    sc4(shared::SYS_MQ_SEND, fd as u64, data.as_ptr() as u64,
+        data.len() as u64, prio as u64) as i64
+}
+
+/// mq_receive(fd, buf) -> Ok((n, prio)) | err
+pub fn mq_recv(fd: i64, buf: &mut [u8]) -> Result<(usize, u32), i64> {
+    let v = sc3(shared::SYS_MQ_RECV, fd as u64, buf.as_mut_ptr() as u64,
+                buf.len() as u64);
+    if (v as i64) < 0 {
+        Err(v as i64)
+    } else {
+        Ok(((v & 0xffff_ffff) as usize, (v >> 32) as u32))
+    }
+}
+
+/// mq_unlink(name): detach a named queue (POSIX lifetime: dies at last
+/// close once unlinked)
+pub fn mq_unlink(name: &str) -> i64 {
+    sc2(shared::SYS_MQ_UNLINK, name.as_ptr() as u64, name.len() as u64) as i64
+}
+
+/// mmap at a fixed address (MAP_FIXED semantics — evicts overlaps)
+pub fn mmap_fixed(addr: u64, size: u64) -> Option<*mut u8> {
+    let p = sc3(shared::SYS_MMAP, size, 1, addr);
+    if p == 0 || p == ERR { None } else { Some(p as *mut u8) }
+}
+
 /// Register an alternate signal stack (sa_flags=SA_ONSTACK handlers run
 /// on it). Pass SS_DISABLE as flags to unregister.
 pub fn sigaltstack(sp: u64, size: u64) -> i64 {
@@ -810,7 +858,7 @@ pub fn reboot() -> ! {
 // memory
 // ---------------------------------------------------------------------------
 pub fn mmap(size: u64) -> Option<*mut u8> {
-    let p = sc1(shared::SYS_MMAP, size);
+    let p = sc3(shared::SYS_MMAP, size, 0, 0);
     if p == 0 || is_err(p) {
         None
     } else {

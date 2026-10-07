@@ -127,6 +127,7 @@ pub struct Task {
     pub rlim_as: u64,           // RLIMIT_AS: total mapped bytes bound
     pub cur_syscall: u64,       // nr of the syscall this task is inside (MAX = none)
     pub sc_args: [u64; 5],      // its arg registers (for /proc/<pid>/syscall)
+    pub itimers: [[u64; 2]; 3], // setitimer: [REAL, VIRTUAL, PROF] = [cur,int] ticks, cur 0 = disarmed
     pub cont_pending: bool,     // continued (SIGCONT/ptrace) since last wait report
     pub sig: SigState,          // sa_flags, altstack, handler masking, EINTR
 }
@@ -296,6 +297,7 @@ pub fn init() {
         rlim_as: u64::MAX,
         cur_syscall: u64::MAX,
         sc_args: [0; 5],
+        itimers: [[0; 2]; 3],
         cont_pending: false,
         sig: SigState::new(),
     };
@@ -328,8 +330,8 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
         let t = &mut s.tasks[s.cur];
         t.vrun += 4000 / (40 - t.nice as i64) as u64;
     }
-    // wake sleepers (sleep + timed waits)
-    for t in s.tasks.iter_mut() {
+    // wake sleepers (sleep + timed waits) and decay itimers
+    for (i, t) in s.tasks.iter_mut().enumerate() {
         if t.state == State::Blocked && t.wake_at <= ticks() {
             t.state = State::Running;
         }
@@ -337,6 +339,24 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
             t.alarm_at = 0;
             t.sigpending |= 1 << 14; // SIGALRM
             wake_for_signal(t, 14);
+        }
+        // setitimer decay: REAL runs on wall ticks; VIRTUAL/PROF charge
+        // only the task that held the cpu this tick (i == s.cur)
+        let ran = i == s.cur;
+        for k in 0..3 {
+            if t.itimers[k][0] == 0 {
+                continue;
+            }
+            if k != 0 && !ran {
+                continue;
+            }
+            t.itimers[k][0] -= 1;
+            if t.itimers[k][0] == 0 {
+                t.itimers[k][0] = t.itimers[k][1]; // 0 = one-shot
+                let sig = [14usize, 26, 27][k]; // ALRM/VTALRM/PROF
+                t.sigpending |= 1 << sig;
+                wake_for_signal(t, sig);
+            }
         }
         // RLIMIT_CPU: exceeded cpu_ticks quota pends a real SIGXCPU —
         // default disposition kills the task when it next resumes
@@ -740,6 +760,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         rlim_as: u64::MAX,
         cur_syscall: u64::MAX,
         sc_args: [0; 5],
+        itimers: [[0; 2]; 3],
         cont_pending: false,
         sig: SigState::new(),
     };
@@ -833,6 +854,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         rlim_as: u64::MAX,
         cur_syscall: u64::MAX,
         sc_args: [0; 5],
+        itimers: [[0; 2]; 3],
         cont_pending: false,
         sig: SigState::new(),
     }));
@@ -1002,6 +1024,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64) -> Option<u32> {
         rlim_as: ras,
         cur_syscall: u64::MAX,
         sc_args: [0; 5],
+        itimers: [[0; 2]; 3],
         cont_pending: false,
         sig: s.tasks[s.cur].sig.for_thread(),
     };
@@ -1563,6 +1586,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         rlim_as: s.tasks[s.cur].rlim_as,
         cur_syscall: u64::MAX,
         sc_args: [0; 5],
+        itimers: [[0; 2]; 3],
         cont_pending: false,
         sig: s.tasks[s.cur].sig.for_fork(),
     };

@@ -29,6 +29,15 @@ fn metric(name: &str, v: u64) {
     println!("METRIC {}={}", name, v);
 }
 
+extern "C" fn vt_hit(_: u64) {
+    unsafe { VT_HIT = 1 };
+}
+extern "C" fn al_hit(_: u64) {
+    unsafe { AL_HIT += 1 };
+}
+static mut VT_HIT: u32 = 0;
+static mut AL_HIT: u32 = 0;
+
 #[unsafe(no_mangle)]
 extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
     println!("[selftest] starting");
@@ -1317,6 +1326,78 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 nr > 0
             }
             _ => false,
+        }
+    });
+    check("itimer-virtual", {
+        // ITIMER_VIRTUAL: charges cpu ticks of THIS task only — a busy
+        // loop runs it down and SIGVTALRM(26) delivers for real
+        unsafe {
+            VT_HIT = 0;
+            ustd::sigaction(26, vt_hit as usize as u64);
+            if ustd::setitimer(1, 30, 0) != 0 {
+                false
+            } else {
+                let mut x = 0u64;
+                let t0 = ustd::uptime_ms();
+                while VT_HIT == 0 && ustd::uptime_ms() - t0 <= 5000 {
+                    x = core::hint::black_box(x.wrapping_add(1));
+                }
+                let _ = x;
+                ustd::sigaction(26, 0);
+                VT_HIT == 1
+            }
+        }
+    });
+    check("itimer-real-periodic", {
+        // ITIMER_REAL wall-time periodic: two expiries arrive while the
+        // task sleeps (interval re-arms itself)
+        unsafe {
+            AL_HIT = 0;
+            ustd::sigaction(14, al_hit as usize as u64);
+            ustd::setitimer(0, 20, 20);
+            // count hits over time — the first SIGALRM EINTRs any sleep
+            let t0 = ustd::uptime_ms();
+            while AL_HIT < 2 && ustd::uptime_ms() - t0 < 3000 {
+                ustd::yield_now();
+            }
+            ustd::setitimer(0, 0, 0);
+            ustd::sigaction(14, 0);
+            AL_HIT >= 2
+        }
+    });
+    check("mqueue-prio", {
+        // POSIX mq: named queue, whole messages, highest-prio-first
+        let fd = ustd::mq_open("/selftest-mq", 4, 64);
+        if fd < 0 {
+            false
+        } else {
+        let a = ustd::mq_send(fd, b"low", 1) == 0;
+        let b = ustd::mq_send(fd, b"hi!", 9) == 0;
+        let mut buf = [0u8; 64];
+        let r1 = ustd::mq_recv(fd, &mut buf);
+        let first = r1.map(|(n, p)| (buf[..n].to_vec(), p)).unwrap_or_default();
+        let r2 = ustd::mq_recv(fd, &mut buf);
+        let second = r2.map(|(n, p)| (buf[..n].to_vec(), p)).unwrap_or_default();
+        ustd::close(fd);
+        ustd::mq_unlink("/selftest-mq");
+        a && b && first.0 == b"hi!" && first.1 == 9
+            && second.0 == b"low" && second.1 == 1
+        }
+    });
+    check("mmap-fixed", {
+        // MAP_FIXED: the map lands exactly at addr and replaces an
+        // overlapping map's contents
+        let addr = 0x3000_0000u64;
+        let p1 = ustd::mmap_fixed(addr, 0x2000);
+        match p1 {
+            None => false,
+            Some(p) => {
+                unsafe { *p = 0xAA };
+                let p2 = ustd::mmap_fixed(addr, 0x1000);
+                let ok = p2 == p1 && unsafe { *p == 0 };
+                let _ = ustd::munmap(p, 0x2000);
+                ok
+            }
         }
     });
     check("tls-fsbase", {

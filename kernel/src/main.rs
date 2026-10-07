@@ -34,6 +34,7 @@ mod syscall;
 mod task;
 mod timer;
 mod timerfd;
+mod mqueue;
 mod signalfd;
 mod vfs;
 mod virtio;
