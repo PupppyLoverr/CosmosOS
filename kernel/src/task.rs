@@ -65,6 +65,7 @@ pub struct Task {
     pub vrun: u64,           // virtual runtime (scaled by nice) for fair scheduling
     pub trace: bool,         // syscall tracing on (strace -p)
     pub trbuf: Vec<u64>,     // packed trace records, 7 u64s each: nr,a1..a5,ret
+    pub umask: u32,          // file-creation mask (POSIX); inherited across spawn
 }
 
 pub struct Sched {
@@ -110,6 +111,7 @@ pub fn init() {
         vrun: 0,
         trace: false,
         trbuf: Vec::new(),
+        umask: 0o022,
     };
     *SCHED.lock() = Some(Sched { tasks: vec![Box::new(boot)], cur: 0, next_pid: 1 });
 }
@@ -361,6 +363,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         vrun: s.tasks[s.cur].vrun,
         trace: false,
         trbuf: Vec::new(),
+        umask: s.tasks.iter().find(|t| t.id == parent).map(|t| t.umask).unwrap_or(0o022),
     };
     s.tasks.push(Box::new(t));
     sprintln!("[task] spawned pid={} '{}' entry={:#x}", pid, name, entry);
@@ -418,6 +421,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         vrun: s.tasks[s.cur].vrun,
         trace: false,
         trbuf: Vec::new(),
+        umask: 0o022,
     }));
     pid
 }
