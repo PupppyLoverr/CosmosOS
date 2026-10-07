@@ -665,6 +665,98 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         ustd::sigprocmask(ustd::SIG_SETMASK, 0);
         ok
     });
+    check("pgrp-kill", {
+        // kill(-pgid): one call terminates the whole process group
+        match ustd::fork() {
+            0 => {
+                ustd::sleep_ms(4000);
+                ustd::exit(0);
+            }
+            c1 if c1 > 0 => match ustd::fork() {
+                0 => {
+                    ustd::sleep_ms(4000);
+                    ustd::exit(0);
+                }
+                c2 if c2 > 0 => {
+                    ustd::setpgid(c1 as u32, c1 as u32);
+                    ustd::setpgid(c2 as u32, c1 as u32);
+                    let same = ustd::getpgid(c2 as u32) == c1;
+                    let _ = ustd::killpg(c1 as u32, 15);
+                    let e1 = ustd::waitpid(c1 as u32, 4000).unwrap_or(-1);
+                    let e2 = ustd::waitpid(c2 as u32, 4000).unwrap_or(-1);
+                    same && e1 == 143 && e2 == 143
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    });
+    check("setsid-self", {
+        match ustd::fork() {
+            0 => {
+                let ok = ustd::setsid() == 0 && ustd::getsid(0) == ustd::getpid() as i64;
+                ustd::exit(if ok { 0 } else { 1 });
+            }
+            p if p > 0 => ustd::waitpid(p as u32, 4000).unwrap_or(-1) == 0,
+            _ => false,
+        }
+    });
+    check("pdeathsig", {
+        // B is a grandchild: parent A dies mid-flight -> B's handler fires
+        use core::sync::atomic::Ordering;
+        static PD: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn pd(s: u64) {
+            PD.store(s, Ordering::SeqCst);
+        }
+        let (pr, pw) = ustd::pipe().unwrap_or((-1, -1));
+        let ok = if pr < 0 {
+            false
+        } else {
+            match ustd::fork() {
+                0 => {
+                    match ustd::fork() {
+                        0 => {
+                            // grandchild B
+                            ustd::sigaction(10, pd as usize as u64);
+                            ustd::set_pdeathsig(10);
+                            for _ in 0..40 {
+                                if PD.load(Ordering::SeqCst) == 10 {
+                                    let _ = ustd::write(pw, b"D");
+                                    ustd::exit(0);
+                                }
+                                ustd::sleep_ms(100);
+                            }
+                            ustd::exit(1);
+                        }
+                        _a if _a > 0 => {
+                            // A: brief life then dies — orphans B
+                            ustd::sleep_ms(150);
+                            ustd::exit(0);
+                        }
+                        _ => ustd::exit(1),
+                    }
+                }
+                a if a > 0 => {
+                    let _ = ustd::waitpid(a as u32, 4000);
+                    let mut got = false;
+                    for _ in 0..40 {
+                        let n = ustd::poll(&[pr as u32], &[1], 100);
+                        if n > 0 {
+                            let mut b = [0u8; 4];
+                            let _ = ustd::read(pr, &mut b);
+                            got = b[0] == b'D';
+                            break;
+                        }
+                    }
+                    got
+                }
+                _ => false,
+            }
+        };
+        let _ = ustd::close(pr);
+        let _ = ustd::close(pw);
+        ok
+    });
     check("kern-ptr-rejected", {
         // syscall boundary must reject a kernel VA (phys-map region)
         ustd::sc1(shared::SYS_MEMINFO, 0xFFFF_8000_0000_0000) == u64::MAX

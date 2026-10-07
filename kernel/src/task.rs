@@ -111,6 +111,9 @@ pub struct Task {
     pub sigrest_mapped: bool,   // sigreturn trampoline page installed
     pub sigmask: u64,           // blocked-signal bitmask (sigprocmask)
     pub alarm_at: u64,          // SIGALRM deadline (ms ticks; 0 = disarmed)
+    pub pgid: u32,              // process-group id (kill(-pgid) targets it)
+    pub sid: u32,               // session id (setsid detaches)
+    pub pdeathsig: u8,          // PR_SET_PDEATHSIG: signal on parent's death
 }
 
 pub struct Sched {
@@ -199,6 +202,9 @@ pub fn init() {
         sigrest_mapped: false,
         sigmask: 0,
         alarm_at: 0,
+        pgid: 0,
+        sid: 0,
+        pdeathsig: 0,
     };
     *SCHED.lock() = Some(Sched { tasks: vec![Box::new(boot)], cur: 0, next_pid: 1 });
 }
@@ -569,6 +575,10 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         sigrest_mapped: false,
         sigmask: 0,
         alarm_at: 0,
+        // POSIX: the child lands in the parent's process group + session
+        pgid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.pgid).unwrap_or(0),
+        sid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.sid).unwrap_or(0),
+        pdeathsig: 0,
     };
     mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -644,6 +654,9 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         sigrest_mapped: false,
         sigmask: 0,
         alarm_at: 0,
+        pgid: 0,
+        sid: 0,
+        pdeathsig: 0,
     }));
     pid
 }
@@ -768,6 +781,9 @@ pub fn clone_user(entry: u64, arg: u64) -> Option<u32> {
         sigrest_mapped: s.tasks[s.cur].sigrest_mapped,
         sigmask: s.tasks[s.cur].sigmask,
         alarm_at: 0,
+        pgid: s.tasks[s.cur].pgid,
+        sid: s.tasks[s.cur].sid,
+        pdeathsig: 0,
     };
     mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -1189,6 +1205,9 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         sigrest_mapped: cur.sigrest_mapped,
         sigmask: cur.sigmask,
         alarm_at: 0,
+        pgid: cur.pgid,
+        sid: cur.sid,
+        pdeathsig: 0,
     };
     mm_inc(cpml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -1542,6 +1561,22 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
             }
         }
     }
+    // orphaned children reparent to init and get their requested
+    // parent-death signal
+    for c in s.tasks.iter_mut() {
+        if c.parent == id && c.state != State::Dead {
+            c.parent = 1;
+            if c.pdeathsig != 0 {
+                c.sigpending |= 1 << (c.pdeathsig as u64);
+                if c.state == State::Blocked {
+                    c.state = State::Running;
+                    c.waiting_on = 0;
+                    c.wait_port = 0;
+                    c.wait_futex = 0;
+                }
+            }
+        }
+    }
     // s.cur bookkeeping after the remove: if the CURRENT task died, point
     // s.cur at its tombstone so the next sched_tick records the int-32
     // context on the dead entry instead of clobbering a live task's
@@ -1873,6 +1908,61 @@ pub fn trace_rec(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, ret: u64)
     });
 }
 
+/// setsid: caller leaves its session/group and starts a new one.
+/// Fails (like POSIX) when the caller is already a group leader.
+pub fn sys_setsid() -> i64 {
+    with_current(|t| {
+        if t.pgid == t.id {
+            return -1; // EPERM: already a leader
+        }
+        t.sid = t.id;
+        t.pgid = t.id;
+        0
+    })
+}
+
+/// setpgid(pid, pgid): 0s mean "self"/"same as pid". Target must be a
+/// live userspace task.
+pub fn sys_setpgid(pid: u32, pgid: u32) -> i64 {
+    let target = if pid == 0 { with_current(|t| t.id) } else { pid };
+    with_pid_mut(target, |t| {
+        if !t.is_user {
+            return -3;
+        }
+        t.pgid = if pgid == 0 { target } else { pgid };
+        0
+    })
+}
+
+/// getpgid(pid): 0 = self.
+pub fn sys_getpgid(pid: u32) -> i64 {
+    let target = if pid == 0 { with_current(|t| t.id) } else { pid };
+    with_pid_mut(target, |t| t.pgid as i64)
+}
+
+/// getsid(pid): 0 = self.
+pub fn sys_getsid(pid: u32) -> i64 {
+    let target = if pid == 0 { with_current(|t| t.id) } else { pid };
+    with_pid_mut(target, |t| t.sid as i64)
+}
+
+/// prctl(op, arg): only PR_SET_PDEATHSIG(1) — the signal delivered to
+/// this task when its parent dies.
+pub fn sys_prctl(op: u64, arg: u64) -> i64 {
+    match op {
+        1 => {
+            if arg >= 32 {
+                return -22;
+            }
+            with_current(|t| {
+                t.pdeathsig = arg as u8;
+                0
+            })
+        }
+        _ => -22,
+    }
+}
+
 /// Consume the lowest pending signal of `pid` that `mask` allows — used
 /// by signalfd reads. None = nothing deliverable (or no such task).
 pub fn take_pending_sig(pid: u32, mask: u64) -> Option<u32> {
@@ -1903,6 +1993,35 @@ pub fn has_pending_sig(pid: u32, mask: u64) -> bool {
 /// 0 probes, 19 STOP, 18 CONT. Vital tasks (init, winserver, kernel
 /// threads) refuse all signals.
 pub fn signal(pid: u32, sig: u64) -> i64 {
+    // POSIX kill(-pgid): a negative pid signals every member of the group
+    if (pid as i32) < 0 {
+        let pgid = (-(pid as i32)) as u32;
+        let pids: Vec<u32> = {
+            let g = SCHED.lock();
+            let s = g.as_ref().unwrap();
+            s.tasks
+                .iter()
+                .filter(|t| {
+                    t.pgid == pgid
+                        && t.is_user
+                        && t.state != State::Dead
+                        && t.id != 1
+                        && t.name != "cosmos-winserver"
+                })
+                .map(|t| t.id)
+                .collect()
+        };
+        if pids.is_empty() {
+            return -3; // ESRCH: no such group
+        }
+        let mut any = false;
+        for p in pids {
+            if signal(p, sig) == 0 {
+                any = true;
+            }
+        }
+        return if any { 0 } else { -3 };
+    }
     match sig {
         0 => {
             // probe: exists, live, killable
