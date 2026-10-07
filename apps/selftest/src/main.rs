@@ -1782,6 +1782,41 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    // ---- batch 41: traceroute + setsockopt/broadcast ----
+    check("traceroute", {
+        // loopback tracer: our own stack answers the unbound probe port
+        // with a real ICMP 3/3 — deterministic, no wire needed.
+        let hops = ustd::net_trace(0x7F00_0001, 4); // 127.0.0.1
+        hops.len() == 1
+            && matches!(hops[0], (1, Some(([127, 0, 0, 1], _)), true))
+    });
+    check("setsockopt", {
+        // SO_REUSEADDR: two UDP sockets may share a port only when both
+        // opted in. SO_BROADCAST gates 255.255.255.255 sends.
+        let a = ustd::socketx(ustd::SOCK_DGRAM, shared::AF_INET);
+        let b = ustd::socketx(ustd::SOCK_DGRAM, shared::AF_INET);
+        let mut ok = a >= 0 && b >= 0;
+        if ok {
+            ok = ustd::bind(a, 19790) == 0
+                && ustd::bind(b, 19790) == -98 // EADDRINUSE without reuse
+                && ustd::setsockopt(b, shared::SOL_SOCKET, shared::SO_REUSEADDR, 1) == 0
+                && ustd::bind(b, 19790) == -98 // a hasn't opted in
+                && ustd::setsockopt(a, shared::SOL_SOCKET, shared::SO_REUSEADDR, 1) == 0
+                && ustd::bind(b, 19790) == 0;  // both reuse: allowed
+            ok = ok
+                && ustd::getsockopt(a, shared::SOL_SOCKET, shared::SO_REUSEADDR) == Ok(1)
+                && ustd::getsockopt(b, shared::SOL_SOCKET, shared::SO_BROADCAST) == Ok(0)
+                // broadcast send refused until SO_BROADCAST is set
+                && ustd::sendto(b, b"b", [255, 255, 255, 255], 19790) == -13
+                && ustd::setsockopt(b, shared::SOL_SOCKET, shared::SO_BROADCAST, 1) == 0
+                && ustd::sendto(b, b"b", [255, 255, 255, 255], 19790) == 1
+                && ustd::getsockopt(b, shared::SOL_SOCKET, shared::SO_BROADCAST) == Ok(1)
+                && ustd::setsockopt(b, shared::SOL_SOCKET, 999, 1) == -92; // ENOPROTOOPT
+            ustd::close(a);
+            ustd::close(b);
+        }
+        ok
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64
