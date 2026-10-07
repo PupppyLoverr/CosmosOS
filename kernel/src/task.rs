@@ -504,9 +504,11 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
         }
     }
     t.waiting_on = 0;
-    // release ports, shm objects (frees their frames when refcount hits 0)
+    // release ports, shm objects (frees their frames when refcount hits 0),
+    // and any flock-style file locks this task held
     ipc::close_task_ports(&mut t);
     shm::drop_task_shm(&mut t);
+    crate::locks::release_pid(t.id);
     if let Some(pml4) = t.pml4 {
         // walk the user tree; free every leaf+PT frame except shm-borrowed ones
         let borrowed = core::mem::take(&mut t.borrowed);
@@ -602,6 +604,12 @@ pub fn exists(pid: u32) -> bool {
 
 /// Kill task `pid` (userspace only). Returns false if absent/kernel.
 pub fn kill_pid(pid: u32) -> bool {
+    kill_pid_code(pid, -9)
+}
+
+/// Kill task `pid` recording `code` as its exit status (used by signal()
+/// to report the POSIX 128+sig wait-status for signal termination).
+fn kill_pid_code(pid: u32, code: i64) -> bool {
     let mut g = SCHED.lock();
     let s = g.as_mut().unwrap();
     let Some(idx) = s.tasks.iter().position(|t| t.id == pid && t.state != State::Dead) else {
@@ -612,7 +620,7 @@ pub fn kill_pid(pid: u32) -> bool {
         return false;
     }
     let was_cur = idx == s.cur;
-    kill_at(s, idx, -9);
+    kill_at(s, idx, code);
     drop(g);
     if was_cur {
         park_dead_task();
@@ -798,12 +806,30 @@ pub fn trace_rec(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, ret: u64)
     });
 }
 
-/// POSIX-lite signals: 9/15 kill, 19 STOP, 18 CONT.
-/// Vital tasks (init, winserver, kernel threads) refuse all signals.
+/// POSIX-lite signals: 1/2/3/6/9/15 terminate (wait-status 128+sig),
+/// 0 probes, 19 STOP, 18 CONT. Vital tasks (init, winserver, kernel
+/// threads) refuse all signals.
 pub fn signal(pid: u32, sig: u64) -> i64 {
     match sig {
-        9 | 15 => {
-            if kill_pid(pid) {
+        0 => {
+            // probe: exists, live, killable
+            let g = SCHED.lock();
+            match g.as_ref() {
+                Some(s) => match s.tasks.iter().find(|t| t.id == pid) {
+                    Some(t)
+                        if t.is_user && t.state != State::Dead && t.id != 1
+                            && t.name != "cosmos-winserver" =>
+                    {
+                        0
+                    }
+                    _ => -1,
+                },
+                None => -1,
+            }
+        }
+        // terminating signals: exit status = 128+sig like POSIX wait-status
+        1 | 2 | 3 | 6 | 9 | 15 => {
+            if kill_pid_code(pid, 128 + sig as i64) {
                 0
             } else {
                 -1

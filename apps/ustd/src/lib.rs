@@ -590,6 +590,22 @@ pub fn readlink(path: &str) -> Option<String> {
 pub fn mkfifo(path: &str) -> i64 {
     sc2(shared::SYS_MKFIFO, path.as_ptr() as u64, path.len() as u64) as i64
 }
+
+pub const LOCK_SH: u64 = shared::LOCK_SH;
+pub const LOCK_EX: u64 = shared::LOCK_EX;
+pub const LOCK_NB: u64 = shared::LOCK_NB;
+pub const LOCK_UN: u64 = shared::LOCK_UN;
+
+/// Advisory file lock: LOCK_SH|LOCK_EX (+LOCK_NB) acquires, LOCK_UN releases.
+/// 0 | -35 EWOULDBLOCK | <0. Held locks drop when this task exits.
+pub fn flock(path: &str, op: u64) -> i64 {
+    sc3(
+        shared::SYS_FLOCK,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        op,
+    ) as i64
+}
 pub fn mkdir(path: &str) -> Result<(), i64> {
     let r = sc2(shared::SYS_MKDIR, path.as_ptr() as u64, path.len() as u64);
     if is_err(r) {
