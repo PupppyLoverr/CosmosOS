@@ -1940,6 +1940,44 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    check("tcpnb", {
+        // O_NONBLOCK write takes the nowait+retransmit-queue path over lo
+        let l = ustd::socket(ustd::SOCK_STREAM);
+        let c = ustd::socket(ustd::SOCK_STREAM);
+        let mut ok = l >= 0 && c >= 0;
+        if ok {
+            ok = ustd::bind(l, 19830) == 0 && ustd::listen(l, 4) == 0
+                && ustd::connect(c, [127, 0, 0, 1], 19830) == 0;
+            let acc = ustd::accept(l);
+            ok = ok && acc.is_ok();
+            if let Ok((a, _, _)) = acc {
+                ok = ok && ustd::fcntl(c, ustd::F_SETFL, ustd::O_NONBLOCK) == 0;
+                let payload = [b'x'; 6000];
+                let (mut sent, mut tries) = (0usize, 0u32);
+                while sent < payload.len() && tries < 400 {
+                    tries += 1;
+                    match ustd::write(c, &payload[sent..]) {
+                        Ok(n) => sent += n,
+                        Err(_) => ustd::sleep_ms(20),
+                    }
+                }
+                let mut got = 0usize;
+                let mut b = [0u8; 7000];
+                let t0 = ustd::uptime_ms();
+                while got < 6000 && ustd::uptime_ms() - t0 < 5000 {
+                    match ustd::read(a, &mut b[got..]) {
+                        Ok(n) if n > 0 => got += n,
+                        _ => ustd::sleep_ms(20),
+                    }
+                }
+                ok = ok && sent == 6000 && got == 6000;
+                ustd::close(a);
+            }
+            ustd::close(c);
+            ustd::close(l);
+        }
+        ok
+    });
     check("tcprefused", {
         // SYN to an unclaimed port -> real RST back -> -111 ECONNREFUSED
         let c = ustd::socket(ustd::SOCK_STREAM);

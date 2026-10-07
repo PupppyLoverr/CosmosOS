@@ -642,7 +642,11 @@ fn try_read_once(path: &str, buf: &mut [u8], peek: bool) -> Result<usize, i64> {
             }
         }
         Kind::Tcp => match crate::net::tcp_read_ready(s.cid) {
-            None => Ok(0), // peer finished and queue drained: EOF
+            // peer finished and queue drained: EOF on FIN, ECONNRESET on RST
+            None => match crate::net::tcp_was_rst(s.cid) {
+                Some(true) => Err(-104),
+                _ => Ok(0),
+            },
             Some(false) => Err(-11),
             Some(true) => {
                 let d = if peek {
