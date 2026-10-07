@@ -41,7 +41,13 @@ fn copy_in(ptr: u64, len: u64) -> Option<Vec<u8>> {
     let mut off = 0u64;
     while off < len {
         let va = ptr + off;
-        let phys = elf::translate(pml4, va)?;
+        // demand-page file-backed/bss pages on first touch — a syscall
+        // can legitimately hit a not-yet-faulted user page
+        let phys = match elf::translate(pml4, va) {
+            Some(p) => p,
+            None if task::demand_page(va) => elf::translate(pml4, va)?,
+            None => return None,
+        };
         let chunk = (0x1000 - (va & 0xFFF)).min(len - off);
         unsafe {
             let src = (mem::phys_to_virt(phys)) as *const u8;
@@ -58,7 +64,11 @@ fn copy_out(ptr: u64, data: &[u8]) -> Option<()> {
     let mut off = 0u64;
     while off < data.len() as u64 {
         let va = ptr + off;
-        let phys = elf::translate(pml4, va)?;
+        let phys = match elf::translate(pml4, va) {
+            Some(p) => p,
+            None if task::demand_page(va) => elf::translate(pml4, va)?,
+            None => return None,
+        };
         let chunk = ((0x1000 - (va & 0xFFF)) as usize).min(data.len() - off as usize);
         unsafe {
             let dst = (mem::phys_to_virt(phys)) as *mut u8;
@@ -1423,6 +1433,7 @@ fn sys_mmap_file(fd: u64, size: u64, offset: u64) -> u64 {
             end: base + pages * 0x1000,
             path,
             off: offset,
+            perm: 1 | 2,
         });
         t.mmap_next += pages * 0x1000 + 0x1000; // guard page
         base
@@ -1503,6 +1514,7 @@ fn sys_munmap(addr: u64, len: u64) -> u64 {
                     end: addr,
                     path: f.path.clone(),
                     off: f.off,
+                    perm: f.perm,
                 });
             }
             if f.end > end {
@@ -1511,6 +1523,7 @@ fn sys_munmap(addr: u64, len: u64) -> u64 {
                     end: f.end,
                     path: f.path,
                     off: f.off + (end - f.start),
+                    perm: f.perm,
                 });
             }
         }

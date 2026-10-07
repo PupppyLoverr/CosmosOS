@@ -49,8 +49,9 @@ pub struct MapEnt {
 pub struct FileMap {
     pub start: u64,
     pub end: u64,
-    pub path: String,
+    pub path: String, // "" = demand-zero (bss sentinel)
     pub off: u64,
+    pub perm: u8, // R1W2X4 — the demand pager maps with these flags
 }
 
 pub struct Task {
@@ -294,11 +295,27 @@ fn alloc_kstack(frames_out: &mut Vec<u64>) -> (u64, u64) {
 
 /// Spawn a userspace process from an ELF executable path.
 pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
+    // demand-loading reads only the header window up front — PT_LOAD
+    // contents page in lazily from the image file on first touch
+    let mut hdr = vec![0u8; 96 * 1024];
+    let (file_size, hdrn) = match vfs::stat_path(path) {
+        Ok(st) => {
+            let want = (st.size as usize).min(hdr.len());
+            match vfs::read_range(path, 0, &mut hdr[..want]) {
+                Ok(n) => (st.size as u64, n),
+                Err(_) => (0, 0),
+            }
+        }
+        Err(_) => (0, 0),
+    };
     let data = match vfs::read_all(path) {
-        Ok(d) => d,
+        Ok(d) => Some(d),
         Err(e) => {
             crate::sprintln!("[spawn] read_all {} failed: {}", path, e);
-            return Err(!0u64);
+            if file_size == 0 {
+                return Err(!0u64);
+            }
+            None
         }
     };
 
@@ -322,13 +339,54 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
     frames.push(pml4.start_address().as_u64());
 
     let mut umaps: Vec<MapEnt> = Vec::new();
-    let entry = match crate::elf::load_into(pml4, &data, &mut frames, &mut umaps) {
-        Ok(e) => e,
-        Err(_) => {
-            crate::sprintln!("[spawn] elf load {} failed", path);
-            free_frames(&frames);
-            free_frames(&kframes);
-            return Err(!0u64);
+    let mut filemaps: Vec<FileMap> = Vec::new();
+    // try the demand-paged load first; on any fallback condition read the
+    // whole image and map it eagerly (headers beyond the window, weird
+    // alignment, pseudo-fs path)
+    let lazy_ok = data.is_none() || hdr.len() > 0;
+    let entry = if lazy_ok {
+        match crate::elf::load_into_lazy(
+            pml4,
+            path,
+            &hdr[..hdrn],
+            file_size,
+            &mut frames,
+            &mut umaps,
+            &mut filemaps,
+        ) {
+            Ok(e) => Some(e),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let entry = match entry {
+        Some(e) => e,
+        None => {
+            let data = match data {
+                Some(d) => d,
+                None => match vfs::read_all(path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        crate::sprintln!("[spawn] read_all {} failed: {}", path, e);
+                        free_frames(&frames);
+                        free_frames(&kframes);
+                        return Err(!0u64);
+                    }
+                },
+            };
+            umaps.clear();
+            filemaps.clear();
+            // an eager reload re-maps the same VAs — demand state is fresh
+            match crate::elf::load_into(pml4, &data, &mut frames, &mut umaps) {
+                Ok(e) => e,
+                Err(_) => {
+                    crate::sprintln!("[spawn] elf load {} failed", path);
+                    free_frames(&frames);
+                    free_frames(&kframes);
+                    return Err(!0u64);
+                }
+            }
         }
     };
     for m in umaps.iter_mut() {
@@ -420,7 +478,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         umask: s.tasks.iter().find(|t| t.id == parent).map(|t| t.umask).unwrap_or(0o022),
         exe: String::from(path),
         maps: umaps,
-        filemaps: Vec::new(),
+        filemaps,
         rbytes: 0,
         wbytes: 0,
     };
@@ -1172,26 +1230,41 @@ pub fn demand_page(va: u64) -> bool {
             t.filemaps
                 .iter()
                 .find(|f| page >= f.start && page < f.end)
-                .map(|f| (f.path.clone(), f.off + (page - f.start))),
+                .map(|f| (f.path.clone(), f.off + (page - f.start), f.perm)),
         )
     });
-    let (Some(pml4), Some((path, file_off))) = (pml4, hit) else {
-        sprintln!("[demand] miss va={:#x}", va);
+    let (Some(pml4), Some((path, file_off, perm))) = (pml4, hit) else {
         return false;
     };
     let mut scratch = Vec::new();
-    let Some(phys) = crate::elf::map_user_page(pml4, va & !0xFFF, &mut scratch) else {
+    let phys = crate::elf::map_user_page_flags(
+        pml4,
+        va & !0xFFF,
+        perm & 2 != 0,
+        perm & 4 != 0,
+        &mut scratch,
+    );
+    let Some(phys) = phys else {
         sprintln!("[demand] map fail va={:#x}", va);
         return false;
     };
     if scratch.is_empty() {
         return false; // already mapped — this was a real fault
     }
+    // the demand-alloc'd frame belongs to the task (freed at exit)
+    with_current(|t| t.frames.push(phys));
     let mut buf = [0u8; 4096];
-    match crate::vfs::read_range_pf(&path, file_off, &mut buf) {
-        Ok(n) => {
+    let fill = if path.is_empty() {
+        Ok(0) // bss sentinel: pure zero page
+    } else {
+        crate::vfs::read_range_pf(&path, file_off, &mut buf)
+    };
+    match fill {
+        Ok(_) => {
             let dst = crate::mem::phys_to_virt(phys) as *mut u8;
-            unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, n) };
+            // buf is zero-initialized — a full-page copy also zeroes the
+            // tail past EOF (no stale frame bytes reach userspace)
+            unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, 0x1000) };
             true
         }
         Err(e) => {
