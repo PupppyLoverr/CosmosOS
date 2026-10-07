@@ -1817,6 +1817,56 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    check("udpeek", {
+        // MSG_PEEK: front datagram readable twice, then consumed for real
+        let a = ustd::socket(ustd::SOCK_DGRAM);
+        let b = ustd::socket(ustd::SOCK_DGRAM);
+        let mut ok = a >= 0 && b >= 0;
+        if ok {
+            ok = ustd::bind(b, 19805) == 0
+                && ustd::sendto(a, b"peekme", [127, 0, 0, 1], 19805) == 6;
+            if ok {
+                let mut buf = [0u8; 16];
+                let p = ustd::recvfrom_flags(b, &mut buf, ustd::MSG_PEEK);
+                ok = matches!(p, Ok((6, _, _))) && &buf[..6] == b"peekme";
+                // still there: the same datagram, again
+                let mut buf2 = [0u8; 16];
+                let r = ustd::recvfrom(b, &mut buf2);
+                ok = ok && matches!(r, Ok((6, _, _))) && &buf2[..6] == b"peekme";
+            }
+            ustd::close(a);
+            ustd::close(b);
+        }
+        ok
+    });
+    check("rcvtimeo", {
+        // SO_RCVTIMEO: a blocked recv surfaces EAGAIN after the deadline
+        let b = ustd::socket(ustd::SOCK_DGRAM);
+        let mut ok = b >= 0 && ustd::bind(b, 19806) == 0;
+        if ok {
+            ok = ustd::setsockopt(b, shared::SOL_SOCKET, shared::SO_RCVTIMEO, 250) == 0
+                && ustd::getsockopt(b, shared::SOL_SOCKET, shared::SO_RCVTIMEO) == Ok(250);
+            let t0 = ustd::uptime_ms();
+            let mut buf = [0u8; 8];
+            let r = ustd::recvfrom(b, &mut buf);
+            let dt = ustd::uptime_ms() - t0;
+            ok = ok && r == Err(-11) && dt >= 200 && dt < 3000;
+            // data still delivered normally after a timeout
+            if ok {
+                let a = ustd::socket(ustd::SOCK_DGRAM);
+                ok = a >= 0 && ustd::sendto(a, b"zz", [127, 0, 0, 1], 19806) == 2;
+                if ok {
+                    let r2 = ustd::recvfrom(b, &mut buf);
+                    ok = matches!(r2, Ok((2, _, _))) && &buf[..2] == b"zz";
+                }
+                if a >= 0 {
+                    ustd::close(a);
+                }
+            }
+            ustd::close(b);
+        }
+        ok
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

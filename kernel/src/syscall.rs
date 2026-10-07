@@ -861,9 +861,9 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 Some(Some(f)) => f.path.clone(),
                 _ => String::new(),
             });
-            match crate::sockfd::recvfrom(&path, &mut tmp) {
+            match crate::sockfd::recvfrom(&path, &mut tmp, a5 & 1 != 0) {
                 Err(-11) => {
-                    if fd_nonblock(a1 as usize) {
+                    if crate::sockfd::wait_expired(&path) || fd_nonblock(a1 as usize) {
                         ctx.rax = (-11i64) as u64;
                     } else {
                         block_reenter(ctx, task::ticks() + 2, 0);
@@ -1571,7 +1571,13 @@ fn sys_read(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
     let mut tmp = vec![0u8; len as usize];
     match fd_read_once(fd as usize, &mut tmp) {
         Err(-11) => {
-            if fd_nonblock(fd as usize) {
+            let path = task::with_current(|t| match t.fds.get(fd as usize) {
+                Some(Some(f)) => f.path.clone(),
+                _ => String::new(),
+            });
+            // SO_RCVTIMEO expiry: the socket already waited its budget —
+            // the -11 is a real EAGAIN for userspace, not "retry"
+            if crate::sockfd::wait_expired(&path) || fd_nonblock(fd as usize) {
                 (-11i64) as u64 // EAGAIN instead of blocking
             } else {
                 block_reenter(ctx, task::ticks() + 2, 0) // poll every ~20ms

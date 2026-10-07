@@ -1379,13 +1379,23 @@ pub fn sendto(fd: i64, data: &[u8], ip: [u8; 4], port: u16) -> i64 {
 }
 /// recvfrom: read + the sender's (ip,port) for datagram sockets.
 pub fn recvfrom(fd: i64, buf: &mut [u8]) -> Result<(usize, [u8; 4], u16), i64> {
+    recvfrom_flags(fd, buf, 0)
+}
+/// recvfrom with flags — flag bit0 = MSG_PEEK: the front datagram/stream
+/// bytes are copied but NOT consumed (the next read gets them again).
+pub fn recvfrom_flags(
+    fd: i64,
+    buf: &mut [u8],
+    flags: u64,
+) -> Result<(usize, [u8; 4], u16), i64> {
     let mut src = [0u8; 8];
-    let r = sc4(
+    let r = sc5(
         shared::SYS_RECVFROM,
         fd as u64,
         buf.as_mut_ptr() as u64,
         buf.len() as u64,
         src.as_mut_ptr() as u64,
+        flags,
     ) as i64;
     if r < 0 {
         return Err(r);
@@ -1396,6 +1406,7 @@ pub fn recvfrom(fd: i64, buf: &mut [u8]) -> Result<(usize, [u8; 4], u16), i64> {
         u16::from_be_bytes([src[4], src[5]]),
     ))
 }
+pub const MSG_PEEK: u64 = 1;
 /// sendmsg: stream write that can carry one fd to the peer (SCM_RIGHTS,
 /// AF_UNIX only). Pass -1 as `pass` for no ancillary data.
 pub fn sendmsg(fd: i64, data: &[u8], pass: i64) -> i64 {
