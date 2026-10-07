@@ -114,6 +114,8 @@ pub struct Task {
     pub pgid: u32,              // process-group id (kill(-pgid) targets it)
     pub sid: u32,               // session id (setsid detaches)
     pub pdeathsig: u8,          // PR_SET_PDEATHSIG: signal on parent's death
+    pub stop_notified: bool,    // this stop already reported to waitpid
+    pub stop_sig: u8,           // signal that stopped it (for WUNTRACED)
 }
 
 pub struct Sched {
@@ -205,6 +207,8 @@ pub fn init() {
         pgid: 0,
         sid: 0,
         pdeathsig: 0,
+        stop_notified: false,
+        stop_sig: 0,
     };
     *SCHED.lock() = Some(Sched { tasks: vec![Box::new(boot)], cur: 0, next_pid: 1 });
 }
@@ -227,6 +231,7 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
         None => return saved, // scheduler busy in a syscall — defer
     };
     let s = g.as_mut().unwrap();
+    let out_idx = s.cur;
     s.tasks[s.cur].saved_rsp = saved;
     s.tasks[s.cur].cpu_ticks += 1; // the outgoing task owned this interval
     // charge virtual runtime: weight = 40 - nice (-20..=19 -> 60..=21)
@@ -274,17 +279,31 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
             Some((_, i)) => i,
             None => {
                 IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
-                return saved; // stay on current (idle) context
+                if s.tasks[out_idx].state == State::Running {
+                    return saved; // stay on current (idle) context
+                }
+                // the interrupted task was stopped/killed by delivery —
+                // park on whatever is still runnable instead
+                if let Some(i) =
+                    s.tasks.iter().position(|t| t.state == State::Running)
+                {
+                    s.cur = i;
+                    activate(&s.tasks[i]);
+                    return s.tasks[i].saved_rsp;
+                }
+                return saved;
             }
         };
         s.cur = next;
         activate(&s.tasks[next]);
         let rsp = s.tasks[next].saved_rsp;
         maybe_deliver(s, next, rsp as *mut CpuContext);
-        if s.tasks[s.cur].state != State::Dead {
+        if s.tasks[s.cur].state != State::Dead
+            && s.tasks[s.cur].state != State::Stopped
+        {
             return rsp;
         }
-        // delivery killed it — tombstone is at s.cur now; scan again
+        // delivery killed or stopped it — scan again
     }
 }
 
@@ -331,7 +350,9 @@ pub fn yield_ctx(ctx: *mut CpuContext) -> ! {
                     maybe_deliver(s, s.cur, rsp as *mut CpuContext);
                     // a fatal signal killed the pick during delivery —
                     // never resume a corpse: scan again
-                    if s.tasks[s.cur].state == State::Dead {
+                    if s.tasks[s.cur].state == State::Dead
+                        || s.tasks[s.cur].state == State::Stopped
+                    {
                         continue 'outer;
                     }
                     drop(g);
@@ -339,7 +360,20 @@ pub fn yield_ctx(ctx: *mut CpuContext) -> ! {
                 }
             }
         }
-        // nothing else to run — stay
+        // nothing else to run — stay, unless the yielding task itself
+        // was stopped/killed by its own signal delivery: then park on
+        // any runnable task (a stopped ctx may not resume)
+        if s.tasks[s.cur].state != State::Running {
+            if let Some(i) =
+                s.tasks.iter().position(|t| t.state == State::Running)
+            {
+                s.cur = i;
+                activate(&s.tasks[i]);
+                let rsp = s.tasks[i].saved_rsp;
+                drop(g);
+                unsafe { switch_tail(rsp) }
+            }
+        }
         drop(g);
         unsafe { switch_tail(ctx as u64) }
     }
@@ -579,6 +613,8 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         pgid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.pgid).unwrap_or(0),
         sid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.sid).unwrap_or(0),
         pdeathsig: 0,
+        stop_notified: false,
+        stop_sig: 0,
     };
     mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -657,6 +693,8 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         pgid: 0,
         sid: 0,
         pdeathsig: 0,
+        stop_notified: false,
+        stop_sig: 0,
     }));
     pid
 }
@@ -784,6 +822,8 @@ pub fn clone_user(entry: u64, arg: u64) -> Option<u32> {
         pgid: s.tasks[s.cur].pgid,
         sid: s.tasks[s.cur].sid,
         pdeathsig: 0,
+        stop_notified: false,
+        stop_sig: 0,
     };
     mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -846,6 +886,18 @@ pub fn maybe_deliver(s: &mut Sched, idx: usize, ctx: *mut CpuContext) {
     if handler == 0 && (sig == 18 || sig == 17) {
         t.sigpending &= !(1 << sig);
         return; // SIGCONT resumes / SIGCHLD default-ignores: no frame
+    }
+    if handler == 0 && (19..=22).contains(&sig) {
+        // default disposition of job-control signals: stop the task
+        t.sigpending &= !(1 << sig);
+        if t.state != State::Dead {
+            t.state = State::Stopped;
+            t.stop_sig = sig as u8;
+            t.waiting_on = 0;
+            t.wait_port = 0;
+            t.wait_futex = 0;
+        }
+        return;
     }
     if handler == 0 {
         t.sigpending &= !(1 << sig);
@@ -1208,6 +1260,8 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         pgid: cur.pgid,
         sid: cur.sid,
         pdeathsig: 0,
+        stop_notified: false,
+        stop_sig: 0,
     };
     mm_inc(cpml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -1644,6 +1698,29 @@ pub fn child_exit(pid: u32) -> Option<i64> {
         .and_then(|t| if t.state == State::Dead { Some(t.exit_code) } else { None })
 }
 
+/// WUNTRACED: a stopped-and-not-yet-reported child of `pid`.
+/// Returns (cpid, status) with the POSIX encoding 0x7f | (sig << 8).
+pub fn child_stopped_any(pid: u32) -> Option<(u32, i64)> {
+    let mut g = SCHED.lock();
+    let s = g.as_mut().unwrap();
+    let t = s.tasks.iter_mut().find(|t| {
+        t.parent == pid && t.state == State::Stopped && !t.stop_notified
+    })?;
+    t.stop_notified = true;
+    Some((t.id, 0x7f | ((t.stop_sig.max(19) as i64) << 8)))
+}
+
+/// Same for a specific child pid.
+pub fn child_stopped_one(pid: u32, cpid: u32) -> Option<(u32, i64)> {
+    let mut g = SCHED.lock();
+    let s = g.as_mut().unwrap();
+    let t = s.tasks.iter_mut().find(|t| {
+        t.id == cpid && t.parent == pid && t.state == State::Stopped && !t.stop_notified
+    })?;
+    t.stop_notified = true;
+    Some((t.id, 0x7f | ((t.stop_sig.max(19) as i64) << 8)))
+}
+
 /// POSIX wait(-1): first dead child of `pid`, reaped (removed) on return.
 pub fn child_exit_any(pid: u32) -> Option<(u32, i64)> {
     let mut g = SCHED.lock();
@@ -2055,6 +2132,7 @@ pub fn signal(pid: u32, sig: u64) -> i64 {
                 19 => {
                     if t.state != State::Dead {
                         t.state = State::Stopped;
+                        t.stop_sig = 19;
                         // a stopped waiter must not wake on its old condition
                         t.waiting_on = 0;
                         t.wait_port = 0;
@@ -2063,7 +2141,10 @@ pub fn signal(pid: u32, sig: u64) -> i64 {
                     0
                 }
                 18 => {
-                    t.sigpending &= !(1 << 19);
+                    // POSIX: SIGCONT discards pending stop signals and
+                    // lets waitpid report the next stop transition
+                    t.sigpending &= !(0b1111 << 19);
+                    t.stop_notified = false;
                     if t.state == State::Stopped {
                         t.state = State::Running;
                     }

@@ -108,6 +108,29 @@ pub fn waitpid(pid: u32, timeout_ms: u64) -> Result<i64, ()> {
     }
 }
 
+pub const WUNTRACED: u64 = 1;
+
+/// waitpid with POSIX option flags (WUNTRACED reports stopped children,
+/// returned status is 0x7f | (sig << 8)).
+pub fn waitpid_opt(pid: u32, flags: u64, timeout_ms: u64) -> Result<i64, ()> {
+    let r = sc3(shared::SYS_WAITPID, pid as u64, timeout_ms, flags);
+    if is_err(r) {
+        Err(())
+    } else {
+        Ok(r as i64)
+    }
+}
+
+/// Parent pid of the calling process.
+pub fn getppid() -> i64 {
+    sc1(shared::SYS_GETPPID, 0) as i64
+}
+
+/// PR_SET_NAME: rename this task (visible in /proc and ps).
+pub fn set_name(name: &str) -> i64 {
+    sc2(shared::SYS_PRCTL, 15, name.as_ptr() as u64) as i64
+}
+
 /// pthread-style thread: `f(arg)` runs in the caller's address space on a
 /// private 256KiB stack; the thread exits with `f`'s return code (reap
 /// with `waitpid`, same as a process). Err = no stack slot / bad entry.
