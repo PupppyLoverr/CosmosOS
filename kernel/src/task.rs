@@ -106,6 +106,9 @@ pub struct Task {
     pub stack_max: u64,
     pub rbytes: u64,         // bytes read via vfs (/proc/<pid>/io)
     pub wbytes: u64,         // bytes written via vfs
+    pub sigpending: u64,        // pending userspace-signal bitmask
+    pub sighandlers: [u64; 32], // 0=SIG_DFL 1=SIG_IGN else handler VA
+    pub sigrest_mapped: bool,   // sigreturn trampoline page installed
 }
 
 pub struct Sched {
@@ -189,6 +192,9 @@ pub fn init() {
         stack_max: 0,
         rbytes: 0,
         wbytes: 0,
+        sigpending: 0,
+        sighandlers: [0; 32],
+        sigrest_mapped: false,
     };
     *SCHED.lock() = Some(Sched { tasks: vec![Box::new(boot)], cur: 0, next_pid: 1 });
 }
@@ -226,32 +232,40 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
     }
     // wake port receivers whose queues filled
     crate::ipc::wake_receivers(s);
-    let n = s.tasks.len();
     // CFS-lite: run the runnable task with the smallest virtual runtime;
     // runnable SCHED_RT tasks preempt every non-rt task first.
     // Scan starts just past `cur` so equal keys still round-robin.
-    let mut best: Option<((u8, u64), usize)> = None;
-    for off in 1..=n {
-        let i = (s.cur + off) % n;
-        let t = &s.tasks[i];
-        if t.state == State::Running {
-            let key = (if t.rt { 0u8 } else { 1u8 }, t.vrun);
-            match best {
-                Some((k, _)) if key >= k => {}
-                _ => best = Some((key, i)),
+    // Re-picks when signal delivery killed the chosen task.
+    loop {
+        let n = s.tasks.len();
+        let mut best: Option<((u8, u64), usize)> = None;
+        for off in 1..=n {
+            let i = (s.cur + off) % n;
+            let t = &s.tasks[i];
+            if t.state == State::Running {
+                let key = (if t.rt { 0u8 } else { 1u8 }, t.vrun);
+                match best {
+                    Some((k, _)) if key >= k => {}
+                    _ => best = Some((key, i)),
+                }
             }
         }
-    }
-    let next = match best {
-        Some((_, i)) => i,
-        None => {
-            IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
-            return saved; // stay on current (idle) context
+        let next = match best {
+            Some((_, i)) => i,
+            None => {
+                IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
+                return saved; // stay on current (idle) context
+            }
+        };
+        s.cur = next;
+        activate(&s.tasks[next]);
+        let rsp = s.tasks[next].saved_rsp;
+        maybe_deliver(s, next, rsp as *mut CpuContext);
+        if s.tasks[s.cur].state != State::Dead {
+            return rsp;
         }
-    };
-    s.cur = next;
-    activate(&s.tasks[next]);
-    s.tasks[next].saved_rsp
+        // delivery killed it — tombstone is at s.cur now; scan again
+    }
 }
 
 fn activate(t: &Task) {
@@ -284,23 +298,31 @@ pub fn yield_ctx(ctx: *mut CpuContext) -> ! {
     let mut g = SCHED.lock();
     let s = g.as_mut().unwrap();
     s.tasks[s.cur].saved_rsp = ctx as u64;
-    let n = s.tasks.len();
-    // runnable rt tasks first, then anyone runnable
-    for want_rt in [true, false] {
-        for i in 1..=n {
-            let t = &s.tasks[(s.cur + i) % n];
-            if t.state == State::Running && t.rt == want_rt {
-                s.cur = (s.cur + i) % n;
-                activate(&s.tasks[s.cur]);
-                let rsp = s.tasks[s.cur].saved_rsp;
-                drop(g);
-                unsafe { switch_tail(rsp) }
+    'outer: loop {
+        let n = s.tasks.len();
+        // runnable rt tasks first, then anyone runnable
+        for want_rt in [true, false] {
+            for i in 1..=n {
+                let t = &s.tasks[(s.cur + i) % n];
+                if t.state == State::Running && t.rt == want_rt {
+                    s.cur = (s.cur + i) % n;
+                    activate(&s.tasks[s.cur]);
+                    let rsp = s.tasks[s.cur].saved_rsp;
+                    maybe_deliver(s, s.cur, rsp as *mut CpuContext);
+                    // a fatal signal killed the pick during delivery —
+                    // never resume a corpse: scan again
+                    if s.tasks[s.cur].state == State::Dead {
+                        continue 'outer;
+                    }
+                    drop(g);
+                    unsafe { switch_tail(rsp) }
+                }
             }
         }
+        // nothing else to run — stay
+        drop(g);
+        unsafe { switch_tail(ctx as u64) }
     }
-    // nothing else to run — stay
-    drop(g);
-    unsafe { switch_tail(ctx as u64) }
 }
 
 /// Jump to a suspended task's saved context and resume it.
@@ -528,6 +550,9 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         stack_max: USER_STACK_TOP,
         rbytes: 0,
         wbytes: 0,
+        sigpending: 0,
+        sighandlers: [0; 32],
+        sigrest_mapped: false,
     };
     mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -598,6 +623,9 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         stack_max: 0,
         rbytes: 0,
         wbytes: 0,
+        sigpending: 0,
+        sighandlers: [0; 32],
+        sigrest_mapped: false,
     }));
     pid
 }
@@ -717,11 +745,145 @@ pub fn clone_user(entry: u64, arg: u64) -> Option<u32> {
         stack_max: stack_top,
         rbytes: 0,
         wbytes: 0,
+        sigpending: 0,
+        sighandlers: s.tasks[s.cur].sighandlers,
+        sigrest_mapped: s.tasks[s.cur].sigrest_mapped,
     };
     mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
     sprintln!("[task] cloned pid={} entry={:#x} stk={:#x}", pid, entry, stack_top);
     Some(pid)
+}
+
+/// Sigreturn trampoline page — sits just under the thread-stack arena,
+/// clear of every other VA region. Contents: `mov rax, SYS_SIGRETURN;
+/// int 0x80` — a handler's return address points here.
+pub const SIGREST_VA: u64 = 0x7BFF_F000;
+
+/// Grow task `t`'s demand-paged stack by one page. Returns true only when
+/// a fresh page was actually mapped — an already-present page means this
+/// was a real protection fault, not growth.
+fn stack_grow(t: &mut Task, page: u64) -> bool {
+    let Some(pml4) = t.pml4 else { return false };
+    if crate::elf::translate_user(pml4, page).is_some() {
+        return false;
+    }
+    let mut scratch = Vec::new();
+    let Some(phys) = crate::elf::map_user_page_flags(pml4, page, true, false, &mut scratch)
+    else {
+        return false;
+    };
+    t.frames.push(phys);
+    t.min_flt += 1;
+    if let Some(m) = t.maps.iter_mut().find(|m| m.name == "[stack]") {
+        m.start = m.start.min(page);
+    }
+    true
+}
+
+/// Deliver one pending signal to task `idx` by rewriting the user-mode
+/// ctx it is about to resume on: the interrupted CpuContext is pushed
+/// onto the user stack and rip diverts to the registered handler, whose
+/// return address is the sigreturn trampoline (sigreturn restores the
+/// frame). Default dispositions act here too — SIG_IGN drops, SIGCONT
+/// resumes silently, anything else uncaught terminates with 128+sig.
+/// Called with SCHED held, just before a ring-3 ctx resumes.
+pub fn maybe_deliver(s: &mut Sched, idx: usize, ctx: *mut CpuContext) {
+    let t = &mut s.tasks[idx];
+    if !t.is_user || t.sigpending == 0 {
+        return;
+    }
+    let c = unsafe { &mut *ctx };
+    if c.cs & 3 != 3 {
+        return; // suspended inside the kernel — deliver on a later resume
+    }
+    let sig = t.sigpending.trailing_zeros() as usize;
+    let handler = t.sighandlers[sig];
+    if handler == 1 {
+        t.sigpending &= !(1 << sig);
+        return; // SIG_IGN
+    }
+    if handler == 0 && sig == 18 {
+        t.sigpending &= !(1 << sig);
+        return; // SIGCONT default: resume, no frame
+    }
+    if handler == 0 {
+        t.sigpending &= !(1 << sig);
+        // uncaught terminating signal — POSIX wait status 128+sig
+        kill_at(s, idx, 128 + sig as i64);
+        return;
+    }
+    let Some(pml4) = t.pml4 else { return };
+    if !t.sigrest_mapped {
+        // lazily install the sigreturn trampoline page for this mm
+        let mut sc = Vec::new();
+        if crate::elf::map_user_page_flags(pml4, SIGREST_VA, false, true, &mut sc).is_none() {
+            return;
+        }
+        let Some(pp) = crate::elf::translate_user(pml4, SIGREST_VA) else {
+            return;
+        };
+        let tramp: [u8; 9] = [
+            0x48, 0xC7, 0xC0, shared::SYS_SIGRETURN as u8, 0, 0, 0, 0xCD, 0x80,
+        ];
+        unsafe {
+            core::ptr::copy_nonoverlapping(tramp.as_ptr(), mem::phys_to_virt(pp) as *mut u8, 9);
+        }
+        t.sigrest_mapped = true;
+    }
+    // frame: 160B saved CpuContext then the 8B trampoline return address;
+    // handler entry rsp = base+160 (≡ 8 mod 16 like a real call site)
+    let base = ((c.rsp.wrapping_sub(168)) & !0xF) + 8;
+    let mut segv = false;
+    for page in [base & !0xFFF, (base + 167) & !0xFFF] {
+        match crate::elf::translate_user(pml4, page) {
+            None => {
+                if !(page >= t.stack_min && page < t.stack_max && stack_grow(t, page)) {
+                    segv = true;
+                    break;
+                }
+            }
+            Some(p) => {
+                cow_split(pml4, page, p & !0xFFF); // split shared stack pages
+            }
+        }
+    }
+    if segv {
+        kill_at(s, idx, 128 + 11); // undeliverable = SIGSEGV
+        return;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(ctx as *const u8, 160) };
+    let mut ok = true;
+    for (i, w) in bytes.chunks_exact(8).enumerate() {
+        let va = base + (i * 8) as u64;
+        match crate::elf::translate_user(pml4, va) {
+            Some(p) => unsafe {
+                *(mem::phys_to_virt(p) as *mut u64) =
+                    u64::from_le_bytes(w.try_into().unwrap());
+            },
+            None => {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if ok {
+        match crate::elf::translate_user(pml4, base + 160) {
+            Some(p) => unsafe {
+                *(mem::phys_to_virt(p) as *mut u64) = SIGREST_VA;
+            },
+            None => ok = false,
+        }
+    }
+    if !ok {
+        kill_at(s, idx, 128 + 11);
+        return;
+    }
+    c.rdi = sig as u64; // handler arg
+    c.rsi = 0;
+    c.rip = handler;
+    c.rsp = base + 160;
+    t.sigpending &= !(1 << sig);
 }
 
 /// Copy-on-write bookkeeping: (owner pml4 phys, va page) -> shared phys
@@ -844,7 +1006,6 @@ pub fn cow_split(pml4: PhysFrame, page: u64, phys: u64) -> bool {
             &mut Vec::new(),
         );
         mem::free_frame(phys);
-        with_current(|t| t.frames.push(nf.start_address().as_u64()));
     }
     cow_unmap(pp, page);
     true
@@ -995,6 +1156,9 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         stack_max: smax,
         rbytes: 0,
         wbytes: 0,
+        sigpending: 0,
+        sighandlers: cur.sighandlers,
+        sigrest_mapped: cur.sigrest_mapped,
     };
     mm_inc(cpml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -1126,6 +1290,10 @@ pub fn exec_current(ctx: &mut CpuContext, path: &str, args: &str) -> bool {
     t.min_flt = 0;
     t.maj_flt = 0;
     t.mem_bytes = 0;
+    t.sigpending = 0;
+    // POSIX: caught handlers revert to SIG_DFL across exec; IGN stays
+    t.sighandlers = t.sighandlers.map(|h| if h == 1 { 1 } else { 0 });
+    t.sigrest_mapped = false;
     t.exe = String::from(path);
     t.argv = String::from(args);
     t.name = String::from(path.rsplit('/').next().unwrap_or(path));
@@ -1677,15 +1845,15 @@ pub fn signal(pid: u32, sig: u64) -> i64 {
                 None => -1,
             }
         }
-        // terminating signals: exit status = 128+sig like POSIX wait-status
-        1 | 2 | 3 | 6 | 9 | 15 => {
-            if kill_pid_code(pid, 128 + sig as i64) {
+        // SIGKILL stays unconditional — it can never be caught/deferred
+        9 => {
+            if kill_pid_code(pid, 128 + 9) {
                 0
             } else {
                 -1
             }
         }
-        _ => with_pid_mut(pid, |t| {
+        18 | 19 => with_pid_mut(pid, |t| {
             if !t.is_user {
                 return -1;
             }
@@ -1701,14 +1869,35 @@ pub fn signal(pid: u32, sig: u64) -> i64 {
                     0
                 }
                 18 => {
+                    t.sigpending &= !(1 << 19);
                     if t.state == State::Stopped {
                         t.state = State::Running;
                     }
                     0
                 }
-                _ => -22, // EINVAL
+                _ => -22,
             }
         }),
+        // every other signal is deliverable: mark it pending and wake
+        // the task if it's sleeping — the disposition (handler vs
+        // default-kill) is decided when it next resumes in maybe_deliver
+        1..=31 => with_pid_mut(pid, |t| {
+            if !t.is_user || t.state == State::Dead {
+                return -1;
+            }
+            if t.id == 1 || t.name == "cosmos-winserver" {
+                return -1;
+            }
+            t.sigpending |= 1 << sig;
+            if t.state == State::Blocked {
+                t.state = State::Running;
+                t.waiting_on = 0;
+                t.wait_port = 0;
+                t.wait_futex = 0;
+            }
+            0
+        }),
+        _ => -22,
     }
 }
 
@@ -1950,25 +2139,7 @@ pub fn demand_page(va: u64) -> bool {
     // slot). The region bound is the guard — a fault outside is a real
     // overflow and falls through to kill the task.
     if with_current(|t| page >= t.stack_min && page < t.stack_max) {
-        let Some(pml4) = with_current(|t| t.pml4) else {
-            return false;
-        };
-        let mut scratch = Vec::new();
-        let Some(phys) = crate::elf::map_user_page_flags(pml4, page, true, false, &mut scratch)
-        else {
-            return false;
-        };
-        if scratch.is_empty() {
-            return false; // already mapped — real protection fault
-        }
-        with_current(|t| {
-            t.frames.push(phys);
-            t.min_flt += 1;
-            if let Some(m) = t.maps.iter_mut().find(|m| m.name == "[stack]") {
-                m.start = m.start.min(page);
-            }
-        });
-        return true;
+        return with_current(|t| stack_grow(t, page));
     }
     let (pml4, hit) = with_current(|t| {
         (
