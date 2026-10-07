@@ -12322,11 +12322,20 @@ impl Term {
                 }
                 match (size, file) {
                     (Some(n), Some(p)) => {
-                        let mut d = ustd::read_all(p).unwrap_or_default();
-                        d.resize(n, 0);
-                        match ustd::write_all(p, &d) {
-                            Ok(()) => {}
-                            Err(e) => self.fail(&alloc::format!("truncate: err {}", e)),
+                        // real ftruncate: resize through an open descriptor
+                        match ustd::open(p, ustd::O_WRONLY | ustd::O_CREATE) {
+                            Ok(fd) => {
+                                let e = ustd::ftruncate(fd, n as u64);
+                                ustd::close(fd);
+                                if e != 0 {
+                                    self.fail(&alloc::format!(
+                                        "truncate: err {}",
+                                        e
+                                    ));
+                                }
+                            }
+                            Err(e) => self
+                                .fail(&alloc::format!("truncate: {}: err {}", p, e)),
                         }
                     }
                     _ => self.fail("usage: truncate -s N <file>"),
@@ -21146,13 +21155,26 @@ impl Term {
                     }
                     _ => String::from(to),
                 };
-                match ustd::read_all(from) {
-                    Ok(d) => {
-                        if let Err(e) = ustd::write_all(&dst, &d) {
-                            self.fail(&alloc::format!("cp: {}: err {}", dst, e));
+                // kernel-side copy via sendfile: data streams through the
+                // kernel between the two fds — no userspace bounce
+                match (ustd::open(from, ustd::O_RDONLY), ustd::open(
+                    &dst,
+                    ustd::O_WRONLY | ustd::O_CREATE | ustd::O_TRUNC,
+                )) {
+                    (Ok(inf), Ok(outf)) => {
+                        let n = ustd::sendfile_all(outf, inf, u64::MAX);
+                        ustd::close(inf);
+                        ustd::close(outf);
+                        if n < 0 {
+                            self.fail(&alloc::format!("cp: {}: err {}", dst, n));
                         }
                     }
-                    Err(e) => self.fail(&alloc::format!("cp: {}: err {}", from, e)),
+                    (Err(e), _) => {
+                        self.fail(&alloc::format!("cp: {}: err {}", from, e))
+                    }
+                    (_, Err(e)) => {
+                        self.fail(&alloc::format!("cp: {}: err {}", dst, e))
+                    }
                 }
             }
             Err(e) => self.fail(&alloc::format!("cp: {}: err {}", from, e)),
