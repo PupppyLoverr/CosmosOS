@@ -144,6 +144,9 @@ extern "x86-interrupt" fn gp_exc(frame: InterruptStackFrame, ec: u64) {
 
 extern "x86-interrupt" fn pf_exc(frame: InterruptStackFrame, ec: PageFaultErrorCode) {
     let cr2 = x86_64::registers::control::Cr2::read_raw();
+    if task::demand_page(cr2) {
+        return; // demand-paged mmap page filled — retry the instruction
+    }
     sprintln!(
         "\n[exc] PAGE FAULT addr={:#x} ec={:?} rip={:#x} cs={:#x} rsp={:#x} ss={:#x}",
         cr2,
