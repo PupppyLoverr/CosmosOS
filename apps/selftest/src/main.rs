@@ -12,7 +12,7 @@ use ustd::*;
 
 static mut PASS: u32 = 0;
 static mut FAIL: u32 = 0;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicI64, AtomicU64};
 static THREAD_HIT: AtomicU64 = AtomicU64::new(0);
 
 fn check(name: &str, ok: bool) {
@@ -797,6 +797,114 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             .unwrap_or_default();
         ustd::set_name("cosmos-selftest");
         n.contains("st-renamed")
+    });
+    check("sigpending", {
+        // blocked signal shows in sigpending until unmasked
+        ustd::sigaction(13, ustd::SIG_IGN); // don't die on delivery
+        ustd::sigprocmask(ustd::SIG_BLOCK, 1 << 13);
+        let _ = ustd::kill2(ustd::getpid() as u32, 13);
+        let seen = ustd::sigpending() & (1 << 13) != 0;
+        ustd::sigprocmask(ustd::SIG_SETMASK, 0);
+        seen
+    });
+    check("sigsuspend", {
+        // child raises sig10 -> parent's handler runs -> suspend returns
+        match ustd::fork() {
+            0 => {
+                ustd::sleep_ms(150);
+                let _ = ustd::kill2(ustd::getppid() as u32, 10);
+                ustd::exit(0);
+            }
+            p if p > 0 => {
+                extern "C" fn hs(_sig: u64) {}
+                ustd::sigaction(10, hs as usize as u64);
+                let r = ustd::sigsuspend(0); // unmask all: 10 deliverable
+                let code = ustd::waitpid(p as u32, 4000).unwrap_or(-1);
+                r == -4 && code == 0
+            }
+            _ => false,
+        }
+    });
+    check("sighup-session", {
+        // session leader dies -> surviving member gets SIGHUP (handler
+        // proves it by writing 'H' to the pipe the parent reads)
+        match ustd::pipe() {
+            Some((pr, pw)) => {
+                match ustd::fork() {
+                    0 => {
+                        let _ = ustd::close(pr);
+                        let _ = ustd::setsid();
+                        match ustd::fork() {
+                            0 => {
+                                // member: report pid, catch SIGHUP — the
+                                // handler writes 'H' through the pipe
+                                use core::sync::atomic::Ordering;
+                                static HPW: AtomicI64 =
+                                    AtomicI64::new(-1);
+                                extern "C" fn hh(_sig: u64) {
+                                    let fd = HPW.load(Ordering::SeqCst);
+                                    if fd >= 0 {
+                                        let _ = ustd::write(fd, b"H");
+                                    }
+                                }
+                                HPW.store(pw, Ordering::SeqCst);
+                                ustd::sigaction(1, hh as usize as u64);
+                                let mut b = [0u8; 4];
+                                b.copy_from_slice(
+                                    &(ustd::getpid() as u32).to_le_bytes(),
+                                );
+                                let _ = ustd::write(pw, &b);
+                                let mut i = 0i64;
+                                while i < 600 {
+                                    ustd::sleep_ms(50);
+                                    i += 1;
+                                }
+                                ustd::exit(0);
+                            }
+                            bp if bp > 0 => {
+                                // leader dies — after the member had time
+                                // to install its SIGHUP handler
+                                ustd::sleep_ms(400);
+                                ustd::exit(0)
+                            }
+                            _ => ustd::exit(1),
+                        }
+                    }
+                    ap if ap > 0 => {
+                        let _ = ustd::close(pw);
+                        let _ = ustd::waitpid(ap as u32, 4000);
+                        // read member pid (4B) then 'H' — member writes its
+                        // pid first so the leader's death races are ordered
+                        let mut hdr = [0u8; 4];
+                        let mut got = 0usize;
+                        while got < 4 {
+                            match ustd::read(pr, &mut hdr[got..]) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => got += n,
+                            }
+                        }
+                        let member = u32::from_le_bytes(hdr);
+                        let mut byte = [0u8; 1];
+                        let mut got_h = false;
+                        let mut i = 0;
+                        while i < 120 && !got_h {
+                            match ustd::read(pr, &mut byte) {
+                                Ok(1) if byte[0] == b'H' => got_h = true,
+                                Ok(_) => {}
+                                Err(_) => break,
+                            }
+                            i += 1;
+                            ustd::sleep_ms(50);
+                        }
+                        let _ = ustd::kill2(member, 9);
+                        let _ = ustd::close(pr);
+                        got_h
+                    }
+                    _ => false,
+                }
+            }
+            None => false,
+        }
     });
     check("kern-ptr-rejected", {
         // syscall boundary must reject a kernel VA (phys-map region)

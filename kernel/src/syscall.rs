@@ -169,6 +169,8 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
         }
         shared::SYS_GETPPID => task::with_current(|t| t.parent as u64),
+        shared::SYS_SIGPENDING => task::with_current(|t| t.sigpending),
+        shared::SYS_SIGSUSPEND => sys_sigsuspend(ctx, a1),
         shared::SYS_ALARM => task::with_current(|t| {
             let left = if t.alarm_at == 0 {
                 0
@@ -2509,6 +2511,35 @@ fn sys_sleep(ctx: &mut CpuContext, ms: u64) -> u64 {
     }
     task::with_current(|t| t.sleep_deadline = 0);
     0
+}
+
+/// SYS_SIGSUSPEND(mask): atomically swap the blocked mask and sleep until
+/// a signal is deliverable, then restore the old mask and return EINTR.
+/// Re-entrant through block_reenter: the pre-suspend mask lives in the
+/// task (`sigsuspend_saved`), so every re-entry after a spurious or
+/// masked-signal wake re-checks deliverability and re-blocks.
+fn sys_sigsuspend(ctx: &mut CpuContext, mask: u64) -> u64 {
+    let done = task::with_current(|t| {
+        if t.sigsuspend_saved == u64::MAX {
+            t.sigsuspend_saved = t.sigmask;
+            t.sigsuspend_seq = t.sig_seq;
+            t.sigmask = mask & !(1 << 9 | 1 << 19);
+        }
+        // suspended until a signal is DELIVERED — the handler runs at
+        // pick time and consumes the pending bit (bumping sig_seq), so
+        // the re-executed int80 lands here after sigreturn and sees the
+        // bump; a pending-but-deliverable bit also ends it directly
+        (t.sigpending & !t.sigmask != 0) || (t.sig_seq != t.sigsuspend_seq)
+    });
+    if done {
+        task::with_current(|t| {
+            t.sigmask = t.sigsuspend_saved;
+            t.sigsuspend_saved = u64::MAX;
+            0u64
+        });
+        return (-4i64) as u64; // EINTR
+    }
+    block_reenter(ctx, task::ticks() + 86_400_000, 0);
 }
 
 fn sys_waitpid(ctx: &mut CpuContext, pid: u64, timeout_ms: u64, opts: u64) -> u64 {
