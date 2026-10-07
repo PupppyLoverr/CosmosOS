@@ -465,6 +465,42 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         static W2: AtomicU64 = AtomicU64::new(3);
         ustd::futex(&W2, ustd::FUTEX_WAIT, 99, 1000) == -11
     });
+    check("fork-exit-code", {
+        // real fork: child resumes at this same instruction with 0
+        match ustd::fork() {
+            0 => ustd::exit(33),
+            p if p > 0 => ustd::waitpid(p as u32, 5000).unwrap_or(-1) == 33,
+            _ => false,
+        }
+    });
+    check("fork-private-mm", {
+        // the child's writes land in its private copy — parent's word
+        // must be untouched (proves copy, not share)
+        use core::sync::atomic::Ordering;
+        static V: AtomicU64 = AtomicU64::new(1);
+        match ustd::fork() {
+            0 => {
+                V.store(9, Ordering::SeqCst);
+                ustd::exit(0);
+            }
+            p if p > 0 => {
+                let _ = ustd::waitpid(p as u32, 5000);
+                V.load(Ordering::SeqCst) == 1
+            }
+            _ => false,
+        }
+    });
+    check("fork-exec", {
+        // fork + execve: child swaps images into selftest-child (exit 7)
+        match ustd::fork() {
+            0 => {
+                let _ = ustd::execve("/bin/cosmos-selftest-child", "execed");
+                ustd::exit(-1);
+            }
+            p if p > 0 => ustd::waitpid(p as u32, 8000).unwrap_or(-1) == 7,
+            _ => false,
+        }
+    });
     check("kern-ptr-rejected", {
         // syscall boundary must reject a kernel VA (phys-map region)
         ustd::sc1(shared::SYS_MEMINFO, 0xFFFF_8000_0000_0000) == u64::MAX

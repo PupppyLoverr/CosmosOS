@@ -724,6 +724,294 @@ pub fn clone_user(entry: u64, arg: u64) -> Option<u32> {
     Some(pid)
 }
 
+/// SYS_FORK: duplicate the calling task into a child resuming at the same
+/// userspace instruction with rax=0. Eager copy-on-fork (no COW): every
+/// present private page gets a physical copy; not-yet-faulted file-backed
+/// pages stay lazy via the cloned FileMap; borrowed (shm/fb) frames are
+/// shared by reference. Returns Some(pid) to the parent.
+pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
+    // kernel stack FIRST so the new pml4 inherits the kernel PDPT with it
+    let mut kframes = Vec::new();
+    let (kbase, ktop) = alloc_kstack(&mut kframes);
+    let cpml4 = create_user_pml4()?;
+    let mut g = SCHED.lock();
+    let s = g.as_mut().unwrap();
+    let cur = &mut s.tasks[s.cur];
+    let pml4 = cur.pml4?;
+    let pid = s.next_pid;
+    s.next_pid += 1;
+    let parent = cur.id;
+
+    // rebuild every present user page in the child
+    let mut cborrowed: Vec<u64> = Vec::new();
+    let mut pt_scratch: Vec<u64> = Vec::new(); // intermediate PT frames of the child
+    let mut ok = true;
+    for (va, pphys, w, x) in crate::elf::collect_user_pages(pml4) {
+        if cur.borrowed.contains(&pphys) {
+            if !crate::elf::map_phys_user_flags(cpml4, va, pphys, w, x, &mut pt_scratch) {
+                ok = false;
+                break;
+            }
+            cborrowed.push(pphys);
+        } else {
+            let Some(nf) = mem::alloc_frame() else {
+                ok = false;
+                break;
+            };
+            unsafe {
+                let src = mem::phys_to_virt(pphys) as *const u8;
+                let dst = mem::phys_to_virt(nf.start_address().as_u64()) as *mut u8;
+                core::ptr::copy_nonoverlapping(src, dst, 0x1000);
+            }
+            if !crate::elf::map_phys_user_flags(
+                cpml4,
+                va,
+                nf.start_address().as_u64(),
+                w,
+                x,
+                &mut pt_scratch,
+            ) {
+                mem::free_frame(nf.start_address().as_u64());
+                ok = false;
+                break;
+            }
+        }
+    }
+    if !ok {
+        // tear down the partial child table
+        let freed = crate::elf::free_user_space(cpml4);
+        for f in freed {
+            if !cborrowed.contains(&f) {
+                mem::free_frame(f);
+            }
+        }
+        mem::free_frame(cpml4.start_address().as_u64());
+        free_frames(&kframes);
+        return None;
+    }
+    let _ = pt_scratch; // owned by the child table tree now
+
+    let fds = cur.fds.clone();
+    for f in fds.iter().flatten() {
+        crate::vfs::acquire_desc(f);
+    }
+    let shm_ids = cur.shm.clone();
+    for id in &shm_ids {
+        shm::acquire(*id);
+    }
+    let (name, argv, cwd) = (cur.name.clone(), cur.argv.clone(), cur.cwd.clone());
+    let (maps, filemaps) = (cur.maps.clone(), cur.filemaps.clone());
+    let (nice, umask, exe) = (cur.nice, cur.umask, cur.exe.clone());
+    let (smin, smax, mnext, apage) = (cur.stack_min, cur.stack_max, cur.mmap_next, cur.arg_page);
+
+    // the child resumes right after the int-80 with rax=0
+    let ctx = (ktop - core::mem::size_of::<CpuContext>() as u64) as *mut CpuContext;
+    unsafe {
+        core::ptr::write(ctx, *parent_ctx);
+        (*ctx).rax = 0;
+    }
+    let t = Task {
+        id: pid,
+        name,
+        argv,
+        is_user: true,
+        state: State::Running,
+        saved_rsp: ctx as u64,
+        kstack: kbase,
+        kstack_top: ktop,
+        pml4: Some(cpml4),
+        wake_at: 0,
+        exit_code: 0,
+        parent,
+        fds,
+        cwd,
+        ports: Vec::new(),
+        shm: shm_ids,
+        frames: kframes,
+        mem_bytes: 0,
+        waiting_on: 0,
+        wait_port: 0,
+        wait_futex: 0,
+        borrowed: cborrowed,
+        mmap_next: mnext,
+        arg_page: apage,
+        sleep_deadline: 0,
+        wait_timeout: 0,
+        cpu_ticks: 0,
+        nice,
+        rt: false,
+        vrun: cur.vrun,
+        trace: false,
+        trbuf: Vec::new(),
+        umask,
+        exe,
+        maps,
+        filemaps,
+        min_flt: 0,
+        maj_flt: 0,
+        stack_min: smin,
+        stack_max: smax,
+        rbytes: 0,
+        wbytes: 0,
+    };
+    mm_inc(cpml4.start_address().as_u64());
+    s.tasks.push(Box::new(t));
+    sprintln!("[task] forked pid={} from pid={}", pid, parent);
+    Some(pid)
+}
+
+/// SYS_EXECVE: replace the calling task's image. Builds the whole new
+/// user space on a fresh pml4 first — any failure keeps the old image
+/// running and returns false, so exec is never half-applied. fds stay
+/// open (POSIX), shm segments detach, the old mm frees only when this
+/// task was its last user.
+pub fn exec_current(ctx: &mut CpuContext, path: &str, args: &str) -> bool {
+    // ---- stage the new image ----
+    let mut hdr = vec![0u8; 96 * 1024];
+    let (file_size, hdrn) = match vfs::stat_path(path) {
+        Ok(st) => {
+            let want = (st.size as usize).min(hdr.len());
+            match vfs::read_range(path, 0, &mut hdr[..want]) {
+                Ok(n) => (st.size as u64, n),
+                Err(_) => (0, 0),
+            }
+        }
+        Err(_) => (0, 0),
+    };
+    if file_size == 0 {
+        return false;
+    }
+    let data = vfs::read_all(path).ok();
+    let Some(pml4n) = create_user_pml4() else {
+        return false;
+    };
+    let mut frames: Vec<u64> = vec![pml4n.start_address().as_u64()];
+    let mut umaps: Vec<MapEnt> = Vec::new();
+    let mut filemaps: Vec<FileMap> = Vec::new();
+    let entry = match crate::elf::load_into_lazy(
+        pml4n,
+        path,
+        &hdr[..hdrn],
+        file_size,
+        &mut frames,
+        &mut umaps,
+        &mut filemaps,
+    ) {
+        Ok(e) => Some(e),
+        Err(_) => None,
+    };
+    let entry = match (entry, data) {
+        (Some(e), _) => e,
+        (None, Some(d)) => {
+            umaps.clear();
+            filemaps.clear();
+            match crate::elf::load_into(pml4n, &d, &mut frames, &mut umaps) {
+                Ok(e) => e,
+                Err(_) => {
+                    free_frames(&frames);
+                    return false;
+                }
+            }
+        }
+        (None, None) => {
+            free_frames(&frames);
+            return false;
+        }
+    };
+    for m in umaps.iter_mut() {
+        m.name = String::from(path);
+    }
+    // fresh main stack: eager top page, demand-grown down
+    let stack_lo = USER_STACK_TOP - 0x1000;
+    if crate::elf::map_user_range(pml4n, stack_lo, 0x1000, &mut frames).is_none() {
+        free_frames(&frames);
+        return false;
+    }
+    umaps.push(MapEnt {
+        start: stack_lo,
+        end: USER_STACK_TOP,
+        perm: 1 | 2,
+        name: String::from("[stack]"),
+    });
+    let Some(argf) = crate::elf::map_user_range(pml4n, USER_ARG_PAGE, 0x1000, &mut frames) else {
+        free_frames(&frames);
+        return false;
+    };
+    umaps.push(MapEnt {
+        start: USER_ARG_PAGE,
+        end: USER_ARG_PAGE + 0x1000,
+        perm: 1 | 2,
+        name: String::from("[args]"),
+    });
+    let abytes = args.as_bytes();
+    let n = abytes.len().min(0xF00);
+    unsafe {
+        let dst = mem::phys_to_virt(argf[0]) as *mut u8;
+        core::ptr::copy_nonoverlapping(abytes.as_ptr(), dst, n);
+        *dst.add(n) = 0;
+    }
+    let _ = frames; // owned by the new table tree now
+
+    // ---- swap the mm under SCHED ----
+    let mut g = SCHED.lock();
+    let s = g.as_mut().unwrap();
+    let t = &mut s.tasks[s.cur];
+    let Some(old) = t.pml4 else {
+        return false;
+    };
+    let old_phys = old.start_address().as_u64();
+    shm::drop_task_shm(t); // POSIX exec detaches shared memory
+    let borrowed = core::mem::take(&mut t.borrowed);
+    if mm_dec_last(old_phys) {
+        let freed = crate::elf::free_user_space(old);
+        for f in freed {
+            if !borrowed.contains(&f) {
+                mem::free_frame(f);
+            }
+        }
+        mem::free_frame(old_phys);
+    }
+    // if threads share the old mm they keep it; we just moved out
+    t.pml4 = Some(pml4n);
+    mm_inc(pml4n.start_address().as_u64());
+    t.maps = umaps;
+    t.filemaps = filemaps;
+    t.mmap_next = USER_MMAP_BASE;
+    t.stack_min = USER_STACK_MIN;
+    t.stack_max = USER_STACK_TOP;
+    t.arg_page = USER_ARG_PAGE;
+    t.min_flt = 0;
+    t.maj_flt = 0;
+    t.mem_bytes = 0;
+    t.exe = String::from(path);
+    t.argv = String::from(args);
+    t.name = String::from(path.rsplit('/').next().unwrap_or(path));
+
+    // rewrite the live syscall frame: iret lands at the new entry
+    ctx.r15 = 0;
+    ctx.r14 = 0;
+    ctx.r13 = 0;
+    ctx.r12 = 0;
+    ctx.r11 = 0;
+    ctx.r10 = 0;
+    ctx.r9 = 0;
+    ctx.r8 = 0;
+    ctx.rdi = USER_ARG_PAGE;
+    ctx.rsi = n as u64;
+    ctx.rbp = 0;
+    ctx.rbx = 0;
+    ctx.rdx = 0;
+    ctx.rcx = 0;
+    ctx.rax = 0;
+    ctx.rip = entry;
+    ctx.cs = unsafe { gdt::USER_CS.0 as u64 };
+    ctx.rflags = 0x202;
+    ctx.rsp = USER_STACK_TOP - 8;
+    ctx.ss = unsafe { gdt::USER_DS.0 as u64 };
+    sprintln!("[task] pid={} exec {}", t.id, path);
+    true
+}
+
 /// Apply `f` to every live task sharing the given mm (pml4 phys frame).
 /// Callers must NOT hold SCHED — this locks it itself.
 pub fn for_mm_peers(pml4_phys: u64, f: impl Fn(&mut Task)) {
