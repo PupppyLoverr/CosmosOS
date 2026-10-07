@@ -945,7 +945,8 @@ fn send_tcp(
     seg.extend_from_slice(&[0u8; 2]); // checksum
     seg.extend_from_slice(&[0u8; 2]); // urg
     seg.extend_from_slice(payload);
-    let c = tcp_csum(our_ip(), dst_ip, &seg);
+    let src = if dst_ip[0] == 127 { LOOPBACK_IP } else { our_ip() };
+    let c = tcp_csum(src, dst_ip, &seg);
     put16(&mut seg[16..], c);
     send_ip(dst_mac, dst_ip, 6, &seg);
 }
@@ -1416,9 +1417,37 @@ fn dispatch(src_ip: [u8; 4], proto: u8, p: Vec<u8>) -> bool {
                 accept_syn(&s, src_ip);
                 return true;
             }
+            // unclaimed TCP port: RST the peer — a real ECONNREFUSED,
+            // not a silent drop (also refuse our own lo probes)
+            if s.flags & TCP_RST == 0 {
+                tcp_rst(src_ip, &s);
+            }
             false
         }
         _ => false,
+    }
+}
+
+/// Reply to a segment aimed at an unclaimed port (RFC 793 reset rules):
+/// ACK'd segs get a bare RST(seq=their ack); non-ACK get RST|ACK(seq=0,
+/// ack=their consumed seq). Best-effort ARP (0ms — never RST-wait).
+fn tcp_rst(src_ip: [u8; 4], s: &TcpSeg) {
+    let Some(mac) = next_hop(src_ip, 0) else { return };
+    let consume = s.payload.len() as u32
+        + if s.flags & (TCP_SYN | TCP_FIN) != 0 { 1 } else { 0 };
+    if s.flags & TCP_ACK != 0 {
+        send_tcp(mac, src_ip, s.dport, s.sport, s.ack, 0, TCP_RST, &[]);
+    } else {
+        send_tcp(
+            mac,
+            src_ip,
+            s.dport,
+            s.sport,
+            0,
+            s.seq.wrapping_add(consume),
+            TCP_RST | TCP_ACK,
+            &[],
+        );
     }
 }
 
@@ -1524,7 +1553,7 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
         return Err(-1);
     }
     let Some(mac) = next_hop(rip, 1500) else {
-        return Err(-2);
+        return Err(-101); // EHOSTUNREACH: no route
     };
     let isn = (now_ms() as u32).wrapping_add(lport as u32) ^ 0xC05A_0000;
     TCP_SOCKS.lock().insert(
@@ -1574,8 +1603,18 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
         );
         Ok(())
     } else {
+        // RST'd (state Closed) = refused; plain deadline = timed out
+        let refused = TCP_SOCKS
+            .lock()
+            .get(&lport)
+            .map(|k| k.state == TcpState::Closed)
+            .unwrap_or(false);
         TCP_SOCKS.lock().remove(&lport);
-        Err(-2)
+        if refused {
+            Err(-111) // ECONNREFUSED
+        } else {
+            Err(-110) // ETIMEDOUT
+        }
     }
 }
 

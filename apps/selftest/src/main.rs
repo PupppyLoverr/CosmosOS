@@ -1916,6 +1916,42 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    check("lotcp", {
+        // full TCP over loopback: connect+accept complete a real 3-way
+        // handshake inside LOOPBACK_Q, then data flows both directions
+        let l = ustd::socket(ustd::SOCK_STREAM);
+        let c = ustd::socket(ustd::SOCK_STREAM);
+        let mut ok = l >= 0 && c >= 0;
+        if ok {
+            ok = ustd::bind(l, 19820) == 0 && ustd::listen(l, 4) == 0
+                && ustd::connect(c, [127, 0, 0, 1], 19820) == 0;
+            let acc = ustd::accept(l);
+            ok = ok && acc.is_ok();
+            if let Ok((a, _, _)) = acc {
+                let mut b = [0u8; 8];
+                ok = ok && ustd::write(c, b"ping") == Ok(4)
+                    && ustd::read(a, &mut b) == Ok(4) && &b[..4] == b"ping"
+                    && ustd::write(a, b"pong") == Ok(4)
+                    && ustd::read(c, &mut b) == Ok(4) && &b[..4] == b"pong";
+                ustd::close(a);
+            }
+            ustd::close(c);
+            ustd::close(l);
+        }
+        ok
+    });
+    check("tcprefused", {
+        // SYN to an unclaimed port -> real RST back -> -111 ECONNREFUSED
+        let c = ustd::socket(ustd::SOCK_STREAM);
+        let mut ok = c >= 0;
+        if ok {
+            let t0 = ustd::uptime_ms();
+            ok = ustd::connect(c, [127, 0, 0, 1], 19821) == -111
+                && ustd::uptime_ms() - t0 < 3000; // refused fast, not a timeout
+            ustd::close(c);
+        }
+        ok
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64
