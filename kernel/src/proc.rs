@@ -27,7 +27,7 @@ const FILES: &[&str] = &[
 ];
 
 /// files under /proc/net
-const NET_FILES: &[&str] = &["tcp", "udp", "dev", "operstate"];
+const NET_FILES: &[&str] = &["tcp", "udp", "dev", "operstate", "owners"];
 
 /// files under /proc/sys/kernel
 const SYS_FILES: &[&str] = &["hostname"];
@@ -51,8 +51,8 @@ fn pid_of(path: &str) -> Option<u32> {
 }
 
 const PID_FILES: &[&str] = &[
-    "status", "cmdline", "stat", "fds", "cwd", "maps", "io", "statm", "exe",
-    "smaps", "wchan", "children",
+    "status", "cmdline", "stat", "fds", "fdinfo", "cwd", "maps", "io",
+    "statm", "exe", "smaps", "wchan", "children",
 ];
 
 pub fn is_dir(path: &str) -> bool {
@@ -213,6 +213,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
             "{}\n",
             if net::is_up() { "up" } else { "down" }
         ),
+        "/proc/net/owners" => net::net_owners(),
         "/proc/sys/kernel/hostname" => alloc::format!("{}\n", crate::syscall::hostname()),
         "/proc/stat" => {
             let (user, all) = task::cpu_sums();
@@ -424,6 +425,7 @@ fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
             vrun
         ),
         "fds" => task::fd_list(pid).unwrap_or_default(),
+        "fdinfo" => task::fd_info(pid).unwrap_or_default(),
         "cwd" => alloc::format!("{}\n", task::pid_cwd(pid).unwrap_or_default()),
         "maps" => task::pid_maps(pid).unwrap_or_default(),
         "io" => {

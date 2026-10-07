@@ -660,6 +660,22 @@ pub fn net_tcp() -> String {
 }
 
 /// Linux-style `/proc/net/udp` dump.
+/// Socket ownership table for `netstat -p` and /proc/net/owners:
+/// one line per socket as "{tcp|udp|listen} {lport} {owner-pid}".
+pub fn net_owners() -> String {
+    let mut s = String::new();
+    for (_, k) in TCP_SOCKS.lock().iter() {
+        s.push_str(&alloc::format!("tcp {} {}\n", k.lport, k.owner));
+    }
+    for (p, o) in UDP_OWNERS.lock().iter() {
+        s.push_str(&alloc::format!("udp {} {}\n", p, o));
+    }
+    for (p, o) in LISTEN_OWNERS.lock().iter() {
+        s.push_str(&alloc::format!("listen {} {}\n", p, o));
+    }
+    s
+}
+
 pub fn net_udp() -> String {
     let lip = our_ip();
     let mut s = String::from("  sl  local_address rem_address   st tx_queue rx_queue\n");
@@ -822,11 +838,15 @@ pub fn udp_open(lport: u16) -> Result<(), i64> {
         return Err(-1);
     }
     s.insert(lport, VecDeque::new());
+    UDP_OWNERS
+        .lock()
+        .insert(lport, crate::task::with_current(|t| t.id));
     Ok(())
 }
 
 pub fn udp_close(lport: u16) {
     SOCKS.lock().remove(&lport);
+    UDP_OWNERS.lock().remove(&lport);
 }
 
 /// Send a datagram from `lport` to `dst_ip:dst_port` (real ARP next-hop).
@@ -951,6 +971,7 @@ pub struct TcpSock {
     rcv_nxt: u32, // next rx seq we accept in-order
     state: TcpState,
     q: VecDeque<Vec<u8>>, // in-order payload chunks
+    owner: u32,           // task id that opened/accepted it (0 = kernel side)
 }
 
 static TCP_SOCKS: Mutex<BTreeMap<u16, TcpSock>> = Mutex::new(BTreeMap::new());
@@ -959,6 +980,8 @@ static TCP_SOCKS: Mutex<BTreeMap<u16, TcpSock>> = Mutex::new(BTreeMap::new());
 // their handshake and are waiting for tcp_accept to pick them up.
 static LISTENERS: Mutex<alloc::collections::BTreeSet<u16>> =
     Mutex::new(alloc::collections::BTreeSet::new());
+static LISTEN_OWNERS: Mutex<BTreeMap<u16, u32>> = Mutex::new(BTreeMap::new());
+static UDP_OWNERS: Mutex<BTreeMap<u16, u32>> = Mutex::new(BTreeMap::new());
 static ACCEPTED: Mutex<BTreeMap<u16, VecDeque<(u16, [u8; 4], u16)>>> =
     Mutex::new(BTreeMap::new());
 static NEXT_CID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x8000);
@@ -1038,6 +1061,7 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
             state: TcpState::SynSent,
             q: VecDeque::new(),
             cid: lport,
+            owner: crate::task::with_current(|t| t.id),
         },
     );
     let deadline = now_ms() + timeout_ms;
@@ -1078,11 +1102,15 @@ pub fn tcp_listen(lport: u16) -> Result<(), i64> {
     if TCP_SOCKS.lock().contains_key(&lport) || !LISTENERS.lock().insert(lport) {
         return Err(-1);
     }
+    LISTEN_OWNERS
+        .lock()
+        .insert(lport, crate::task::with_current(|t| t.id));
     Ok(())
 }
 
 pub fn tcp_unlisten(lport: u16) {
     LISTENERS.lock().remove(&lport);
+    LISTEN_OWNERS.lock().remove(&lport);
     ACCEPTED.lock().remove(&lport);
 }
 
@@ -1110,6 +1138,7 @@ fn accept_syn(s: &TcpSeg, src_ip: [u8; 4]) {
             rcv_nxt: s.seq + 1,
             state: TcpState::SynRecv,
             q: VecDeque::new(),
+            owner: 0,
         },
     );
     send_tcp(mac, src_ip, s.dport, s.sport, isn, s.seq + 1, TCP_SYN | TCP_ACK, &[]);
@@ -1127,6 +1156,10 @@ pub fn tcp_accept(lport: u16, timeout_ms: u64) -> Option<(u16, [u8; 4], u16)> {
             .get_mut(&lport)
             .and_then(|q| q.pop_front())
         {
+            let me = crate::task::with_current(|t| t.id);
+            if let Some(k) = TCP_SOCKS.lock().get_mut(&x.0) {
+                k.owner = me;
+            }
             return Some(x);
         }
         if now_ms() >= deadline {

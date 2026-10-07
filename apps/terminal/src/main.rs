@@ -839,6 +839,131 @@ fn tilde_expand(w: &str, home: &str) -> String {
 }
 
 /// Unix epoch seconds -> (y, m, d, h, min, s) UTC.
+/// Build an HTTP/1.1 response for one raw request. Returns
+/// (request-line, response-head, body, keep-alive, head-only).
+fn httpd_reply(req: &[u8], root: &str) -> (String, String, Vec<u8>, bool, bool) {
+    let line = String::from_utf8_lossy(req);
+    let first = line.lines().next().unwrap_or("").to_string();
+    let mut fparts = first.split_whitespace();
+    let method = fparts.next().unwrap_or("");
+    let path = fparts
+        .next()
+        .unwrap_or("/")
+        .split('?')
+        .next()
+        .unwrap_or("/")
+        .to_string();
+    let head_only = method == "HEAD";
+    if method != "GET" && method != "HEAD" {
+        let body = Vec::from(&b"405 method not allowed"[..]);
+        let head = alloc::format!(
+            "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        return (first, head, body, false, head_only);
+    }
+    let keep = !line.to_lowercase().contains("connection: close");
+    let bad = path.contains("..") || path.bytes().any(|b| !(32..127).contains(&b));
+    let clean = path.trim_start_matches('/');
+    let mut full = alloc::format!(
+        "{}{}",
+        if root.ends_with('/') || clean.is_empty() {
+            String::from(root.trim_end_matches('/'))
+        } else {
+            alloc::format!("{}/", root.trim_end_matches('/'))
+        },
+        clean
+    );
+    if full.is_empty() {
+        full.push('/');
+    }
+    let is_dir = ustd::stat(&full).map(|s| s.is_dir != 0).unwrap_or(false);
+    if is_dir && !full.ends_with('/') {
+        full.push('/');
+    }
+    let index = alloc::format!("{}index.html", full);
+    let (status, mime, body): (&str, &str, Vec<u8>) = if bad {
+        ("400 Bad Request", "text/plain", Vec::from(&b"bad request"[..]))
+    } else if is_dir && ustd::stat(&index).is_ok() {
+        match ustd::read_all(&index) {
+            Ok(d) => ("200 OK", "text/html", d),
+            Err(_) => ("404 Not Found", "text/html", Vec::from(&b"<h1>404</h1>"[..])),
+        }
+    } else if is_dir {
+        // autoindex: real directory listing with links
+        let mut h = alloc::format!("<html><body><h1>Index of /{}</h1><pre>", clean);
+        if let Ok(ents) = ustd::readdir(&full) {
+            for e in ents {
+                let name = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("?");
+                let disp = alloc::format!("{}{}", name, if e.is_dir != 0 { "/" } else { "" });
+                let dirpart = alloc::format!("/{}", clean.trim_end_matches('/'));
+                h.push_str(&alloc::format!(
+                    "<a href=\"{}{}{}\">{}</a>  {} B\n",
+                    dirpart,
+                    if dirpart == "/" { "" } else { "/" },
+                    disp,
+                    disp,
+                    e.size
+                ));
+            }
+        }
+        h.push_str("</pre></body></html>");
+        ("200 OK", "text/html", h.into_bytes())
+    } else {
+        match ustd::read_all(&full) {
+            Ok(d) => {
+                let mime = if full.ends_with(".html") || full.ends_with(".htm") {
+                    "text/html"
+                } else if full.ends_with(".txt") {
+                    "text/plain"
+                } else if full.ends_with(".ppm") {
+                    "image/x-portable-pixmap"
+                } else {
+                    "application/octet-stream"
+                };
+                ("200 OK", mime, d)
+            }
+            Err(_) => ("404 Not Found", "text/html", Vec::from(&b"<h1>404 Not Found</h1>"[..])),
+        }
+    };
+    // real Last-Modified from the FAT dir entry; Date = live RTC
+    let lm = ustd::stat(&full)
+        .map(|s| s.mtime)
+        .ok()
+        .filter(|m| *m > 0)
+        .map(|m| alloc::format!("Last-Modified: {}\r\n", http_date(m)))
+        .unwrap_or_default();
+    let now = ustd::datetime();
+    let date = http_date_dt(now.year, now.month, now.day, now.hour, now.minute, now.second);
+    let head = alloc::format!(
+        "HTTP/1.1 {}\r\nDate: {}\r\nServer: CosmosOS\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: {}\r\n\r\n",
+        status, date, mime, body.len(), lm,
+        if keep { "keep-alive" } else { "close" }
+    );
+    (first, head, body, keep, head_only)
+}
+
+/// RFC 7231 IMF-fixdate for HTTP Date/Last-Modified headers.
+fn http_date(secs: u64) -> String {
+    let (y, mo, d, h, mi, s) = epoch_to_dt(secs);
+    http_date_dt(y, mo, d, h, mi, s)
+}
+
+/// Same, from civil fields (ustd::datetime() for the live RTC clock).
+fn http_date_dt(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8) -> String {
+    const DOW: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = cal_days(y, mo, d);
+    let dow = ((days + 4) % 7) as usize; // 1970-01-01 = Thursday
+    alloc::format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        DOW[dow], d, MON[(mo - 1) as usize], y, h, mi, s
+    )
+}
+
 fn epoch_to_dt(secs: u64) -> (u16, u8, u8, u8, u8, u8) {
     let mut d = secs / 86400;
     let rem = secs % 86400;
@@ -4791,6 +4916,8 @@ struct Term {
     prev_cwd: String,                                  // for `cd -`
     pager: Option<(Vec<String>, usize)>,               // (all lines, page top) for `more`
     httpd: Option<(ustd::TcpListener, String)>,        // `httpd <port> [root]` server mode
+    // open keep-alive conn: (sock, rip, rport, idle-deadline ms, reqs served)
+    httpd_conn: Option<(ustd::TcpSock, [u8; 4], u16, u64, u32)>,
     nc: Option<ustd::TcpSock>,                         // `nc <ip> <port>` raw session
     nc_listen: Option<ustd::TcpListener>,              // `nc -l <port>` waiting for a client
     nc_udp: Option<(ustd::UdpSock, Option<([u8; 4], u16)>)>, // `nc -u`/`-lu` UDP session (peer learned)
@@ -4802,7 +4929,7 @@ struct Term {
     sel_drag: bool,                                    // left button currently held
     pq: String,                                        // pager search query
     pg_input: bool,                                    // pager `/` input active
-    tailf: Option<(String, u64)>,
+    tailf: Option<(String, i64)>,
     top: Option<u64>,           // top mode: refresh interval ms
     jobs: Vec<(u32, String)>,   // tracked spawned processes (jobs/fg/disown/$!)
     last_spawn: u32,            // pid of the most recent spawned process ($!)
@@ -8159,7 +8286,7 @@ impl Term {
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
             "egrep", "fgrep", "sdiff", "diff3", "merge", "compress",
-            "uncompress", "sum", "sha224sum", "namei",
+            "uncompress", "sum", "sha224sum", "namei", "ts", "pr",
         ];
         let glob_tok = |t: &str| {
             t.contains('*')
@@ -14120,12 +14247,22 @@ impl Term {
                                     }
                                 }
                             }
-                            // tail -f: keep following new appended bytes
+                            // tail -f: persistent fd followed via poll() —
+                            // works on regular files AND fifos
                             if cmd == "tail" && args.iter().any(|a| *a == "-f") {
                                 if let Some(p) = popt {
-                                    self.tailf = Some((String::from(p), blen as u64));
-                                    self.tailf_last = 0;
-                                    self.emit("  (following -- Esc/Enter to stop)");
+                                    match ustd::open(p, ustd::O_RDONLY) {
+                                        Ok(fd) => {
+                                            // jump to the end we already printed
+                                            let _ = ustd::seek(fd, blen as u64, 0);
+                                            self.tailf = Some((String::from(p), fd));
+                                            self.tailf_last = 0;
+                                            self.emit("  (following -- Esc/Enter to stop)");
+                                        }
+                                        Err(e) => self.fail(&alloc::format!(
+                                            "tail: {}: err {}", p, e
+                                        )),
+                                    }
                                 } else {
                                     self.fail("tail: -f needs a file");
                                 }
@@ -14710,10 +14847,29 @@ impl Term {
                 }
             }
             "netstat" => {
-                // netstat [-l] [-t] [-u]: -l listening only, -t/-u filter proto
+                // netstat [-l] [-t] [-u] [-p]: -p joins /proc/net/owners ->
+                // real owning pid+program name per socket row
                 let only_l = args.iter().any(|a| *a == "-l");
                 let tf = args.iter().any(|a| *a == "-t");
                 let uf = args.iter().any(|a| *a == "-u");
+                let want_p = args.iter().any(|a| *a == "-p");
+                // owners file: "{tcp|udp|listen} <lport> <pid>" per line
+                let mut owners: alloc::collections::BTreeMap<u64, u32> =
+                    Default::default();
+                if want_p {
+                    if let Ok(d) = ustd::read_all("/proc/net/owners") {
+                        for ol in String::from_utf8_lossy(&d).lines() {
+                            let f: Vec<&str> = ol.split_whitespace().collect();
+                            if f.len() == 3 {
+                                if let (Ok(port), Ok(pid)) =
+                                    (f[1].parse::<u64>(), f[2].parse::<u32>())
+                                {
+                                    owners.insert(port, pid);
+                                }
+                            }
+                        }
+                    }
+                }
                 for l in ustd::net_stat().lines() {
                     if only_l && !l.contains("LISTEN") {
                         continue;
@@ -14723,7 +14879,43 @@ impl Term {
                     {
                         continue;
                     }
+                    if want_p {
+                        // row shape "tcp  :<lport> ..." — lport after first ':'
+                        let port = l
+                            .split(':')
+                            .nth(1)
+                            .and_then(|s| s.split_whitespace().next())
+                            .and_then(|s| s.parse::<u64>().ok());
+                        if let Some(pid) = port.and_then(|p| owners.get(&p)) {
+                            let name = ustd::read_all(&alloc::format!("/proc/{}/exe", pid))
+                                .map(|d| {
+                                    let s = String::from_utf8_lossy(&d);
+                                    s.trim().rsplit('/').next().unwrap_or("?").to_string()
+                                })
+                                .unwrap_or_else(|_| "?".into());
+                            self.emit(&alloc::format!(
+                                "{}  {} (pid {})", l, name, pid
+                            ));
+                            continue;
+                        }
+                        self.emit(&alloc::format!("{}  - (pid 0)", l));
+                        continue;
+                    }
                     self.emit(l);
+                }
+            }
+            "rusage" => {
+                // rusage [pid]: real per-task cpu ticks + mapped kib
+                let pid = args
+                    .first()
+                    .and_then(|a| a.parse::<u32>().ok())
+                    .unwrap_or_else(ustd::getpid);
+                match ustd::rusage(pid) {
+                    Some((ut, rss)) => self.emit(&alloc::format!(
+                        "pid {}: utime {} ticks ({} ms)  maxrss {} kB",
+                        pid, ut, ut * 10, rss
+                    )),
+                    None => self.fail(&alloc::format!("rusage: {}: no such task", pid)),
                 }
             }
             "arp" => {
@@ -17338,6 +17530,18 @@ impl Term {
                     false => self.fail("usage: <cmd> | read [-a ARR] VAR"),
                 }
             }
+            "wait" if args.first() == Some(&"-n") => {
+                // wait -n: POSIX wait(-1) — first child to exit, any job
+                match ustd::waitpid_any(60_000) {
+                    Ok((pid, code)) => {
+                        self.jobs.retain(|(p, _)| *p != pid);
+                        self.emit(&alloc::format!("[{}] exited ({})", pid, code));
+                        self.last_code = code;
+                        self.last_ok = code == 0;
+                    }
+                    Err(_) => self.fail("wait: no children"),
+                }
+            }
             "wait" => match args.first().map(|a| *a) {
                 // wait: no args waits for all tracked jobs
                 None => {
@@ -17922,6 +18126,27 @@ impl Term {
                     }
                 }
             }
+            "ts" => {
+                // ts: prefix each line with [HH:MM:SS] — stdin or a file
+                let popt = args.iter().find(|a| !a.starts_with('-'));
+                let content = match popt {
+                    Some(p) => ustd::read_all(p).ok()
+                        .map(|d| String::from_utf8_lossy(&d).into_owned()),
+                    None => self.pipe_in.clone(),
+                };
+                match content {
+                    Some(s) => {
+                        let now = ustd::datetime();
+                        for l in s.lines() {
+                            self.emit(&alloc::format!(
+                                "[{:02}:{:02}:{:02}] {}",
+                                now.hour, now.minute, now.second, l
+                            ));
+                        }
+                    }
+                    None => self.fail("usage: ts [file]  (or pipe stdin)"),
+                }
+            }
             // ---- batch 30: observability + hardware inventory ----
             "dmidecode" => {
                 // dmidecode [-t TYPE] — real SMBIOS structures streamed from
@@ -18274,11 +18499,52 @@ impl Term {
                 _ => self.fail("usage: ip a|addr | ip l|link [set eth0 up|down] | ip r|route"),
             },
             "ss" => {
-                // socket snapshot over the kernel's /proc/net dumps
+                // socket snapshot over the kernel's /proc/net dumps;
+                // -p joins /proc/net/owners (hex local port -> real pid)
                 let only_tcp = args.iter().any(|a| *a == "-t");
                 let only_udp = args.iter().any(|a| *a == "-u");
+                let want_p = args.iter().any(|a| *a == "-p");
                 let show_tcp = only_tcp || !only_udp;
                 let show_udp = only_udp || !only_tcp;
+                let mut owners: alloc::collections::BTreeMap<u64, u32> =
+                    Default::default();
+                if want_p {
+                    if let Ok(d) = ustd::read_all("/proc/net/owners") {
+                        for ol in String::from_utf8_lossy(&d).lines() {
+                            let f: Vec<&str> = ol.split_whitespace().collect();
+                            if f.len() == 3 {
+                                if let (Ok(port), Ok(pid)) =
+                                    (f[1].parse::<u64>(), f[2].parse::<u32>())
+                                {
+                                    owners.insert(port, pid);
+                                }
+                            }
+                        }
+                    }
+                }
+                // hex local "ADDR:PORT" field -> "users:((name,pid=N))"
+                let owner_field = |l: &str| -> String {
+                    if !want_p {
+                        return String::new();
+                    }
+                    let port = l
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|a| a.rsplit(':').next())
+                        .and_then(|h| u64::from_str_radix(h, 16).ok());
+                    match port.and_then(|p| owners.get(&p)) {
+                        Some(pid) => {
+                            let name = ustd::read_all(&alloc::format!("/proc/{}/exe", pid))
+                                .map(|d| {
+                                    let s = String::from_utf8_lossy(&d);
+                                    s.trim().rsplit('/').next().unwrap_or("?").to_string()
+                                })
+                                .unwrap_or_else(|_| "?".into());
+                            alloc::format!("  users:(({},pid={}))", name, pid)
+                        }
+                        None => String::new(),
+                    }
+                };
                 self.emit("Netid  Local Address:Port  Peer Address:Port");
                 if show_tcp {
                     if let Ok(d) = ustd::read_all("/proc/net/tcp") {
@@ -18287,7 +18553,9 @@ impl Term {
                             if l.trim().is_empty() {
                                 continue;
                             }
-                            self.emit(&alloc::format!("tcp  {}", l.trim()));
+                            self.emit(&alloc::format!(
+                                "tcp  {}{}", l.trim(), owner_field(l)
+                            ));
                         }
                     }
                 }
@@ -18298,7 +18566,9 @@ impl Term {
                             if l.trim().is_empty() {
                                 continue;
                             }
-                            self.emit(&alloc::format!("udp  {}", l.trim()));
+                            self.emit(&alloc::format!(
+                                "udp  {}{}", l.trim(), owner_field(l)
+                            ));
                         }
                     }
                 }
@@ -19032,6 +19302,7 @@ impl Term {
         // httpd mode: Esc stops the listener (other keys keep working)
         if self.httpd.is_some() && k.key == KeyCode::Escape as u32 {
             self.httpd = None; // Drop -> SYS_NET_TCP_UNLISTEN
+            self.httpd_conn = None;
             self.push_line("httpd: stopped");
             self.dirty_all = true;
             return;
@@ -19059,7 +19330,9 @@ impl Term {
                     self.push_line("watch stopped");
                 }
                 if self.tailf.is_some() {
-                    self.tailf = None;
+                    if let Some((_, fd)) = self.tailf.take() {
+                        ustd::close(fd);
+                    }
                     self.push_line("tail: stopped");
                 }
                 if self.yesing.is_some() {
@@ -19305,6 +19578,7 @@ impl Term {
             "hostid", "who", "w", "users", "last", "sum", "sha224sum",
             "lsmod", "merge", "diff3", "compress", "uncompress", "sdiff",
             "egrep", "fgrep",
+        "rusage", "ts",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -20568,6 +20842,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         pipe_in: None,
         watch: None,
         httpd: None,
+        httpd_conn: None,
         nc: None,
         nc_listen: None,
         nc_udp: None,
@@ -20760,112 +21035,61 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 t.dirty_all = true;
             }
         }
-        // httpd mode: poll for one accepted conn per loop turn
-        if let Some((l, root)) = &t.httpd {
-            if let Some((sock, rip, rport)) = l.accept(0) {
-                let req = sock.recv(400).unwrap_or_default();
-                let line = String::from_utf8_lossy(&req);
-                let first = line.lines().next().unwrap_or("");
-                // GET /path -- sanitize, map under the docroot, serve a real
-                // file or an autoindex listing
-                let path = first
-                    .strip_prefix("GET ")
-                    .unwrap_or("/")
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("/")
-                    .split('?')
-                    .next()
-                    .unwrap_or("/");
-                let bad = path.contains("..") || path.bytes().any(|b| !(32..127).contains(&b));
-                let clean = path.trim_start_matches('/');
-                let mut full = alloc::format!(
-                    "{}{}",
-                    if root.ends_with('/') || clean.is_empty() {
-                        String::from(root.trim_end_matches('/'))
+        // httpd mode: HTTP/1.1 — accept into a persistent conn slot, then
+        // serve requests non-blockingly across ticks (keep-alive, GET+HEAD,
+        // max 8 per conn, 3s idle timeout). Servicing never blocks the UI.
+        if t.httpd_conn.is_none() {
+            if let Some((l, _)) = &t.httpd {
+                if let Some((sock, rip, rport)) = l.accept(0) {
+                    t.httpd_conn = Some((sock, rip, rport, now + 3000, 0));
+                }
+            }
+        }
+        if let Some((sock, rip, rport, mut dl, mut nreq)) = t.httpd_conn.take() {
+            let mut keep_it = true;
+            match sock.recv(0) {
+                Some(req) if !req.is_empty() => {
+                    nreq += 1;
+                    let root = t
+                        .httpd
+                        .as_ref()
+                        .map(|(_, r)| r.clone())
+                        .unwrap_or_else(|| String::from("/"));
+                    let (first, resp_head, body, keep, head_only) =
+                        httpd_reply(&req, &root);
+                    let _ = sock.send(resp_head.as_bytes());
+                    if !head_only {
+                        let _ = sock.send(&body);
+                    }
+                    let status = resp_head
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim_start_matches("HTTP/1.1 ")
+                        .to_string();
+                    t.push_line(&alloc::format!(
+                        "httpd: {} -> {} <- {}.{}.{}.{}:{}",
+                        first, status,
+                        rip[0], rip[1], rip[2], rip[3], rport
+                    ));
+                    t.dirty_all = true;
+                    if keep && nreq < 8 {
+                        dl = now + 3000;
                     } else {
-                        alloc::format!("{}/", root.trim_end_matches('/'))
-                    },
-                    clean
-                );
-                if full.is_empty() {
-                    full.push('/');
+                        keep_it = false;
+                    }
                 }
-                let is_dir = ustd::stat(&full).map(|s| s.is_dir != 0).unwrap_or(false);
-                if is_dir && !full.ends_with('/') {
-                    full.push('/');
+                Some(_) => {}
+                None => {
+                    if now >= dl || nreq >= 8 {
+                        keep_it = false;
+                    }
                 }
-                let index = alloc::format!("{}index.html", full);
-                let (status, mime, body): (&str, &str, Vec<u8>) = if bad {
-                    ("400 Bad Request", "text/plain", Vec::from(&b"bad request"[..]))
-                } else if is_dir && ustd::stat(&index).is_ok() {
-                    match ustd::read_all(&index) {
-                        Ok(d) => ("200 OK", "text/html", d),
-                        Err(_) => ("404 Not Found", "text/html", Vec::from(&b"<h1>404</h1>"[..])),
-                    }
-                } else if is_dir {
-                    // autoindex: real directory listing with links
-                    let mut h = alloc::format!(
-                        "<html><body><h1>Index of /{}</h1><pre>",
-                        clean
-                    );
-                    if let Ok(ents) = ustd::readdir(&full) {
-                        for e in ents {
-                            let name = core::str::from_utf8(&e.name[..e.name_len as usize])
-                                .unwrap_or("?");
-                            let disp = alloc::format!(
-                                "{}{}",
-                                name,
-                                if e.is_dir != 0 { "/" } else { "" }
-                            );
-                            let dirpart = alloc::format!(
-                                "/{}",
-                                clean.trim_end_matches('/')
-                            );
-                            h.push_str(&alloc::format!(
-                                "<a href=\"{}{}{}\">{}</a>  {} B\n",
-                                dirpart,
-                                if dirpart == "/" { "" } else { "/" },
-                                disp,
-                                disp,
-                                e.size
-                            ));
-                        }
-                    }
-                    h.push_str("</pre></body></html>");
-                    ("200 OK", "text/html", h.into_bytes())
-                } else {
-                    match ustd::read_all(&full) {
-                        Ok(d) => {
-                            let mime = if full.ends_with(".html") || full.ends_with(".htm") {
-                                "text/html"
-                            } else if full.ends_with(".txt") {
-                                "text/plain"
-                            } else if full.ends_with(".ppm") {
-                                "image/x-portable-pixmap"
-                            } else {
-                                "application/octet-stream"
-                            };
-                            ("200 OK", mime, d)
-                        }
-                        Err(_) => ("404 Not Found", "text/html", Vec::from(&b"<h1>404 Not Found</h1>"[..])),
-                    }
-                };
-                let resp = alloc::format!(
-                    "HTTP/1.0 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    status,
-                    mime,
-                    body.len()
-                );
-                let _ = sock.send(resp.as_bytes());
-                let _ = sock.send(&body);
-                t.push_line(&alloc::format!(
-                    "httpd: {} -> {} <- {}.{}.{}.{}:{}",
-                    first,
-                    status,
-                    rip[0], rip[1], rip[2], rip[3], rport
-                ));
-                t.dirty_all = true;
+            }
+            if keep_it {
+                t.httpd_conn = Some((sock, rip, rport, dl, nreq));
+            } else {
+                t.push_line("httpd: connection closed");
             }
         }
         // nc -l: accept a pending inbound connection into the nc session
@@ -21015,17 +21239,30 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             }
         }
         // tail -f mode: poll the file, print bytes appended since last read
-        if let Some((path, off)) = t.tailf.clone() {
+        if let Some((path, fd)) = t.tailf.clone() {
             if now - t.tailf_last >= 400 {
                 t.tailf_last = now;
-                if let Ok(d) = ustd::read_all(&path) {
-                    if (d.len() as u64) > off {
-                        let s = String::from_utf8_lossy(&d[off as usize..]);
-                        for l in s.lines().take(20) {
-                            t.push_line(l);
+                // gate on poll(): an empty fifo reports not-ready so the
+                // read below never blocks the terminal task
+                if ustd::poll(&[fd as u32], &[1], 0) > 0 {
+                    let mut buf = [0u8; 8192];
+                    match ustd::read(fd, &mut buf) {
+                        Ok(n) if n > 0 => {
+                            let txt = String::from_utf8_lossy(&buf[..n]);
+                            for l in txt.lines().take(20) {
+                                t.push_line(l);
+                            }
+                            t.dirty_all = true;
                         }
-                        t.tailf = Some((path, d.len() as u64));
-                        t.dirty_all = true;
+                        _ => {
+                            // truncated? regular files: reseek to keep following
+                            if let Ok(st) = ustd::stat(&path) {
+                                let cur = ustd::seek(fd, 0, 1).unwrap_or(0);
+                                if st.size < cur {
+                                    let _ = ustd::seek(fd, 0, 0);
+                                }
+                            }
+                        }
                     }
                 }
             }

@@ -932,6 +932,96 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             .unwrap_or(false)
     });
     check("chrt-bogus-pid", !ustd::chrt(0xFFFF_FFFE, 1));
+
+    // ---- batch 31: real fd plumbing -------------------------------------
+    check("anon-pipe", {
+        // SYS_PIPE: write on the write fd, read it back on the read fd —
+        // real bytes through a kernel pipe object, no fs file involved
+        ustd::pipe()
+            .map(|(rfd, wfd)| {
+                let n = ustd::write(wfd, b"pipe7").unwrap_or(0);
+                let mut b = [0u8; 8];
+                let got = ustd::read(rfd, &mut b).unwrap_or(0);
+                ustd::close(rfd);
+                ustd::close(wfd);
+                n == 5 && got == 5 && &b[..5] == b"pipe7"
+            })
+            .unwrap_or(false)
+    });
+    check("pipe-poll", {
+        // SYS_POLL: reader polls not-ready before the write, ready after
+        ustd::pipe()
+            .map(|(rfd, wfd)| {
+                let before = ustd::poll(&[rfd as u32], &[1], 0);
+                let _ = ustd::write(wfd, b"x");
+                let after = ustd::poll(&[rfd as u32], &[1], 0);
+                let wr = ustd::poll(&[wfd as u32], &[2], 0);
+                ustd::close(rfd);
+                ustd::close(wfd);
+                before == 0 && after == 1 && wr == 1
+            })
+            .unwrap_or(false)
+    });
+    check("pipe-eof", {
+        // last writer closing => reader sees EOF (0), not a hang
+        ustd::pipe()
+            .map(|(rfd, wfd)| {
+                let _ = ustd::write(wfd, b"q");
+                ustd::close(wfd);
+                let mut b = [0u8; 8];
+                let n1 = ustd::read(rfd, &mut b).unwrap_or(0);
+                let n2 = ustd::read(rfd, &mut b).unwrap_or(0);
+                ustd::close(rfd);
+                n1 == 1 && n2 == 0
+            })
+            .unwrap_or(false)
+    });
+    check("dup2", {
+        // SYS_DUP2: an aliased fd hits the same pipe queue
+        ustd::pipe()
+            .map(|(rfd, wfd)| {
+                let nd = ustd::dup2(wfd as u64, 40);
+                let n = if nd == 40 { ustd::write(40i64, b"dd").unwrap_or(0) } else { 0 };
+                let mut b = [0u8; 4];
+                let got = ustd::read(rfd, &mut b).unwrap_or(0);
+                ustd::close(rfd);
+                ustd::close(wfd);
+                ustd::close(40i64);
+                n == 2 && got == 2 && &b[..2] == b"dd"
+            })
+            .unwrap_or(false)
+    });
+    check("rusage", {
+        ustd::rusage(ustd::getpid())
+            .map(|(_t, rss)| rss > 0)
+            .unwrap_or(false)
+            && ustd::rusage(0xFFFF_FFFE).is_none()
+    });
+    check("proc-fdinfo", {
+        let pid = ustd::getpid();
+        ustd::read_all(&alloc::format!("/proc/{}/fdinfo", pid))
+            .map(|d| {
+                let t = String::from_utf8_lossy(&d);
+                t.contains("flags:")
+            })
+            .unwrap_or(false)
+    });
+    check("net-owners", {
+        // bind a real listener -> /proc/net/owners names its owner pid
+        ustd::TcpListener::bind(8164)
+            .map(|l| {
+                let me = ustd::getpid();
+                let s = ustd::read_all("/proc/net/owners")
+                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                    .unwrap_or_default();
+                let hit = s
+                    .lines()
+                    .any(|row| row == alloc::format!("listen 8164 {}", me));
+                drop(l);
+                hit
+            })
+            .unwrap_or(false)
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

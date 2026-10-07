@@ -107,6 +107,17 @@ pub fn waitpid(pid: u32, timeout_ms: u64) -> Result<i64, ()> {
         Ok(r as i64)
     }
 }
+
+/// POSIX wait(-1): (pid, exit_code) of the first dead child — reaped by
+/// the kernel. Err = no children / timeout.
+pub fn waitpid_any(timeout_ms: u64) -> Result<(u32, i64), ()> {
+    let r = sc2(shared::SYS_WAITPID, u32::MAX as u64, timeout_ms);
+    if is_err(r) {
+        Err(())
+    } else {
+        Ok(((r >> 32) as u32, (r & 0xffff_ffff) as i64))
+    }
+}
 pub fn kill(pid: u32) -> bool {
     sc1(shared::SYS_KILL, pid as u64) == 0
 }
@@ -1005,4 +1016,41 @@ pub fn set_hostname(s: &str) -> bool {
         s.as_ptr() as u64,
         s.len().min(64) as u64,
     ) == 0
+}
+
+/// Anonymous pipe: returns (read_fd, write_fd), or None on failure.
+pub fn pipe() -> Option<(i64, i64)> {
+    let v = sc0(shared::SYS_PIPE);
+    if v == u64::MAX {
+        return None;
+    }
+    Some(((v & 0xffff_ffff) as i64, (v >> 32) as i64))
+}
+
+/// Clone `oldfd` into slot `newfd` (POSIX dup2). Returns newfd or -1.
+pub fn dup2(oldfd: u64, newfd: u64) -> i64 {
+    sc2(shared::SYS_DUP2, oldfd, newfd) as i64
+}
+
+/// Wait until any of `fds`/`evs` is ready or `timeout_ms` passes
+/// (u64::MAX = forever). evs bits: 1=read, 2=write. Returns count ready.
+pub fn poll(fds: &[u32], evs: &[u32], timeout_ms: u64) -> i64 {
+    sc4(
+        shared::SYS_POLL,
+        fds.as_ptr() as u64,
+        evs.as_ptr() as u64,
+        fds.len() as u64,
+        timeout_ms,
+    ) as i64
+}
+
+/// Per-task resource usage: (cpu_ticks, maxrss_kib). None = no such pid.
+pub fn rusage(pid: u32) -> Option<(u64, u64)> {
+    let mut out = [0u64; 3];
+    if sc2(shared::SYS_RUSAGE, pid as u64, out.as_mut_ptr() as u64) != 0 {
+        return None;
+    }
+    // the kernel wrote through the raw ptr — force a real reload
+    let out = unsafe { core::ptr::read_volatile(&out) };
+    Some((out[0], out[2]))
 }
