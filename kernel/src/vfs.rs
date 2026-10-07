@@ -140,6 +140,9 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, i64> {
 
 /// Read `buf.len()` bytes at `offset` of a real file (normal callers).
 pub fn read_range(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    if crate::memfd::handles(path) {
+        return crate::memfd::read_at(path, offset, buf);
+    }
     if crate::pipes::handles(path) || crate::dev::handles(path) || crate::proc::handles(path) {
         return Err(-22);
     }
@@ -155,6 +158,10 @@ pub fn read_range(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64>
 /// spinning here would deadlock the fault handler — rescheduling it
 /// lets it finish and release.
 pub fn read_range_pf(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    if crate::memfd::handles(path) {
+        // RAM store — no FS lock needed, safe inside the fault handler
+        return crate::memfd::read_at(path, offset, buf);
+    }
     loop {
         if let Some(mut g) = FS.try_lock() {
             return match g.as_mut() {
@@ -347,6 +354,16 @@ pub fn read(fd: i64, buf: &mut [u8]) -> Result<i64, i64> {
             crate::pipes::TryRead::WouldBlock => Ok(0), // nonblocking caller sees EOF
         };
     }
+    if crate::memfd::handles(&path) {
+        let n = crate::memfd::read_at(&path, pos, buf)? as u64;
+        task::with_current(|t| {
+            if let Some(Some(f)) = t.fds.get_mut(fd as usize) {
+                f.pos += n;
+            }
+        });
+        task::io_charge(true, n);
+        return Ok(n as i64);
+    }
     if crate::dev::handles(&path) {
         let n = crate::dev::read_at(&path, pos, buf)? as u64;
         task::with_current(|t| {
@@ -413,6 +430,16 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
     if crate::pipes::handles(&path) {
         return crate::pipes::try_write(&path, buf);
     }
+    if crate::memfd::handles(&path) {
+        let n = crate::memfd::write_at(&path, pos, buf)? as u64;
+        task::with_current(|t| {
+            if let Some(Some(f)) = t.fds.get_mut(fd as usize) {
+                f.pos += n as u64;
+            }
+        });
+        task::io_charge(false, n as u64);
+        return Ok(n as i64);
+    }
     if crate::dev::handles(&path) {
         let n = crate::dev::write(&path, pos, buf)?;
         task::with_current(|t| {
@@ -474,6 +501,7 @@ pub fn acquire_desc(f: &task::FileDesc) {
     }
     crate::sockpair::acquire(&f.path);
     crate::mqueue::acquire(&f.path);
+    crate::memfd::acquire(&f.path);
 }
 
 /// Release one desc's hold on its kernel object. Pipe roles and socketpair
@@ -491,6 +519,8 @@ fn release_desc_obj(f: &task::FileDesc, still_open: bool) {
     // mqueue fds are refcounted too — a named queue survives until
     // unlink + last close, so release runs on every desc
     crate::mqueue::release(&f.path);
+    // memfd stores die at last close
+    crate::memfd::release(&f.path);
     if still_open {
         return;
     }
@@ -536,6 +566,12 @@ pub fn seek(fd: i64, pos: u64) -> Result<i64, i64> {
 pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if crate::memfd::handles(&full) {
+        return match crate::memfd::stat(&full) {
+            Some((sz, at)) => Ok(shared::Stat { size: sz, is_dir: 0, mtime: 0, attr: at as u32 }),
+            None => Err(-2),
+        };
+    }
     if crate::pipes::handles(&full) {
         if crate::pipes::is_dir(&full) {
             return Ok(shared::Stat { size: 0, is_dir: 1, mtime: 0, attr: 0 });
@@ -702,6 +738,9 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
 /// Resize a filesystem file to `len` (pad zeros or cut) — backs ftruncate(2).
 /// Pseudo-fs objects and pipes reject with -22 like a real fd-based truncate.
 pub fn truncate_path(path: &str, len: u64) -> Result<(), i64> {
+    if crate::memfd::handles(path) {
+        return crate::memfd::truncate(path, len);
+    }
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
     if crate::pipes::handles(&full)

@@ -439,6 +439,37 @@ pub fn mq_unlink(name: &str) -> i64 {
     sc2(shared::SYS_MQ_UNLINK, name.as_ptr() as u64, name.len() as u64) as i64
 }
 
+/// memfd_create(name): an anonymous RAM-backed file fd — read/write/
+/// seek/truncate/mmap like a real file; dies with its last fd.
+pub fn memfd_create(name: &str) -> i64 {
+    sc2(shared::SYS_MEMFD_CREATE, name.as_ptr() as u64, name.len() as u64) as i64
+}
+
+/// POSIX timer_create(sig) -> timer id | err
+pub fn timer_create(sig: u64) -> i64 {
+    sc1(shared::SYS_TIMER_CREATE, sig) as i64
+}
+
+/// timer_settime(id, init_ms, interval_ms) -> 0 | err
+pub fn timer_settime(id: u64, init_ms: u64, interval_ms: u64) -> i64 {
+    sc3(shared::SYS_TIMER_SETTIME, id, init_ms, interval_ms) as i64
+}
+
+/// timer_delete(id) -> 0 | err
+pub fn timer_delete(id: u64) -> i64 {
+    sc1(shared::SYS_TIMER_DELETE, id) as i64
+}
+
+/// clock_gettime(clkid) -> (sec, nsec); clk 0=REALTIME(rtc), 1=MONOTONIC
+pub fn clock_gettime(clkid: u64) -> Option<(u64, u64)> {
+    let mut v = [0u64; 2];
+    if sc2(shared::SYS_CLOCK_GETTIME, clkid, v.as_mut_ptr() as u64) == 0 {
+        Some((v[0], v[1]))
+    } else {
+        None
+    }
+}
+
 /// mmap at a fixed address (MAP_FIXED semantics — evicts overlaps)
 pub fn mmap_fixed(addr: u64, size: u64) -> Option<*mut u8> {
     let p = sc3(shared::SYS_MMAP, size, 1, addr);

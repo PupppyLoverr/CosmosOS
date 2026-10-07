@@ -395,6 +395,75 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 Err(e) => e as u64,
             }
         }
+        shared::SYS_MEMFD_CREATE => {
+            let Some(nb) = copy_in(a1, a2.min(64)) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let name = String::from_utf8_lossy(&nb).into_owned();
+            let Ok(path) = crate::memfd::create(&name) else {
+                ctx.rax = ERR;
+                return;
+            };
+            task::with_current(|t| {
+                let Some(fd) = alloc_slot(t) else { return ERR; };
+                t.fds[fd] = Some(task::FileDesc {
+                    path,
+                    pos: 0,
+                    flags: 0, // read+write
+                });
+                fd as u64
+            })
+        }
+        shared::SYS_TIMER_CREATE => {
+            // (sig) -> timer id: per-task POSIX timer slot
+            task::with_current(|t| {
+                let id = (t.ptimers.iter().map(|p| p.id).max().unwrap_or(0)) + 1;
+                t.ptimers.push(task::PTimer {
+                    id,
+                    cur: 0,
+                    int: 0,
+                    sig: a1,
+                });
+                id
+            })
+        }
+        shared::SYS_TIMER_SETTIME => {
+            // (id, init_ms, interval_ms) -> 0|err
+            task::with_current(|t| match t.ptimers.iter_mut().find(|p| p.id == a1) {
+                Some(pt) => {
+                    pt.cur = a2.div_ceil(10).min(u64::MAX / 2);
+                    pt.int = a3 / 10;
+                    0
+                }
+                None => ERR,
+            })
+        }
+        shared::SYS_TIMER_DELETE => {
+            task::with_current(|t| {
+                let n = t.ptimers.len();
+                t.ptimers.retain(|p| p.id != a1);
+                if t.ptimers.len() < n { 0 } else { ERR }
+            })
+        }
+        shared::SYS_CLOCK_GETTIME => {
+            // (clkid, out_ptr): clk 0 = realtime (rtc epoch ms), 1 = monotonic
+            let ms = if a1 == 1 {
+                task::ticks() * 10
+            } else if a1 == 0 {
+                crate::timer::rtc_ms()
+            } else {
+                ctx.rax = ERR;
+                return;
+            };
+            let v = [ms / 1000, (ms % 1000) * 1_000_000];
+            match copy_out(a2, unsafe {
+                core::slice::from_raw_parts(v.as_ptr() as *const u8, 16)
+            }) {
+                Some(_) => 0,
+                None => ERR,
+            }
+        }
         shared::SYS_MQ_UNLINK => {
             let Some(nb) = copy_in(a1, a2.min(64)) else {
                 ctx.rax = ERR;
@@ -2331,6 +2400,8 @@ pub fn fd_ready(path: &str, ev: u32) -> bool {
     } else if crate::sockfd::handles(path) {
         (ev & 1 != 0 && crate::sockfd::ready(path, true))
             || (ev & 2 != 0 && crate::sockfd::ready(path, false))
+    } else if crate::memfd::handles(path) {
+        crate::memfd::exists(path) // real file semantics: always ready
     } else if crate::mqueue::handles(path) {
         // readable while a message is queued; writable while under maxmsg
         (ev & 1 != 0 && crate::mqueue::ready(path))

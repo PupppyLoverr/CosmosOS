@@ -1400,6 +1400,98 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             }
         }
     });
+    check("memfd", {
+        // memfd: RAM-backed file — write/seek/read/truncate/stat all real
+        let fd = ustd::memfd_create("selftest-mfd");
+        if fd < 0 {
+            false
+        } else {
+            let w = ustd::write(fd, b"memfd-works");
+            let _ = ustd::seek(fd, 0, 0);
+            let mut buf = [0u8; 16];
+            let r = ustd::read(fd, &mut buf);
+            let read_ok = r.map(|n| buf[..n] == *b"memfd-works").unwrap_or(false);
+            let _ = ustd::ftruncate(fd, 5);
+            let st = ustd::fstat(fd).map(|s| s.size).unwrap_or(0);
+            ustd::close(fd);
+            w.is_ok() && read_ok && st == 5
+        }
+    });
+    check("memfd-mmap", {
+        // mmap_file on a memfd: pages fault in from the RAM store
+        let fd = ustd::memfd_create("mmap-mfd");
+        if fd < 0 {
+            false
+        } else {
+            let _ = ustd::write(fd, b"MMMM");
+            let _ = ustd::seek(fd, 0x1000, 0);
+            let _ = ustd::write(fd, b"NNNN");
+            match ustd::mmap_file(fd, 0x2000, 0) {
+                None => false,
+                Some(p) => unsafe {
+                    let a = core::ptr::read_volatile(p.add(1)) == b'M';
+                    let b = core::ptr::read_volatile(p.add(0x1001)) == b'N';
+                    let _ = ustd::munmap(p, 0x2000);
+                    ustd::close(fd);
+                    a && b
+                },
+            }
+        }
+    });
+    check("posix-timer", {
+        // timer_create/settime: a one-shot POSIX timer pends its signal
+        static mut PH: u32 = 0;
+        extern "C" fn th(_: u64) {
+            unsafe { PH = 1 };
+        }
+        unsafe {
+            PH = 0;
+            ustd::sigaction(11, th as usize as u64);
+            let id = ustd::timer_create(11);
+            if id < 0 {
+                false
+            } else {
+                ustd::timer_settime(id as u64, 30, 0);
+                let t0 = ustd::uptime_ms();
+                while PH == 0 && ustd::uptime_ms() - t0 < 3000 {
+                    ustd::yield_now();
+                }
+                ustd::sigaction(11, 0);
+                ustd::timer_delete(id as u64);
+                PH == 1
+            }
+        }
+    });
+    check("proc-sig", {
+        // /proc/self/sig reflects a real pending + masked signal
+        extern "C" fn s12(_: u64) {}
+        ustd::sigaction(12, s12 as usize as u64); // safe delivery on unmask
+        ustd::sigprocmask(ustd::SIG_BLOCK, 1 << 12); // block sig12
+        ustd::kill2(ustd::getpid(), 12);
+        let s = ustd::read_all("/proc/self/sig")
+            .map(|d| String::from_utf8_lossy(&d).into_owned())
+            .unwrap_or_default();
+        ustd::sigprocmask(ustd::SIG_SETMASK, 0); // unmask → handler fires
+        let pend = s.lines().find(|l| l.starts_with("sigpending"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|h| u64::from_str_radix(h, 16).ok()).unwrap_or(0);
+        let mask = s.lines().find(|l| l.starts_with("sigmask"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|h| u64::from_str_radix(h, 16).ok()).unwrap_or(0);
+        pend & (1 << 12) != 0 && mask & (1 << 12) != 0
+    });
+    check("clock-gettime", {
+        // MONOTONIC advances; REALTIME is a sane epoch (>2020)
+        let m1 = ustd::clock_gettime(1);
+        ustd::sleep_ms(30);
+        let m2 = ustd::clock_gettime(1);
+        let r = ustd::clock_gettime(0);
+        match (m1, m2, r) {
+            (Some((s1, _)), Some((s2, n2)), Some((rs, _))) =>
+                (s2, n2) != (0, 0) && (s2, n2) >= (s1, 0) && rs > 1_600_000_000,
+            _ => false,
+        }
+    });
     check("tls-fsbase", {
         // arch_prctl SET_FS/GET_FS: real FS segment per task
         static mut CELL: u64 = 0;

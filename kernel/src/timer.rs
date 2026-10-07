@@ -159,6 +159,25 @@ fn civil_from_days(z: i64) -> (u16, u8, u8) {
     ((if m <= 2 { y + 1 } else { y }) as u16, m as u8, d as u8)
 }
 
+// Hinnant's days_from_civil (public domain): unix days for y/m/d.
+fn days_from_civil(y: i64, m: u8, d: u8) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = ((m as i64) + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + (d as i64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Current wall clock as unix milliseconds (RTC base + uptime).
+pub fn rtc_ms() -> u64 {
+    let dt = datetime();
+    let days = days_from_civil(dt.year as i64, dt.month, dt.day);
+    (days as u64 * 86400 + dt.hour as u64 * 3600 + dt.minute as u64 * 60
+        + dt.second as u64) * 1000 + uptime_ms() % 1000
+}
+
 fn cmos_write(reg: u8, val: u8) {
     unsafe {
         let mut a: Port<u8> = Port::new(0x70);
