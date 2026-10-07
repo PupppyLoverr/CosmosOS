@@ -152,6 +152,9 @@ pub const SYS_FORK: u64 = 139;         // () -> pid | 0 (child) | !0  — eager 
 pub const SYS_EXECVE: u64 = 140;       // (path_ptr,path_len,args_ptr,args_len) -> 0 | !0 — replaces the image
 pub const SYS_SIGACTION: u64 = 141;    // (sig, handler) -> old handler | !0 — 0=DFL 1=IGN
 pub const SYS_SIGRETURN: u64 = 142;    // () -> restores the pushed signal frame
+pub const SYS_SIGPROCMASK: u64 = 143;    // (how 0=BLOCK 1=UNBLOCK 2=SETMASK, mask) -> old mask | !0
+pub const SYS_SIGNALFD: u64 = 144;       // (mask) -> fd | !0 — reads pending sigs as 128B records
+pub const SYS_ALARM: u64 = 145;          // (secs) -> prev remaining secs — SIGALRM one-shot
 pub const SOL_SOCKET: u64 = 1;
 pub const SO_REUSEADDR: u64 = 2;
 pub const SO_TYPE: u64 = 3;

@@ -211,6 +211,26 @@ pub fn raise(sig: u64) -> i64 {
     kill2(getpid(), sig)
 }
 
+pub const SIG_BLOCK: u64 = 0;
+pub const SIG_UNBLOCK: u64 = 1;
+pub const SIG_SETMASK: u64 = 2;
+
+/// sigprocmask: adjust the blocked-signal mask; returns the old mask.
+pub fn sigprocmask(how: u64, mask: u64) -> i64 {
+    sc2(shared::SYS_SIGPROCMASK, how, mask) as i64
+}
+
+/// A signalfd: read pending signals in `mask` as 128B records (first u32 =
+/// signo). Poll-able, O_NONBLOCK-able like any fd.
+pub fn signalfd(mask: u64) -> i64 {
+    sc1(shared::SYS_SIGNALFD, mask) as i64
+}
+
+/// Arm a one-shot SIGALRM in `secs`; returns the previous seconds left.
+pub fn alarm(secs: u64) -> i64 {
+    sc1(shared::SYS_ALARM, secs) as i64
+}
+
 /// Real fork(): the child resumes here with 0, in a private copy of the
 /// parent's whole address space; the parent gets the child pid.
 pub fn fork() -> i64 {

@@ -128,6 +128,33 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_EXECVE => sys_execve(ctx, a1, a2, a3, a4),
         shared::SYS_SIGACTION => sys_sigaction(a1, a2),
         shared::SYS_SIGRETURN => sys_sigreturn(ctx),
+        shared::SYS_SIGPROCMASK => sys_sigprocmask(a1, a2),
+        shared::SYS_SIGNALFD => {
+            let owner = task::with_current(|t| t.id);
+            let Ok(path) = crate::signalfd::create(owner, a1) else {
+                ctx.rax = ERR;
+                return;
+            };
+            task::with_current(|t| {
+                let fd = alloc_slot(t);
+                t.fds[fd] = Some(task::FileDesc {
+                    path,
+                    pos: 0,
+                    flags: shared::O_RDONLY,
+                });
+                fd as u64
+            })
+        }
+        shared::SYS_ALARM => task::with_current(|t| {
+            let left = if t.alarm_at == 0 {
+                0
+            } else {
+                // alarm_at is in PIT ticks (~10ms each); a1 is seconds
+            t.alarm_at.saturating_sub(task::ticks()) / 100
+            };
+            t.alarm_at = if a1 == 0 { 0 } else { task::ticks() + a1 * 100 };
+            left
+        }),
         shared::SYS_DEBUG => sys_debug(a1, a2),
         shared::SYS_OPEN => sys_open(a1, a2, a3),
         shared::SYS_CLOSE => {
@@ -1667,6 +1694,9 @@ fn fd_read_once(fd: usize, buf: &mut [u8]) -> Result<usize, i64> {
     if crate::timerfd::handles(&path) {
         return crate::timerfd::try_read(&path, buf);
     }
+    if crate::signalfd::handles(&path) {
+        return crate::signalfd::try_read(&path, buf);
+    }
     if crate::sockfd::handles(&path) {
         return crate::sockfd::try_read(&path, buf);
     }
@@ -2033,6 +2063,8 @@ pub fn fd_ready(path: &str, ev: u32) -> bool {
         ev & 1 != 0 && crate::notify::ready(path)
     } else if crate::timerfd::handles(path) {
         ev & 1 != 0 && crate::timerfd::ready(path)
+    } else if crate::signalfd::handles(path) {
+        ev & 1 != 0 && crate::signalfd::ready(path)
     } else if crate::eventfd::handles(path) {
         (ev & 1 != 0 && crate::eventfd::ready(path, true))
             || (ev & 2 != 0 && crate::eventfd::ready(path, false))
@@ -2397,6 +2429,25 @@ fn sys_sigaction(sig: u64, handler: u64) -> u64 {
 /// handler returns — restores the CpuContext pushed by maybe_deliver.
 /// Segments/rflags are forced safe: the frame lives on the user stack
 /// and could have been tampered with.
+/// SYS_SIGPROCMASK(how, mask): 0=SIG_BLOCK(or), 1=SIG_UNBLOCK(and-not),
+/// 2=SIG_SETMASK(replace). SIGKILL/SIGSTOP can't be masked — POSIX strips
+/// them silently. Returns the previous mask.
+fn sys_sigprocmask(how: u64, mask: u64) -> u64 {
+    if how > 2 {
+        return ERR;
+    }
+    let mask = mask & !((1u64 << 9) | (1u64 << 19));
+    task::with_current(|t| {
+        let old = t.sigmask;
+        t.sigmask = match how {
+            0 => t.sigmask | mask,
+            1 => t.sigmask & !mask,
+            _ => mask,
+        };
+        old
+    })
+}
+
 fn sys_sigreturn(ctx: &mut CpuContext) -> u64 {
     let fbase = ctx.rsp.wrapping_sub(168);
     let Some(bytes) = copy_in(fbase, 160) else {

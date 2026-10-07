@@ -109,6 +109,8 @@ pub struct Task {
     pub sigpending: u64,        // pending userspace-signal bitmask
     pub sighandlers: [u64; 32], // 0=SIG_DFL 1=SIG_IGN else handler VA
     pub sigrest_mapped: bool,   // sigreturn trampoline page installed
+    pub sigmask: u64,           // blocked-signal bitmask (sigprocmask)
+    pub alarm_at: u64,          // SIGALRM deadline (ms ticks; 0 = disarmed)
 }
 
 pub struct Sched {
@@ -195,6 +197,8 @@ pub fn init() {
         sigpending: 0,
         sighandlers: [0; 32],
         sigrest_mapped: false,
+        sigmask: 0,
+        alarm_at: 0,
     };
     *SCHED.lock() = Some(Sched { tasks: vec![Box::new(boot)], cur: 0, next_pid: 1 });
 }
@@ -228,6 +232,16 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
     for t in s.tasks.iter_mut() {
         if t.state == State::Blocked && t.wake_at <= ticks() {
             t.state = State::Running;
+        }
+        if t.alarm_at != 0 && t.alarm_at <= ticks() {
+            t.alarm_at = 0;
+            t.sigpending |= 1 << 14; // SIGALRM
+            if t.state == State::Blocked {
+                t.state = State::Running;
+                t.waiting_on = 0;
+                t.wait_port = 0;
+                t.wait_futex = 0;
+            }
         }
     }
     // wake port receivers whose queues filled
@@ -553,6 +567,8 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         sigpending: 0,
         sighandlers: [0; 32],
         sigrest_mapped: false,
+        sigmask: 0,
+        alarm_at: 0,
     };
     mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -626,6 +642,8 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         sigpending: 0,
         sighandlers: [0; 32],
         sigrest_mapped: false,
+        sigmask: 0,
+        alarm_at: 0,
     }));
     pid
 }
@@ -748,6 +766,8 @@ pub fn clone_user(entry: u64, arg: u64) -> Option<u32> {
         sigpending: 0,
         sighandlers: s.tasks[s.cur].sighandlers,
         sigrest_mapped: s.tasks[s.cur].sigrest_mapped,
+        sigmask: s.tasks[s.cur].sigmask,
+        alarm_at: 0,
     };
     mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -797,15 +817,19 @@ pub fn maybe_deliver(s: &mut Sched, idx: usize, ctx: *mut CpuContext) {
     if c.cs & 3 != 3 {
         return; // suspended inside the kernel — deliver on a later resume
     }
-    let sig = t.sigpending.trailing_zeros() as usize;
+    let deliverable = t.sigpending & !t.sigmask;
+    if deliverable == 0 {
+        return; // everything pending is blocked — stays queued
+    }
+    let sig = deliverable.trailing_zeros() as usize;
     let handler = t.sighandlers[sig];
     if handler == 1 {
         t.sigpending &= !(1 << sig);
         return; // SIG_IGN
     }
-    if handler == 0 && sig == 18 {
+    if handler == 0 && (sig == 18 || sig == 17) {
         t.sigpending &= !(1 << sig);
-        return; // SIGCONT default: resume, no frame
+        return; // SIGCONT resumes / SIGCHLD default-ignores: no frame
     }
     if handler == 0 {
         t.sigpending &= !(1 << sig);
@@ -978,8 +1002,17 @@ pub fn cow_split(pml4: PhysFrame, page: u64, phys: u64) -> bool {
     if n <= 1 && !was_tracked {
         return false; // already private
     }
+    // a recorded page was logically writable (or executable) before it
+    // was shared — splitting restores that writability, same as the
+    // write-fault path in cow_resolve; callers re-protect if needed
+    let x = MM_COW
+        .lock()
+        .get(&(pp, page))
+        .map(|p| p >> 63 != 0)
+        .unwrap_or(false);
     if n <= 1 {
         mem::cow_claim(phys);
+        crate::elf::protect_user_page(pml4, page, true, x);
     } else {
         let Some(nf) = mem::alloc_frame() else {
             return false;
@@ -991,17 +1024,12 @@ pub fn cow_split(pml4: PhysFrame, page: u64, phys: u64) -> bool {
                 0x1000,
             );
         }
-        let x = MM_COW
-            .lock()
-            .get(&(pp, page))
-            .map(|p| p >> 63 != 0)
-            .unwrap_or(false);
         let _ = crate::elf::unmap_user_page(pml4, page);
         crate::elf::map_phys_user_flags(
             pml4,
             page,
             nf.start_address().as_u64(),
-            false,
+            true,
             x,
             &mut Vec::new(),
         );
@@ -1159,6 +1187,8 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         sigpending: 0,
         sighandlers: cur.sighandlers,
         sigrest_mapped: cur.sigrest_mapped,
+        sigmask: cur.sigmask,
+        alarm_at: 0,
     };
     mm_inc(cpml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -1294,6 +1324,8 @@ pub fn exec_current(ctx: &mut CpuContext, path: &str, args: &str) -> bool {
     // POSIX: caught handlers revert to SIG_DFL across exec; IGN stays
     t.sighandlers = t.sighandlers.map(|h| if h == 1 { 1 } else { 0 });
     t.sigrest_mapped = false;
+    t.sigmask = 0;
+    t.alarm_at = 0;
     t.exe = String::from(path);
     t.argv = String::from(args);
     t.name = String::from(path.rsplit('/').next().unwrap_or(path));
@@ -1436,6 +1468,7 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
     ipc::close_task_ports(&mut t);
     shm::drop_task_shm(&mut t);
     crate::locks::release_pid(t.id);
+    crate::signalfd::drop_owner(t.id);
     // release fd-table objects (pipe roles, inotify/timerfd objects) — a
     // dead task must not pin e.g. a pipe's writer count, or readers block
     // forever waiting for an EOF that can never come. Another live task
@@ -1492,7 +1525,23 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
     // stubs keep pushing contexts onto it until the scheduler switches away.
     let id = t.id;
     let name = t.name.clone();
+    let parent = t.parent;
     s.tasks.push(t); // keep as tombstone for wait_pid
+    // SIGCHLD: every death path (exit, kill, fault) notifies the parent;
+    // default disposition ignores it, a registered handler interrupts
+    if parent != 0 {
+        if let Some(p) = s.tasks.iter_mut().find(|x| x.id == parent) {
+            if p.state != State::Dead {
+                p.sigpending |= 1 << 17;
+                if p.state == State::Blocked {
+                    p.state = State::Running;
+                    p.waiting_on = 0;
+                    p.wait_port = 0;
+                    p.wait_futex = 0;
+                }
+            }
+        }
+    }
     // s.cur bookkeeping after the remove: if the CURRENT task died, point
     // s.cur at its tombstone so the next sched_tick records the int-32
     // context on the dead entry instead of clobbering a live task's
@@ -1822,6 +1871,32 @@ pub fn trace_rec(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, ret: u64)
                 .extend_from_slice(&[nr, a1, a2, a3, a4, a5, ret]);
         }
     });
+}
+
+/// Consume the lowest pending signal of `pid` that `mask` allows — used
+/// by signalfd reads. None = nothing deliverable (or no such task).
+pub fn take_pending_sig(pid: u32, mask: u64) -> Option<u32> {
+    let mut g = SCHED.lock();
+    let s = g.as_mut().unwrap();
+    let t = s.tasks.iter_mut().find(|t| t.id == pid && t.is_user)?;
+    let avail = t.sigpending & mask;
+    if avail == 0 {
+        return None;
+    }
+    let sig = avail.trailing_zeros();
+    t.sigpending &= !(1 << sig);
+    Some(sig)
+}
+
+/// Is any of `pid`'s pending signals visible through `mask`? (poll support)
+pub fn has_pending_sig(pid: u32, mask: u64) -> bool {
+    let g = SCHED.lock();
+    let s = g.as_ref().unwrap();
+    s.tasks
+        .iter()
+        .find(|t| t.id == pid)
+        .map(|t| t.sigpending & mask != 0)
+        .unwrap_or(false)
 }
 
 /// POSIX-lite signals: 1/2/3/6/9/15 terminate (wait-status 128+sig),
