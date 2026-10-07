@@ -1158,6 +1158,80 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         ustd::close(tfd);
         ok
     });
+    check("socketpair", {
+        // a->b and b->a both carry bytes; poll reports ready
+        match ustd::socketpair() {
+            Some((a, b)) => {
+                let mut buf = [0u8; 8];
+                let ok = ustd::write(a, b"hi").is_ok()
+                    && ustd::write(b, b"yo").is_ok()
+                    && ustd::poll(&[b as u32], &[1], 1000) == 1
+                    && ustd::read(b, &mut buf).map(|n| &buf[..n] == b"hi").unwrap_or(false)
+                    && ustd::poll(&[a as u32], &[1], 1000) == 1
+                    && ustd::read(a, &mut buf).map(|n| &buf[..n] == b"yo").unwrap_or(false)
+                    && ustd::poll(&[b as u32], &[1], 0) == 0;
+                ustd::close(a);
+                ustd::close(b);
+                ok
+            }
+            None => false,
+        }
+    });
+    check("socketpair-eof", {
+        // closing side A makes side B's read return EOF and write EPIPE
+        match ustd::socketpair() {
+            Some((a, b)) => {
+                ustd::close(a);
+                let mut buf = [0u8; 8];
+                let ok = ustd::poll(&[b as u32], &[1], 1000) == 1
+                    && ustd::read(b, &mut buf) == Ok(0)
+                    && ustd::write(b, b"x") == Err(-32);
+                ustd::close(b);
+                ok
+            }
+            None => false,
+        }
+    });
+    check("pidfd", {
+        // pidfd of a live task: not ready while running, readable after
+        // kill; read yields a status. pidfd of an absent pid must fail.
+        match ustd::spawn("/bin/cosmos-calc", "") {
+            Ok(pid) => {
+                let pfd = ustd::pidfd(pid);
+                let ok = pfd >= 0
+                    && ustd::pidfd(999_999) < 0
+                    && ustd::poll(&[pfd as u32], &[1], 0) == 0
+                    && ustd::kill2(pid, 9) == 0
+                    && ustd::poll(&[pfd as u32], &[1], 4000) == 1
+                    && ustd::pidfd_read(pfd).is_some();
+                ustd::close(pfd);
+                ok
+            }
+            Err(_) => ustd::pidfd(999_999) < 0,
+        }
+    });
+    check("fcntl", {
+        // F_GETFL/F_SETFL roundtrip; F_DUPFD lands at >= min, shares pos
+        match ustd::open("/st-fcntl", ustd::O_CREATE | ustd::O_RDWR) {
+            Ok(fd) => {
+                let fl = ustd::fcntl(fd, ustd::F_GETFL, 0);
+                let ok = fl >= 0
+                    && ustd::fcntl(fd, ustd::F_SETFL, fl as u64 | ustd::O_NONBLOCK)
+                        == 0
+                    && ustd::fcntl(fd, ustd::F_GETFL, 0) & ustd::O_NONBLOCK as i64
+                        != 0;
+                let dup = ustd::fcntl(fd, ustd::F_DUPFD, 10);
+                let ok = ok && dup >= 10;
+                if dup >= 0 {
+                    ustd::close(dup);
+                }
+                ustd::close(fd);
+                let _ = ustd::remove("/st-fcntl");
+                ok
+            }
+            Err(_) => false,
+        }
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64
