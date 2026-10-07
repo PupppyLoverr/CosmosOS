@@ -56,6 +56,10 @@ pub fn init() -> bool {
     }
 }
 
+pub fn now_unix() -> u64 {
+    current_unix()
+}
+
 fn current_unix() -> u64 {
     let d = crate::timer::datetime();
     dos_dt_to_unix(d.year, d.month, d.day, d.hour, d.minute, d.second)
@@ -98,6 +102,21 @@ pub fn normalize(cwd: &str, path: &str) -> String {
 }
 
 pub fn read_all(path: &str) -> Result<Vec<u8>, i64> {
+    if crate::pipes::handles(path) {
+        return if crate::pipes::is_dir(path) {
+            Err(-4) // EISDIR
+        } else {
+            let mut out = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                match crate::pipes::try_read(path, &mut tmp) {
+                    crate::pipes::TryRead::Data(n) => out.extend_from_slice(&tmp[..n]),
+                    _ => break,
+                }
+            }
+            Ok(out)
+        };
+    }
     if crate::dev::handles(path) {
         return if crate::dev::is_dir(path) {
             Err(-4) // EISDIR
@@ -144,6 +163,29 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     let fs = g.as_mut().ok_or(-1i64)?;
     let is_proc = crate::proc::handles(&full);
     let is_dev = crate::dev::handles(&full);
+    let is_pipe = crate::pipes::handles(&full);
+    if is_pipe {
+        if crate::pipes::is_dir(&full) {
+            return Err(-4);
+        }
+        // mkfifo-style create: O_CREATE on a missing /pipes path makes a
+        // pipe object, not a FAT file
+        if !crate::pipes::exists(&full) {
+            if flags & shared::O_CREATE == 0 {
+                return Err(-2);
+            }
+            crate::pipes::create(&full)?;
+        }
+        // writer = an fd opened for write (O_WRONLY|O_TRUNC|O_APPEND), i.e.
+        // `>` / `>>` opens; plain readers take the reader slot
+        let writer = flags & (shared::O_WRONLY | shared::O_TRUNC | shared::O_APPEND) != 0;
+        crate::pipes::open_role(&full, writer);
+        let fd = alloc_fd() as i64;
+        task::with_current(|t| {
+            t.fds[fd as usize] = Some(FileDesc { path: full, pos: 0, flags });
+        });
+        return Ok(fd);
+    }
     if is_dev && crate::dev::is_dir(&full) {
         return Err(-4);
     }
@@ -207,6 +249,13 @@ pub fn read(fd: i64, buf: &mut [u8]) -> Result<i64, i64> {
     if pos == u64::MAX {
         return Err(-3);
     }
+    if crate::pipes::handles(&path) {
+        return match crate::pipes::try_read(&path, buf) {
+            crate::pipes::TryRead::Data(n) => Ok(n as i64),
+            crate::pipes::TryRead::Eof => Ok(0),
+            crate::pipes::TryRead::WouldBlock => Ok(0), // nonblocking caller sees EOF
+        };
+    }
     if crate::dev::handles(&path) {
         let n = crate::dev::read_at(&path, pos, buf)? as u64;
         task::with_current(|t| {
@@ -252,6 +301,9 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
     if pos == u64::MAX {
         return Err(-3);
     }
+    if crate::pipes::handles(&path) {
+        return crate::pipes::try_write(&path, buf);
+    }
     if crate::dev::handles(&path) {
         let n = crate::dev::write(&path, buf.len())?;
         task::with_current(|t| {
@@ -295,11 +347,16 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
 }
 
 pub fn close(fd: i64) {
-    task::with_current(|t| {
-        if let Some(slot) = t.fds.get_mut(fd as usize) {
-            *slot = None;
-        }
+    let gone = task::with_current(|t| match t.fds.get_mut(fd as usize) {
+        Some(slot) => slot.take(),
+        None => None,
     });
+    if let Some(f) = gone {
+        if crate::pipes::handles(&f.path) {
+            let writer = f.flags & (shared::O_WRONLY | shared::O_TRUNC | shared::O_APPEND) != 0;
+            crate::pipes::close_role(&f.path, writer);
+        }
+    }
 }
 
 pub fn seek(fd: i64, pos: u64) -> Result<i64, i64> {
@@ -315,6 +372,15 @@ pub fn seek(fd: i64, pos: u64) -> Result<i64, i64> {
 pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if crate::pipes::handles(&full) {
+        if crate::pipes::is_dir(&full) {
+            return Ok(shared::Stat { size: 0, is_dir: 1, mtime: 0, attr: 0 });
+        }
+        return match crate::pipes::stat(&full) {
+            Some((sz, mt)) => Ok(shared::Stat { size: sz, is_dir: 0, mtime: mt, attr: 0x20 }),
+            None => Err(-2),
+        };
+    }
     if crate::dev::handles(&full) {
         return Ok(shared::Stat {
             size: 0,
@@ -342,7 +408,7 @@ pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
 pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
-    if crate::proc::handles(&full) || crate::dev::handles(&full) {
+    if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
     }
     let mut g = FS.lock();
@@ -355,7 +421,7 @@ pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
 pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
-    if crate::proc::handles(&full) || crate::dev::handles(&full) {
+    if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
     }
     let mut g = FS.lock();
@@ -366,6 +432,13 @@ pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
 pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if crate::pipes::handles(&full) {
+        return if crate::pipes::is_dir(&full) {
+            Ok(crate::pipes::entries())
+        } else {
+            Err(-4) // ENOTDIR
+        };
+    }
     if crate::dev::handles(&full) {
         return if crate::dev::is_dir(&full) {
             Ok(crate::dev::entries())
@@ -405,7 +478,7 @@ pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
 pub fn mkdir(path: &str) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
-    if crate::proc::handles(&full) || crate::dev::handles(&full) {
+    if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
     }
     let mut g = FS.lock();
@@ -416,7 +489,10 @@ pub fn mkdir(path: &str) -> Result<(), i64> {
 pub fn remove(path: &str) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
-    if crate::proc::handles(&full) || crate::dev::handles(&full) {
+    if crate::pipes::handles(&full) && !crate::pipes::is_dir(&full) {
+        return crate::pipes::remove(&full);
+    }
+    if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
     }
     let mut g = FS.lock();
@@ -432,6 +508,8 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
         || crate::proc::handles(&t2)
         || crate::dev::handles(&f)
         || crate::dev::handles(&t2)
+        || crate::pipes::handles(&f)
+        || crate::pipes::handles(&t2)
     {
         return Err(-4);
     }

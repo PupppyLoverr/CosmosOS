@@ -569,6 +569,11 @@ pub fn umask(mask: u64) -> u64 {
 pub fn klog_clear() {
     sc0(shared::SYS_KLOG_CLEAR);
 }
+
+/// Create a named pipe at `path` (absolute). 0 | <0 (EEXIST=-5).
+pub fn mkfifo(path: &str) -> i64 {
+    sc2(shared::SYS_MKFIFO, path.as_ptr() as u64, path.len() as u64) as i64
+}
 pub fn mkdir(path: &str) -> Result<(), i64> {
     let r = sc2(shared::SYS_MKDIR, path.as_ptr() as u64, path.len() as u64);
     if is_err(r) {

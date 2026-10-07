@@ -108,8 +108,8 @@ pub fn dispatch(ctx: &mut CpuContext) {
             vfs::close(a1 as i64);
             0
         }
-        shared::SYS_READ => sys_read(a1, a2, a3),
-        shared::SYS_WRITE => sys_write(a1, a2, a3),
+        shared::SYS_READ => sys_read(ctx, a1, a2, a3),
+        shared::SYS_WRITE => sys_write(ctx, a1, a2, a3),
         shared::SYS_SEEK => sys_seek(a1, a2, a3),
         shared::SYS_STAT => sys_stat(a1, a2, a3),
         shared::SYS_READDIR => sys_readdir(a1, a2, a3, a4),
@@ -372,6 +372,23 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
             old
         }),
+        shared::SYS_MKFIFO => {
+            // (ptr,len): mkfifo — create a named pipe at any canonical path
+            match copy_in(a1, a2.min(4096)) {
+                Some(b) => {
+                    let path = String::from_utf8_lossy(&b).into_owned();
+                    if !path.starts_with('/') {
+                        -3i64 as u64 // must be absolute
+                    } else {
+                        match crate::pipes::mkfifo(&path) {
+                            Ok(()) => 0,
+                            Err(e) => e as u64,
+                        }
+                    }
+                }
+                None => ERR,
+            }
+        }
         shared::SYS_KLOG_CLEAR => {
             crate::klog::clear();
             0
@@ -587,11 +604,31 @@ fn sys_open(pptr: u64, plen: u64, flags: u64) -> u64 {
     }
 }
 
-fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
+fn sys_read(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
     if len > 1 << 20 {
         return ERR;
     }
+    // named pipes: block (rewind the syscall) while the queue is empty and a
+    // writer is still attached; EOF once the last writer closes
+    let pipe_path = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) if crate::pipes::handles(&f.path) => Some(f.path.clone()),
+        _ => None,
+    });
     let mut tmp = vec![0u8; len as usize];
+    if let Some(p) = pipe_path {
+        match crate::pipes::try_read(&p, &mut tmp) {
+            crate::pipes::TryRead::WouldBlock => {
+                block_reenter(ctx, task::ticks() + 2, 0); // poll every ~20ms
+            }
+            crate::pipes::TryRead::Eof => return 0,
+            crate::pipes::TryRead::Data(n) => {
+                return match copy_out(buf, &tmp[..n]) {
+                    Some(_) => n as u64,
+                    None => ERR,
+                };
+            }
+        }
+    }
     match vfs::read(fd as i64, &mut tmp) {
         Ok(n) => match copy_out(buf, &tmp[..n as usize]) {
             Some(_) => n as u64,
@@ -601,9 +638,16 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     }
 }
 
-fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
+fn sys_write(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
     let Some(data) = copy_in(buf, len.min(1 << 20)) else { return ERR };
+    // named pipes: a full queue with a reader attached re-blocks and retries;
+    // full with no readers is EPIPE
+    let is_pipe = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) => crate::pipes::handles(&f.path),
+        _ => false,
+    });
     match vfs::write(fd as i64, &data) {
+        Err(-11) if is_pipe => block_reenter(ctx, task::ticks() + 2, 0),
         Ok(n) => n as u64,
         Err(e) => e as u64,
     }
