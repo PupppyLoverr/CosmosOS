@@ -4973,6 +4973,8 @@ struct Term {
     nc_udp: Option<(ustd::UdpSock, Option<([u8; 4], u16)>)>, // `nc -u`/`-lu` UDP session (peer learned)
     snc_fd: Option<i64>,                               // `snc <ip> <port>` — socket-fd raw session
     udpecho_fd: Option<i64>,                           // `udpecho <port>` — UDP socket-fd echo server
+    ucat_l: Option<(i64, String)>,                     // `ucat -l <path>` — AF_UNIX echo listener (fd, name)
+    ucat_c: Option<i64>,                               // accepted unix conn fd being echoed
     fd_httpd: Option<(i64, String)>,                   // `fd-httpd <port> [root]` — socket-fd server (lfd, root)
     fd_httpd_conn: Option<(i64, u64, u32)>,            // accepted conn fd, idle deadline, reqs served
     last_ok: bool,                                     // success of the last statement (for && / ||)
@@ -14047,6 +14049,67 @@ impl Term {
                     None => self.fail("usage: udpecho <port>  (real UDP socket fd)"),
                 }
             }
+            "ucat" => {
+                // ucat -l <path>: AF_UNIX stream echo listener (socket fd).
+                // Peers: `cosmos-ucat <path> <msg> [out]` — a real spawned
+                // task — connects, writes, half-closes, reads the echo.
+                if args.first() == Some(&"-l") {
+                    match args.get(1).cloned() {
+                        Some(p) if p.starts_with('/') => match ustd::UnixFd::listen(p) {
+                            Ok(l) => {
+                                self.emit(&alloc::format!(
+                                    "ucat: listening {} (fd {}) — Esc to stop",
+                                    p, l.0
+                                ));
+                                self.ucat_l = Some((l.0, String::from(p)));
+                                core::mem::forget(l);
+                            }
+                            Err(e) => self.fail(&alloc::format!(
+                                "ucat: listen {} failed ({})", p, e
+                            )),
+                        },
+                        _ => self.fail("usage: ucat -l /<sock-path>"),
+                    }
+                } else {
+                    // in-process client shortcut: `ucat <path> <msg>` —
+                    // connect, send, print the reply (bounded 4s).
+                    match (args.first(), args.get(1)) {
+                        (Some(p), Some(m)) if p.starts_with('/') => {
+                            match ustd::UnixFd::connect(p) {
+                                Ok(s) => {
+                                    let _ = s.write(m.as_bytes());
+                                    ustd::shutdown(s.0, 1);
+                                    let mut got = alloc::vec::Vec::new();
+                                    let dl = ustd::uptime_ms() + 4000;
+                                    while ustd::uptime_ms() < dl {
+                                        if ustd::poll(&[s.0 as u32], &[1], 250) <= 0 {
+                                            continue;
+                                        }
+                                        let mut b = [0u8; 512];
+                                        match s.read(&mut b) {
+                                            Ok(0) => break,
+                                            Ok(n) => got.extend_from_slice(&b[..n]),
+                                            Err(_) => {}
+                                        }
+                                    }
+                                    if got.is_empty() {
+                                        self.fail("ucat: no reply (timeout)");
+                                    } else {
+                                        self.emit(&alloc::format!(
+                                            "ucat: got {}",
+                                            String::from_utf8_lossy(&got)
+                                        ));
+                                    }
+                                }
+                                Err(e) => self.fail(&alloc::format!(
+                                    "ucat: connect {} failed ({})", p, e
+                                )),
+                            }
+                        }
+                        _ => self.fail("usage: ucat -l <path>  |  ucat <path> <msg>"),
+                    }
+                }
+            }
             "fd-httpd" => {
                 // fd-httpd <port> [root]: the socket-fd HTTP server —
                 // socket/bind/listen/accept + read/write on conn fds
@@ -19763,6 +19826,18 @@ impl Term {
             self.dirty_all = true;
             return;
         }
+        // ucat -l mode: Esc closes listener + conn and frees the name
+        if self.ucat_l.is_some() && k.key == KeyCode::Escape as u32 {
+            if let Some(c) = self.ucat_c.take() {
+                ustd::close(c);
+            }
+            if let Some((l, name)) = self.ucat_l.take() {
+                ustd::close(l);
+                self.push_line(&alloc::format!("ucat: {} closed", name));
+            }
+            self.dirty_all = true;
+            return;
+        }
         // udpecho mode: Esc closes the UDP socket fd
         if self.udpecho_fd.is_some() && k.key == KeyCode::Escape as u32 {
             if let Some(fd) = self.udpecho_fd {
@@ -20040,7 +20115,7 @@ impl Term {
         "uptime", "reboot", "shutdown", "exit", "history", "time",
         "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
         "set", "env", "printenv", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
-        "dmesg", "arp", "httpd", "fd-httpd", "ntp", "nc", "snc", "udpecho", "fserve", "fget", "true", "false",
+        "dmesg", "arp", "httpd", "fd-httpd", "ntp", "nc", "snc", "udpecho", "ucat", "fserve", "fget", "true", "false",
         "shot", "find", "killall", "basename", "dirname", "strings", "diff", "stat",
         "uniq", "tr", "cut", "tee", "base64", "sha256sum", "tar", "show",
         "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
@@ -21360,6 +21435,8 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         nc_udp: None,
         snc_fd: None,
         udpecho_fd: None,
+        ucat_l: None,
+        ucat_c: None,
         fd_httpd: None,
         fd_httpd_conn: None,
         last_ok: true,
@@ -21689,6 +21766,38 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                     }
                     Err(_) => {}
                 }
+            }
+        }
+        // ucat -l: accept queued conns, then echo reads back to the writer
+        if let Some((lfd, _)) = t.ucat_l {
+            if ustd::poll(&[lfd as u32], &[1], 0) > 0 {
+                if let Ok((cfd, _, _)) = ustd::accept(lfd) {
+                    if let Some(old) = t.ucat_c.replace(cfd) {
+                        ustd::close(old);
+                    }
+                }
+            }
+        }
+        if let Some(cfd) = t.ucat_c {
+            let mut keep = true;
+            if ustd::poll(&[cfd as u32], &[1], 0) > 0 {
+                let mut b = [0u8; 1024];
+                match ustd::read(cfd, &mut b) {
+                    Ok(0) => keep = false, // client half-closed: echoed all
+                    Ok(n) => {
+                        let _ = ustd::write(cfd, &b[..n]);
+                        let t2 = String::from_utf8_lossy(&b[..n]).into_owned();
+                        t.push_line(&alloc::format!(
+                            "ucat: echo {}B: {}", n, t2.trim_end()
+                        ));
+                        t.dirty_all = true;
+                    }
+                    Err(_) => {}
+                }
+            }
+            if !keep {
+                ustd::close(cfd);
+                t.ucat_c = None;
             }
         }
         // snc: drain the socket fd — poll(read) then read; Ok(0)=remote close

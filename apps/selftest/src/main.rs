@@ -1396,6 +1396,116 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    // ---- batch 37: AF_UNIX + shutdown + sockname ----
+    check("unix-socket", {
+        // bind+listen a unix name, connect a client, accept, echo both
+        // directions over the real sockpair-backed data plane.
+        let mut ok = false;
+        let lfd = ustd::socketx(ustd::SOCK_STREAM, shared::AF_UNIX);
+        let cfd = ustd::socketx(ustd::SOCK_STREAM, shared::AF_UNIX);
+        if lfd >= 0 && cfd >= 0 {
+            ustd::fcntl(lfd, ustd::F_SETFL, ustd::O_NONBLOCK);
+            ok = ustd::bind_path(lfd, "/uts-selftest") == 0
+                // connect before listen -> ECONNREFUSED, not ENOENT
+                && ustd::connect_path(cfd, "/uts-selftest") == -111
+                && ustd::listen(lfd, 4) == 0
+                && ustd::connect_path(cfd, "/uts-selftest") == 0
+                // name taken while bound
+                && {
+                    let d = ustd::socketx(ustd::SOCK_STREAM, shared::AF_UNIX);
+                    let r = ustd::bind_path(d, "/uts-selftest");
+                    ustd::close(d);
+                    r == -98
+                };
+            if ok {
+                // listener is readable -> accept -> server fd
+                let sfd = if ustd::poll(&[lfd as u32], &[1], 500) > 0 {
+                    ustd::accept(lfd).ok().map(|(f, _, _)| f)
+                } else {
+                    None
+                };
+                if let Some(sfd) = sfd {
+                    let mut b = [0u8; 64];
+                    ok = ustd::write(cfd, b"ping") == Ok(4)
+                        && ustd::poll(&[sfd as u32], &[1], 500) > 0
+                        && ustd::read(sfd, &mut b) == Ok(4)
+                        && &b[..4] == b"ping"
+                        && ustd::write(sfd, b"pong") == Ok(4)
+                        && ustd::poll(&[cfd as u32], &[1], 500) > 0
+                        && ustd::read(cfd, &mut b) == Ok(4)
+                        && &b[..4] == b"pong"
+                        // getsockname on the listener = the bound path
+                        && ustd::getsockname(lfd, &mut b)
+                            .map(|n| {
+                                n >= 3
+                                    && u16::from_le_bytes([b[0], b[1]]) == 1
+                                    && &b[2..n - 1] == b"/uts-selftest"
+                            })
+                            .unwrap_or(false)
+                        // getpeername on the client = the path it dialed
+                        && ustd::getpeername(cfd, &mut b)
+                            .map(|n| {
+                                n >= 3
+                                    && u16::from_le_bytes([b[0], b[1]]) == 1
+                                    && &b[2..n - 1] == b"/uts-selftest"
+                            })
+                            .unwrap_or(false);
+                    // shutdown(client, WR): server sees EOF after drain;
+                    // client can still read; server->client still works
+                    ok = ok
+                        && ustd::shutdown(cfd, 1) == 0
+                        && ustd::write(cfd, b"x") == Err(-32) // EPIPE
+                        && ustd::poll(&[sfd as u32], &[1], 500) > 0
+                        && ustd::read(sfd, &mut b) == Ok(0) // peer EOF
+                        && ustd::write(sfd, b"tail") == Ok(4)
+                        && ustd::poll(&[cfd as u32], &[1], 500) > 0
+                        && ustd::read(cfd, &mut b) == Ok(4)
+                        && &b[..4] == b"tail";
+                    ustd::close(sfd);
+                } else {
+                    ok = false;
+                }
+            }
+        }
+        if lfd >= 0 {
+            ustd::close(lfd); // frees the name
+        }
+        if cfd >= 0 {
+            ustd::close(cfd);
+        }
+        // listener gone -> connect is ENOENT; name is rebindable
+        let d = ustd::socketx(ustd::SOCK_STREAM, shared::AF_UNIX);
+        ok = ok && d >= 0 && ustd::connect_path(d, "/uts-selftest") == -2
+            && ustd::bind_path(d, "/uts-selftest") == 0;
+        if d >= 0 {
+            ustd::close(d);
+        }
+        ok
+    });
+    check("shutdown", {
+        // on a plain socketpair: SHUT_WR -> peer EOF + our writes EPIPE,
+        // our reads still fine
+        let mut ok = false;
+        if let Some((a, b)) = ustd::socketpair() {
+            ustd::fcntl(a, ustd::F_SETFL, ustd::O_NONBLOCK);
+            ustd::fcntl(b, ustd::F_SETFL, ustd::O_NONBLOCK);
+            let mut buf = [0u8; 16];
+            ok = ustd::write(a, b"hi") == Ok(2)
+                && ustd::shutdown(a, 1) == 0
+                && ustd::write(a, b"x") == Err(-32)
+                && ustd::read(b, &mut buf) == Ok(2)
+                && &buf[..2] == b"hi"
+                && ustd::read(b, &mut buf) == Ok(0) // EOF after drain
+                && ustd::write(b, b"yo") == Ok(2)
+                && ustd::read(a, &mut buf) == Ok(2)
+                && &buf[..2] == b"yo"
+                && ustd::shutdown(b, 0) == 0
+                && ustd::read(b, &mut buf) == Ok(0); // SHUT_RD
+            ustd::close(a);
+            ustd::close(b);
+        }
+        ok
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64
