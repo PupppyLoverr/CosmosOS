@@ -1095,6 +1095,69 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             ok
         }
     });
+    check("eventfd", {
+        // write 5, poll-ready, read drains to 5; empty then write 3 -> 3
+        let fd = ustd::eventfd(0, 0);
+        if fd < 0 {
+            false
+        } else {
+            let ok = ustd::eventfd_write(fd, 5) == 0
+                && ustd::poll(&[fd as u32], &[1], 2000) > 0
+                && ustd::eventfd_read(fd) == Some(5)
+                && ustd::poll(&[fd as u32], &[1], 0) == 0
+                && ustd::eventfd_write(fd, 3) == 0
+                && ustd::eventfd_read(fd) == Some(3);
+            ustd::close(fd);
+            ok
+        }
+    });
+    check("eventfd-sem", {
+        // semaphore mode: count 2 yields two reads of 1, then not-ready
+        let fd = ustd::eventfd(2, ustd::EFD_SEMAPHORE);
+        if fd < 0 {
+            false
+        } else {
+            let ok = ustd::eventfd_read(fd) == Some(1)
+                && ustd::eventfd_read(fd) == Some(1)
+                && ustd::poll(&[fd as u32], &[1], 0) == 0;
+            ustd::close(fd);
+            ok
+        }
+    });
+    check("epoll", {
+        // epoll over a pipe read-end: quiet before write, fires after
+        match (ustd::pipe(), ustd::epoll_create()) {
+            (Some((rfd, wfd)), ep) if ep >= 0 => {
+                let mut evs = [(0u32, 0u32); 4];
+                let ok = ustd::epoll_ctl(ep, ustd::EPOLL_CTL_ADD, rfd, ustd::EPOLLIN)
+                    == 0
+                    && ustd::epoll_wait(ep, &mut evs, 0) == 0
+                    && ustd::write(wfd, b"x").is_ok()
+                    && ustd::epoll_wait(ep, &mut evs, 2000) == 1
+                    && evs[0].0 == rfd as u32
+                    && evs[0].1 & ustd::EPOLLIN as u32 != 0;
+                ustd::close(ep);
+                ustd::close(rfd);
+                ustd::close(wfd);
+                ok
+            }
+            _ => false,
+        }
+    });
+    check("epoll-timerfd", {
+        // a timerfd interest fires once its armed timer expires
+        let (tfd, ep) = (ustd::timerfd_create(), ustd::epoll_create());
+        let mut evs = [(0u32, 0u32); 4];
+        let ok = tfd >= 0
+            && ep >= 0
+            && ustd::timerfd_set(tfd, 25, 0) == 0
+            && ustd::epoll_ctl(ep, ustd::EPOLL_CTL_ADD, tfd, ustd::EPOLLIN) == 0
+            && ustd::epoll_wait(ep, &mut evs, 2000) == 1
+            && evs[0].0 == tfd as u32;
+        ustd::close(ep);
+        ustd::close(tfd);
+        ok
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

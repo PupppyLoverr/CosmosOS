@@ -424,7 +424,8 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
 }
 
 /// Release the kernel-side object a descriptor holds: pipe reader/writer
-/// role, inotify watch instance, timerfd. Called from close() and from the
+/// role, inotify watch instance, timerfd, eventfd, epoll set. Called from
+/// close() and from the
 /// task-exit reaper so dead tasks can't pin objects (e.g. a dead writer
 /// would otherwise keep a pipe's `writers` count elevated forever).
 pub fn release_desc(f: &task::FileDesc) {
@@ -434,6 +435,8 @@ pub fn release_desc(f: &task::FileDesc) {
     }
     crate::notify::close_obj(&f.path);
     crate::timerfd::close_obj(&f.path);
+    crate::eventfd::close_obj(&f.path);
+    crate::epoll::close_obj(&f.path);
 }
 
 pub fn close(fd: i64) {

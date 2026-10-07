@@ -15032,8 +15032,8 @@ impl Term {
                     self.fail(&alloc::format!("{}: {}: err {}", cmd, p, wd));
                     return;
                 }
-                let monitor = cmd == "inotifywatch";
-                let dl = if monitor {
+                let monitor = cmd == "inotifywatch" || args.iter().any(|a| *a == "-m");
+                let dl = if cmd == "inotifywatch" {
                     ustd::uptime_ms() + secs * 1000
                 } else {
                     u64::MAX
@@ -15042,7 +15042,7 @@ impl Term {
                 self.emit(&alloc::format!(
                     "{}: watching {} {}",
                     cmd, p,
-                    if monitor {
+                    if cmd == "inotifywatch" {
                         alloc::format!("({}s — Esc stops)", secs)
                     } else {
                         String::from("(Esc stops)")
@@ -15105,7 +15105,12 @@ impl Term {
                 }
             }
             "dmesg" => {
-                // last 40 lines of the kernel log ring buffer; -c clears it
+                // last 40 lines of the kernel log ring buffer;
+                // -c reads AND clears (prints), -C clears silently
+                if args.iter().any(|a| *a == "-C") {
+                    ustd::klog_clear();
+                    return;
+                }
                 let s = ustd::klog();
                 let ls: Vec<&str> = s.lines().collect();
                 for l in ls.iter().skip(ls.len().saturating_sub(40)) {
@@ -18022,8 +18027,10 @@ impl Term {
                 // field 1; paste [-s] a b [-d c] = side-by-side columns
                 // (-s serial: each file becomes one joined line)
                 let mut join_sep = String::from(" ");
-                let mut paste_d = '\t';
+                // paste -d accepts a LIST of delims, cycled per column
+                let mut paste_dl = String::from("\t");
                 let mut paste_s = false;
+                let mut join_v: u8 = 0; // 1=file1 unpairables, 2=file2, 3=both
                 let mut pos: Vec<&str> = Vec::new();
                 let mut it = args.iter().peekable();
                 while let Some(a) = it.next() {
@@ -18035,15 +18042,18 @@ impl Term {
                         }
                         "-d" => {
                             if let Some(v) = it.next() {
-                                paste_d = v.chars().next().unwrap_or('\t');
+                                paste_dl = String::from(*v);
                             }
                         }
                         "-s" => paste_s = true,
+                        "-v1" => join_v |= 1,
+                        "-v2" => join_v |= 2,
+                        "-v" => join_v = 3,
                         a if a.starts_with("-t") && a.len() > 2 => {
                             join_sep = String::from(&a[2..]);
                         }
                         a if a.starts_with("-d") && a.len() > 2 => {
-                            paste_d = a[2..].chars().next().unwrap_or('\t');
+                            paste_dl = String::from(&a[2..]);
                         }
                         a if !a.starts_with('-') => pos.push(a),
                         _ => {}
@@ -18093,7 +18103,9 @@ impl Term {
                                 }
                                 "join" => {
                                     // -t C: fields split/output on C (default
-                                    // whitespace like POSIX join)
+                                    // whitespace like POSIX join); -v1/-v2
+                                    // print lines with no pair instead of
+                                    // the merged output
                                     let jt: Option<char> = match join_sep.as_str() {
                                         " " => None,
                                         s => s.chars().next(),
@@ -18111,41 +18123,82 @@ impl Term {
                                         }
                                     };
                                     let sep = join_sep.as_str();
-                                    for l1 in &la {
-                                        let f1 = f(l1);
-                                        if f1.is_empty() {
-                                            continue;
+                                    if join_v == 0 {
+                                        for l1 in &la {
+                                            let f1 = f(l1);
+                                            if f1.is_empty() {
+                                                continue;
+                                            }
+                                            for l2 in &lb {
+                                                let f2 = f(l2);
+                                                if f2.first() == f1.first() {
+                                                    let rest1 = f1[1..].join(sep);
+                                                    let rest2 = f2[1..].join(sep);
+                                                    let out = alloc::format!(
+                                                        "{}{}{}{}{}",
+                                                        f1[0],
+                                                        sep,
+                                                        rest1,
+                                                        sep,
+                                                        rest2
+                                                    );
+                                                    self.emit(&out);
+                                                }
+                                            }
                                         }
-                                        for l2 in &lb {
-                                            let f2 = f(l2);
-                                            if f2.first() == f1.first() {
-                                                let rest1 = f1[1..].join(sep);
-                                                let rest2 = f2[1..].join(sep);
-                                                let out = alloc::format!(
-                                                    "{}{}{}{}{}",
-                                                    f1[0],
-                                                    sep,
-                                                    rest1,
-                                                    sep,
-                                                    rest2
-                                                );
-                                                self.emit(&out);
+                                    } else {
+                                        // -v: unpairable lines only
+                                        if join_v & 1 != 0 {
+                                            'o1: for l1 in &la {
+                                                let f1 = f(l1);
+                                                if f1.is_empty() {
+                                                    continue;
+                                                }
+                                                for l2 in &lb {
+                                                    if f(l2).first() == f1.first() {
+                                                        continue 'o1;
+                                                    }
+                                                }
+                                                self.emit(l1);
+                                            }
+                                        }
+                                        if join_v & 2 != 0 {
+                                            'o2: for l2 in &lb {
+                                                let f2 = f(l2);
+                                                if f2.is_empty() {
+                                                    continue;
+                                                }
+                                                for l1 in &la {
+                                                    if f(l1).first() == f2.first() {
+                                                        continue 'o2;
+                                                    }
+                                                }
+                                                self.emit(l2);
                                             }
                                         }
                                     }
                                 }
                                 _ => {
-                                    // paste [-s] [-d c]: side-by-side, or -s
-                                    // serial (each file -> one joined line)
+                                    // paste [-s] [-d LIST]: side-by-side or
+                                    // serial; a multi-char delim list cycles
+                                    // per column like real GNU paste
+                                    let dl: Vec<char> = paste_dl.chars().collect();
+                                    let d_at = |i: usize| {
+                                        dl.get(i % dl.len().max(1)).copied().unwrap_or('\t')
+                                    };
                                     if paste_s {
-                                        self.emit(&la.join(&alloc::format!("{}", paste_d)));
-                                        self.emit(&lb.join(&alloc::format!("{}", paste_d)));
+                                        // serial: join each file's lines on
+                                        // the first delim
+                                        let d = d_at(0);
+                                        self.emit(&la.join(&alloc::format!("{}", d)));
+                                        self.emit(&lb.join(&alloc::format!("{}", d)));
                                     } else {
                                         let n = la.len().max(lb.len());
                                         for i in 0..n {
                                             let a = la.get(i).map(|s| s.as_str()).unwrap_or("");
                                             let b = lb.get(i).map(|s| s.as_str()).unwrap_or("");
-                                            let out = alloc::format!("{}{}{}", a, paste_d, b);
+                                            let out =
+                                                alloc::format!("{}{}{}", a, d_at(i), b);
                                             self.emit(&out);
                                         }
                                     }
@@ -21482,16 +21535,19 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                         let name = it.next().unwrap_or("");
                         let ev = inotify_mask_name(mask);
                         *counts.entry(ev.clone()).or_default() += 1;
-                        if !monitor {
+                        // wait prints each event then stops after the first
+                        // batch; -m (monitor+no deadline) prints forever
+                        if !monitor || dl == u64::MAX {
                             t.push_line(&alloc::format!("{} {}", name, ev));
                             printed = true;
                         }
                     }
                 }
             }
-            if printed || (dl != u64::MAX && now >= dl) {
+            let cont = monitor && dl == u64::MAX; // inotifywait -m
+            if (printed && !cont) || (dl != u64::MAX && now >= dl) {
                 ustd::close(ifd);
-                if monitor {
+                if monitor && !cont {
                     t.push_line("inotifywatch: summary");
                     let mut tot = 0u64;
                     for (ev, c) in counts.iter() {
@@ -21504,7 +21560,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             } else {
                 t.inotw = Some((ifd, dl, counts, monitor));
             }
-            if printed || dl != u64::MAX {
+            if printed || dl != u64::MAX || cont {
                 t.dirty_all = true;
             }
         }

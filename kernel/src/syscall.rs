@@ -558,6 +558,56 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
+        shared::SYS_EVENTFD => {
+            let Ok(path) = crate::eventfd::create(a1, a2 as u32) else {
+                ctx.rax = ERR;
+                return;
+            };
+            task::with_current(|t| {
+                let fd = alloc_slot(t);
+                t.fds[fd] = Some(task::FileDesc {
+                    path,
+                    pos: 0,
+                    flags: 0, // read+write
+                });
+                fd as u64
+            })
+        }
+        shared::SYS_EPOLL_CREATE => {
+            let Ok(path) = crate::epoll::create() else {
+                ctx.rax = ERR;
+                return;
+            };
+            task::with_current(|t| {
+                let fd = alloc_slot(t);
+                t.fds[fd] = Some(task::FileDesc {
+                    path,
+                    pos: 0,
+                    flags: shared::O_RDONLY,
+                });
+                fd as u64
+            })
+        }
+        shared::SYS_EPOLL_CTL => {
+            // (epfd, op, fd, events): resolve both fds through the task table
+            let both = task::with_current(|t| {
+                let ep = match t.fds.get(a1 as usize) {
+                    Some(Some(f)) if crate::epoll::handles(&f.path) => Some(f.path.clone()),
+                    _ => None,
+                };
+                let mp = match t.fds.get(a3 as usize) {
+                    Some(Some(f)) => Some(f.path.clone()),
+                    _ => None,
+                };
+                (ep, mp)
+            });
+            let (Some(ep_path), Some(m_path)) = both else {
+                ctx.rax = ERR;
+                return;
+            };
+            crate::epoll::ctl(&ep_path, a2, a3 as u32, &m_path, a4 as u32) as u64
+        }
+        shared::SYS_EPOLL_WAIT => sys_epoll_wait(ctx, a1, a2, a3, a4),
         shared::SYS_ARP => {
             let s = net::arp_stat();
             let n = s.len().min(a2 as usize);
@@ -904,10 +954,12 @@ fn sys_read(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
             }
         }
     }
-    // inotify / timerfd objects: block while empty, drain when ready
+    // inotify / timerfd / eventfd objects: block while empty, drain when ready
     let obj_path = task::with_current(|t| match t.fds.get(fd as usize) {
         Some(Some(f))
-            if crate::notify::handles(&f.path) || crate::timerfd::handles(&f.path) =>
+            if crate::notify::handles(&f.path)
+                || crate::timerfd::handles(&f.path)
+                || crate::eventfd::handles(&f.path) =>
         {
             Some(f.path.clone())
         }
@@ -916,6 +968,8 @@ fn sys_read(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
     if let Some(p) = obj_path {
         let r = if crate::notify::handles(&p) {
             crate::notify::try_read(&p, &mut tmp)
+        } else if crate::eventfd::handles(&p) {
+            crate::eventfd::try_read(&p, &mut tmp)
         } else {
             crate::timerfd::try_read(&p, &mut tmp)
         };
@@ -945,6 +999,18 @@ fn sys_write(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
         Some(Some(f)) => crate::pipes::handles(&f.path),
         _ => false,
     });
+    // eventfd objects: adding past the cap re-blocks like a full pipe
+    let efd_path = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) if crate::eventfd::handles(&f.path) => Some(f.path.clone()),
+        _ => None,
+    });
+    if let Some(p) = efd_path {
+        return match crate::eventfd::try_write(&p, &data) {
+            Err(-11) => block_reenter(ctx, task::ticks() + 2, 0),
+            Err(e) => e as u64,
+            Ok(n) => n as u64,
+        };
+    }
     match vfs::write(fd as i64, &data) {
         Err(-11) if is_pipe => block_reenter(ctx, task::ticks() + 2, 0),
         Ok(n) => n as u64,
@@ -1054,6 +1120,27 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
     newfd
 }
 
+/// Single-fd readiness, shared by `SYS_POLL` and `SYS_EPOLL_WAIT`.
+/// `ev` bit0 = read, bit1 = write. fs/proc/dev fds are always ready both ways.
+pub fn fd_ready(path: &str, ev: u32) -> bool {
+    if crate::pipes::handles(path) {
+        (ev & 1 != 0 && crate::pipes::ready(path, true))
+            || (ev & 2 != 0 && crate::pipes::ready(path, false))
+    } else if crate::notify::handles(path) {
+        // events queued = readable; never writable
+        ev & 1 != 0 && crate::notify::ready(path)
+    } else if crate::timerfd::handles(path) {
+        ev & 1 != 0 && crate::timerfd::ready(path)
+    } else if crate::eventfd::handles(path) {
+        (ev & 1 != 0 && crate::eventfd::ready(path, true))
+            || (ev & 2 != 0 && crate::eventfd::ready(path, false))
+    } else if crate::epoll::handles(path) {
+        false // epoll fds are wait targets, not readable/writable streams
+    } else {
+        true
+    }
+}
+
 /// SYS_POLL: wait until any listed fd is ready or `timeout_ms` elapses.
 /// `fds`/`evs` are parallel user arrays of u32: events bit0=read bit1=write.
 /// Returns the count of ready fds.
@@ -1082,18 +1169,7 @@ fn sys_poll(ctx: &mut CpuContext, fds: u64, evs: u64, nfds: u64, timeout_ms: u64
             continue;
         }
         let ev = rd32(&evv, i);
-        let ok = if crate::pipes::handles(path) {
-            (ev & 1 != 0 && crate::pipes::ready(path, true))
-                || (ev & 2 != 0 && crate::pipes::ready(path, false))
-        } else if crate::notify::handles(path) {
-            // events queued = readable; never writable
-            ev & 1 != 0 && crate::notify::ready(path)
-        } else if crate::timerfd::handles(path) {
-            ev & 1 != 0 && crate::timerfd::ready(path)
-        } else {
-            true // fs/proc/dev fds are always readable+writable
-        };
-        if ok {
+        if fd_ready(path, ev) {
             ready += 1;
         }
     }
@@ -1102,6 +1178,44 @@ fn sys_poll(ctx: &mut CpuContext, fds: u64, evs: u64, nfds: u64, timeout_ms: u64
     }
     // block: re-enter the syscall until something is ready or deadline hits
     // (u64::MAX = wait forever, same sentinel as waitpid)
+    let dl = if timeout_ms == u64::MAX {
+        u64::MAX
+    } else {
+        task::ticks() + timeout_ms.div_ceil(10) + 1
+    };
+    if task::ticks() >= dl {
+        return 0;
+    }
+    block_reenter(ctx, dl, 0)
+}
+
+/// SYS_EPOLL_WAIT: copy {u32 fd, u32 revents} pairs for ready interests to
+/// `out` (up to `max`), blocking until at least one is ready or `timeout_ms`
+/// elapses (u64::MAX waits forever, like poll).
+fn sys_epoll_wait(ctx: &mut CpuContext, epfd: u64, out: u64, max: u64, timeout_ms: u64) -> u64 {
+    let ep_path = match task::with_current(|t| match t.fds.get(epfd as usize) {
+        Some(Some(f)) if crate::epoll::handles(&f.path) => Some(f.path.clone()),
+        _ => None,
+    }) {
+        Some(p) => p,
+        _ => return ERR,
+    };
+    let max = (max as usize).min(64);
+    let hits = crate::epoll::collect(&ep_path, max);
+    if !hits.is_empty() {
+        let mut buf = alloc::vec![0u8; hits.len() * 8];
+        for (i, (fdn, re)) in hits.iter().enumerate() {
+            buf[i * 8..i * 8 + 4].copy_from_slice(&fdn.to_le_bytes());
+            buf[i * 8 + 4..i * 8 + 8].copy_from_slice(&re.to_le_bytes());
+        }
+        return match copy_out(out, &buf) {
+            Some(()) => hits.len() as u64,
+            None => ERR,
+        };
+    }
+    if timeout_ms == 0 {
+        return 0;
+    }
     let dl = if timeout_ms == u64::MAX {
         u64::MAX
     } else {
