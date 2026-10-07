@@ -100,7 +100,8 @@ pub fn spawn(path: &str, args: &str) -> Result<u32, ()> {
     }
 }
 pub fn waitpid(pid: u32, timeout_ms: u64) -> Result<i64, ()> {
-    let r = sc2(shared::SYS_WAITPID, pid as u64, timeout_ms);
+    // opts must be explicit — a stale 3rd register reads as garbage flags
+    let r = sc3(shared::SYS_WAITPID, pid as u64, timeout_ms, 0);
     if is_err(r) {
         Err(())
     } else {
@@ -325,6 +326,17 @@ pub use shared::PtRegs;
 /// PEEK returns the read word directly.
 pub fn ptrace(op: u64, pid: u32, addr: u64, data: u64) -> i64 {
     sc4(shared::SYS_PTRACE, op, pid as u64, addr, data) as i64
+}
+
+pub const PT_PEEKUSER: u64 = 3;
+pub const PT_POKEUSER: u64 = 6;
+pub const PT_SYSCALL: u64 = 24;
+
+/// waitid(idtype, id, flags): idtype 0=P_ALL, 1=P_PID; flags bit0
+/// WNOHANG, bit1 WSTOPPED, bit2 WCONTINUED. Returns packed
+/// (pid << 32) | (kind << 24) | status — kind 1=exit, 2=stop, 3=cont.
+pub fn waitid(idtype: u64, id: u32, flags: u64) -> i64 {
+    sc3(shared::SYS_WAITID, idtype, id as u64, flags) as i64
 }
 
 /// PTRACE_GETREGS into a shared::PtRegs.

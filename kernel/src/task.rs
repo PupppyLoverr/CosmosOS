@@ -123,6 +123,9 @@ pub struct Task {
     pub rlim_nofile: u64,       // RLIMIT_NOFILE: fd-table bound
     pub rlim_nproc: u64,        // RLIMIT_NPROC: live user-task bound
     pub rlim_stack: u64,        // RLIMIT_STACK bytes (advisory for new spawns)
+    pub rlim_cpu: u64,          // RLIMIT_CPU: ticks before SIGXCPU
+    pub rlim_as: u64,           // RLIMIT_AS: total mapped bytes bound
+    pub cont_pending: bool,     // continued (SIGCONT/ptrace) since last wait report
     pub sig: SigState,          // sa_flags, altstack, handler masking, EINTR
 }
 
@@ -142,6 +145,8 @@ pub struct SigState {
     pub wake_eintr: bool,        // a signal woke our blocked syscall -> EINTR
     pub traced: bool,            // this task is ptrace'd — stops on signals
     pub tracer: u32,             // task id allowed to inspect/control it
+    pub syscall_trace: bool,     // PTRACE_SYSCALL: stop on syscall boundaries
+    pub sc_phase: u8,            // 0=disarmed 1=entry-stop pending 2=exit-stop pending
 }
 
 impl SigState {
@@ -157,6 +162,8 @@ impl SigState {
             wake_eintr: false,
             traced: false,
             tracer: 0,
+            syscall_trace: false,
+            sc_phase: 0,
         }
     }
 
@@ -169,6 +176,8 @@ impl SigState {
         n.wake_eintr = false;
         n.traced = false; // ptrace linkage is never inherited
         n.tracer = 0;
+        n.syscall_trace = false;
+        n.sc_phase = 0;
         n
     }
 
@@ -281,6 +290,9 @@ pub fn init() {
         rlim_nofile: 1024,
         rlim_nproc: 512,
         rlim_stack: 256 * 1024,
+        rlim_cpu: u64::MAX,
+        rlim_as: u64::MAX,
+        cont_pending: false,
         sig: SigState::new(),
     };
     *SCHED.lock() = Some(Sched { tasks: vec![Box::new(boot)], cur: 0, next_pid: 1 });
@@ -321,6 +333,16 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
             t.alarm_at = 0;
             t.sigpending |= 1 << 14; // SIGALRM
             wake_for_signal(t, 14);
+        }
+        // RLIMIT_CPU: exceeded cpu_ticks quota pends a real SIGXCPU —
+        // default disposition kills the task when it next resumes
+        if t.is_user
+            && t.state != State::Dead
+            && t.cpu_ticks > t.rlim_cpu
+            && t.sigpending & (1 << 24) == 0
+        {
+            t.sigpending |= 1 << 24; // SIGXCPU
+            wake_for_signal(t, 24);
         }
     }
     // wake port receivers whose queues filled
@@ -710,6 +732,9 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         rlim_nofile: 1024,
         rlim_nproc: 512,
         rlim_stack: 256 * 1024,
+        rlim_cpu: u64::MAX,
+        rlim_as: u64::MAX,
+        cont_pending: false,
         sig: SigState::new(),
     };
     mm_inc(pml4.start_address().as_u64());
@@ -798,6 +823,9 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         rlim_nofile: 1024,
         rlim_nproc: 512,
         rlim_stack: 256 * 1024,
+        rlim_cpu: u64::MAX,
+        rlim_as: u64::MAX,
+        cont_pending: false,
         sig: SigState::new(),
     }));
     pid
@@ -886,7 +914,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64) -> Option<u32> {
     let cwd = cur.cwd.clone();
     let borrowed = cur.borrowed.clone();
     let shm_ids = cur.shm.clone();
-    let (nice, rt, vrun, umask, exe, pfs, rnf, rnp, rstk) = (
+    let (nice, rt, vrun, umask, exe, pfs, rnf, rnp, rstk, rcu, ras) = (
         cur.nice,
         cur.rt,
         cur.vrun,
@@ -896,6 +924,8 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64) -> Option<u32> {
         cur.rlim_nofile,
         cur.rlim_nproc,
         cur.rlim_stack,
+        cur.rlim_cpu,
+        cur.rlim_as,
     );
     for id in &shm_ids {
         shm::acquire(*id);
@@ -960,6 +990,9 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64) -> Option<u32> {
         rlim_nofile: rnf,
         rlim_nproc: rnp,
         rlim_stack: rstk,
+        rlim_cpu: rcu,
+        rlim_as: ras,
+        cont_pending: false,
         sig: s.tasks[s.cur].sig.for_thread(),
     };
     mm_inc(pml4.start_address().as_u64());
@@ -1516,6 +1549,9 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         rlim_nofile: s.tasks[s.cur].rlim_nofile,
         rlim_nproc: s.tasks[s.cur].rlim_nproc,
         rlim_stack: s.tasks[s.cur].rlim_stack,
+        rlim_cpu: s.tasks[s.cur].rlim_cpu,
+        rlim_as: s.tasks[s.cur].rlim_as,
+        cont_pending: false,
         sig: s.tasks[s.cur].sig.for_fork(),
     };
     mm_inc(cpml4.start_address().as_u64());
@@ -1983,6 +2019,30 @@ pub fn child_stopped_one(pid: u32, cpid: u32) -> Option<(u32, i64)> {
     Some((t.id, 0x7f | ((t.stop_sig as i64) << 8)))
 }
 
+/// WCONTINUED: a child that was continued since its last report —
+/// status is the POSIX WIFCONTINUED encoding 0xffff.
+pub fn child_cont_any(pid: u32) -> Option<(u32, i64)> {
+    let mut g = SCHED.lock();
+    let s = g.as_mut().unwrap();
+    let t = s
+        .tasks
+        .iter_mut()
+        .find(|t| (t.parent == pid || t.sig.tracer == pid) && t.cont_pending)?;
+    t.cont_pending = false;
+    Some((t.id, 0xffff))
+}
+
+/// Same for a specific child pid.
+pub fn child_cont_one(pid: u32, cpid: u32) -> Option<(u32, i64)> {
+    let mut g = SCHED.lock();
+    let s = g.as_mut().unwrap();
+    let t = s.tasks.iter_mut().find(|t| {
+        t.id == cpid && (t.parent == pid || t.sig.tracer == pid) && t.cont_pending
+    })?;
+    t.cont_pending = false;
+    Some((t.id, 0xffff))
+}
+
 /// POSIX wait(-1): first dead child of `pid`, reaped (removed) on return.
 pub fn child_exit_any(pid: u32) -> Option<(u32, i64)> {
     let mut g = SCHED.lock();
@@ -2409,6 +2469,7 @@ pub fn signal(pid: u32, sig: u64) -> i64 {
                     t.stop_notified = false;
                     if t.state == State::Stopped {
                         t.state = State::Running;
+                        t.cont_pending = true; // waitpid WCONTINUED
                     }
                     0
                 }
@@ -2745,9 +2806,11 @@ fn rlim_get(pid: u32, res: u64) -> Option<u64> {
         .iter()
         .find(|t| t.id == pid && t.state != State::Dead)
         .and_then(|t| match res {
+            0 => Some(t.rlim_cpu),
             3 => Some(t.rlim_stack),
             6 => Some(t.rlim_nproc),
             7 => Some(t.rlim_nofile),
+            9 => Some(t.rlim_as),
             _ => None,
         })
 }
@@ -2762,9 +2825,11 @@ fn rlim_set(pid: u32, res: u64, v: u64) -> i64 {
     {
         Some(t) => {
             match res {
+                0 => t.rlim_cpu = v,
                 3 => t.rlim_stack = v,
                 6 => t.rlim_nproc = v,
                 7 => t.rlim_nofile = v,
+                9 => t.rlim_as = v,
                 _ => return -22,
             }
             0
@@ -2790,7 +2855,12 @@ pub fn sys_prlimit(pid: u32, res: u64, new: u64, old_ptr: u64) -> i64 {
     if new == u64::MAX {
         return 0;
     }
-    rlim_set(who, res, new.min(1 << 20))
+    // per-resource sanity caps (NOFILE used to share a global 1<<20 clamp)
+    let capped = match res {
+        7 => new.min(1 << 20),
+        _ => new.min(1 << 40),
+    };
+    rlim_set(who, res, capped)
 }
 
 /// arch_prctl(op, val): op 2 = ARCH_SET_FS (validate user range),

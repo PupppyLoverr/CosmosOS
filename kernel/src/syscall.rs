@@ -112,6 +112,28 @@ pub fn dispatch(ctx: &mut CpuContext) {
     crate::input::pump();
     let nr = ctx.rax;
     let (a1, a2, a3, a4, a5) = (ctx.rdi, ctx.rsi, ctx.rdx, ctx.r8, ctx.r9);
+    // PTRACE_SYSCALL entry-stop: a tracer armed sc_phase=1, so the tracee
+    // halts BEFORE the syscall body runs (rax/rdi/rsi/rdx still hold the
+    // args). rip rewinds so CONT re-executes the int80; the re-dispatch
+    // then sees sc_phase==2 and falls through to real dispatch.
+    let entry_stop = task::with_current(|t| {
+        // phase 2 = mid-syscall (entry-stop already happened, resume
+        // re-executed this int80) — anything else armed is a real entry
+        t.sig.syscall_trace && t.sig.sc_phase != 2 && nr != shared::SYS_SIGRETURN
+    });
+    if entry_stop {
+        ctx.rip -= 2;
+        {
+            let mut g = task::SCHED.lock();
+            if let Some(s) = g.as_mut() {
+                s.tasks[s.cur].sig.sc_phase = 2;
+                s.tasks[s.cur].state = task::State::Stopped;
+                s.tasks[s.cur].stop_sig = 5; // SIGTRAP
+                s.tasks[s.cur].stop_notified = false;
+            }
+        }
+        task::yield_ctx(ctx);
+    }
     let ret: u64 = match nr {
         shared::SYS_EXIT => {
             // POSIX ptrace: a traced task must stop for pending signals
@@ -275,6 +297,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_CHDIR => sys_chdir(a1, a2),
         shared::SYS_GETCWD => sys_getcwd(a1, a2),
         shared::SYS_WAITPID => sys_waitpid(ctx, a1, a2, a3),
+        shared::SYS_WAITID => sys_waitid(ctx, a1, a2, a3),
         shared::SYS_KILL => sys_kill(a1),
         shared::SYS_NET_PING => {
             let ip = [
@@ -1441,6 +1464,22 @@ pub fn dispatch(ctx: &mut CpuContext) {
     let mut g = task::SCHED.lock();
     if let Some(s) = g.as_mut() {
         task::maybe_deliver(s, s.cur, ctx);
+        // PTRACE_SYSCALL exit-stop: the syscall's result is already in
+        // ctx.rax; mark the tracee Stopped so the repick below switches
+        // away instead of resuming it. The next PTRACE_SYSCALL re-arms
+        // sc_phase=1. This MUST use the live Sched borrow — a nested
+        // SCHED.lock() here deadlocks the non-reentrant spin mutex.
+        if nr != shared::SYS_SIGRETURN
+            && s.tasks[s.cur].state == task::State::Running
+            && s.tasks[s.cur].sig.syscall_trace
+            && s.tasks[s.cur].sig.sc_phase == 2
+        {
+            // phase 1 = next boundary is the NEXT syscall's entry
+            s.tasks[s.cur].sig.sc_phase = 1;
+            s.tasks[s.cur].state = task::State::Stopped;
+            s.tasks[s.cur].stop_sig = 5;
+            s.tasks[s.cur].stop_notified = false;
+        }
         if s.tasks[s.cur].state == task::State::Dead
             || s.tasks[s.cur].state == task::State::Stopped
         {
@@ -1471,6 +1510,15 @@ fn sys_spawn(pptr: u64, plen: u64, aptr: u64, alen: u64) -> u64 {
 
 fn sys_mmap(size: u64) -> u64 {
     if size == 0 || size > 64 << 20 {
+        return 0;
+    }
+    // RLIMIT_AS (res 9): the new range must fit the task's total mapped
+    // bytes bound — checked against the live maps table
+    let over = task::with_current(|t| {
+        let used: u64 = t.maps.iter().map(|m| m.end - m.start).sum();
+        used.saturating_add(size) > t.rlim_as
+    });
+    if over {
         return 0;
     }
     // (real anon mmap — see SYS_MUNMAP/SYS_MPROTECT for the full lifecycle)
@@ -1505,6 +1553,14 @@ fn sys_mmap(size: u64) -> u64 {
 /// past EOF). Pseudo-fs fds are rejected: only real files page in.
 fn sys_mmap_file(fd: u64, size: u64, offset: u64) -> u64 {
     if size == 0 || size > 64 << 20 {
+        return 0;
+    }
+    // RLIMIT_AS: same bound as sys_mmap
+    let over = task::with_current(|t| {
+        let used: u64 = t.maps.iter().map(|m| m.end - m.start).sum();
+        used.saturating_add(size) > t.rlim_as
+    });
+    if over {
         return 0;
     }
     let path = task::with_current(|t| match t.fds.get(fd as usize) {
@@ -2522,6 +2578,8 @@ fn sys_ptrace(op: u64, pid: u32, addr: u64, data: u64) -> u64 {
                 }
                 t.sig.traced = false;
                 t.sig.tracer = 0;
+                t.sig.syscall_trace = false;
+                t.sig.sc_phase = 0;
                 t.stop_notified = false;
                 if t.state == task::State::Stopped {
                     t.state = task::State::Running;
@@ -2626,6 +2684,67 @@ fn sys_ptrace(op: u64, pid: u32, addr: u64, data: u64) -> u64 {
                         (*(t.saved_rsp as *mut CpuContext)).rflags |= 0x100;
                     }
                 }
+                t.sig.sc_phase = 0; // CONT/STEP runs without syscall stops
+                t.stop_notified = false;
+                t.state = task::State::Running;
+                0
+            });
+            if ok == 0 { 0 } else { ERR }
+        }
+        shared::PT_PEEKUSER | shared::PT_POKEUSER => {
+            // access the tracee's saved register area (its CpuContext at
+            // saved_rsp on the kstack) — addr is a byte offset, 8-aligned
+            if addr & 7 != 0 || addr >= 160 {
+                return ERR;
+            }
+            let rsp = task::with_pid_mut(pid, |t| {
+                if !t.sig.traced || t.sig.tracer != me
+                    || t.state != task::State::Stopped
+                    || t.saved_rsp == 0
+                {
+                    return 0;
+                }
+                t.saved_rsp as i64
+            });
+            if rsp <= 0 {
+                return ERR;
+            }
+            let cell = (rsp as u64 + addr) as *mut u64;
+            if op == shared::PT_PEEKUSER {
+                unsafe { *cell }
+            } else {
+                // don't let the tracer corrupt cs/ss/rflags through the
+                // byte-level door — same invariants SETREGS enforces
+                if addr == 152 || addr == 168 {
+                    return ERR; // cs, ss (CpuContext field offsets)
+                }
+                if addr == 136 {
+                    // rflags: force IF + reserved bit, drop IOPL/TF/NT
+                    let v = (data & !0x0003_7100) | 0x202;
+                    unsafe { *cell = v };
+                    return 0;
+                }
+                unsafe { *cell = data };
+                0
+            }
+        }
+        shared::PT_SYSCALL => {
+            // resume the stopped tracee and arm syscall-boundary stops:
+            // it halts at the next dispatch entry (sc_phase=1->2) and
+            // again at each syscall exit (sc_phase=2->0)
+            let ok = task::with_pid_mut(pid, |t| {
+                if !t.sig.traced || t.sig.tracer != me
+                    || t.state != task::State::Stopped
+                {
+                    return -1;
+                }
+                if data > 0 && data < 32 {
+                    t.sigpending |= 1 << data;
+                }
+                t.sig.syscall_trace = true;
+                // sc_phase stays: it encodes where the tracee sits —
+                // a signal-stop mid-syscall (0) entry-stops next int80,
+                // an entry-stop rewind (2) must NOT re-stop on re-dispatch
                 t.stop_notified = false;
                 t.state = task::State::Running;
                 0
@@ -2828,6 +2947,23 @@ fn sys_waitpid(ctx: &mut CpuContext, pid: u64, timeout_ms: u64, opts: u64) -> u6
             };
         }
     }
+    // WCONTINUED (bit1): report a child continued since its last report —
+    // status is the POSIX WIFCONTINUED encoding 0xffff
+    if opts & 2 != 0 {
+        let got = if any {
+            task::child_cont_any(me)
+        } else {
+            task::child_cont_one(me, pid as u32)
+        };
+        if let Some((cpid, st)) = got {
+            task::with_current(|t| t.wait_timeout = 0);
+            return if any {
+                ((cpid as u64) << 32) | (st as u64 & 0xffff_ffff)
+            } else {
+                st as u64
+            };
+        }
+    }
     if any {
         // wait(-1): returns pid<<32 | exit_code of the first dead child
         if let Some((cpid, code)) = task::child_exit_any(me) {
@@ -2864,6 +3000,63 @@ fn sys_waitpid(ctx: &mut CpuContext, pid: u64, timeout_ms: u64, opts: u64) -> u6
         t.state = task::State::Blocked;
         t.waiting_on = pid as u32;
         t.wake_at = dl;
+    });
+    ctx.rip -= 2;
+    task::yield_ctx(ctx);
+}
+
+/// SYS_WAITID(idtype, id, flags): wait report returning
+/// (pid<<32)|(kind<<24)|status — kind 1=exit, 2=stopped, 3=continued.
+/// idtype 0 = this child pid, 2 (or id=MAX) = any child.
+/// flags: bit0 WNOHANG, bit1 WSTOPPED, bit2 WCONTINUED.
+fn sys_waitid(ctx: &mut CpuContext, idtype: u64, id: u64, flags: u64) -> u64 {
+    let me = cur_id();
+    let any = idtype == 2 || id as u32 == u32::MAX;
+    if flags & 2 != 0 {
+        let got = if any {
+            task::child_stopped_any(me)
+        } else {
+            task::child_stopped_one(me, id as u32)
+        };
+        if let Some((cpid, st)) = got {
+            return ((cpid as u64) << 32) | (2 << 24) | (st as u64 & 0xffff);
+        }
+    }
+    if flags & 4 != 0 {
+        let got = if any {
+            task::child_cont_any(me)
+        } else {
+            task::child_cont_one(me, id as u32)
+        };
+        if let Some((cpid, st)) = got {
+            return ((cpid as u64) << 32) | (3 << 24) | (st as u64 & 0xffff);
+        }
+    }
+    if any {
+        if let Some((cpid, code)) = task::child_exit_any(me) {
+            return ((cpid as u64) << 32) | (1 << 24) | (code as u64 & 0xffff);
+        }
+        if !task::has_children(me) {
+            return ERR;
+        }
+    } else {
+        if !task::exists(id as u32) {
+            return ERR;
+        }
+        if let Some(code) = task::child_exit(id as u32) {
+            return ((id as u64) << 32) | (1 << 24) | (code as u64 & 0xffff);
+        }
+    }
+    if flags & 1 != 0 {
+        return 0; // WNOHANG: nothing reportable
+    }
+    // block until a child changes state; wake re-executes this syscall
+    // (rip rewind is REQUIRED — without it the resumed frame abandons
+    // the wait entirely)
+    task::with_current(|t| {
+        t.state = task::State::Blocked;
+        t.waiting_on = if any { u32::MAX } else { id as u32 };
+        t.wake_at = task::ticks() + 50; // recheck window
     });
     ctx.rip -= 2;
     task::yield_ctx(ctx);
