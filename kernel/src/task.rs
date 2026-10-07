@@ -123,6 +123,58 @@ pub struct Task {
     pub rlim_nofile: u64,       // RLIMIT_NOFILE: fd-table bound
     pub rlim_nproc: u64,        // RLIMIT_NPROC: live user-task bound
     pub rlim_stack: u64,        // RLIMIT_STACK bytes (advisory for new spawns)
+    pub sig: SigState,          // sa_flags, altstack, handler masking, EINTR
+}
+
+/// Signal-semantic state beyond the raw handler/mask fields: per-signal
+/// sa_flags, the registered alternate stack, the sigmask save stack used
+/// while a handler runs, and the flag that turns a signal-woken blocked
+/// syscall into a real EINTR return.
+#[derive(Clone, Copy)]
+pub struct SigState {
+    pub sa_flags: [u8; 32],      // SA_RESTART/SA_ONSTACK/SA_NODEFER
+    pub sigstack_sp: u64,        // registered alternate stack base (low addr)
+    pub sigstack_size: u64,      // bytes; <2048 counts as unregistered
+    pub sigstack_flags: u64,     // SS_DISABLE disables it
+    pub sigmask_stack: [u64; 8], // sigmask saved while a handler runs
+    pub sigmask_depth: u8,
+    pub last_sig: u8,            // signal most recently run through a frame
+    pub wake_eintr: bool,        // a signal woke our blocked syscall -> EINTR
+}
+
+impl SigState {
+    pub const fn new() -> Self {
+        Self {
+            sa_flags: [0; 32],
+            sigstack_sp: 0,
+            sigstack_size: 0,
+            sigstack_flags: 0,
+            sigmask_stack: [0; 8],
+            sigmask_depth: 0,
+            last_sig: 0,
+            wake_eintr: false,
+        }
+    }
+
+    /// fork inherits dispositions and the registered altstack; the handler
+    /// mask stack and pending-EINTR state do not carry over.
+    pub fn for_fork(&self) -> Self {
+        let mut n = *self;
+        n.sigmask_depth = 0;
+        n.last_sig = 0;
+        n.wake_eintr = false;
+        n
+    }
+
+    /// A clone'd thread shares dispositions but the alternate stack is
+    /// per-thread — a fresh thread starts with it unregistered.
+    pub fn for_thread(&self) -> Self {
+        let mut n = self.for_fork();
+        n.sigstack_sp = 0;
+        n.sigstack_size = 0;
+        n.sigstack_flags = 0;
+        n
+    }
 }
 
 pub struct Sched {
@@ -223,6 +275,7 @@ pub fn init() {
         rlim_nofile: 1024,
         rlim_nproc: 512,
         rlim_stack: 256 * 1024,
+        sig: SigState::new(),
     };
     *SCHED.lock() = Some(Sched { tasks: vec![Box::new(boot)], cur: 0, next_pid: 1 });
 }
@@ -261,12 +314,7 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
         if t.alarm_at != 0 && t.alarm_at <= ticks() {
             t.alarm_at = 0;
             t.sigpending |= 1 << 14; // SIGALRM
-            if t.state == State::Blocked {
-                t.state = State::Running;
-                t.waiting_on = 0;
-                t.wait_port = 0;
-                t.wait_futex = 0;
-            }
+            wake_for_signal(t, 14);
         }
     }
     // wake port receivers whose queues filled
@@ -656,6 +704,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         rlim_nofile: 1024,
         rlim_nproc: 512,
         rlim_stack: 256 * 1024,
+        sig: SigState::new(),
     };
     mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -743,6 +792,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         rlim_nofile: 1024,
         rlim_nproc: 512,
         rlim_stack: 256 * 1024,
+        sig: SigState::new(),
     }));
     pid
 }
@@ -904,6 +954,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64) -> Option<u32> {
         rlim_nofile: rnf,
         rlim_nproc: rnp,
         rlim_stack: rstk,
+        sig: s.tasks[s.cur].sig.for_thread(),
     };
     mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -956,6 +1007,26 @@ fn stack_grow(t: &mut Task, page: u64) -> bool {
 /// frame). Default dispositions act here too — SIG_IGN drops, SIGCONT
 /// resumes silently, anything else uncaught terminates with 128+sig.
 /// Called with SCHED held, just before a ring-3 ctx resumes.
+/// Wake a Blocked task for an incoming signal. POSIX: a signal that will
+/// run a handler interrupts the blocked syscall — it returns EINTR unless
+/// the handler was installed with SA_RESTART (block_reenter consumes
+/// `wake_eintr`). Masked or handler-less signals just wake the task; the
+/// disposition is decided in maybe_deliver.
+fn wake_for_signal(t: &mut Task, sig: usize) {
+    if t.state != State::Blocked {
+        return;
+    }
+    let will_handle =
+        t.sighandlers[sig] > 1 && (t.sigmask >> sig) & 1 == 0;
+    if will_handle && (t.sig.sa_flags[sig] & shared::SA_RESTART) == 0 {
+        t.sig.wake_eintr = true;
+    }
+    t.state = State::Running;
+    t.waiting_on = 0;
+    t.wait_port = 0;
+    t.wait_futex = 0;
+}
+
 pub fn maybe_deliver(s: &mut Sched, idx: usize, ctx: *mut CpuContext) {
     let t = &mut s.tasks[idx];
     if !t.is_user || t.sigpending == 0 {
@@ -970,6 +1041,12 @@ pub fn maybe_deliver(s: &mut Sched, idx: usize, ctx: *mut CpuContext) {
         return; // everything pending is blocked — stays queued
     }
     let sig = deliverable.trailing_zeros() as usize;
+    // A signal that woke a blocked syscall carries its EINTR intent in
+    // the handler frame (byte below the context) — the task flag clears
+    // here so the handler's own syscalls are unaffected; sigreturn
+    // re-arms it for the interrupted ctx's next block_reenter.
+    let eintr_frame = t.sig.wake_eintr;
+    t.sig.wake_eintr = false;
     t.sig_seq = t.sig_seq.wrapping_add(1); // a pending signal is being consumed
     let handler = t.sighandlers[sig];
     if handler == 1 {
@@ -1017,10 +1094,24 @@ pub fn maybe_deliver(s: &mut Sched, idx: usize, ctx: *mut CpuContext) {
         t.sigrest_mapped = true;
     }
     // frame: 160B saved CpuContext then the 8B trampoline return address;
-    // handler entry rsp = base+160 (≡ 8 mod 16 like a real call site)
-    let base = ((c.rsp.wrapping_sub(168)) & !0xF) + 8;
+    // handler entry rsp = base+160 (≡ 8 mod 16 like a real call site).
+    // SA_ONSTACK puts the frame at the top of the registered alternate
+    // stack instead — unless we're already running on it (nested handlers
+    // continue downward, POSIX-style).
+    let on_alt = c.rsp >= t.sig.sigstack_sp
+        && c.rsp < t.sig.sigstack_sp + t.sig.sigstack_size;
+    let use_alt = t.sig.sa_flags[sig] & shared::SA_ONSTACK != 0
+        && t.sig.sigstack_size >= 2048
+        && t.sig.sigstack_flags & shared::SS_DISABLE == 0
+        && !on_alt;
+    let base = if use_alt {
+        let top = t.sig.sigstack_sp + t.sig.sigstack_size;
+        ((top.wrapping_sub(168)) & !0xF) + 8
+    } else {
+        ((c.rsp.wrapping_sub(168)) & !0xF) + 8
+    };
     let mut segv = false;
-    for page in [base & !0xFFF, (base + 167) & !0xFFF] {
+    for page in [(base - 8) & !0xFFF, (base + 167) & !0xFFF] {
         match crate::elf::translate_user(pml4, page) {
             None => {
                 if !(page >= t.stack_min && page < t.stack_max && stack_grow(t, page)) {
@@ -1060,6 +1151,14 @@ pub fn maybe_deliver(s: &mut Sched, idx: usize, ctx: *mut CpuContext) {
             None => ok = false,
         }
     }
+    if ok {
+        match crate::elf::translate_user(pml4, base - 8) {
+            Some(p) => unsafe {
+                *(mem::phys_to_virt(p) as *mut u64) = eintr_frame as u64;
+            },
+            None => ok = false,
+        }
+    }
     if !ok {
         kill_at(s, idx, 128 + 11);
         return;
@@ -1068,6 +1167,16 @@ pub fn maybe_deliver(s: &mut Sched, idx: usize, ctx: *mut CpuContext) {
     c.rsi = 0;
     c.rip = handler;
     c.rsp = base + 160;
+    // POSIX: the delivered signal is masked inside its own handler unless
+    // SA_NODEFER; the pre-handler mask is stacked and sigreturn pops it.
+    if (t.sig.sigmask_depth as usize) < 8 {
+        t.sig.sigmask_stack[t.sig.sigmask_depth as usize] = t.sigmask;
+        t.sig.sigmask_depth += 1;
+    }
+    if t.sig.sa_flags[sig] & shared::SA_NODEFER == 0 {
+        t.sigmask |= 1 << sig;
+    }
+    t.sig.last_sig = sig as u8;
     t.sigpending &= !(1 << sig);
 }
 
@@ -1376,6 +1485,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         rlim_nofile: s.tasks[s.cur].rlim_nofile,
         rlim_nproc: s.tasks[s.cur].rlim_nproc,
         rlim_stack: s.tasks[s.cur].rlim_stack,
+        sig: s.tasks[s.cur].sig.for_fork(),
     };
     mm_inc(cpml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -1721,12 +1831,7 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
         if let Some(p) = s.tasks.iter_mut().find(|x| x.id == parent) {
             if p.state != State::Dead {
                 p.sigpending |= 1 << 17;
-                if p.state == State::Blocked {
-                    p.state = State::Running;
-                    p.waiting_on = 0;
-                    p.wait_port = 0;
-                    p.wait_futex = 0;
-                }
+                wake_for_signal(p, 17);
             }
         }
     }
@@ -1736,12 +1841,7 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
         for c in s.tasks.iter_mut() {
             if c.sid == id && c.id != id && c.state != State::Dead {
                 c.sigpending |= 1 << 1; // SIGHUP
-                if c.state == State::Blocked {
-                    c.state = State::Running;
-                    c.waiting_on = 0;
-                    c.wait_port = 0;
-                    c.wait_futex = 0;
-                }
+                wake_for_signal(c, 1);
             }
         }
     }
@@ -1751,13 +1851,9 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
         if c.parent == id && c.state != State::Dead {
             c.parent = 1;
             if c.pdeathsig != 0 {
-                c.sigpending |= 1 << (c.pdeathsig as u64);
-                if c.state == State::Blocked {
-                    c.state = State::Running;
-                    c.waiting_on = 0;
-                    c.wait_port = 0;
-                    c.wait_futex = 0;
-                }
+                let ds = c.pdeathsig;
+                c.sigpending |= 1 << (ds as u64);
+                wake_for_signal(c, ds as usize);
             }
         }
     }
@@ -2294,12 +2390,7 @@ pub fn signal(pid: u32, sig: u64) -> i64 {
                 return -1;
             }
             t.sigpending |= 1 << sig;
-            if t.state == State::Blocked {
-                t.state = State::Running;
-                t.waiting_on = 0;
-                t.wait_port = 0;
-                t.wait_futex = 0;
-            }
+            wake_for_signal(t, sig as usize);
             0
         }),
         _ => -22,

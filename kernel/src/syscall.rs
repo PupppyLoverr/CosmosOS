@@ -131,7 +131,8 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_FUTEX => sys_futex(ctx, a1, a2, a3, a4),
         shared::SYS_FORK => task::fork_current(ctx).map(|p| p as u64).unwrap_or(ERR),
         shared::SYS_EXECVE => sys_execve(ctx, a1, a2, a3, a4),
-        shared::SYS_SIGACTION => sys_sigaction(a1, a2),
+        shared::SYS_SIGACTION => sys_sigaction(a1, a2, a3),
+        shared::SYS_SIGALTSTACK => sys_sigaltstack(a1, a2, a3, a4),
         shared::SYS_SIGRETURN => sys_sigreturn(ctx),
         shared::SYS_SIGPROCMASK => sys_sigprocmask(a1, a2),
         shared::SYS_SIGNALFD => {
@@ -1414,6 +1415,12 @@ pub fn dispatch(ctx: &mut CpuContext) {
         task::trace_rec(nr, a1, a2, a3, a4, a5, ret);
     }
     ctx.rax = ret;
+    // a normal return to user code means no interrupted-block remains —
+    // except SYS_SIGRETURN, whose restored wake_eintr must survive for
+    // the re-executed syscall's block_reenter to consume
+    if nr != shared::SYS_SIGRETURN {
+        task::with_current(|t| t.sig.wake_eintr = false);
+    }
     // a pending userspace signal delivers right here — the saved frame
     // captures rax=ret so the handler's sigreturn resumes correctly
     let mut g = task::SCHED.lock();
@@ -2453,7 +2460,40 @@ fn sys_execve(ctx: &mut CpuContext, pptr: u64, plen: u64, aptr: u64, alen: u64) 
 /// SYS_SIGACTION(sig, handler): handler 0=SIG_DFL, 1=SIG_IGN, else a
 /// userspace handler address. SIGKILL/SIGSTOP are uncatchable.
 /// Returns the previous handler value.
-fn sys_sigaction(sig: u64, handler: u64) -> u64 {
+/// SYS_SIGALTSTACK(sp, size, flags, old_ptr): register the alternate
+/// signal stack handlers run on when installed SA_ONSTACK. flags=SS_DISABLE
+/// clears it; old_ptr (24B) receives the previous {sp,size,flags}.
+fn sys_sigaltstack(sp: u64, size: u64, flags: u64, old_ptr: u64) -> u64 {
+    let old = task::with_current(|t| {
+        [
+            t.sig.sigstack_sp,
+            t.sig.sigstack_size,
+            t.sig.sigstack_flags,
+        ]
+    });
+    if old_ptr != 0 {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(old.as_ptr() as *const u8, 24)
+        };
+        if copy_out_pub(old_ptr, bytes).is_none() {
+            return ERR;
+        }
+    }
+    if sp != 0 || size != 0 || flags != 0 {
+        task::with_current(|t| {
+            if flags & shared::SS_DISABLE != 0 {
+                t.sig.sigstack_flags = shared::SS_DISABLE;
+            } else {
+                t.sig.sigstack_sp = sp;
+                t.sig.sigstack_size = size;
+                t.sig.sigstack_flags = flags;
+            }
+        });
+    }
+    0
+}
+
+fn sys_sigaction(sig: u64, handler: u64, flags: u64) -> u64 {
     if sig == 0 || sig >= 32 || sig == 9 || sig == 19 {
         return ERR;
     }
@@ -2463,6 +2503,7 @@ fn sys_sigaction(sig: u64, handler: u64) -> u64 {
     task::with_current(|t| {
         let old = t.sighandlers[sig as usize];
         t.sighandlers[sig as usize] = handler;
+        t.sig.sa_flags[sig as usize] = flags as u8;
         old
     })
 }
@@ -2492,6 +2533,19 @@ fn sys_sigprocmask(how: u64, mask: u64) -> u64 {
 
 fn sys_sigreturn(ctx: &mut CpuContext) -> u64 {
     let fbase = ctx.rsp.wrapping_sub(168);
+    // restore the mask saved when the handler frame was pushed, and the
+    // EINTR marker carried in the byte below the frame
+    task::with_current(|t| {
+        if t.sig.sigmask_depth > 0 {
+            t.sig.sigmask_depth -= 1;
+            t.sigmask = t.sig.sigmask_stack[t.sig.sigmask_depth as usize];
+        }
+    });
+    if let Some(e) = copy_in(fbase - 8, 8) {
+        if e.len() >= 8 && u64::from_le_bytes(e[..8].try_into().unwrap()) != 0 {
+            task::with_current(|t| t.sig.wake_eintr = true);
+        }
+    }
     let Some(bytes) = copy_in(fbase, 160) else {
         return ERR;
     };
@@ -2626,11 +2680,30 @@ fn sys_kill(pid: u64) -> u64 {
 /// Mark current task blocked until `deadline` ticks, rewind rip so the syscall
 /// re-executes on wake, and yield to the scheduler.
 fn block_reenter(ctx: &mut CpuContext, deadline: u64, wait_port: u32) -> ! {
-    task::with_current(|t| {
-        t.state = task::State::Blocked;
-        t.wake_at = deadline;
-        t.wait_port = wait_port;
+    // POSIX EINTR: if a signal woke this blocked syscall and its handler
+    // ran without SA_RESTART, the syscall returns EINTR to user code
+    // instead of re-blocking. signal() sets wake_eintr; a normal syscall
+    // return clears it, so it can never fire stale.
+    let intr = task::with_current(|t| {
+        if t.sig.wake_eintr {
+            t.sig.wake_eintr = false;
+            t.sleep_deadline = 0;
+            t.wake_at = 0;
+            t.wait_port = 0;
+            t.waiting_on = 0;
+            t.wait_futex = 0;
+            true
+        } else {
+            t.state = task::State::Blocked;
+            t.wake_at = deadline;
+            t.wait_port = wait_port;
+            false
+        }
     });
+    if intr {
+        ctx.rax = (-4i64) as u64; // EINTR — ctx resumes past the int80
+        task::yield_ctx(ctx);
+    }
     ctx.rip -= 2;
     task::yield_ctx(ctx);
 }

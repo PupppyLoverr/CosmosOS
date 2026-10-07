@@ -164,7 +164,15 @@ pub const SYS_GETPPID: u64 = 151;        // () -> parent pid
 pub const SYS_SIGPENDING: u64 = 152;     // () -> pending-signal bitmask
 pub const SYS_SIGSUSPEND: u64 = 153;     // (mask) — sleep until deliverable
 pub const SYS_ARCH_PRCTL: u64 = 154;     // (op, val) — 2=SET_FS, 3=GET_FS
-pub const SYS_PRLIMIT: u64 = 155;        // (pid, res, new_or_MAX, old_ptr)
+pub const SYS_PRLIMIT: u64 = 155;
+pub const SYS_SIGALTSTACK: u64 = 156;
+
+// sigaction flags (a3)
+pub const SA_RESTART: u8 = 1; // interrupted slow syscalls restart (no EINTR)
+pub const SA_ONSTACK: u8 = 2; // run the handler on the sigaltstack stack
+pub const SA_NODEFER: u8 = 4; // don't block this signal inside its own handler
+// sigaltstack ss_flags
+pub const SS_DISABLE: u64 = 2;        // (pid, res, new_or_MAX, old_ptr)
 pub const SOL_SOCKET: u64 = 1;
 pub const SO_REUSEADDR: u64 = 2;
 pub const SO_TYPE: u64 = 3;

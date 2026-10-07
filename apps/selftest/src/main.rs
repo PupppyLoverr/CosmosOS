@@ -906,6 +906,85 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             None => false,
         }
     });
+    check("sig-eintr", {
+        // a caught signal without SA_RESTART interrupts a slow sleep —
+        // the syscall returns EINTR and sleep_ms comes back early
+        use core::sync::atomic::Ordering;
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn he(s: u64) {
+            SEEN.store(s, Ordering::SeqCst);
+        }
+        ustd::sigaction_fl(14, he as usize as u64, 0);
+        ustd::alarm(1);
+        let t0 = ustd::uptime_ms();
+        ustd::sleep_ms(4000); // EINTR should cut this to ~1s
+        let dt = ustd::uptime_ms().saturating_sub(t0);
+        SEEN.load(Ordering::SeqCst) == 14 && dt < 3000
+    });
+    check("sig-restart", {
+        // SA_RESTART: the handler runs and the sleep completes anyway
+        use core::sync::atomic::Ordering;
+        static SEEN2: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn hr(s: u64) {
+            SEEN2.store(s, Ordering::SeqCst);
+        }
+        ustd::sigaction_fl(14, hr as usize as u64, ustd::SA_RESTART);
+        ustd::alarm(1);
+        let t0 = ustd::uptime_ms();
+        ustd::sleep_ms(1800);
+        let dt = ustd::uptime_ms().saturating_sub(t0);
+        SEEN2.load(Ordering::SeqCst) == 14 && dt >= 1500
+    });
+    check("sigaltstack", {
+        // SA_ONSTACK handler runs on the registered alternate stack —
+        // its rsp must land inside the buffer we registered
+        use core::sync::atomic::Ordering;
+        static ALT_RSP: AtomicU64 = AtomicU64::new(0);
+        static mut ALT: [u8; 8192] = [0; 8192];
+        extern "C" fn ho(_: u64) {
+            let r: u64;
+            unsafe { core::arch::asm!("mov {}, rsp", out(reg) r) };
+            ALT_RSP.store(r, Ordering::SeqCst);
+        }
+        unsafe {
+            let base = core::ptr::addr_of_mut!(ALT) as u64;
+            ustd::sigaltstack(base, 8192);
+            ustd::sigaction_fl(14, ho as usize as u64, ustd::SA_ONSTACK);
+            ustd::alarm(1);
+            for _ in 0..30 {
+                if ALT_RSP.load(Ordering::SeqCst) != 0 {
+                    break;
+                }
+                ustd::sleep_ms(100);
+            }
+            let r = ALT_RSP.load(Ordering::SeqCst);
+            ustd::sigaltstack(0, 0); // leave it registered; just report
+            r >= base && r < base + 8192
+        }
+    });
+    check("sigmask-in-handler", {
+        // POSIX default: the running signal is masked inside its handler —
+        // a self-raise pends, then re-delivers after sigreturn
+        use core::sync::atomic::Ordering;
+        static DEPTH: AtomicU64 = AtomicU64::new(0);
+        static PEND: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn hm(_: u64) {
+            let d = DEPTH.fetch_add(1, Ordering::SeqCst) + 1;
+            if d == 1 {
+                ustd::kill2(ustd::getpid() as u32, 14);
+                PEND.store(ustd::sigpending() & (1 << 14), Ordering::SeqCst);
+            }
+        }
+        ustd::sigaction_fl(14, hm as usize as u64, 0);
+        ustd::kill2(ustd::getpid() as u32, 14);
+        for _ in 0..30 {
+            if DEPTH.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            ustd::sleep_ms(50);
+        }
+        DEPTH.load(Ordering::SeqCst) >= 2 && PEND.load(Ordering::SeqCst) != 0
+    });
     check("tls-fsbase", {
         // arch_prctl SET_FS/GET_FS: real FS segment per task
         static mut CELL: u64 = 0;
