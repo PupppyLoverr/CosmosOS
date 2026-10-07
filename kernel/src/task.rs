@@ -83,6 +83,7 @@ pub struct Task {
     pub mem_bytes: u64,
     pub waiting_on: u32, // pid we're wait_pid'ing on, 0 = none
     pub wait_port: u32,  // port id we're blocked receiving on, 0 = none
+    pub wait_futex: u64, // phys-page key of the futex word we block on, 0 = none
     pub borrowed: Vec<u64>, // phys frames mapped in but owned by shm objects
     pub mmap_next: u64,  // next anonymous mmap vaddr
     pub arg_page: u64,   // vaddr of arg page (0 if none)
@@ -166,6 +167,7 @@ pub fn init() {
         mem_bytes: 0,
         waiting_on: 0,
         wait_port: 0,
+        wait_futex: 0,
         borrowed: Vec::new(),
         mmap_next: USER_MMAP_BASE,
         arg_page: 0,
@@ -504,6 +506,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         mem_bytes: 0,
         waiting_on: 0,
         wait_port: 0,
+        wait_futex: 0,
         borrowed: Vec::new(),
         mmap_next: USER_MMAP_BASE,
         arg_page: USER_ARG_PAGE,
@@ -573,6 +576,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         mem_bytes: 0,
         waiting_on: 0,
         wait_port: 0,
+        wait_futex: 0,
         borrowed: Vec::new(),
         mmap_next: 0,
         arg_page: 0,
@@ -691,6 +695,7 @@ pub fn clone_user(entry: u64, arg: u64) -> Option<u32> {
         mem_bytes: 0,
         waiting_on: 0,
         wait_port: 0,
+        wait_futex: 0,
         borrowed,
         mmap_next: s.tasks[s.cur].mmap_next,
         arg_page: USER_ARG_PAGE,
@@ -816,6 +821,7 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
     // no field on the tombstone may ever re-mark it schedulable
     t.wake_at = u64::MAX;
     t.wait_port = 0;
+    t.wait_futex = 0;
     // wake any waiters (only live ones); u32::MAX = wait(-1) any-child
     for o in s.tasks.iter_mut() {
         if o.waiting_on == t.id || (o.waiting_on == u32::MAX && t.parent == o.id) {
@@ -1257,6 +1263,7 @@ pub fn signal(pid: u32, sig: u64) -> i64 {
                         // a stopped waiter must not wake on its old condition
                         t.waiting_on = 0;
                         t.wait_port = 0;
+                        t.wait_futex = 0;
                     }
                     0
                 }
@@ -1398,6 +1405,30 @@ pub fn pid_rt(pid: u32) -> Option<bool> {
     g.as_ref()?.tasks.iter().find(|t| t.id == pid).map(|t| t.rt)
 }
 
+/// FUTEX_WAKE: mark up to `n` blocked waiters on `key` runnable. Returns
+/// how many were woken. A claimed-but-not-yet-blocked waiter still counts
+/// (its commit step will see the cleared flag and not sleep).
+pub fn futex_wake(key: u64, n: u64) -> u64 {
+    let mut g = SCHED.lock();
+    let Some(s) = g.as_mut() else {
+        return 0;
+    };
+    let mut woke = 0;
+    for t in s.tasks.iter_mut() {
+        if t.wait_futex == key {
+            t.wait_futex = 0;
+            if t.state == State::Blocked {
+                t.state = State::Running;
+            }
+            woke += 1;
+            if woke >= n {
+                break;
+            }
+        }
+    }
+    woke
+}
+
 /// `/proc/<pid>/wchan` — the kernel function the task sleeps in ("0" if running).
 pub fn pid_wchan(pid: u32) -> Option<String> {
     let g = SCHED.lock();
@@ -1408,6 +1439,9 @@ pub fn pid_wchan(pid: u32) -> Option<String> {
         State::Stopped => "signal",
         State::Dead => "exited",
         State::Blocked => {
+            if t.wait_futex != 0 {
+                return Some(String::from("futex"));
+            }
             if t.waiting_on != 0 {
                 "waitpid"
             } else if t.wait_port != 0 {

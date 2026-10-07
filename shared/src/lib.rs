@@ -147,6 +147,7 @@ pub const SYS_NET_TRACE: u64 = 134;      // (ip u32 BE, max_hops, out, cap) -> n
 pub const SYS_SETSOCKOPT: u64 = 135;
 pub const SYS_MMAP_FILE: u64 = 136;     // (fd, size, offset) -> user ptr | 0     // (fd, level, opt, val) -> 0 | errno
 pub const SYS_CLONE: u64 = 137;        // (entry, arg) -> pid | !0  — thread in the caller's mm
+pub const SYS_FUTEX: u64 = 138;        // (uaddr, op, val, timeout_ms) -> 0|n | -errno  — futex wait/wake
 pub const SOL_SOCKET: u64 = 1;
 pub const SO_REUSEADDR: u64 = 2;
 pub const SO_TYPE: u64 = 3;

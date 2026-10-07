@@ -297,6 +297,35 @@ pub fn translate(pml4: PhysFrame, vaddr: u64) -> Option<u64> {
     Some(pt[i1].addr().as_u64() + (vaddr & 0xFFF))
 }
 
+/// translate() but enforces USER_ACCESSIBLE at every level — the syscall
+/// boundary must never resolve a supervisor mapping for a user pointer.
+/// Also refuses anything outside PML4[0]: user tables share the kernel's
+/// upper entries by value, so i4 > 0 would name a shared kernel mapping.
+pub fn translate_user(pml4: PhysFrame, vaddr: u64) -> Option<u64> {
+    use x86_64::structures::paging::PageTableFlags as F;
+    let l4 = unsafe { &*(mem::phys_to_virt(pml4.start_address().as_u64()) as *const PageTable) };
+    let i4 = ((vaddr >> 39) & 0x1FF) as usize;
+    if i4 != 0 || l4[i4].is_unused() || !l4[i4].flags().contains(F::USER_ACCESSIBLE) {
+        return None;
+    }
+    let pdpt = unsafe { &*(mem::phys_to_virt(l4[i4].addr().as_u64()) as *const PageTable) };
+    let i3 = ((vaddr >> 30) & 0x1FF) as usize;
+    if pdpt[i3].is_unused() || !pdpt[i3].flags().contains(F::USER_ACCESSIBLE) {
+        return None;
+    }
+    let pd = unsafe { &*(mem::phys_to_virt(pdpt[i3].addr().as_u64()) as *const PageTable) };
+    let i2 = ((vaddr >> 21) & 0x1FF) as usize;
+    if pd[i2].is_unused() || !pd[i2].flags().contains(F::USER_ACCESSIBLE) {
+        return None;
+    }
+    let pt = unsafe { &*(mem::phys_to_virt(pd[i2].addr().as_u64()) as *const PageTable) };
+    let i1 = ((vaddr >> 12) & 0x1FF) as usize;
+    if pt[i1].is_unused() || !pt[i1].flags().contains(F::USER_ACCESSIBLE) {
+        return None;
+    }
+    Some(pt[i1].addr().as_u64() + (vaddr & 0xFFF))
+}
+
 /// Count present 4KiB leaf mappings in the user half (PML4[0] only — the
 /// shared kernel upper-half entries are not the task's own pages).
 pub fn count_mapped(pml4: PhysFrame) -> u64 {
@@ -329,6 +358,9 @@ pub fn count_mapped(pml4: PhysFrame) -> u64 {
 pub fn unmap_user_page(pml4: PhysFrame, vaddr: u64) -> Option<u64> {
     let l4 = user_l4(pml4);
     let i4 = ((vaddr >> 39) & 0x1FF) as usize;
+    if i4 != 0 {
+        return None; // never reach into the shared kernel-half tables
+    }
     if l4[i4].is_unused() {
         return None;
     }
@@ -374,6 +406,9 @@ pub fn protect_user_page(pml4: PhysFrame, vaddr: u64, writable: bool, executable
     use x86_64::structures::paging::PageTableFlags as F;
     let l4 = user_l4(pml4);
     let i4 = ((vaddr >> 39) & 0x1FF) as usize;
+    if i4 != 0 {
+        return None; // never reach into the shared kernel-half tables
+    }
     if l4[i4].is_unused() {
         return None;
     }

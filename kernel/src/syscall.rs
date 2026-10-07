@@ -43,9 +43,9 @@ fn copy_in(ptr: u64, len: u64) -> Option<Vec<u8>> {
         let va = ptr + off;
         // demand-page file-backed/bss pages on first touch — a syscall
         // can legitimately hit a not-yet-faulted user page
-        let phys = match elf::translate(pml4, va) {
+        let phys = match elf::translate_user(pml4, va) {
             Some(p) => p,
-            None if task::demand_page(va) => elf::translate(pml4, va)?,
+            None if task::demand_page(va) => elf::translate_user(pml4, va)?,
             None => return None,
         };
         let chunk = (0x1000 - (va & 0xFFF)).min(len - off);
@@ -64,9 +64,9 @@ fn copy_out(ptr: u64, data: &[u8]) -> Option<()> {
     let mut off = 0u64;
     while off < data.len() as u64 {
         let va = ptr + off;
-        let phys = match elf::translate(pml4, va) {
+        let phys = match elf::translate_user(pml4, va) {
             Some(p) => p,
-            None if task::demand_page(va) => elf::translate(pml4, va)?,
+            None if task::demand_page(va) => elf::translate_user(pml4, va)?,
             None => return None,
         };
         let chunk = ((0x1000 - (va & 0xFFF)) as usize).min(data.len() - off as usize);
@@ -117,6 +117,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
             Some(pid) => pid as u64,
             None => ERR,
         },
+        shared::SYS_FUTEX => sys_futex(ctx, a1, a2, a3, a4),
         shared::SYS_DEBUG => sys_debug(a1, a2),
         shared::SYS_OPEN => sys_open(a1, a2, a3),
         shared::SYS_CLOSE => {
@@ -2242,6 +2243,86 @@ fn sys_ipc_recv(ctx: &mut CpuContext, port: u64, buf: u64, buflen: u64, timeout_
     });
     ctx.rip -= 2;
     task::yield_ctx(ctx);
+}
+
+/// SYS_FUTEX(uaddr, op, val, timeout_ms) — real futex wait/wake.
+/// op 0 = FUTEX_WAIT: sleep while *uaddr == val; op 1 = FUTEX_WAKE: wake
+/// `val` waiters. The wait key is the word's PHYSICAL page (shared-mm
+/// threads and any mapping of the same frame collide; unrelated
+/// processes' identical VAs can't). wait_timeout doubles as the
+/// re-entry marker; wait_futex is the claimed key a waker clears.
+fn sys_futex(ctx: &mut CpuContext, uaddr: u64, op: u64, val: u64, timeout_ms: u64) -> u64 {
+    if uaddr & 7 != 0 {
+        return ERR;
+    }
+    let pml4 = task::with_current(|t| t.pml4);
+    let Some(pml4) = pml4 else { return ERR };
+    // touch the word first: a demand-paged page must be present to key on
+    let Some(bytes) = copy_in(uaddr, 8) else {
+        return (u64::MAX - 13) as u64; // -EFAULT
+    };
+    let Some(phys) = elf::translate_user(pml4, uaddr & !0xfff) else {
+        return (u64::MAX - 13) as u64;
+    };
+    let key = phys | (uaddr & 0xfff);
+    if op == 1 {
+        // FUTEX_WAKE(val = max waiters)
+        return task::futex_wake(key, val);
+    }
+    if op != 0 {
+        return (u64::MAX - 21) as u64; // -EINVAL
+    }
+    let now = task::ticks();
+    let was_waiting = task::with_current(|t| t.wait_timeout != 0);
+    if !was_waiting {
+        // fresh wait: semantics require *uaddr == val at call time
+        let cur = u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]));
+        if cur != val {
+            return (u64::MAX - 10) as u64; // -EAGAIN
+        }
+        let dl = if timeout_ms == u64::MAX {
+            u64::MAX
+        } else {
+            now + timeout_ms.div_ceil(10) + 1
+        };
+        task::with_current(|t| {
+            t.wait_timeout = dl;
+            t.wait_futex = key; // claim — makes us visible to wakers
+        });
+    } else {
+        // re-entry after a scheduler wake
+        let (flag, dl) = task::with_current(|t| (t.wait_futex, t.wait_timeout));
+        if flag == 0 {
+            // a waker cleared our key while we slept
+            task::with_current(|t| t.wait_timeout = 0);
+            return 0;
+        }
+        if now >= dl {
+            task::with_current(|t| {
+                t.wait_timeout = 0;
+                t.wait_futex = 0;
+            });
+            return (u64::MAX - 109) as u64; // -ETIMEDOUT
+        }
+    }
+    // commit to blocking — the waker may have fired between claim and
+    // here; it clears wait_futex, so only sleep if the flag still stands
+    let (still_wait, dl) = task::with_current(|t| {
+        if t.wait_futex == key {
+            t.state = task::State::Blocked;
+            t.wake_at = t.wait_timeout; // generic tick wake doubles as timeout
+            (true, t.wait_timeout)
+        } else {
+            t.wait_timeout = 0; // claimed-then-woken: count as a wake
+            (false, 0)
+        }
+    });
+    let _ = dl;
+    if !still_wait {
+        return 0;
+    }
+    ctx.rip -= 2;
+    task::yield_ctx(ctx)
 }
 
 fn sys_sleep(ctx: &mut CpuContext, ms: u64) -> u64 {

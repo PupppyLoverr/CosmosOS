@@ -132,6 +132,65 @@ pub fn thread_spawn(f: extern "C" fn(u64) -> i64, arg: u64) -> Result<u32, ()> {
     }
 }
 
+// ---- futex: real kernel wait/wake on a userspace atomic word ----
+
+pub const FUTEX_WAIT: u64 = 0;
+pub const FUTEX_WAKE: u64 = 1;
+
+/// Raw futex syscall. WAIT returns 0 woken, -11 EAGAIN (value differs),
+/// -110 ETIMEDOUT. WAKE returns the number of waiters woken.
+pub fn futex(uaddr: &core::sync::atomic::AtomicU64, op: u64, val: u64, timeout_ms: u64) -> i64 {
+    sc4(
+        shared::SYS_FUTEX,
+        uaddr as *const _ as u64,
+        op,
+        val,
+        timeout_ms,
+    ) as i64
+}
+
+/// Sleep while `*uaddr == val` (spurious wakes possible — callers loop).
+pub fn futex_wait(uaddr: &core::sync::atomic::AtomicU64, val: u64) {
+    let _ = futex(uaddr, FUTEX_WAIT, val, u64::MAX);
+}
+
+/// Wake up to `n` waiters blocked on `uaddr`.
+pub fn futex_wake(uaddr: &core::sync::atomic::AtomicU64, n: u64) -> i64 {
+    futex(uaddr, FUTEX_WAKE, n, 0)
+}
+
+/// A real three-state futex mutex (glibc-style): 0 = free, 1 = locked
+/// without waiters, 2 = locked with sleepers queued in the kernel.
+pub struct Mutex {
+    pub state: core::sync::atomic::AtomicU64,
+}
+
+impl Mutex {
+    pub const fn new() -> Self {
+        Mutex { state: core::sync::atomic::AtomicU64::new(0) }
+    }
+    pub fn lock(&self) {
+        use core::sync::atomic::Ordering;
+        if self
+            .state
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+        // contested: mark waiters and sleep while the word stays != 0
+        while self.state.swap(2, Ordering::Acquire) != 0 {
+            futex_wait(&self.state, 2);
+        }
+    }
+    pub fn unlock(&self) {
+        use core::sync::atomic::Ordering;
+        if self.state.swap(0, Ordering::Release) == 2 {
+            futex_wake(&self.state, 1);
+        }
+    }
+}
+
 /// POSIX wait(-1): (pid, exit_code) of the first dead child — reaped by
 /// the kernel. Err = no children / timeout.
 pub fn waitpid_any(timeout_ms: u64) -> Result<(u32, i64), ()> {
