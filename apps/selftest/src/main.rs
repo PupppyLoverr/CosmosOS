@@ -12,6 +12,7 @@ use ustd::*;
 
 static mut PASS: u32 = 0;
 static mut FAIL: u32 = 0;
+static THREAD_HIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn check(name: &str, ok: bool) {
     if ok {
@@ -369,6 +370,58 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         ok
     });
     check("nice-bad-pid", ustd::set_nice(0xFFFF_FFFE, 0) == -1000);
+    check("thread-shared-mm", {
+        // a clone()'d thread writes OUR atomics through the shared address
+        // space and returns an exit code we reap like a process
+        use core::sync::atomic::Ordering;
+        extern "C" fn th(arg: u64) -> i64 {
+            THREAD_HIT.store(arg, Ordering::SeqCst);
+            42
+        }
+        match ustd::thread_spawn(th, 0x5AFE) {
+            Ok(tid) => {
+                let code = ustd::waitpid(tid, 5000).unwrap_or(-1);
+                code == 42 && THREAD_HIT.load(Ordering::SeqCst) == 0x5AFE
+            }
+            Err(_) => false,
+        }
+    });
+    check("thread-task-list", {
+        // /proc/self/task names every live tid sharing this address space
+        extern "C" fn nap(_: u64) -> i64 {
+            ustd::sleep_ms(400);
+            0
+        }
+        match ustd::thread_spawn(nap, 0) {
+            Ok(tid) => {
+                let d = ustd::read_all("/proc/self/task").unwrap_or_default();
+                let s = String::from_utf8_lossy(&d);
+                let has = s.split_whitespace().any(|v| v.parse::<u32>().ok() == Some(tid));
+                let _ = ustd::waitpid(tid, 3000);
+                has
+            }
+            Err(_) => false,
+        }
+    });
+    check("thread-private-stack", {
+        // the thread runs on its own slot: deep recursion there must not
+        // collide with our stack — growdown bounds are per-task
+        extern "C" fn deep(x: u64) -> i64 {
+            let mut frame = [0u8; 2048];
+            unsafe {
+                core::ptr::write_volatile(frame.as_mut_ptr(), x as u8);
+            }
+            if x == 0 {
+                frame[0] as i64
+            } else {
+                deep(x - 1) + frame[0] as i64
+            }
+        }
+        match ustd::thread_spawn(deep, 30) {
+            Ok(tid) => ustd::waitpid(tid, 5000).unwrap_or(-1) == (0..=30).sum::<u64>() as i64,
+            Err(_) => false,
+        }
+    });
     check("stack-growdown", {
         // deep recursion over big per-frame arrays forces the user stack to
         // demand-grow pages below the single eager top page

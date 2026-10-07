@@ -52,7 +52,7 @@ fn pid_of(path: &str) -> Option<u32> {
 
 const PID_FILES: &[&str] = &[
     "status", "cmdline", "stat", "fds", "fdinfo", "cwd", "maps", "io",
-    "statm", "exe", "smaps", "wchan", "children",
+    "statm", "exe", "smaps", "wchan", "children", "task",
 ];
 
 pub fn is_dir(path: &str) -> bool {
@@ -444,6 +444,15 @@ fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
             nice,
             vrun,
             rss
+        ),
+        "task" => alloc::format!(
+            "{}\n",
+            task::pid_threads(pid)
+                .unwrap_or_default()
+                .iter()
+                .map(|t| alloc::format!("{}", t))
+                .collect::<Vec<_>>()
+                .join(" ")
         ),
         "fds" => task::fd_list(pid).unwrap_or_default(),
         "fdinfo" => task::fd_info(pid).unwrap_or_default(),

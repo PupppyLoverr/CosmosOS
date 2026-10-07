@@ -113,6 +113,10 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_SLEEP_MS => sys_sleep(ctx, a1),
         shared::SYS_MMAP => sys_mmap(a1),
         shared::SYS_MMAP_FILE => sys_mmap_file(a1, a2, a3),
+        shared::SYS_CLONE => match task::clone_user(a1, a2) {
+            Some(pid) => pid as u64,
+            None => ERR,
+        },
         shared::SYS_DEBUG => sys_debug(a1, a2),
         shared::SYS_OPEN => sys_open(a1, a2, a3),
         shared::SYS_CLOSE => {
@@ -663,6 +667,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                     if s > 4096 {
                         return ERR;
                     }
+                    vfs::acquire_desc(&nf);
                     if s == t.fds.len() {
                         t.fds.push(Some(nf));
                     } else {
@@ -1031,11 +1036,13 @@ pub fn dispatch(ctx: &mut CpuContext) {
                     let newfd: i64 = match got {
                         Some(p) if a4 != 0 => task::with_current(|t| {
                             let s = alloc_slot(t);
-                            t.fds[s] = Some(task::FileDesc {
+                            let nf = task::FileDesc {
                                 path: p,
                                 pos: 0,
                                 flags: shared::O_RDWR,
-                            });
+                            };
+                            vfs::acquire_desc(&nf);
+                            t.fds[s] = Some(nf);
                             s as i64
                         }),
                         _ => -1,
@@ -1447,8 +1454,9 @@ fn sys_munmap(addr: u64, len: u64) -> u64 {
         return ERR;
     }
     let end = addr.saturating_add(len.div_ceil(0x1000) * 0x1000);
-    task::with_current(|t| {
-        let Some(pml4) = t.pml4 else { return ERR };
+    let mut pml4_phys = None;
+    let ret: Option<u64> = task::with_current(|t| {
+        let pml4 = t.pml4?;
         let mut unmapped = 0u64;
         let mut a = addr;
         while a < end {
@@ -1461,7 +1469,7 @@ fn sys_munmap(addr: u64, len: u64) -> u64 {
             a += 0x1000;
         }
         if unmapped == 0 {
-            return ERR;
+            return None;
         }
         // release shm segments whose region is fully covered
         let mut releases: Vec<u32> = Vec::new();
@@ -1476,62 +1484,77 @@ fn sys_munmap(addr: u64, len: u64) -> u64 {
             shm::release(t, id);
             t.shm.retain(|&s| s != id);
         }
-        // shrink, split or drop overlapping map entries
-        let mut out: Vec<task::MapEnt> = Vec::new();
-        for m in core::mem::take(&mut t.maps) {
-            if m.end <= addr || m.start >= end {
-                out.push(m);
-                continue;
-            }
-            if m.start < addr {
-                out.push(task::MapEnt {
-                    start: m.start,
-                    end: addr,
-                    perm: m.perm,
-                    name: m.name.clone(),
-                });
-            }
-            if m.end > end {
-                out.push(task::MapEnt {
-                    start: end,
-                    end: m.end,
-                    perm: m.perm,
-                    name: m.name,
-                });
-            }
-        }
-        t.maps = out;
-        // filemap bookkeeping tracks the same split
-        let mut fout: Vec<task::FileMap> = Vec::new();
-        for f in core::mem::take(&mut t.filemaps) {
-            if f.end <= addr || f.start >= end {
-                fout.push(f);
-                continue;
-            }
-            if f.start < addr {
-                fout.push(task::FileMap {
-                    start: f.start,
-                    end: addr,
-                    path: f.path.clone(),
-                    off: f.off,
-                    perm: f.perm,
-                });
-            }
-            if f.end > end {
-                fout.push(task::FileMap {
-                    start: end,
-                    end: f.end,
-                    path: f.path,
-                    off: f.off + (end - f.start),
-                    perm: f.perm,
-                });
-            }
-        }
-        t.filemaps = fout;
+        trim_map_lists(t, addr, end);
         t.mem_bytes = t.mem_bytes.saturating_sub(unmapped * 0x1000);
         unsafe { x86_64::instructions::tlb::flush_all() };
-        0
-    })
+        pml4_phys = t.pml4.map(|p| p.start_address().as_u64());
+        pml4_phys
+    });
+    // cloned threads share this mm — every sharer's bookkeeping must see
+    // the same trim or a stale filemap would resurrect unmapped pages on
+    // the next fault. (for_mm_peers re-trims ours too: idempotent.)
+    if let Some(pp) = pml4_phys {
+        task::for_mm_peers(pp, |o| trim_map_lists(o, addr, end));
+    }
+    match ret {
+        Some(_) => 0,
+        None => ERR,
+    }
+}
+
+/// Split/shrink/drop one task's maps+filemaps bookkeeping over [addr,end).
+fn trim_map_lists(t: &mut task::Task, addr: u64, end: u64) {
+    let mut out: Vec<task::MapEnt> = Vec::new();
+    for m in core::mem::take(&mut t.maps) {
+        if m.end <= addr || m.start >= end {
+            out.push(m);
+            continue;
+        }
+        if m.start < addr {
+            out.push(task::MapEnt {
+                start: m.start,
+                end: addr,
+                perm: m.perm,
+                name: m.name.clone(),
+            });
+        }
+        if m.end > end {
+            out.push(task::MapEnt {
+                start: end,
+                end: m.end,
+                perm: m.perm,
+                name: m.name,
+            });
+        }
+    }
+    t.maps = out;
+    // filemap bookkeeping tracks the same split
+    let mut fout: Vec<task::FileMap> = Vec::new();
+    for f in core::mem::take(&mut t.filemaps) {
+        if f.end <= addr || f.start >= end {
+            fout.push(f);
+            continue;
+        }
+        if f.start < addr {
+            fout.push(task::FileMap {
+                start: f.start,
+                end: addr,
+                path: f.path.clone(),
+                off: f.off,
+                perm: f.perm,
+            });
+        }
+        if f.end > end {
+            fout.push(task::FileMap {
+                start: end,
+                end: f.end,
+                path: f.path,
+                off: f.off + (end - f.start),
+                perm: f.perm,
+            });
+        }
+    }
+    t.filemaps = fout;
 }
 
 /// SYS_MPROTECT(addr,len,prot R1W2X4): rewrites real PTE flags on the
@@ -1959,6 +1982,7 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
     };
     // close the occupying fd first so pipe roles stay honest
     vfs::close(newfd as i64);
+    vfs::acquire_desc(&f);
     task::with_current(|t| {
         while t.fds.len() <= newfd as usize {
             t.fds.push(None);
