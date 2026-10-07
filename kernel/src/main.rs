@@ -20,6 +20,7 @@ mod notify;
 mod epoll;
 mod eventfd;
 mod sockpair;
+mod sockfd;
 mod pidfd;
 mod pci;
 mod dev;

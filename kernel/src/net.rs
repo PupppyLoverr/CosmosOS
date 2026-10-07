@@ -1251,6 +1251,88 @@ pub fn tcp_close(lport: u16) {
     }
 }
 
+// ---- socket-fd support (kernel/src/sockfd.rs rides these) ----
+
+/// One non-blocking rx pump+dispatch so socket-fd readiness and reads see
+/// packets that arrived since the last blocking call.
+pub fn pump_once() {
+    for (src_ip, proto, p) in pump_rx() {
+        dispatch(src_ip, proto, p);
+    }
+}
+
+/// True when no UDP socket, TCP conn or listener occupies `lport`.
+pub fn lport_free(lport: u16) -> bool {
+    !udp_bound(lport)
+        && !TCP_SOCKS.lock().contains_key(&lport)
+        && !LISTENERS.lock().contains(&lport)
+}
+
+/// UDP datagrams queued for `lport`?
+pub fn udp_ready(lport: u16) -> bool {
+    SOCKS
+        .lock()
+        .get(&lport)
+        .map(|q| !q.is_empty())
+        .unwrap_or(false)
+}
+
+/// TCP fd-read state: Some(true)=data queued, Some(false)=open but empty,
+/// None=conn gone (EOF — reads return 0).
+pub fn tcp_read_ready(cid: u16) -> Option<bool> {
+    let t = TCP_SOCKS.lock();
+    let k = t.get(&cid)?;
+    if !k.q.is_empty() {
+        Some(true)
+    } else if k.state == TcpState::Closed {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// A completed inbound handshake is queued for accept on `lport`?
+pub fn tcp_accept_ready(lport: u16) -> bool {
+    ACCEPTED
+        .lock()
+        .get(&lport)
+        .map(|q| !q.is_empty())
+        .unwrap_or(false)
+}
+
+/// Fire a single data segment and return without waiting for the ack — the
+/// O_NONBLOCK write path for socket fds. Err(-1) no conn, Err(-2) closed.
+pub fn tcp_send_nowait(cid: u16, data: &[u8]) -> Result<usize, i64> {
+    let (seq, mac, rip, lport, rport, ack) = {
+        let t = TCP_SOCKS.lock();
+        let Some(k) = t.get(&cid) else { return Err(-1) };
+        if k.state != TcpState::Open {
+            return Err(-2);
+        }
+        (k.snd_nxt, k.mac, k.rip, k.lport, k.rport, k.rcv_nxt)
+    };
+    let n = data.len().min(1400);
+    send_tcp(mac, rip, lport, rport, seq, ack, TCP_ACK | TCP_PSH, &data[..n]);
+    if let Some(k) = TCP_SOCKS.lock().get_mut(&cid) {
+        k.snd_nxt = seq.wrapping_add(n as u32);
+    }
+    Ok(n)
+}
+
+/// Nonblocking partial read: at most `cap` bytes of the front queued chunk;
+/// the remainder stays queued for the next read. None = nothing buffered.
+pub fn tcp_recv_some(cid: u16, cap: usize) -> Option<Vec<u8>> {
+    let mut t = TCP_SOCKS.lock();
+    let k = t.get_mut(&cid)?;
+    let front = k.q.front_mut()?;
+    let n = front.len().min(cap);
+    let d: Vec<u8> = front.drain(..n).collect();
+    if front.is_empty() {
+        k.q.pop_front();
+    }
+    Some(d)
+}
+
 pub fn init() {
     if virtio_net::init() {
         match dhcp() {
