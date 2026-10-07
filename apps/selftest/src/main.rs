@@ -1678,6 +1678,110 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    // ---- batch 40: loopback + dgram socketpair + peercred ----
+    check("loopback", {
+        // lo: packets to 127/8 re-enter the stack instead of the wire —
+        // UDP round trip, TCP listen/connect/echo, and a real ICMP
+        // echo reply answered by our own stack.
+        let mut ok = false;
+        let u = ustd::socketx(ustd::SOCK_DGRAM, shared::AF_INET);
+        if u >= 0 {
+            ustd::fcntl(u, ustd::F_SETFL, ustd::O_NONBLOCK);
+            ok = ustd::bind(u, 19777) == 0
+                && ustd::sendto(u, b"loop", [127, 0, 0, 1], 19777) == 4
+                && ustd::poll(&[u as u32], &[1], 1000) > 0
+                && ustd::recvfrom(u, &mut [0u8; 8])
+                    .map(|(n, ip, _)| n == 4 && ip == [127, 0, 0, 1])
+                    .unwrap_or(false);
+            ustd::close(u);
+        }
+        // TCP over lo: full handshake inside the guest
+        let l = ustd::socketx(ustd::SOCK_STREAM, shared::AF_INET);
+        let c = ustd::socketx(ustd::SOCK_STREAM, shared::AF_INET);
+        if l >= 0 && c >= 0 {
+            ustd::fcntl(l, ustd::F_SETFL, ustd::O_NONBLOCK);
+            ok = ok
+                && ustd::bind(l, 19778) == 0
+                && ustd::listen(l, 2) == 0
+                && ustd::connect(c, [127, 0, 0, 1], 19778) == 0
+                && ustd::accept(l).map(|(a, _, _)| {
+                    let w = ustd::write(a, b"li").is_ok();
+                    ustd::close(a);
+                    w
+                }).unwrap_or(false)
+                && ustd::poll(&[c as u32], &[1], 1000) > 0
+                && ustd::read(c, &mut [0u8; 4]).map(|n| n == 2).unwrap_or(false);
+            ustd::close(c);
+            ustd::close(l);
+        }
+        // the stack itself answers echo requests on lo
+        ok = ok && ustd::net_ping(0x7F000001, 1000).is_some()
+            // and /etc/hosts resolved 'localhost' without a wire query
+            && ustd::net_dns("localhost") == Some([127, 0, 0, 1]);
+        ok
+    });
+    check("socketpair-dgram", {
+        // socketpair(AF_UNIX, SOCK_DGRAM): two cross-linked mailboxes —
+        // packet boundaries preserved both ways.
+        match ustd::socketpair_t(ustd::SOCK_DGRAM) {
+            Some((a, b)) => {
+                ustd::fcntl(b, ustd::F_SETFL, ustd::O_NONBLOCK);
+                let mut buf = [0u8; 32];
+                let ok = ustd::write(a, b"one") == Ok(3)
+                    && ustd::write(a, b"two22") == Ok(5)
+                    && ustd::write(b, b"back") == Ok(4)
+                    && ustd::read(b, &mut buf).map(|n| n == 3).unwrap_or(false)
+                    && ustd::read(b, &mut buf).map(|n| n == 5).unwrap_or(false)
+                    && ustd::read(a, &mut buf).map(|n| n == 4).unwrap_or(false)
+                    // sender name is the peer's auto mailbox
+                    && ustd::getsockopt(a, shared::SOL_SOCKET, 17)
+                        .map(|p| p != 0)
+                        .unwrap_or(false);
+                ustd::close(a);
+                ustd::close(b);
+                ok
+            }
+            None => false,
+        }
+    });
+    check("peercred", {
+        // SO_PEERCRED: the client's getsockopt reports the listener
+        // owner's pid; the accepted end reports the connector's pid —
+        // verified against a real spawned task (cosmos-ucat).
+        let mut ok = false;
+        let lfd = ustd::socketx(ustd::SOCK_STREAM, shared::AF_UNIX);
+        if lfd >= 0 {
+            ustd::fcntl(lfd, ustd::F_SETFL, ustd::O_NONBLOCK);
+            ok = ustd::bind_path(lfd, "/pc-selftest") == 0
+                && ustd::listen(lfd, 2) == 0;
+            if ok {
+                match ustd::spawn("/bin/cosmos-ucat", "/pc-selftest cred /tmp/pcred-out") {
+                    Ok(cpid) => {
+                        // wait for the connect to land in the accept queue
+                        let mut afd = -1i64;
+                        for _ in 0..50 {
+                            if let Ok((a, _, _)) = ustd::accept(lfd) {
+                                afd = a;
+                                break;
+                            }
+                            ustd::sleep_ms(20);
+                        }
+                        ok = afd >= 0
+                            && ustd::getsockopt(afd, shared::SOL_SOCKET, 17)
+                                == Ok(cpid)
+                            && ustd::getsockopt(lfd, shared::SOL_SOCKET, 17)
+                                == Err(-107);
+                        if afd >= 0 {
+                            ustd::close(afd);
+                        }
+                    }
+                    Err(_) => ok = false,
+                }
+            }
+            ustd::close(lfd);
+        }
+        ok
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64
