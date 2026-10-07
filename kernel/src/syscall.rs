@@ -378,7 +378,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
             match copy_in(a1, a2.min(4096)) {
                 Some(b) => {
                     let path = String::from_utf8_lossy(&b).into_owned();
-                    match crate::vfs::readlink(&path) {
+                    match crate::vfs::readlink_path(&path) {
                         Ok(t) => {
                             let n = (t.len() as u64).min(a4);
                             match copy_out(a3, &t.as_bytes()[..n as usize]) {
@@ -623,6 +623,12 @@ fn sys_mmap(size: u64) -> u64 {
             }
         }
         t.mem_bytes += pages * 0x1000;
+        t.maps.push(task::MapEnt {
+            start: base,
+            end: base + pages * 0x1000,
+            perm: 1 | 2,
+            name: alloc::string::String::from("[anon]"),
+        });
         t.mmap_next += pages * 0x1000 + 0x1000; // guard page
         base
     })
@@ -782,6 +788,12 @@ fn sys_shm_map(id: u64) -> u64 {
         }
         t.mmap_next += n + 0x1000;
         t.mem_bytes += n;
+        t.maps.push(task::MapEnt {
+            start: vaddr,
+            end: vaddr + n,
+            perm: 1 | 2,
+            name: alloc::format!("shm#{}", id),
+        });
         vaddr
     })
 }
@@ -942,6 +954,13 @@ fn sys_fb_info(out: u64) -> u64 {
     let me = cur_id();
     match fb::claim_and_map(pml4, me) {
         Ok(info) => {
+            task::record_map(
+                me,
+                info.addr,
+                info.addr + (info.stride as u64) * (info.height as u64) * 4,
+                1 | 2,
+                "[fb]",
+            );
             let bytes = unsafe {
                 core::slice::from_raw_parts(&info as *const _ as *const u8, core::mem::size_of::<shared::FbInfo>())
             };
@@ -986,7 +1005,7 @@ fn sys_getcwd(buf: u64, len: u64) -> u64 {
     }
 }
 
-fn power_off() -> ! {
+pub fn power_off() -> ! {
     // QEMU q35 ACPI shutdown
     unsafe {
         use x86_64::instructions::port::Port;
@@ -1055,7 +1074,7 @@ fn next_seed() -> u64 {
     s.wrapping_mul(0x2545_F491_4F6C_DD1D)
 }
 
-fn reboot() -> ! {
+pub fn reboot() -> ! {
     unsafe {
         use x86_64::instructions::port::Port;
         let mut p: Port<u8> = Port::new(0x64);

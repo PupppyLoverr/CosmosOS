@@ -6,7 +6,25 @@ use crate::virtio_net::{self, NET};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
+
+/// Interface counters for /proc/net/dev.
+pub static RX_PKTS: AtomicU64 = AtomicU64::new(0);
+pub static RX_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static TX_PKTS: AtomicU64 = AtomicU64::new(0);
+pub static TX_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// `/proc/net/dev` body: real rx/tx counters for the virtio-net iface.
+pub fn net_dev() -> String {
+    alloc::format!(
+        "Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n  eth0:{:>8}{:>8}    0    0    0     0          0         0 {:>8}{:>8}    0    0    0     0       0          0\n",
+        RX_BYTES.load(Ordering::Relaxed),
+        RX_PKTS.load(Ordering::Relaxed),
+        TX_BYTES.load(Ordering::Relaxed),
+        TX_PKTS.load(Ordering::Relaxed),
+    )
+}
 
 /// Fallback IP when DHCP fails (slirp's static-assignment convention).
 pub const DEFAULT_IP: [u8; 4] = [10, 0, 2, 15];
@@ -71,6 +89,8 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
     let mut out = Vec::new();
     for f in virtio_net::take_rx() {
         crate::pcap::log_frame(&f);
+        RX_PKTS.fetch_add(1, Ordering::Relaxed);
+        RX_BYTES.fetch_add(f.len() as u64, Ordering::Relaxed);
         if let Some(p) = handle_frame(&f) {
             out.push(p);
         }
@@ -80,6 +100,8 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
         n.drain_rx(&mut v);
         for f in v {
             crate::pcap::log_frame(&f);
+            RX_PKTS.fetch_add(1, Ordering::Relaxed);
+            RX_BYTES.fetch_add(f.len() as u64, Ordering::Relaxed);
             if let Some(p) = handle_frame(&f) {
                 out.push(p);
             }
@@ -98,6 +120,8 @@ fn send_frame(dst: [u8; 6], ethertype: u16, payload: &[u8]) -> Result<(), ()> {
     if f.len() < 60 {
         f.resize(60, 0);
     }
+    TX_PKTS.fetch_add(1, Ordering::Relaxed);
+    TX_BYTES.fetch_add(f.len() as u64, Ordering::Relaxed);
     n.send(&f)
 }
 

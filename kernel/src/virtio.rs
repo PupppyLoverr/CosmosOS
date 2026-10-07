@@ -4,7 +4,7 @@ use crate::mem;
 use crate::pci;
 use crate::sprintln;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use fat32::BlockDevice;
 use spin::Mutex;
 use x86_64::instructions::port::Port;
@@ -313,11 +313,17 @@ impl BlkDev {
     }
 }
 
+/// Sector counters for /proc/diskstats.
+pub static BLK_RD_SECTORS: AtomicU64 = AtomicU64::new(0);
+pub static BLK_WR_SECTORS: AtomicU64 = AtomicU64::new(0);
+
 impl BlockDevice for BlkDev {
     fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> fat32::Result<()> {
+        BLK_RD_SECTORS.fetch_add(1, Ordering::Relaxed);
         self.inner.rw_sector(lba, buf, false).map_err(|_| fat32::Error::Io)
     }
     fn write_sector(&mut self, lba: u64, buf: &[u8]) -> fat32::Result<()> {
+        BLK_WR_SECTORS.fetch_add(1, Ordering::Relaxed);
         let mut tmp = [0u8; 512];
         tmp[..512].copy_from_slice(&buf[..512]);
         self.inner.rw_sector(lba, &mut tmp, true).map_err(|_| fat32::Error::Io)

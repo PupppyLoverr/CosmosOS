@@ -7,16 +7,28 @@
 //!   /dev/urandom   same source here — no entropy-pool blocking in this OS
 //!   /dev/rtc       reads the current RTC wall-clock (one line of text)
 //!   /dev/vda       raw virtio-blk data disk, sector-granular, read-only
+//!   /dev/fb0       raw framebuffer pixels (32bpp), read/write at byte offset
+//!   /dev/kmsg      kernel log ring: read = tail, write = userspace printk
+//!   /dev/console   write = serial + klog (the system console sink)
+//!   /dev/mem       raw physical memory via the HHDM map (read-only)
+//!   /dev/nvram     128 bytes of CMOS NVRAM, read-only
+//!   /dev/smbios    raw SMBIOS table bytes if firmware exports one
+//!   /dev/dsp       write u16-LE Hz values -> PC speaker tones (60ms each)
 //!
 //! fd-granularity reads always produce fresh data (streams never EOF);
 //! read_all/stat return a bounded 4KiB snapshot so `cat`/`hex` terminate.
 
+use alloc::string::String;
 use alloc::vec::Vec;
+use x86_64::instructions::port::Port;
 
 const SNAPSHOT: usize = 4096;
 /// /dev/vda caps a single open at 1 MiB (cat-style readers terminate).
 const VDA_SNAPSHOT: usize = 1 << 20;
-const NAMES: [&str; 7] = ["null", "zero", "full", "random", "urandom", "rtc", "vda"];
+const NAMES: [&str; 14] = [
+    "null", "zero", "full", "random", "urandom", "rtc", "vda",
+    "fb0", "kmsg", "console", "mem", "nvram", "smbios", "dsp",
+];
 
 pub fn handles(path: &str) -> bool {
     path == "/dev" || NAMES.iter().any(|n| {
@@ -45,24 +57,34 @@ pub fn entries() -> Vec<shared::DirEntry> {
         .collect()
 }
 
-/// fd-granularity read: each open fd yields a bounded SNAPSHOT-byte
-/// virtual stream (EOF at pos >= 4KiB) so consumers terminate.
-/// /dev/null always EOFs.
+/// fd-granularity read at byte offset `pos`.
 pub fn read_at(path: &str, pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
-    if &path[5..] == "vda" {
-        return vda_read(pos, buf);
-    }
-    if &path[5..] == "rtc" {
-        let d = crate::timer::datetime();
-        let s = alloc::format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC\n",
-            d.year, d.month, d.day, d.hour, d.minute, d.second
-        );
-        let b = s.as_bytes();
-        let rem = (b.len() as u64).saturating_sub(pos) as usize;
-        let n = buf.len().min(rem);
-        buf[..n].copy_from_slice(&b[pos as usize..pos as usize + n]);
-        return Ok(n);
+    match &path[5..] {
+        "vda" => return vda_read(pos, buf),
+        "fb0" => return fb0_read(pos, buf),
+        "mem" => return mem_read(pos, buf),
+        "nvram" => return nvram_read(pos, buf),
+        "smbios" => return smbios_read(pos, buf),
+        "kmsg" => {
+            // stream of the ring tail: pos 0 emits the whole tail, then EOF
+            if pos != 0 {
+                return Ok(0);
+            }
+            return Ok(crate::klog::read_tail(buf));
+        }
+        "rtc" => {
+            let d = crate::timer::datetime();
+            let s = alloc::format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC\n",
+                d.year, d.month, d.day, d.hour, d.minute, d.second
+            );
+            let b = s.as_bytes();
+            let rem = (b.len() as u64).saturating_sub(pos) as usize;
+            let n = buf.len().min(rem);
+            buf[..n].copy_from_slice(&b[pos as usize..pos as usize + n]);
+            return Ok(n);
+        }
+        _ => {}
     }
     let rem = (SNAPSHOT as u64).saturating_sub(pos) as usize;
     let n = buf.len().min(rem);
@@ -76,8 +98,201 @@ pub fn read_at(path: &str, pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
             crate::syscall::rand_fill(&mut buf[..n]);
             Ok(n)
         }
+        "console" | "dsp" => Ok(0), // write-only sinks; reads EOF
         _ => Err(-2),
     }
+}
+
+/// /dev/fb0: raw framebuffer bytes at file offset `pos` (32bpp pixels,
+/// row-major over `stride*height*4` bytes).
+fn fb0_read(pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    let g = crate::fb::FB.lock();
+    let f = g.as_ref().ok_or(-2i64)?;
+    let size = (f.stride as u64) * (f.height as u64) * 4;
+    let rem = size.saturating_sub(pos) as usize;
+    let n = buf.len().min(rem);
+    if n == 0 {
+        return Ok(0);
+    }
+    unsafe {
+        let src = crate::mem::phys_to_virt(f.phys + pos) as *const u8;
+        core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
+    }
+    Ok(n)
+}
+
+fn fb0_write(pos: u64, buf: &[u8]) -> Result<usize, i64> {
+    let g = crate::fb::FB.lock();
+    let f = g.as_ref().ok_or(-2i64)?;
+    let size = (f.stride as u64) * (f.height as u64) * 4;
+    let rem = size.saturating_sub(pos) as usize;
+    let n = buf.len().min(rem);
+    if n == 0 {
+        return Ok(0);
+    }
+    unsafe {
+        let dst = crate::mem::phys_to_virt(f.phys + pos) as *mut u8;
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, n);
+    }
+    Ok(n)
+}
+
+/// /dev/mem: raw physical memory at address `pos`, capped at total RAM
+/// (the allocator knows the real bound; beyond it is unmapped/ballast).
+fn mem_read(pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    let (total, _, _) = crate::mem::meminfo();
+    let rem = total.saturating_sub(pos) as usize;
+    let n = buf.len().min(rem);
+    if n == 0 {
+        return Ok(0);
+    }
+    unsafe {
+        let src = crate::mem::phys_to_virt(pos) as *const u8;
+        core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
+    }
+    Ok(n)
+}
+
+/// /dev/nvram: the 128 bytes of CMOS RAM behind ports 0x70/0x71.
+fn nvram_read(pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    let rem = (128u64).saturating_sub(pos) as usize;
+    let n = buf.len().min(rem);
+    for i in 0..n {
+        let reg = (pos as u8) + i as u8;
+        unsafe {
+            let mut addr: Port<u8> = Port::new(0x70);
+            let mut data: Port<u8> = Port::new(0x71);
+            addr.write(reg);
+            buf[i] = data.read();
+        }
+    }
+    Ok(n)
+}
+
+/// QEMU fw_cfg (ports 0x510 selector / 0x511 data): the real mechanism QEMU
+/// uses to hand firmware blobs (SMBIOS, ACPI, etc.) to the guest — OVMF and
+/// SeaBIOS both consume it. Returns (selector, size) for a named file.
+fn fw_cfg_find(name: &str) -> Option<(u16, u32)> {
+    use x86_64::instructions::port::Port;
+    unsafe {
+        let mut sel: Port<u16> = Port::new(0x510);
+        let mut data: Port<u8> = Port::new(0x511);
+        sel.write(0x0000); // signature selector
+        let mut sig = [0u8; 4];
+        for b in &mut sig {
+            *b = data.read();
+        }
+        if &sig != b"QEMU" {
+            return None;
+        }
+        sel.write(0x0019); // FW_CFG_FILE_DIR
+        let mut cnt = [0u8; 4];
+        for b in &mut cnt {
+            *b = data.read();
+        }
+        let n = u32::from_be_bytes(cnt);
+        for _ in 0..n.min(2048) {
+            // FWCfgFile: u32 size BE, u16 select BE, u16 reserved, name[56]
+            let mut ent = [0u8; 64];
+            for b in &mut ent {
+                *b = data.read();
+            }
+            let size = u32::from_be_bytes(ent[0..4].try_into().unwrap());
+            let select = u16::from_be_bytes(ent[4..6].try_into().unwrap());
+            let end = ent[8..64].iter().position(|&c| c == 0).unwrap_or(56) + 8;
+            let nm = core::str::from_utf8(&ent[8..end]).unwrap_or("");
+            if nm == name {
+                return Some((select, size));
+            }
+        }
+        None
+    }
+}
+
+/// Read `buf.len()` bytes from fw_cfg file `select` starting at `pos`.
+fn fw_cfg_read(select: u16, size: usize, pos: u64, buf: &mut [u8]) -> usize {
+    use x86_64::instructions::port::Port;
+    unsafe {
+        let mut sel: Port<u16> = Port::new(0x510);
+        let mut data: Port<u8> = Port::new(0x511);
+        sel.write(select);
+        let mut skip = pos;
+        while skip > 0 {
+            let _ = data.read();
+            skip -= 1;
+        }
+        let mut n = 0usize;
+        while n < buf.len() && pos as usize + n < size {
+            buf[n] = data.read();
+            n += 1;
+        }
+        n
+    }
+}
+
+/// /dev/smbios: locate the SMBIOS entry point ("_SM3_" 3.x or "_SM_" 2.x
+/// anchor) in the legacy F-segment 0xF0000..0x100000 and expose its raw
+/// entry-point bytes — the real firmware artifact. The structure table it
+/// points at is readable through /dev/mem. ENOENT when absent.
+fn smbios_scan() -> Option<(u64, usize)> {
+    let base = crate::mem::phys_to_virt(0xF0000) as *const u8;
+    let mut i = 0usize;
+    while i + 0x20 <= 0x10000 {
+        unsafe {
+            let p = base.add(i);
+            let ep_len = if *p == b'_'
+                && *p.add(1) == b'S'
+                && *p.add(2) == b'M'
+                && *p.add(3) == b'3'
+                && *p.add(4) == b'_'
+            {
+                // 3.x anchor: "_SM3_", checksum@0x05, ep_len@0x06
+                *p.add(6) as usize
+            } else if *p == b'_'
+                && *p.add(1) == b'S'
+                && *p.add(2) == b'M'
+                && *p.add(3) == b'_'
+            {
+                // 2.x anchor: "_SM_", ep_len@0x05
+                *p.add(5) as usize
+            } else {
+                i += 0x10;
+                continue;
+            };
+            if ep_len < 0x10 || ep_len > 0x40 {
+                i += 0x10;
+                continue;
+            }
+            let mut sum = 0u8;
+            for j in 0..ep_len {
+                sum = sum.wrapping_add(*p.add(j));
+            }
+            if sum == 0 {
+                return Some((0xF0000 + i as u64, ep_len));
+            }
+        }
+        i += 0x10;
+    }
+    None
+}
+
+fn smbios_read(pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    // QEMU hands the entry point to the guest through fw_cfg first
+    // ("etc/smbios/smbios-anchor"); fall back to the legacy F-segment scan
+    // for boots where the firmware installs the anchor there.
+    if let Some((sel, size)) = fw_cfg_find("etc/smbios/smbios-anchor") {
+        let rem = (size as u64).saturating_sub(pos) as usize;
+        let n = buf.len().min(rem);
+        return Ok(fw_cfg_read(sel, size as usize, pos, &mut buf[..n]));
+    }
+    let (ep_addr, ep_len) = smbios_scan().ok_or(-2i64)?;
+    let rem = (ep_len as u64).saturating_sub(pos) as usize;
+    let n = buf.len().min(rem);
+    unsafe {
+        let src = crate::mem::phys_to_virt(ep_addr + pos) as *const u8;
+        core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
+    }
+    Ok(n)
 }
 
 /// Raw disk read at byte offset `pos` (512B-granular), capped at 1 MiB
@@ -121,14 +336,49 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Write: null/zero discard and report success; full -> ENOSPC,
-/// vda/rtc are read-only (EROFS).
-pub fn write(path: &str, len: usize) -> Result<usize, i64> {
+/// Write: null/zero discard and report success; full -> ENOSPC;
+/// vda/rtc/mem/nvram/smbios are read-only (EROFS).
+/// kmsg/console append to the kernel log (userspace printk);
+/// fb0 writes raw pixels at `pos`; dsp turns u16-LE Hz values into tones.
+pub fn write(path: &str, pos: u64, buf: &[u8]) -> Result<usize, i64> {
+    let len = buf.len();
     match &path[5..] {
         "null" | "zero" => Ok(len),
         "full" => Err(-28), // ENOSPC
-        "vda" | "rtc" => Err(-30), // EROFS
+        "vda" | "rtc" | "mem" | "nvram" | "smbios" => Err(-30), // EROFS
         "random" | "urandom" => Ok(len), // accepted, ignored (like a seed write)
+        "fb0" => fb0_write(pos, buf),
+        "kmsg" | "console" => {
+            // userspace printk: into the klog ring and out the serial port
+            let s = String::from_utf8_lossy(buf);
+            crate::klog::append(&alloc::format!("[user] {}", s.trim_end()));
+            for &b in buf {
+                crate::serial::write_byte(b);
+            }
+            Ok(len)
+        }
+        "dsp" => {
+            // pairs of little-endian u16 = Hz; each tone plays 60ms.
+            // Odd trailing byte is ignored (a tone needs a full u16).
+            // Bounded: a write may consume at most 64 tones (~4 s) — a
+            // partial write is POSIX-legal and keeps a huge `cat > dsp`
+            // from monopolising the syscall.
+            let mut i = 0usize;
+            while i + 1 < buf.len() && i < 128 {
+                let freq = u16::from_le_bytes([buf[i], buf[i + 1]]) as u32;
+                if freq > 0 {
+                    crate::timer::beep(freq, 60);
+                    let deadline = crate::task::ticks() + 7;
+                    while crate::task::ticks() < deadline {
+                        // syscall gate runs with interrupts off: sti+hlt so
+                        // the PIT tick can actually fire and advance time
+                        x86_64::instructions::interrupts::enable_and_hlt();
+                    }
+                }
+                i += 2;
+            }
+            Ok(if i == 0 { len } else { i })
+        }
         _ => Err(-4),
     }
 }

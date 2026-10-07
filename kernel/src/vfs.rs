@@ -316,6 +316,7 @@ pub fn read(fd: i64, buf: &mut [u8]) -> Result<i64, i64> {
                 f.pos += n;
             }
         });
+        task::io_charge(true, n);
         return Ok(n as i64);
     }
     if crate::proc::handles(&path) {
@@ -328,6 +329,7 @@ pub fn read(fd: i64, buf: &mut [u8]) -> Result<i64, i64> {
                 f.pos += n as u64;
             }
         });
+        task::io_charge(true, n as u64);
         return Ok(n as i64);
     }
     let mut g = FS.lock();
@@ -341,9 +343,25 @@ pub fn read(fd: i64, buf: &mut [u8]) -> Result<i64, i64> {
             f.pos += n as u64;
         }
     });
+    task::io_charge(true, n as u64);
     Ok(n as i64)
 }
 
+/// Read a symlink target. FAT32 links are handled by resolve_links; proc
+/// files like `/proc/<pid>/exe` resolve to the recorded spawn path.
+pub fn readlink_path(path: &str) -> Result<String, i64> {
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let full = normalize(&cwd, path);
+    if crate::proc::handles(&full) {
+        if let Some(target) = crate::proc::readlink(&full) {
+            return Ok(target);
+        }
+        return Err(-22);
+    }
+    readlink(path)
+}
+
+/// write buf.len() bytes at the fd's current position
 pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
     WR_OPS.fetch_add(1, Ordering::Relaxed);
     WR_BYTES.fetch_add(buf.len() as u64, Ordering::Relaxed);
@@ -358,12 +376,13 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
         return crate::pipes::try_write(&path, buf);
     }
     if crate::dev::handles(&path) {
-        let n = crate::dev::write(&path, buf.len())?;
+        let n = crate::dev::write(&path, pos, buf)?;
         task::with_current(|t| {
             if let Some(Some(f)) = t.fds.get_mut(fd as usize) {
                 f.pos += n as u64;
             }
         });
+        task::io_charge(false, n as u64);
         return Ok(n as i64);
     }
     if crate::proc::handles(&path) {
@@ -375,6 +394,7 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
                         f.pos += n as u64;
                     }
                 });
+                task::io_charge(false, n as u64);
                 return Ok(n as i64);
             }
             None => return Err(-4),
@@ -396,6 +416,7 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
             f.pos = end as u64;
         }
     });
+    task::io_charge(false, buf.len() as u64);
     Ok(buf.len() as i64)
 }
 

@@ -37,6 +37,29 @@ fn cal_days(y: u16, m: u8, d: u8) -> u64 {
     n + d as u64 - 1
 }
 
+/// Parse a `find -size` argument: `[-+]N[c|k|M|G|b]` → (mode, bytes).
+/// mode: -1 = less than, 0 = exactly, +1 = greater than.
+/// Bare `N` is 512-byte blocks (POSIX default); `c` = bytes.
+fn parse_size_spec(s: &str) -> Option<(i8, u64)> {
+    let (mode, rest) = match s.as_bytes().first() {
+        Some(b'-') => (-1i8, &s[1..]),
+        Some(b'+') => (1i8, &s[1..]),
+        _ => (0i8, s),
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let (num, mult) = match rest.bytes().last() {
+        Some(b'k') => (&rest[..rest.len() - 1], 1024u64),
+        Some(b'M') => (&rest[..rest.len() - 1], 1 << 20),
+        Some(b'G') => (&rest[..rest.len() - 1], 1 << 30),
+        Some(b'c') => (&rest[..rest.len() - 1], 1),
+        Some(b'b') => (&rest[..rest.len() - 1], 512),
+        _ => (rest, 512u64), // POSIX: unitless = 512-byte blocks
+    };
+    num.parse::<u64>().ok().map(|n| (mode, n.saturating_mul(mult)))
+}
+
 /// Split a statement at its first top-level `;`, `&&` or `||`
 /// (returns (before, op, after)). Single `|` (pipe) does not match.
 /// `[[` ... `]]` regions are skipped: their && || ! ; are test grammar,
@@ -2004,6 +2027,64 @@ fn diff_lines(a: &[String], b: &[String]) -> Vec<String> {
             out.push(String::from("---"));
             for &x in &adds {
                 out.push(alloc::format!("> {}", bm[x]));
+            }
+        }
+    }
+    out
+}
+
+/// `diff -y` side-by-side rendering: "left <gutter> right" rows where the
+/// gutter is two spaces (same), `|` (different), `<` (left only) or
+/// `>` (right only). Del/Add runs pair up line-by-line like GNU diff.
+fn diff_side(a: &[String], b: &[String], width: usize) -> Vec<String> {
+    let lw = width / 2 - 3;
+    let clip = |s: &str| -> String {
+        let mut t: String = s.chars().take(lw).collect();
+        while t.chars().count() < lw {
+            t.push(' ');
+        }
+        t
+    };
+    let mut out: Vec<String> = Vec::new();
+    let ops = diff_ops(a, b);
+    let (mut k, mut ai, mut bi) = (0usize, 0usize, 0usize);
+    while k < ops.len() {
+        match ops[k] {
+            DiffOp::Eq => {
+                out.push(alloc::format!("{}  {}", clip(&a[ai]), clip(&b[bi])));
+                ai += 1;
+                bi += 1;
+                k += 1;
+            }
+            _ => {
+                let mut dels: Vec<usize> = Vec::new();
+                let mut adds: Vec<usize> = Vec::new();
+                while k < ops.len() && !matches!(ops[k], DiffOp::Eq) {
+                    match ops[k] {
+                        DiffOp::Del(d) => dels.push(d),
+                        DiffOp::Add(x) => adds.push(x),
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                ai += dels.len();
+                bi += adds.len();
+                let rows = dels.len().max(adds.len());
+                for r in 0..rows {
+                    match (dels.get(r), adds.get(r)) {
+                        (Some(&d), Some(&x)) => {
+                            let lv = clip(&a[d]);
+                            out.push(alloc::format!("{} | {}", lv.trim_end(), clip(&b[x])));
+                        }
+                        (Some(&d), None) => {
+                            out.push(alloc::format!("{} <", clip(&a[d])));
+                        }
+                        (None, Some(&x)) => {
+                            out.push(alloc::format!("{} > {}", clip(""), clip(&b[x])));
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -4487,6 +4568,8 @@ struct Term {
     nc_listen: Option<ustd::TcpListener>,              // `nc -l <port>` waiting for a client
     nc_udp: Option<(ustd::UdpSock, Option<([u8; 4], u16)>)>, // `nc -u`/`-lu` UDP session (peer learned)
     last_ok: bool,                                     // success of the last statement (for && / ||)
+    pipestatus: Vec<i64>,                              // $PIPESTATUS: exit code of each stage of the last pipeline
+    histexpand: bool,                                  // set -H/+H: bang history expansion (on by default)
     sel: Option<((usize, usize), (usize, usize))>,     // scrollback selection (line,col)->(line,col)
     sel_drag: bool,                                    // left button currently held
     pq: String,                                        // pager search query
@@ -7178,7 +7261,7 @@ impl Term {
         // !! !n !-n !prefix !?substr? select an entry anywhere in the line,
         // and !$ !^ !* !:N / <event>:N pick words from it. The expanded text
         // is echoed and recorded, not the `!` form itself.
-        if top && input.contains('!') {
+        if top && self.histexpand && input.contains('!') {
             match self.hist_expand(input) {
                 Ok((expanded, true)) => {
                     // `!x:p` — echo the expanded text, record the line, run nothing
@@ -7354,6 +7437,13 @@ impl Term {
                     self.vars = saved_vars;
                     self.func_locals = saved_locals;
                     let _ = ustd::chdir(&saved_cwd);
+                    // a subshell is one command: PIPESTATUS = its status only
+                    self.pipestatus = alloc::vec![self.last_ok as i64 ^ 1];
+                    self.vars
+                        .insert(String::from("PIPESTATUS_0"), alloc::format!("{}", self.pipestatus[0]));
+                    self.vars.insert(String::from("PIPESTATUS_COUNT"), String::from("1"));
+                    self.vars
+                        .insert(String::from("PIPESTATUS"), alloc::format!("{}", self.pipestatus[0]));
                     return;
                 }
             }
@@ -7383,6 +7473,7 @@ impl Term {
         if let Some(pi) = find_unquoted(input, b'|') {
             let left = input[..pi].trim();
             let right = input[pi + 1..].trim();
+            let right_piped = find_unquoted(right, b'|').is_some();
             let out = self.run_captured(left);
             let left_ok = self.last_ok;
             // captured lines are complete output lines: the byte stream feeds
@@ -7393,6 +7484,22 @@ impl Term {
             }
             let saved = self.pipe_in.replace(joined);
             self.run(right);
+            // $PIPESTATUS: this stage's status, then the right side's stage
+            // statuses (its own pipe arm already recorded them)
+            let mut ps: Vec<i64> = alloc::vec![left_ok as i64 ^ 1];
+            if right_piped {
+                ps.extend(self.pipestatus.iter().cloned());
+            } else {
+                ps.push(self.last_ok as i64 ^ 1);
+            }
+            for (i, st) in ps.iter().enumerate() {
+                self.vars.insert(alloc::format!("PIPESTATUS_{}", i), alloc::format!("{}", st));
+            }
+            self.vars
+                .insert(String::from("PIPESTATUS_COUNT"), alloc::format!("{}", ps.len()));
+            self.vars
+                .insert(String::from("PIPESTATUS"), alloc::format!("{}", ps[0]));
+            self.pipestatus = ps;
             // set -o pipefail: a failed left stage fails the whole pipeline
             // (the right side's own pipefail already folded its tail in)
             if self.pipefail && !left_ok {
@@ -8414,7 +8521,8 @@ impl Term {
                 // set -o OPT / set +o OPT / set -o (list) — bash option surface
                 match args.first().map(|a| *a) {
                     Some("-x") | Some("+x") | Some("-e") | Some("+e")
-                    | Some("-C") | Some("+C") | Some("-f") | Some("+f") => {
+                    | Some("-C") | Some("+C") | Some("-f") | Some("+f")
+                    | Some("-H") | Some("+H") => {
                         match args[0] {
                             "-x" => self.setx = true,
                             "+x" => self.setx = false,
@@ -8423,7 +8531,9 @@ impl Term {
                             "-C" => self.noclobber = true,
                             "+C" => self.noclobber = false,
                             "-f" => self.noglob = true,
-                            _ => self.noglob = false,
+                            "+f" => self.noglob = false,
+                            "-H" => self.histexpand = true,
+                            _ => self.histexpand = false,
                         }
                         return;
                     }
@@ -8440,6 +8550,7 @@ impl Term {
                                 // `set -o` / `set +o`: list every option state
                                 for (n, v) in [
                                     ("errexit", self.errexit),
+                                    ("histexpand", self.histexpand),
                                     ("noclobber", self.noclobber),
                                     ("noglob", self.noglob),
                                     ("nounset", self.nounset),
@@ -8457,6 +8568,7 @@ impl Term {
                             Some(o) => {
                                 match o {
                                     "errexit" => self.errexit = on,
+                                    "histexpand" => self.histexpand = on,
                                     "noclobber" => self.noclobber = on,
                                     "noglob" => self.noglob = on,
                                     "nounset" => self.nounset = on,
@@ -8721,6 +8833,22 @@ impl Term {
                         }
                     }
                     None => self.emit("man: what manual page do you want?"),
+                }
+            }
+            "printenv" => {
+                // printenv [NAME]: dump all vars, or just NAME's value
+                match args.iter().find(|a| !a.starts_with('-')) {
+                    Some(name) => match self.lookup_var(name) {
+                        Some(v) => self.emit(&v),
+                        None => {
+                            self.last_ok = false;
+                        }
+                    },
+                    None => {
+                        for (k, v) in self.vars.clone() {
+                            self.emit(&alloc::format!("{}={}", k, v));
+                        }
+                    }
                 }
             }
             "env" => {
@@ -12389,7 +12517,15 @@ impl Term {
                         }
                         self.emit(&out);
                     }
-                    // date -s SPEC / date --set SPEC: set the wall clock
+                    // -u/--utc: the RTC is UTC-only — flag is a no-op display
+                Some(&"-u") | Some(&"--utc") | Some(&"--universal") => {
+                    self.emit(&alloc::format!(
+                        "{} {} {:>2} {:02}:{:02}:{:02} UTC {}",
+                        WDAY[dow], MON[(d.month - 1) as usize], d.day,
+                        d.hour, d.minute, d.second, d.year
+                    ));
+                }
+                // date -s SPEC / date --set SPEC: set the wall clock
                     // (kernel rebases the clock and writes the CMOS RTC).
                     Some(&"-s") | Some(&"--set") => {
                         match args.get(1).and_then(|s| parse_date_spec(s)) {
@@ -12947,18 +13083,42 @@ impl Term {
                 }
             }
             "df" => {
-                let human = args.first().map(|s| *s) == Some("-h");
+                // df [-h] [-T]: -h human sizes, -T adds the fs type column
+                let human = args.iter().any(|a| *a == "-h");
+                let typ = args.iter().any(|a| *a == "-T" || *a == "--print-type");
                 match ustd::df() {
                     Some((total, free)) => {
                         let used = total - free;
+                        let pct = if total > 0 { used * 100 / total } else { 0 };
+                        if typ {
+                            self.emit("Filesystem     Type   Size      Used      Avail   Use%");
+                        } else {
+                            self.emit("Filesystem     Size      Used      Avail   Use%");
+                        }
                         if human {
+                            if typ {
+                                self.emit(&alloc::format!(
+                                    "{:<13} {:<6} {:<9} {:<9} {:<8} {}%",
+                                    "/dev/vda", "vfat",
+                                    human_size(total), human_size(used), human_size(free), pct
+                                ));
+                            } else {
+                                self.emit(&alloc::format!(
+                                    "{:<13} {:<9} {:<9} {:<8} {}%",
+                                    "/dev/vda",
+                                    human_size(total), human_size(used), human_size(free), pct
+                                ));
+                            }
+                        } else if typ {
                             self.emit(&alloc::format!(
-                                "  total {}  used {}  free {}",
-                                human_size(total), human_size(used), human_size(free)
+                                "{:<13} {:<6} {:<9} {:<9} {:<8} {}%",
+                                "/dev/vda", "vfat", total, used, free, pct
                             ));
                         } else {
-                            self.emit(&alloc::format!("  total {} MiB  used {} MiB  free {} MiB", total / (1024 * 1024), used / (1024 * 1024), free / (1024 * 1024)));
-                            self.emit(&alloc::format!("  ({} B / {} B used)", used, total));
+                            self.emit(&alloc::format!(
+                                "{:<13} {:<9} {:<9} {:<8} {}%",
+                                "/dev/vda", total, used, free, pct
+                            ));
                         }
                     }
                     None => self.emit("df: no volume mounted"),
@@ -13384,19 +13544,34 @@ impl Term {
                     .enumerate()
                     .find(|(i, a)| !a.starts_with('-') && !valpos.contains(i))
                     .map(|(_, a)| *a);
-                let n: usize = ni
+                // raw -n value may carry a sign: tail -n +K = from line K,
+                // head -n -N = all but the last N lines (GNU forms)
+                let nraw: Option<String> = ni
                     .and_then(|i| args.get(i + 1))
-                    .and_then(|s| s.parse().ok())
+                    .map(|s| String::from(*s))
                     .or_else(|| {
                         args.iter().find_map(|a| {
-                            if a.starts_with('-') {
-                                a[1..].parse::<usize>().ok()
+                            let t = &a[1..];
+                            if a.starts_with('-')
+                                && !t.is_empty()
+                                && t.chars().all(|c| c.is_ascii_digit())
+                            {
+                                Some(String::from(t))
                             } else {
                                 None
                             }
                         })
-                    })
-                    .unwrap_or(10);
+                    });
+                let (n, n_from, n_butlast): (usize, bool, bool) = match nraw.as_deref() {
+                    Some(v) if cmd == "tail" && v.starts_with('+') => {
+                        (v[1..].parse().unwrap_or(1), true, false)
+                    }
+                    Some(v) if cmd == "head" && v.starts_with('-') => {
+                        (v[1..].parse().unwrap_or(0), false, true)
+                    }
+                    Some(v) => (v.trim_start_matches('+').parse().unwrap_or(10), false, false),
+                    None => (10, false, false),
+                };
                 let mut blen = 0usize;
                 let content = match popt {
                     Some(p) => match ustd::read_all(p) {
@@ -13565,7 +13740,12 @@ impl Term {
                                     }
                                 }
                                 None => {
-                                    for l in ls.iter().take(n) {
+                                    let lim = if n_butlast {
+                                        ls.len().saturating_sub(n)
+                                    } else {
+                                        n
+                                    };
+                                    for l in ls.iter().take(lim) {
                                         self.emit(l);
                                     }
                                 }
@@ -13583,7 +13763,13 @@ impl Term {
                                     }
                                 }
                                 None => {
-                                    for l in ls.iter().skip(ls.len().saturating_sub(n)) {
+                                    let start = if n_from {
+                                        // tail -n +K: print from line K
+                                        n.saturating_sub(1).min(ls.len())
+                                    } else {
+                                        ls.len().saturating_sub(n)
+                                    };
+                                    for l in ls.iter().skip(start) {
                                         self.emit(l);
                                     }
                                 }
@@ -13882,8 +14068,12 @@ impl Term {
                         }
                     }
                     "tr" => {
-                        // tr [-d] <set1> [set2] -- ranges like a-z expand
-                        let del = args.iter().any(|a| a == &"-d");
+                        // tr [-d|-s|-c] <set1> [set2] — ranges a-z expand;
+                        // [:alpha:] [:digit:] [:upper:] [:lower:] [:space:]
+                        // [:alnum:] [:punct:] [:print:] classes decode too.
+                        let del = args.iter().any(|a| a == &"-d" || a == &"-dt" || a == &"-cd");
+                        let sqz = args.iter().any(|a| a == &"-s" || a == &"-ds" || a == &"-cds" || a == &"-cs");
+                        let compl = args.iter().any(|a| a == &"-c" || a == &"-cd" || a == &"-cs" || a == &"-cds");
                         let pos: Vec<&&str> = args.iter().filter(|a| !a.starts_with('-')).collect();
                         let expand = |spec: &str| -> Vec<u8> {
                             let b = spec.as_bytes();
@@ -13902,6 +14092,43 @@ impl Term {
                                     };
                                     v.push(e);
                                     i += 2;
+                                } else if b[i] == b'[' && i + 2 < b.len() && b[i + 1] == b':' {
+                                    // [:class:] — POSIX character class
+                                    let end = b[i + 2..]
+                                        .windows(2)
+                                        .position(|w| w == b":]")
+                                        .map(|o| i + 2 + o);
+                                    match end {
+                                        Some(e) => {
+                                            let name =
+                                                core::str::from_utf8(&b[i + 2..e]).unwrap_or("");
+                                            for c in 0u8..=127 {
+                                                let hit = match name {
+                                                    "alpha" => c.is_ascii_alphabetic(),
+                                                    "digit" => c.is_ascii_digit(),
+                                                    "alnum" => c.is_ascii_alphanumeric(),
+                                                    "upper" => c.is_ascii_uppercase(),
+                                                    "lower" => c.is_ascii_lowercase(),
+                                                    "space" => c.is_ascii_whitespace(),
+                                                    "blank" => c == b' ' || c == b'\t',
+                                                    "punct" => c.is_ascii_punctuation(),
+                                                    "print" => c.is_ascii_graphic() || c == b' ',
+                                                    "cntrl" => c.is_ascii_control(),
+                                                    "xdigit" => c.is_ascii_hexdigit(),
+                                                    "graph" => c.is_ascii_graphic(),
+                                                    _ => false,
+                                                };
+                                                if hit {
+                                                    v.push(c);
+                                                }
+                                            }
+                                            i = e + 2;
+                                        }
+                                        None => {
+                                            v.push(b[i]);
+                                            i += 1;
+                                        }
+                                    }
                                 } else if i + 2 < b.len() && b[i + 1] == b'-' && b[i + 2] > b[i] {
                                     for c in b[i]..=b[i + 2] {
                                         v.push(c);
@@ -13914,10 +14141,27 @@ impl Term {
                             }
                             v
                         };
-                        match (del, pos.first(), pos.get(1)) {
-                            (_, Some(s1), s2) => {
-                                let a = expand(s1);
-                                let b: Vec<u8> = s2.map(|s| expand(s)).unwrap_or_default();
+                        match pos.first() {
+                            Some(s1) => {
+                                let mut a = expand(s1);
+                                if compl {
+                                    // -c: the complement of set1 (bytes not in it)
+                                    let mut cs = [true; 256];
+                                    for &c in &a {
+                                        cs[c as usize] = false;
+                                    }
+                                    let mut ca: Vec<u8> = Vec::new();
+                                    for (i, &yes) in cs.iter().enumerate() {
+                                        if yes {
+                                            ca.push(i as u8);
+                                        }
+                                    }
+                                    a = ca;
+                                }
+                                let b: Vec<u8> = pos
+                                    .get(1)
+                                    .map(|s| expand(s))
+                                    .unwrap_or_default();
                                 let mut map = [0u8; 256];
                                 let mut has = [false; 256];
                                 for &c in &a {
@@ -13934,25 +14178,51 @@ impl Term {
                                         *b.last().unwrap_or(&c)
                                     };
                                 }
+                                // -s squeeze set: set2 if present else set1
+                                let sqz_set: Vec<u8> = if sqz {
+                                    pos.get(2)
+                                        .map(|s| expand(s))
+                                        .or_else(|| pos.get(1).map(|s| expand(s)))
+                                        .unwrap_or_else(|| a.clone())
+                                } else {
+                                    Vec::new()
+                                };
+                                let mut sqz_has = [false; 256];
+                                for &c in &sqz_set {
+                                    sqz_has[c as usize] = true;
+                                }
                                 let src = self.pipe_in.clone().unwrap_or_default();
                                 let mut out = String::new();
+                                let mut prev: Option<u8> = None;
                                 for ch in src.chars() {
                                     let cb = ch as usize;
                                     if cb < 256 && delm[cb] && ch != '\n' {
+                                        prev = None;
                                         continue;
                                     }
-                                    if cb < 256 && has[cb] && !del {
-                                        let m = map[cb];
-                                        out.push(m as char);
+                                    let oc = if cb < 256 && has[cb] && !del && !b.is_empty() {
+                                        map[cb] as char
+                                    } else if cb < 256 && has[cb] && !del {
+                                        ch
                                     } else {
-                                        out.push(ch);
+                                        ch
+                                    };
+                                    let ob = oc as u32;
+                                    if sqz
+                                        && ob < 256
+                                        && sqz_has[ob as usize]
+                                        && prev == Some(ob as u8)
+                                    {
+                                        continue;
                                     }
+                                    prev = if ob < 256 { Some(ob as u8) } else { None };
+                                    out.push(oc);
                                 }
                                 for l in out.lines() {
                                     self.emit(l);
                                 }
                             }
-                            _ => self.fail("usage: tr [-d] <set1> <set2>"),
+                            _ => self.fail("usage: tr [-ds] <set1> <set2>"),
                         }
                     }
                     "cut" => {
@@ -14242,14 +14512,37 @@ impl Term {
                             self.emit(w);
                         }
                     }
-                } else if args.iter().any(|a| *a == "-A" || *a == "-c") {
+                } else if args.iter().any(|a| {
+                    *a == "-A" || *a == "-c" || *a == "-v" || *a == "-a" || *a == "-e"
+                }) {
                     let pfx = args
                         .iter()
                         .rev()
                         .find(|a| !a.starts_with('-'))
                         .copied()
                         .unwrap_or("");
-                    if args.iter().any(|a| *a == "-c") {
+                    if args.iter().any(|a| *a == "-v") {
+                        // -v: variable names
+                        for (k, _) in self.vars.clone() {
+                            if k.starts_with(pfx) {
+                                self.emit(&k);
+                            }
+                        }
+                    } else if args.iter().any(|a| *a == "-a") {
+                        // -a: alias names
+                        for (n, _) in self.aliases.clone() {
+                            if n.starts_with(pfx) {
+                                self.emit(&n);
+                            }
+                        }
+                    } else if args.iter().any(|a| *a == "-e") {
+                        // -e: exported (same flat table here)
+                        for (k, _) in self.vars.clone() {
+                            if k.starts_with(pfx) {
+                                self.emit(&k);
+                            }
+                        }
+                    } else if args.iter().any(|a| *a == "-c") {
                         for c in Self::BUILTINS {
                             if c.starts_with(pfx) {
                                 self.emit(c);
@@ -14669,8 +14962,14 @@ impl Term {
                     let mut want_empty = false;
                     let mut del = false;
                     let mut want_print = false;
+                    let mut size_test: Option<(i8, u64)> = None;
                     for (i, a) in g.iter().enumerate() {
                         match *a {
+                            "-size" => {
+                                if let Some(v) = g.get(i + 1) {
+                                    size_test = parse_size_spec(v);
+                                }
+                            }
                             "-path" => {
                                 if let Some(v) = g.get(i + 1) {
                                     pathpat = Some(String::from(*v));
@@ -14742,6 +15041,19 @@ impl Term {
                                     .unwrap_or(false)
                                     || ustd::readlink(m.trim_end_matches('/'))
                                         .is_some()
+                            });
+                        }
+                        // -size [-+]N[c|k|M|G] (bare N = 512B blocks, POSIX)
+                        if let Some((mode, bytes)) = size_test {
+                            ms.retain(|m| {
+                                let t = m.trim_end_matches('/');
+                                ustd::stat(t)
+                                    .map(|st| match mode {
+                                        0 => st.size == bytes,
+                                        m if m < 0 => st.size < bytes,
+                                        _ => st.size > bytes,
+                                    })
+                                    .unwrap_or(false)
                             });
                         }
                         // -empty: zero-size file or dir with no entries
@@ -14849,6 +15161,7 @@ impl Term {
                 // only that files differ; -i/-w/-B normalize before comparing;
                 // -r diffs two directory trees ("Only in" + per-file diffs)
                 let unified = args.iter().any(|a| *a == "-u");
+                let side = args.iter().any(|a| *a == "-y" || *a == "--side-by-side");
                 let brief = args.iter().any(|a| *a == "-q" || *a == "--brief");
                 let ci = args.iter().any(|a| *a == "-i");
                 let nows = args.iter().any(|a| *a == "-w");
@@ -14885,6 +15198,8 @@ impl Term {
                             }
                             let out = if unified {
                                 diff_unified(&la, &lb, 3)
+                            } else if side {
+                                diff_side(&la, &lb, 72)
                             } else {
                                 diff_lines(&la, &lb)
                             };
@@ -17207,6 +17522,14 @@ impl Term {
                 }
             }
         }
+        // a non-pipeline statement: PIPESTATUS is just this command's status
+        // (the pipe arm records its own stage list and returns before here)
+        let st = self.last_ok as i64 ^ 1;
+        self.pipestatus = alloc::vec![st];
+        self.vars.insert(String::from("PIPESTATUS_0"), alloc::format!("{}", st));
+        self.vars.insert(String::from("PIPESTATUS_COUNT"), String::from("1"));
+        self.vars
+            .insert(String::from("PIPESTATUS"), alloc::format!("{}", st));
     }
 
     /// Reverse-history search state update: scans backward for the newest
@@ -17701,7 +18024,7 @@ impl Term {
         "resolve", "httpget", "wget", "ifconfig", "dhcp", "netstat", "kill", "grep",
         "uptime", "reboot", "shutdown", "exit", "history", "time",
         "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
-        "set", "env", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
+        "set", "env", "printenv", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
         "dmesg", "arp", "httpd", "ntp", "nc", "fserve", "fget", "true", "false",
         "shot", "find", "killall", "basename", "dirname", "strings", "diff", "stat",
         "uniq", "tr", "cut", "tee", "base64", "sha256sum", "tar", "show",
@@ -19001,6 +19324,8 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         nc_listen: None,
         nc_udp: None,
         last_ok: true,
+        pipestatus: alloc::vec![0],
+        histexpand: true,
         vars: alloc::collections::BTreeMap::new(),
         prev_cwd: String::new(),
         pager: None,

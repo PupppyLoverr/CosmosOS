@@ -126,7 +126,12 @@ pub fn init() {
     sprintln!("[input] ps/2 keyboard+mouse enabled");
 }
 
+/// IRQ counters for /proc/interrupts.
+pub static KBD_IRQS: AtomicUsize = AtomicUsize::new(0);
+pub static MOUSE_IRQS: AtomicUsize = AtomicUsize::new(0);
+
 pub fn on_kbd_irq() {
+    KBD_IRQS.fetch_add(1, Ordering::Relaxed);
     let sc: u8 = unsafe { Port::new(DATA).read() };
     unsafe {
         if sc == 0xE0 {
@@ -159,6 +164,7 @@ pub fn on_kbd_irq() {
 }
 
 pub fn on_mouse_irq() {
+    MOUSE_IRQS.fetch_add(1, Ordering::Relaxed);
     let b: u8 = unsafe { Port::new(DATA).read() };
     unsafe {
         let i = MOUSE_IDX;
