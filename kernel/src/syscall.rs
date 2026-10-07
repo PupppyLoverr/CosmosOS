@@ -65,7 +65,13 @@ fn copy_out(ptr: u64, data: &[u8]) -> Option<()> {
     while off < data.len() as u64 {
         let va = ptr + off;
         let phys = match elf::translate_user(pml4, va) {
-            Some(p) => p,
+            Some(p) => {
+                if task::cow_resolve(va) {
+                    elf::translate_user(pml4, va)?
+                } else {
+                    p
+                }
+            }
             None if task::demand_page(va) => elf::translate_user(pml4, va)?,
             None => return None,
         };
@@ -1469,6 +1475,7 @@ fn sys_munmap(addr: u64, len: u64) -> u64 {
                 }
                 unmapped += 1;
             }
+            task::cow_unmap(pml4.start_address().as_u64(), a);
             a += 0x1000;
         }
         if unmapped == 0 {
@@ -1563,7 +1570,7 @@ fn trim_map_lists(t: &mut task::Task, addr: u64, end: u64) {
 /// SYS_MPROTECT(addr,len,prot R1W2X4): rewrites real PTE flags on the
 /// task's own mappings — a subsequent violating access page-faults for real.
 fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
-    if len == 0 || prot > 7 {
+    if len == 0 || prot > 7 || addr & 0xFFF != 0 {
         return ERR;
     }
     let w = prot & shared::PROT_WRITE != 0;
@@ -1574,6 +1581,13 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
         let mut a = addr;
         let mut changed = 0u64;
         while a < end {
+            if w {
+                // break COW sharing before granting write — the frame
+                // may be mapped read-only into a fork sibling
+                if let Some(phys) = elf::translate(pml4, a) {
+                    task::cow_split(pml4, a & !0xFFF, phys & !0xFFF);
+                }
+            }
             if elf::protect_user_page(pml4, a, w, x).is_some() {
                 changed += 1;
             }

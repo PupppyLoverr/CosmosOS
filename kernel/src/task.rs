@@ -724,11 +724,139 @@ pub fn clone_user(entry: u64, arg: u64) -> Option<u32> {
     Some(pid)
 }
 
+/// Copy-on-write bookkeeping: (owner pml4 phys, va page) -> shared phys
+/// with the exec bit packed into bit 63. fork() records every writable
+/// page it demotes to read-only in both tables — the first write fault
+/// in either mm splits the page.
+static MM_COW: Mutex<alloc::collections::BTreeMap<(u64, u64), u64>> =
+    Mutex::new(alloc::collections::BTreeMap::new());
+
+fn cow_lookup(pml4: u64, page: u64) -> Option<u64> {
+    MM_COW.lock().get(&(pml4, page)).copied()
+}
+fn cow_insert(pml4: u64, page: u64, packed: u64) {
+    MM_COW.lock().insert((pml4, page), packed);
+}
+/// Forget the COW record for one unmapped page.
+pub fn cow_unmap(pml4: u64, page: u64) {
+    MM_COW.lock().remove(&(pml4, page));
+}
+/// Forget every COW record in [lo,hi) — unmapped/mprotect-split ranges.
+pub fn cow_unmap_range(pml4: u64, lo: u64, hi: u64) {
+    let mut m = MM_COW.lock();
+    let mut a = lo;
+    while a < hi {
+        m.remove(&(pml4, a));
+        a += 0x1000;
+    }
+}
+/// Drop all COW records owned by a pml4 being torn down — a stale entry
+/// would alias whatever address space the freed pml4 frame gets reused
+/// for next.
+pub fn cow_drop_mm(pml4: u64) {
+    MM_COW.lock().retain(|(p, _), _| *p != pml4);
+}
+
+/// Resolve a write fault on a COW page in the CURRENT task's table:
+/// last mapper claims the shared frame in place, otherwise the page is
+/// copied into a fresh frame and the shared ref released. true = retry.
+pub fn cow_resolve(va: u64) -> bool {
+    let page = va & !0xFFF;
+    let Some((pml4, packed)) =
+        with_current(|t| t.pml4.map(|p| (p, cow_lookup(p.start_address().as_u64(), page))))
+    else {
+        return false;
+    };
+    let Some(packed) = packed else { return false };
+    let phys = packed & !(1u64 << 63);
+    let exec = packed >> 63 != 0;
+    let pp = pml4.start_address().as_u64();
+    if mem::cow_count(phys) <= 1 {
+        // sole mapper left — promote the existing page back to writable
+        mem::cow_claim(phys);
+        let _ = crate::elf::protect_user_page(pml4, page, true, exec);
+    } else {
+        let Some(nf) = mem::alloc_frame() else {
+            return false;
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                mem::phys_to_virt(phys) as *const u8,
+                mem::phys_to_virt(nf.start_address().as_u64()) as *mut u8,
+                0x1000,
+            );
+        }
+        let _ = crate::elf::unmap_user_page(pml4, page);
+        crate::elf::map_phys_user_flags(
+            pml4,
+            page,
+            nf.start_address().as_u64(),
+            true,
+            exec,
+            &mut Vec::new(),
+        );
+        mem::free_frame(phys); // release our share (still mapped elsewhere)
+        with_current(|t| {
+            t.frames.push(nf.start_address().as_u64());
+        });
+    }
+    cow_unmap(pp, page);
+    with_current(|t| t.maj_flt += 1);
+    unsafe { x86_64::instructions::tlb::flush_all() };
+    true
+}
+
+/// Break COW sharing on `page` in `pml4` — used by mprotect when turning
+/// a shared-RO frame writable: split into a private copy first so the
+/// other mm keeps its own contents. true = the page is private now.
+pub fn cow_split(pml4: PhysFrame, page: u64, phys: u64) -> bool {
+    let pp = pml4.start_address().as_u64();
+    let n = mem::cow_count(phys);
+    let was_tracked = MM_COW.lock().contains_key(&(pp, page));
+    if n <= 1 && !was_tracked {
+        return false; // already private
+    }
+    if n <= 1 {
+        mem::cow_claim(phys);
+    } else {
+        let Some(nf) = mem::alloc_frame() else {
+            return false;
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                mem::phys_to_virt(phys) as *const u8,
+                mem::phys_to_virt(nf.start_address().as_u64()) as *mut u8,
+                0x1000,
+            );
+        }
+        let x = MM_COW
+            .lock()
+            .get(&(pp, page))
+            .map(|p| p >> 63 != 0)
+            .unwrap_or(false);
+        let _ = crate::elf::unmap_user_page(pml4, page);
+        crate::elf::map_phys_user_flags(
+            pml4,
+            page,
+            nf.start_address().as_u64(),
+            false,
+            x,
+            &mut Vec::new(),
+        );
+        mem::free_frame(phys);
+        with_current(|t| t.frames.push(nf.start_address().as_u64()));
+    }
+    cow_unmap(pp, page);
+    true
+}
+
 /// SYS_FORK: duplicate the calling task into a child resuming at the same
-/// userspace instruction with rax=0. Eager copy-on-fork (no COW): every
-/// present private page gets a physical copy; not-yet-faulted file-backed
-/// pages stay lazy via the cloned FileMap; borrowed (shm/fb) frames are
-/// shared by reference. Returns Some(pid) to the parent.
+/// userspace instruction with rax=0. Copy-on-write: every present private
+/// page is mapped READ-ONLY into the child and shared via COW_REFS; the
+/// parent's own writable pages are demoted too, so a first write on
+/// either side faults and copies just that page. Read-only pages are
+/// shared outright (refcounted, never promoted). Borrowed (shm/fb)
+/// frames stay genuinely shared. Returns Some(pid) to the parent.
 pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
     // kernel stack FIRST so the new pml4 inherits the kernel PDPT with it
     let mut kframes = Vec::new();
@@ -742,9 +870,12 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
     s.next_pid += 1;
     let parent = cur.id;
 
-    // rebuild every present user page in the child
+    // share every present user page with the child — no copies
+    let pphys4 = pml4.start_address().as_u64();
+    let cphys4 = cpml4.start_address().as_u64();
     let mut cborrowed: Vec<u64> = Vec::new();
     let mut pt_scratch: Vec<u64> = Vec::new(); // intermediate PT frames of the child
+    let mut cowm: Vec<(u64, u64)> = Vec::new(); // (va, phys|exec<<63)
     let mut ok = true;
     for (va, pphys, w, x) in crate::elf::collect_user_pages(pml4) {
         if cur.borrowed.contains(&pphys) {
@@ -753,38 +884,49 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
                 break;
             }
             cborrowed.push(pphys);
-        } else {
-            let Some(nf) = mem::alloc_frame() else {
-                ok = false;
-                break;
-            };
-            unsafe {
-                let src = mem::phys_to_virt(pphys) as *const u8;
-                let dst = mem::phys_to_virt(nf.start_address().as_u64()) as *mut u8;
-                core::ptr::copy_nonoverlapping(src, dst, 0x1000);
-            }
-            if !crate::elf::map_phys_user_flags(
-                cpml4,
-                va,
-                nf.start_address().as_u64(),
-                w,
-                x,
-                &mut pt_scratch,
-            ) {
-                mem::free_frame(nf.start_address().as_u64());
-                ok = false;
-                break;
+            continue;
+        }
+        // already COW-shared by an earlier fork (nested fork) — the va
+        // record carries the original permissions
+        let prior = cow_lookup(pphys4, va);
+        let is_cow = w || prior.is_some();
+        if !crate::elf::map_phys_user_flags(cpml4, va, pphys, false, x, &mut pt_scratch) {
+            ok = false;
+            break;
+        }
+        mem::cow_share(pphys);
+        if is_cow {
+            let packed = prior.unwrap_or(pphys | ((x as u64) << 63));
+            cowm.push((va, packed));
+            if w {
+                // demote the parent page too — first write on either
+                // side faults through cow_resolve
+                let _ = crate::elf::protect_user_page(pml4, va, false, x);
             }
         }
     }
+    if ok {
+        for (va, packed) in &cowm {
+            cow_insert(pphys4, *va, *packed);
+            cow_insert(cphys4, *va, *packed);
+        }
+        unsafe { x86_64::instructions::tlb::flush_all() }; // we demoted live ptes
+    }
     if !ok {
-        // tear down the partial child table
+        // unwind: restore parent perms/records, free the child's shares
+        for (va, packed) in &cowm {
+            let x = packed >> 63 != 0;
+            let _ = crate::elf::protect_user_page(pml4, *va, true, x);
+            cow_unmap(pphys4, *va);
+        }
+        unsafe { x86_64::instructions::tlb::flush_all() };
         let freed = crate::elf::free_user_space(cpml4);
         for f in freed {
             if !cborrowed.contains(&f) {
                 mem::free_frame(f);
             }
         }
+        cow_drop_mm(cphys4);
         mem::free_frame(cpml4.start_address().as_u64());
         free_frames(&kframes);
         return None;
@@ -828,7 +970,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         ports: Vec::new(),
         shm: shm_ids,
         frames: kframes,
-        mem_bytes: 0,
+        mem_bytes: cur.mem_bytes,
         waiting_on: 0,
         wait_port: 0,
         wait_futex: 0,
@@ -969,6 +1111,7 @@ pub fn exec_current(ctx: &mut CpuContext, path: &str, args: &str) -> bool {
                 mem::free_frame(f);
             }
         }
+        cow_drop_mm(old_phys);
         mem::free_frame(old_phys);
     }
     // if threads share the old mm they keep it; we just moved out
@@ -1157,6 +1300,7 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
                 mem::free_frame(f);
             }
         }
+        cow_unmap_range(pml4.start_address().as_u64(), lo, hi);
         if mm_dec_last(pml4.start_address().as_u64()) {
             // last sharer: walk the user tree; free every leaf+PT frame
             // except shm-borrowed ones
@@ -1167,6 +1311,7 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
                     mem::free_frame(f);
                 }
             }
+            cow_drop_mm(pml4.start_address().as_u64());
         }
         // Keep the pml4 frame: CR3 still points at it until the scheduler
         // activates another task, so freeing it here could unmap the parked
@@ -1794,6 +1939,11 @@ pub fn filemap_hit(va: u64) -> Option<(String, u64)> {
 /// file (zero-padded past EOF) and maps it. true = the fault is
 /// satisfied and the instruction may retry.
 pub fn demand_page(va: u64) -> bool {
+    // present-but-read-only COW page written for the first time —
+    // split or claim it before any demand-fill logic runs
+    if cow_resolve(va) {
+        return true;
+    }
     let page = va & !0xFFFu64;
     // demand-grown user stack: an unmapped page inside THIS task's stack
     // region maps a fresh zero page (main stack or a clone's private
