@@ -45,7 +45,9 @@ struct Sock {
     reuse: bool,                  // SO_REUSEADDR
     broadcast: bool,              // SO_BROADCAST (gate on bcast dst sends)
     rcvtimeo: u64,                // SO_RCVTIMEO: max recv block, ms (0 = inf)
+    sndtimeo: u64,                // SO_SNDTIMEO: max send-ack wait, ms
     keepalive: bool,              // SO_KEEPALIVE (TCP: real wire probes)
+    ttl: u8,                      // IP_TTL (0 = default 64)
     wait_expired: bool,           // recv hit rcvtimeo — surface EAGAIN, no reblock
 }
 
@@ -144,7 +146,9 @@ pub fn create(stream: bool, domain: u64) -> Result<String, i64> {
             reuse: false,
             broadcast: false,
             rcvtimeo: 0,
+            sndtimeo: 0,
             keepalive: false,
+            ttl: 0,
             wait_expired: false,
         },
     );
@@ -506,7 +510,9 @@ pub fn accept(id: u64) -> Result<(String, [u8; 4], u16), i64> {
                         reuse: false,
                         broadcast: false,
                         rcvtimeo: 0,
+                        sndtimeo: 0,
                         keepalive: false,
+                        ttl: 0,
                         wait_expired: false,
                     },
                 );
@@ -549,7 +555,9 @@ pub fn accept(id: u64) -> Result<(String, [u8; 4], u16), i64> {
                             reuse: false,
                             broadcast: false,
                             rcvtimeo: 0,
+                            sndtimeo: 0,
                             keepalive: false,
+                            ttl: 0,
                             wait_expired: false,
                         },
                     );
@@ -692,7 +700,14 @@ pub fn try_write(path: &str, data: &[u8], nonblock: bool) -> Result<usize, i64> 
             if crate::net::is_bcast(ip) && !s.broadcast {
                 return Err(-13); // EACCES: SO_BROADCAST not set
             }
-            crate::net::udp_send(s.lport, ip, pt, data).map(|_| data.len())
+            crate::net::udp_send_ttl(
+                s.lport,
+                ip,
+                pt,
+                data,
+                if s.ttl == 0 { 64 } else { s.ttl },
+            )
+            .map(|_| data.len())
         }
         Kind::Tcp => {
             if s.cid == 0 {
@@ -701,7 +716,11 @@ pub fn try_write(path: &str, data: &[u8], nonblock: bool) -> Result<usize, i64> 
             if nonblock {
                 crate::net::tcp_send_nowait(s.cid, data)
             } else {
-                match crate::net::tcp_send(s.cid, data, 8000) {
+                match crate::net::tcp_send(
+                    s.cid,
+                    data,
+                    if s.sndtimeo == 0 { 8000 } else { s.sndtimeo },
+                ) {
                     Ok(()) => Ok(data.len().min(1400)),
                     // dead peer/timeouts surface as EPIPE
                     Err(-2) => Err(-32),
@@ -765,7 +784,14 @@ pub fn sendto(path: &str, data: &[u8], ip: u32, port: u16) -> Result<usize, i64>
             if crate::net::is_bcast(dst) && !s.broadcast {
                 return Err(-13); // EACCES: SO_BROADCAST not set
             }
-            crate::net::udp_send(s.lport, dst, port, data).map(|_| data.len())
+            crate::net::udp_send_ttl(
+                s.lport,
+                dst,
+                port,
+                data,
+                if s.ttl == 0 { 64 } else { s.ttl },
+            )
+            .map(|_| data.len())
         }
         // addr ignored (unix-dgram uses sendto_path for a named dest)
         Kind::Tcp | Kind::Unix | Kind::UnixDgram => try_write(path, data, false),
@@ -1100,10 +1126,17 @@ pub fn kind_name(path: &str) -> &'static str {
 /// Returns the u32-le value bytes. Err(-92) ENOPROTOOPT for the rest.
 pub fn getsockopt(id: u64, level: u64, opt: u64) -> Result<u32, i64> {
     const SOL_SOCKET: u64 = 1;
+    let s = fields(id).ok_or(-9i64)?;
+    if level == 0 {
+        // IPPROTO_IP: IP_TTL readback
+        return match opt {
+            2 => Ok(s.ttl as u32),
+            _ => Err(-92),
+        };
+    }
     if level != SOL_SOCKET {
         return Err(-92); // ENOPROTOOPT
     }
-    let s = fields(id).ok_or(-9i64)?;
     match opt {
         3 => Ok(match s.kind {
             // SO_TYPE
@@ -1138,6 +1171,7 @@ pub fn getsockopt(id: u64, level: u64, opt: u64) -> Result<u32, i64> {
         6 => Ok(s.broadcast as u32),  // SO_BROADCAST
         9 => Ok(s.keepalive as u32),  // SO_KEEPALIVE
         20 => Ok(s.rcvtimeo as u32),  // SO_RCVTIMEO (ms)
+        21 => Ok(s.sndtimeo as u32),  // SO_SNDTIMEO (ms)
         _ => Err(-92),
     }
 }
@@ -1147,11 +1181,22 @@ pub fn getsockopt(id: u64, level: u64, opt: u64) -> Result<u32, i64> {
 /// sends to 255.255.255.255 / subnet-directed broadcast.
 pub fn setsockopt(id: u64, level: u64, opt: u64, val: u64) -> i64 {
     const SOL_SOCKET: u64 = 1;
+    const IPPROTO_IP: u64 = 0;
+    let mut m = SOCKS.lock();
+    let Some(s) = m.get_mut(&id) else { return -9 };
+    if level == IPPROTO_IP {
+        return match opt {
+            2 => {
+                // IP_TTL: honored on every UDP datagram this socket sends
+                s.ttl = val.min(255) as u8;
+                0
+            }
+            _ => -92,
+        };
+    }
     if level != SOL_SOCKET {
         return -92; // ENOPROTOOPT
     }
-    let mut m = SOCKS.lock();
-    let Some(s) = m.get_mut(&id) else { return -9 };
     match opt {
         2 => {
             s.reuse = val != 0;
@@ -1175,6 +1220,10 @@ pub fn setsockopt(id: u64, level: u64, opt: u64, val: u64) -> i64 {
         }
         20 => {
             s.rcvtimeo = val.min(600_000); // SO_RCVTIMEO, ms
+            0
+        }
+        21 => {
+            s.sndtimeo = val.min(600_000); // SO_SNDTIMEO, ms
             0
         }
         _ => -92,
@@ -1218,7 +1267,9 @@ pub fn socketpair_dgram() -> Option<(String, String)> {
                 reuse: false,
                 broadcast: false,
                 rcvtimeo: 0,
+                sndtimeo: 0,
                 keepalive: false,
+                ttl: 0,
                 wait_expired: false,
             },
         );

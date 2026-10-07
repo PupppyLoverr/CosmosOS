@@ -27,7 +27,7 @@ const FILES: &[&str] = &[
 ];
 
 /// files under /proc/net
-const NET_FILES: &[&str] = &["tcp", "udp", "unix", "dev", "operstate", "owners"];
+const NET_FILES: &[&str] = &["tcp", "udp", "unix", "dev", "operstate", "owners", "route"];
 
 /// files under /proc/sys/kernel
 const SYS_FILES: &[&str] = &["hostname"];
@@ -210,6 +210,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/net/udp" => net::net_udp(),
         "/proc/net/unix" => crate::sockfd::net_unix(),
         "/proc/net/dev" => net::net_dev(),
+        "/proc/net/route" => net::net_route(),
         "/proc/net/operstate" => alloc::format!(
             "{}\n",
             if net::is_up() { "up" } else { "down" }
@@ -381,6 +382,19 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
             _ => return None,
         }
         return Some(buf.len());
+    }
+    if path == "/proc/net/route" {
+        // 'add <dest>/<plen> <gw|*>' / 'del <dest>[/<plen>]' per line
+        let text = String::from(String::from_utf8_lossy(buf));
+        let mut ok = true;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            ok &= net::route_ctl(line);
+        }
+        return ok.then_some(buf.len());
     }
     if path != "/proc/sys/kernel/hostname" {
         return None;
