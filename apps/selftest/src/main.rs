@@ -1224,6 +1224,101 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let ok = ustd::mmap(1 << 20).is_some();
         over.is_none() && ok
     });
+    check("exit-group", {
+        // SYS_EXIT_GROUP: exit_group in a forked child kills its threads
+        // too — the whole mm group exits with the code
+        extern "C" fn worker(_: u64) -> i64 {
+            loop {
+                ustd::yield_now();
+            }
+        }
+        match ustd::fork() {
+            0 => {
+                let _ = ustd::thread_spawn(worker, 0);
+                ustd::exit_group(7);
+            }
+            c if c > 0 => ustd::waitpid(c as u32, 5000).unwrap_or(-1) == 7,
+            _ => false,
+        }
+    });
+    check("gettid", {
+        // main thread tid == pid; a clone thread gets its own
+        let main_ok = ustd::gettid() == ustd::getpid();
+        extern "C" fn tiddiff(p: u64) -> i64 {
+            let me = ustd::gettid();
+            (me != 0 && me != p as u32) as i64
+        }
+        let c = ustd::thread_spawn(tiddiff, ustd::getpid() as u64).unwrap_or(0);
+        let r = if c != 0 { ustd::waitpid(c, 3000).unwrap_or(-1) } else { -1 };
+        main_ok && r == 1
+    });
+    check("tgkill", {
+        // signal 9 to a specific tid; wrong-mm tgid -> ESRCH
+        match ustd::fork() {
+            0 => loop {
+                ustd::yield_now();
+            },
+            c if c > 0 => {
+                ustd::sleep_ms(50);
+                let bad = ustd::tgkill(ustd::getpid(), c as u32, 9);
+                let ok = ustd::tgkill(0, c as u32, 9);
+                let ex = ustd::waitpid(c as u32, 4000).unwrap_or(-1);
+                bad < 0 && ok == 0 && ex == 137
+            }
+            _ => false,
+        }
+    });
+    check("ptrace-step-rip", {
+        // PT_STEP: each step retires one instruction then the pending
+        // SIGTRAP stops the tracee (0x7f|(5<<8)); rip advances past the
+        // stepped int80. The child loops yield so stops are repeatable.
+        match ustd::fork() {
+            0 => {
+                ustd::ptrace(ustd::PT_TRACEME, 0, 0, 0);
+                ustd::kill2(ustd::getpid(), 19);
+                loop {
+                    ustd::yield_now();
+                }
+            }
+            c if c > 0 => {
+                let _ = ustd::waitpid_opt(c as u32, 1, 3000);
+                let r0 = ustd::ptrace_getregs(c as u32).map(|r| r.rip).unwrap_or(0);
+                ustd::ptrace(ustd::PT_STEP, c as u32, 0, 0);
+                let st1 = ustd::waitpid_opt(c as u32, 1, 3000).unwrap_or(-1);
+                let r1 = ustd::ptrace_getregs(c as u32).map(|r| r.rip).unwrap_or(0);
+                ustd::ptrace(ustd::PT_STEP, c as u32, 0, 0);
+                let st2 = ustd::waitpid_opt(c as u32, 1, 3000).unwrap_or(-1);
+                let sig = ustd::ptrace_siginfo(c as u32).unwrap_or(0);
+                ustd::ptrace(ustd::PT_KILL, c as u32, 0, 0);
+                let _ = ustd::waitpid(c as u32, 4000);
+                r0 != 0 && r1 != r0
+                    && (st1 & 0xff) == 0x7f && (st2 & 0xff) == 0x7f
+                    && sig == 5
+            }
+            _ => false,
+        }
+    });
+    check("proc-syscall", {
+        // /proc/<pid>/syscall: while a task blocks inside a syscall the
+        // file reports the in-flight nr + args
+        match ustd::fork() {
+            0 => {
+                ustd::sleep_ms(400); // inside SYS_NANOSLEEP-ish when read
+                ustd::exit(0);
+            }
+            c if c > 0 => {
+                ustd::sleep_ms(50);
+                let s = ustd::read_all(&alloc::format!("/proc/{}/syscall", c))
+                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                    .unwrap_or_default();
+                let nr = s.split_whitespace().next()
+                    .and_then(|t| t.parse::<i64>().ok()).unwrap_or(-1);
+                let _ = ustd::waitpid(c as u32, 4000);
+                nr > 0
+            }
+            _ => false,
+        }
+    });
     check("tls-fsbase", {
         // arch_prctl SET_FS/GET_FS: real FS segment per task
         static mut CELL: u64 = 0;
