@@ -18997,9 +18997,30 @@ impl Term {
             "ss" => {
                 // socket snapshot over the kernel's /proc/net dumps;
                 // -p joins /proc/net/owners (hex local port -> real pid)
+                let only_unix = args.iter().any(|a| *a == "-x");
                 let only_tcp = args.iter().any(|a| *a == "-t");
                 let only_udp = args.iter().any(|a| *a == "-u");
                 let want_p = args.iter().any(|a| *a == "-p");
+                if only_unix {
+                    self.emit("Netid  State      Local Address:Path  Peer");
+                    if let Ok(d) = ustd::read_all("/proc/net/unix") {
+                        let t = String::from_utf8_lossy(&d);
+                        for l in t.lines().skip(1) {
+                            if l.trim().is_empty() {
+                                continue;
+                            }
+                            let f: Vec<&str> = l.split_whitespace().collect();
+                            let st = f.get(5).copied().unwrap_or("?");
+                            let p = f.get(7).copied().unwrap_or("");
+                            self.emit(&alloc::format!(
+                                "u_str  {}  {}  {}",
+                                if st == "02" { "LISTENING" } else { "CONNECTED" },
+                                p, "-"
+                            ));
+                        }
+                    }
+                    return;
+                }
                 let show_tcp = only_tcp || !only_udp;
                 let show_udp = only_udp || !only_tcp;
                 let mut owners: alloc::collections::BTreeMap<u64, u32> =
@@ -21782,14 +21803,35 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             let mut keep = true;
             if ustd::poll(&[cfd as u32], &[1], 0) > 0 {
                 let mut b = [0u8; 1024];
-                match ustd::read(cfd, &mut b) {
-                    Ok(0) => keep = false, // client half-closed: echoed all
-                    Ok(n) => {
+                match ustd::recvmsg(cfd, &mut b) {
+                    Ok((0, got)) => {
+                        if got.is_none() {
+                            keep = false; // client half-closed: echoed all
+                        }
+                        if let Some(gfd) = got {
+                            let wn = ustd::write(gfd, b"via-fd\n").unwrap_or(0);
+                            t.push_line(&alloc::format!(
+                                "ucat: got fd {} (wrote {}B into it)",
+                                gfd, wn
+                            ));
+                            ustd::close(gfd);
+                            t.dirty_all = true;
+                        }
+                    }
+                    Ok((n, got)) => {
                         let _ = ustd::write(cfd, &b[..n]);
                         let t2 = String::from_utf8_lossy(&b[..n]).into_owned();
                         t.push_line(&alloc::format!(
                             "ucat: echo {}B: {}", n, t2.trim_end()
                         ));
+                        if let Some(gfd) = got {
+                            let wn = ustd::write(gfd, b"via-fd\n").unwrap_or(0);
+                            t.push_line(&alloc::format!(
+                                "ucat: got fd {} (wrote {}B into it)",
+                                gfd, wn
+                            ));
+                            ustd::close(gfd);
+                        }
                         t.dirty_all = true;
                     }
                     Err(_) => {}

@@ -1,8 +1,10 @@
-//! ucat — AF_UNIX stream client: `cosmos-ucat <sockpath> <msg> [out]`.
-//! Connects to a listening unix socket, sends `msg`, half-closes the write
-//! side (real shutdown(SHUT_WR) — the peer reads EOF), collects the reply
-//! until EOF/timeout, then writes it to `out` (or prints it). Exit 0 = got
-//! data back; 2 = connect/send failed or timed out silent.
+//! ucat — AF_UNIX stream client: `cosmos-ucat <sockpath> <msg> [out] [--passfd <file>]`.
+//! Connects to a listening unix socket, sends `msg` — via sendmsg when
+//! `--passfd` is given, carrying that open file to the peer (SCM_RIGHTS),
+//! then half-closes the write side (real shutdown(SHUT_WR) — the peer
+//! reads EOF), collects the reply until EOF/timeout, then writes it to
+//! `out` (or prints it). Exit 0 = got data back; 2 = connect/send failed
+//! or timed out silent.
 #![no_std]
 #![no_main]
 extern crate alloc;
@@ -20,10 +22,32 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
     };
     let mut it = args.split_whitespace();
     let (Some(path), Some(msg)) = (it.next(), it.next()) else {
-        println!("usage: ucat <sockpath> <msg> [out_file]");
+        println!("usage: ucat <sockpath> <msg> [out_file] [--passfd <file>]");
         return 64;
     };
-    let out = it.next();
+    let mut out: Option<&str> = None;
+    let mut passfd: i64 = -1;
+    while let Some(a) = it.next() {
+        if a == "--passfd" {
+            match it.next() {
+                Some(p) => {
+                    match ustd::open(p, ustd::O_RDWR) {
+                        Ok(f) => passfd = f,
+                        Err(e) => {
+                            println!("ucat: passfd {} err {}", p, e);
+                            return 2;
+                        }
+                    }
+                }
+                None => {
+                    println!("usage: ucat <sockpath> <msg> [out_file] [--passfd <file>]");
+                    return 64;
+                }
+            }
+        } else if out.is_none() {
+            out = Some(a);
+        }
+    }
     let s = match ustd::UnixFd::connect(path) {
         Ok(s) => s,
         Err(e) => {
@@ -31,9 +55,18 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
             return 2;
         }
     };
-    if let Err(e) = s.write(msg.as_bytes()) {
-        println!("ucat: write err {}", e);
+    // sendmsg carries an open fd to the peer when --passfd was used
+    let r = if passfd >= 0 {
+        ustd::sendmsg(s.0, msg.as_bytes(), passfd)
+    } else {
+        s.write(msg.as_bytes()).map(|n| n as i64).unwrap_or(-1)
+    };
+    if r < 0 {
+        println!("ucat: send err {}", r);
         return 2;
+    }
+    if passfd >= 0 {
+        println!("ucat: sent fd {}", passfd);
     }
     // real half-close: server sees our bytes then EOF
     ustd::shutdown(s.0, 1);
@@ -64,6 +97,9 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         let _ = ustd::write_all(f, &got);
     } else {
         println!("ucat: got {}", String::from_utf8_lossy(&got));
+    }
+    if passfd >= 0 {
+        ustd::close(passfd);
     }
     if got.is_empty() {
         2

@@ -1506,6 +1506,72 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    // ---- batch 38: sendmsg/recvmsg SCM_RIGHTS fd passing ----
+    check("sendmsg-fd", {
+        // a client passes an open file fd across an AF_UNIX connection;
+        // the accepted server end adopts it and reads the file through it.
+        let mut ok = false;
+        let _ = ustd::write_all("/st-pass.txt", b"FDPASS");
+        let pfd = ustd::open("/st-pass.txt", ustd::O_RDWR).unwrap_or(-1);
+        let lfd = ustd::socketx(ustd::SOCK_STREAM, shared::AF_UNIX);
+        let cfd = ustd::socketx(ustd::SOCK_STREAM, shared::AF_UNIX);
+        if pfd >= 0 && lfd >= 0 && cfd >= 0 {
+            ustd::fcntl(lfd, ustd::F_SETFL, ustd::O_NONBLOCK);
+            ustd::fcntl(cfd, ustd::F_SETFL, ustd::O_NONBLOCK);
+            ok = ustd::bind_path(lfd, "/stm-selftest") == 0
+                && ustd::listen(lfd, 4) == 0
+                && ustd::connect_path(cfd, "/stm-selftest") == 0
+                && ustd::sendmsg(cfd, b"go", pfd) == 2
+                // a bogus passfd is EBADF, not a transfer
+                && ustd::sendmsg(cfd, b"x", 9999) == -9;
+            if ok {
+                let sfd = if ustd::poll(&[lfd as u32], &[1], 500) > 0 {
+                    ustd::accept(lfd).ok().map(|(f, _, _)| f)
+                } else {
+                    None
+                };
+                if let Some(sfd) = sfd {
+                    ustd::fcntl(sfd, ustd::F_SETFL, ustd::O_NONBLOCK);
+                    let mut b = [0u8; 64];
+                    let got = if ustd::poll(&[sfd as u32], &[1], 500) > 0 {
+                        ustd::recvmsg(sfd, &mut b)
+                    } else {
+                        Err(-1)
+                    };
+                    ok = match got {
+                        Ok((2, Some(gfd))) => {
+                            let mut fb = [0u8; 32];
+                            // the adopted fd is a real open fd: read the
+                            // file through it and write through it too
+                            ustd::read(gfd, &mut fb) == Ok(6)
+                                && &fb[..6] == b"FDPASS"
+                                && ustd::write(gfd, b"!") == Ok(1)
+                                && { ustd::close(gfd); true }
+                        }
+                        _ => false,
+                    };
+                    ustd::close(sfd);
+                } else {
+                    ok = false;
+                }
+            }
+        }
+        if pfd >= 0 {
+            ustd::close(pfd);
+        }
+        if lfd >= 0 {
+            ustd::close(lfd);
+        }
+        if cfd >= 0 {
+            ustd::close(cfd);
+        }
+        // the server's "!" write went into the real file at pos 6
+        ok = ok
+            && ustd::read_all("/st-pass.txt")
+                .map(|d| &d[..] == b"FDPASS!")
+                .unwrap_or(false);
+        ok
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64
