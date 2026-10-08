@@ -107,6 +107,17 @@ pub fn net_ping(ip: u32, timeout_ms: u64) -> Option<u64> {
     let r = sc2(shared::SYS_NET_PING, ip as u64, timeout_ms);
     if r == u64::MAX { None } else { Some(r) }
 }
+/// Resolve a hostname to an IPv4 address via a real DNS query (UDP/53).
+pub fn net_dns(name: &str) -> Option<[u8; 4]> {
+    let mut ip = [0u8; 4];
+    let r = sc3(
+        shared::SYS_NET_DNS,
+        name.as_ptr() as u64,
+        name.len() as u64,
+        ip.as_mut_ptr() as u64,
+    );
+    if r == u64::MAX { None } else { Some(ip) }
+}
 /// (mac, ip) of the virtio-net device, if present.
 pub fn net_info() -> Option<([u8; 6], [u8; 4])> {
     let mut b = [0u8; 10];
