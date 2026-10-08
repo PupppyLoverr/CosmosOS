@@ -436,10 +436,13 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
     s.tasks[s.cur].saved_rsp = saved;
     s.tasks[s.cur].cpu_ticks += 1; // the outgoing task owned this interval
     crate::cgroup::charge(s.tasks[s.cur].cgroup);
-    // charge virtual runtime: weight = 40 - nice (-20..=19 -> 60..=21)
+    // charge virtual runtime: weight = 40 - nice (-20..=19 -> 60..=21),
+    // further scaled by the task's cgroup cpu.weight (weight 100 = ×1;
+    // 10000 = nearly no vrun -> wins CPU, 1 = 100x slower -> starved)
     {
         let t = &mut s.tasks[s.cur];
-        t.vrun += 4000 / (40 - t.nice as i64) as u64;
+        let w = crate::cgroup::weight_of(t.cgroup).max(1);
+        t.vrun += (4000 / (40 - t.nice as i64) as u64) * 100 / w;
     }
     // wake sleepers (sleep + timed waits) and decay itimers
     for (i, t) in s.tasks.iter_mut().enumerate() {
@@ -2932,6 +2935,20 @@ pub fn kill_current_or_halt(reason: &str) -> ! {
     park_dead_task();
 }
 
+/// OOM-kill the current task — cgroup memory.max breach: the kill is
+/// SIGKILL-flavoured (exit 137, "Killed") and diverges like
+/// kill_current_or_halt.
+pub fn kill_current_oom() -> ! {
+    sprintln!("[cgroup] oom-kill: current task over memory.max");
+    let mut g = SCHED.lock();
+    let s = g.as_mut().unwrap();
+    let idx = s.cur;
+    crate::cgroup::note_oom_kill(s.tasks[idx].cgroup);
+    kill_at(s, idx, 128 + 9);
+    drop(g);
+    park_dead_task();
+}
+
 fn kill_at(s: &mut Sched, idx: usize, code: i64) {
     let dead_cur = idx == s.cur;
     let mut t = s.tasks.remove(idx);
@@ -3719,6 +3736,36 @@ pub fn set_nice(pid: u32, nice: i64) -> i64 {
 
 const TRACE_MAX_RECS: usize = 128;
 
+/// Freeze or thaw every pid in `pids`: frozen members go Stopped
+/// (skipped by the pick loop like SIGSTOP), thawed ones return to
+/// Running. One SCHED hold for the whole group. Returns members moved.
+pub fn freeze_pids(pids: &[u32], freeze: bool) -> usize {
+    let mut g = SCHED.lock();
+    let Some(s) = g.as_mut() else { return 0 };
+    let mut n = 0;
+    for t in s.tasks.iter_mut() {
+        if !pids.contains(&t.id) || t.state == State::Dead {
+            continue;
+        }
+        match (freeze, t.state) {
+            // a frozen task that was Blocked keeps its wait bookkeeping;
+            // thawed back to Running it re-enters the syscall and
+            // re-blocks if the condition still holds — same resume
+            // model SIGCONT already uses
+            (true, State::Running) | (true, State::Blocked) => {
+                t.state = State::Stopped;
+                n += 1;
+            }
+            (false, State::Stopped) => {
+                t.state = State::Running;
+                n += 1;
+            }
+            _ => {}
+        }
+    }
+    n
+}
+
 pub fn with_pid_mut<F: FnOnce(&mut Task) -> i64>(pid: u32, f: F) -> i64 {
     let mut g = SCHED.lock();
     match g.as_mut() {
@@ -4001,6 +4048,28 @@ pub fn pid_threads(pid: u32) -> Option<Vec<u32>> {
 }
 
 /// (min_flt, maj_flt, resident user pages) for /proc/<pid>/status.
+/// Per-task io counters (rbytes, wbytes) for cgroup io.stat on the
+/// root group (which sums over live tasks).
+pub fn io_bytes(pid: u32) -> Option<(u64, u64)> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    s.tasks
+        .iter()
+        .find(|t| t.id == pid && t.state != State::Dead)
+        .map(|t| (t.rbytes, t.wbytes))
+}
+
+/// Live rss in frames for `pid` (its owned t.frames count; tombstones
+/// report 0 — dead members stop counting immediately).
+pub fn frames_len(pid: u32) -> Option<u64> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    s.tasks
+        .iter()
+        .find(|t| t.id == pid)
+        .map(|t| if t.state == State::Dead { 0 } else { t.frames.len() as u64 })
+}
+
 pub fn pid_faults(pid: u32) -> Option<(u64, u64, u64)> {
     let g = SCHED.lock();
     let s = g.as_ref()?;
@@ -4046,6 +4115,17 @@ pub fn io_charge(read: bool, n: u64) {
             t.rbytes += n;
         } else {
             t.wbytes += n;
+        }
+        let cg = t.cgroup;
+        if cg != 0 {
+            crate::cgroup::io_charge(cg, read, n);
+            // io.max: over the window's byte budget -> the task can't do
+            // its next I/O until the window rolls (real pacing, like
+            // cgroup v2 throttling).
+            if let Some(wake) = crate::cgroup::io_wait_until(cg) {
+                t.state = State::Blocked;
+                t.wake_at = wake;
+            }
         }
     });
 }
@@ -4182,6 +4262,13 @@ pub fn filemap_hit(va: u64) -> Option<(String, u64)> {
 /// file (zero-padded past EOF) and maps it. true = the fault is
 /// satisfied and the instruction may retry.
 pub fn demand_page(va: u64) -> bool {
+    // cgroup memory.max: a demand fill would grow member rss past the
+    // cap — kill the task (real OOM semantics, exit 137) instead of
+    // letting the allocation land. Runs in #PF context, no locks held.
+    let cg = with_current(|t| t.cgroup);
+    if cg != 0 && crate::cgroup::oom_check(cg) {
+        kill_current_oom(); // diverges
+    }
     // present-but-read-only COW page written for the first time —
     // split or claim it before any demand-fill logic runs
     if cow_resolve(va) {

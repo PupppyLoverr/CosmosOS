@@ -4874,6 +4874,134 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::remove("/sys/fs/cgroup/t1");
         ok
     });
+    check("cgroup-mem", {
+        // memory.max is enforced for real: the child eats pages until
+        // the group's rss crosses the cap and the kernel OOM-kills it —
+        // waitpid reports the SIGKILL exit (137) and memory.events
+        // counts the kill.
+        let mut ok = true;
+        ok = ok && ustd::mkdir("/sys/fs/cgroup/m1").is_ok();
+        ok = ok && ustd::write_all(
+            "/sys/fs/cgroup/m1/memory.max",
+            b"4194304",
+        ).is_ok();
+        match ustd::fork() {
+            0 => {
+                // ~16MB of touched anon pages — far over the 4MB cap
+                let mut v = alloc::vec![0xAAu8; 16 * 1024 * 1024];
+                v[0] = 1;
+                ustd::exit(0); // unreachable once the cap bites
+            }
+            p if p > 0 => {
+                ok = ok && ustd::write_all(
+                    "/sys/fs/cgroup/m1/cgroup.procs",
+                    alloc::format!("{}", p).as_bytes(),
+                ).is_ok();
+                let code = ustd::waitpid(p as u32, 20_000).unwrap_or(-1);
+                ok = ok && code == 128 + 9;
+                let ev = ustd::read_all("/sys/fs/cgroup/m1/memory.events")
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                ok = ok && ev.contains("oom_kill 1");
+                // peak rode up to ~the cap before the kill
+                let peak: u64 = ustd::read_all("/sys/fs/cgroup/m1/memory.peak")
+                    .map(|b| String::from_utf8_lossy(&b).trim().parse().unwrap_or(0))
+                    .unwrap_or(0);
+                ok = ok && peak >= 4 * 1024 * 1024 - 64 * 4096;
+            }
+            _ => ok = false,
+        }
+        let _ = ustd::remove("/sys/fs/cgroup/m1");
+        ok
+    });
+    check("cgroup-weight", {
+        // cpu.weight is read back verbatim and clamps to 1..=10000
+        let mut ok = true;
+        ok = ok && ustd::mkdir("/sys/fs/cgroup/w1").is_ok();
+        ok = ok && ustd::write_all("/sys/fs/cgroup/w1/cpu.weight", b"8000").is_ok();
+        ok = ok && ustd::read_all("/sys/fs/cgroup/w1/cpu.weight")
+            .map(|b| String::from_utf8_lossy(&b).trim() == "8000")
+            .unwrap_or(false);
+        ok = ok && ustd::write_all("/sys/fs/cgroup/w1/cpu.weight", b"99999").is_err();
+        let _ = ustd::remove("/sys/fs/cgroup/w1");
+        ok
+    });
+    check("cgroup-freeze-kill", {
+        // cgroup.freeze stops every member for real (status reads T),
+        // writing 0 resumes it, and cgroup.kill delivers real SIGKILLs
+        // (waitpid sees 137).
+        let mut ok = true;
+        ok = ok && ustd::mkdir("/sys/fs/cgroup/f1").is_ok();
+        match ustd::fork() {
+            0 => {
+                // sit in a spin until killed
+                loop {
+                    ustd::sleep_ms(50);
+                }
+            }
+            p if p > 0 => {
+                let procs = alloc::format!("/sys/fs/cgroup/f1/cgroup.procs");
+                ok = ok && ustd::write_all(&procs, alloc::format!("{}", p).as_bytes()).is_ok();
+                ok = ok && ustd::write_all("/sys/fs/cgroup/f1/cgroup.freeze", b"1").is_ok();
+                ustd::sleep_ms(120);
+                let st = ustd::read_all(&alloc::format!("/proc/{}/status", p))
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                ok = ok && st.contains("stopped");
+                ok = ok && ustd::write_all("/sys/fs/cgroup/f1/cgroup.freeze", b"0").is_ok();
+                ustd::sleep_ms(120);
+                let st = ustd::read_all(&alloc::format!("/proc/{}/status", p))
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                ok = ok && !st.contains("stopped");
+                ok = ok && ustd::write_all("/sys/fs/cgroup/f1/cgroup.kill", b"1").is_ok();
+                let code = ustd::waitpid(p as u32, 6000).unwrap_or(-1);
+                ok = ok && code == 128 + 9;
+            }
+            _ => ok = false,
+        }
+        let _ = ustd::remove("/sys/fs/cgroup/f1");
+        ok
+    });
+    check("cgroup-io", {
+        // io.max paces real block I/O: a member writing 256KiB at
+        // wbps=64KiB must spend multiple 1s windows on the write path.
+        let mut ok = true;
+        ok = ok && ustd::mkdir("/sys/fs/cgroup/i1").is_ok();
+        ok = ok && ustd::write_all(
+            "/sys/fs/cgroup/i1/io.max",
+            b"8:0 wbps=65536",
+        ).is_ok();
+        match ustd::fork() {
+            0 => {
+                let buf = alloc::vec![0x77u8; 65536];
+                for _ in 0..4 {
+                    let _ = ustd::write_all("/iotest.bin", &buf);
+                }
+                ustd::exit(0);
+            }
+            p if p > 0 => {
+                ok = ok && ustd::write_all(
+                    "/sys/fs/cgroup/i1/cgroup.procs",
+                    alloc::format!("{}", p).as_bytes(),
+                ).is_ok();
+                let t0 = ustd::uptime_ms();
+                let _ = ustd::waitpid(p as u32, 30_000);
+                let dt = ustd::uptime_ms().saturating_sub(t0);
+                // 256KiB at 64KiB/s -> >= 2 throttled windows
+                ok = ok && dt >= 1500;
+                let st = ustd::read_all("/sys/fs/cgroup/i1/io.stat")
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                // the group really charged the bytes it wrote
+                ok = ok && st.contains("wbytes=") && !st.contains("wbytes=0");
+            }
+            _ => ok = false,
+        }
+        let _ = ustd::remove("/sys/fs/cgroup/i1");
+        let _ = ustd::remove("/iotest.bin");
+        ok
+    });
     check("pid-ns", {
         // unshare(CLONE_NEWPID) + fork: the child is init of a fresh
         // pid space (getpid()==1, invisible parent), its own child is 2.
