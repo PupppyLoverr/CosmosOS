@@ -14,6 +14,10 @@ struct Spair {
     b2a: VecDeque<u8>, // side 1 -> side 0
     open_a: bool,
     open_b: bool,
+    wr_a: bool, // side 0 shutdown(SHUT_WR): its writes stopped
+    wr_b: bool,
+    rd_a: bool, // side 0 shutdown(SHUT_RD): its reads return EOF
+    rd_b: bool,
 }
 
 static SP: Mutex<BTreeMap<u64, Spair>> = Mutex::new(BTreeMap::new());
@@ -40,6 +44,10 @@ pub fn create() -> Option<(String, String)> {
             b2a: VecDeque::new(),
             open_a: true,
             open_b: true,
+            wr_a: false,
+            wr_b: false,
+            rd_a: false,
+            rd_b: false,
         },
     );
     Some((
@@ -57,11 +65,17 @@ pub fn ready(path: &str, for_read: bool) -> bool {
     let g = SP.lock();
     let Some(s) = g.get(&id) else { return false };
     let peer_open = if side == 0 { s.open_b } else { s.open_a };
+    let peer_wr = if side == 0 { s.wr_b } else { s.wr_a };
+    let my_rd = if side == 0 { s.rd_a } else { s.rd_b };
+    let my_wr = if side == 0 { s.wr_a } else { s.wr_b };
     if for_read {
+        if my_rd {
+            return true; // shutdown(RD) -> reads see EOF
+        }
         let inbox = if side == 0 { &s.b2a } else { &s.a2b };
-        !inbox.is_empty() || !peer_open
+        !inbox.is_empty() || !peer_open || peer_wr
     } else {
-        peer_open
+        peer_open && !my_wr
     }
 }
 
@@ -74,10 +88,15 @@ pub fn try_read(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
     let Some(s) = g.get_mut(&id) else {
         return Err(-2);
     };
+    let my_rd = if side == 0 { s.rd_a } else { s.rd_b };
+    if my_rd {
+        return Ok(0);
+    }
     let inbox = if side == 0 { &mut s.b2a } else { &mut s.a2b };
     if inbox.is_empty() {
         let peer_open = if side == 0 { s.open_b } else { s.open_a };
-        return if peer_open { Err(-11) } else { Ok(0) };
+        let peer_wr = if side == 0 { s.wr_b } else { s.wr_a };
+        return if peer_open && !peer_wr { Err(-11) } else { Ok(0) };
     }
     let n = inbox.len().min(buf.len());
     for b in buf.iter_mut().take(n) {
@@ -96,7 +115,8 @@ pub fn try_write(path: &str, buf: &[u8]) -> Result<usize, i64> {
         return Err(-2);
     };
     let peer_open = if side == 0 { s.open_b } else { s.open_a };
-    if !peer_open {
+    let my_wr = if side == 0 { s.wr_a } else { s.wr_b };
+    if !peer_open || my_wr {
         return Err(-32);
     }
     let out = if side == 0 { &mut s.a2b } else { &mut s.b2a };
@@ -110,6 +130,33 @@ pub fn try_write(path: &str, buf: &[u8]) -> Result<usize, i64> {
         out.push_back(*b);
     }
     Ok(n)
+}
+
+/// shutdown(2) on a pair side: how=0 stops our reads (peer sees nothing),
+/// how=1 stops our writes (peer reads EOF after draining), how=2 both.
+/// Returns -1 when the object or side is already gone.
+pub fn shutdown(path: &str, how: u64) -> i64 {
+    let Some((id, side)) = parse(path) else { return -1 };
+    let mut g = SP.lock();
+    let Some(s) = g.get_mut(&id) else { return -1 };
+    let rd = how == 0 || how == 2;
+    let wr = how == 1 || how == 2;
+    if side == 0 {
+        if rd {
+            s.rd_a = true;
+        }
+        if wr {
+            s.wr_a = true;
+        }
+    } else {
+        if rd {
+            s.rd_b = true;
+        }
+        if wr {
+            s.wr_b = true;
+        }
+    }
+    0
 }
 
 /// One side's fd closed: mark it so the peer sees EOF/EPIPE. The object is

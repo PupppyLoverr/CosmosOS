@@ -1281,13 +1281,68 @@ pub const SOCK_DGRAM: u64 = shared::SOCK_DGRAM;
 /// socket(type) -> real fd bound to a kernel socket object (/socket/{id}).
 /// The fd works with read/write/poll/epoll/close like any other.
 pub fn socket(stream_type: u64) -> i64 {
-    sc1(shared::SYS_SOCKET, stream_type) as i64
+    sc2(shared::SYS_SOCKET, stream_type, shared::AF_INET) as i64
+}
+/// socket(type, domain): AF_INET (2) or AF_UNIX (1).
+pub fn socketx(stream_type: u64, domain: u64) -> i64 {
+    sc2(shared::SYS_SOCKET, stream_type, domain) as i64
 }
 pub fn bind(fd: i64, lport: u16) -> i64 {
     sc2(shared::SYS_BIND, fd as u64, lport as u64) as i64
 }
+/// Bind an AF_UNIX socket to a filesystem-style name ("/x.sock").
+pub fn bind_path(fd: i64, name: &str) -> i64 {
+    sc3(
+        shared::SYS_BIND,
+        fd as u64,
+        name.as_ptr() as u64,
+        name.len() as u64,
+    ) as i64
+}
 pub fn connect(fd: i64, ip: [u8; 4], port: u16) -> i64 {
     sc3(shared::SYS_CONNECT, fd as u64, u32::from_be_bytes(ip) as u64, port as u64) as i64
+}
+/// Connect an AF_UNIX socket to a bound+listening name.
+pub fn connect_path(fd: i64, name: &str) -> i64 {
+    sc3(
+        shared::SYS_CONNECT,
+        fd as u64,
+        name.as_ptr() as u64,
+        name.len() as u64,
+    ) as i64
+}
+/// shutdown(fd, how): 0=read side (EOF), 1=write side (FIN to the peer),
+/// 2=both. Real half-close — the peer sees EOF after its buffer drains.
+pub fn shutdown(fd: i64, how: u64) -> i64 {
+    sc2(shared::SYS_SHUTDOWN, fd as u64, how) as i64
+}
+/// getsockname -> raw sockaddr-lite: [fam u16le][inet: ip4|port2be] or
+/// [unix: name bytes + NUL]. Returns bytes written.
+pub fn getsockname(fd: i64, out: &mut [u8]) -> Result<usize, i64> {
+    let r = sc3(
+        shared::SYS_GETSOCKNAME,
+        fd as u64,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+    ) as i64;
+    if r < 0 {
+        Err(r)
+    } else {
+        Ok(r as usize)
+    }
+}
+pub fn getpeername(fd: i64, out: &mut [u8]) -> Result<usize, i64> {
+    let r = sc3(
+        shared::SYS_GETPEERNAME,
+        fd as u64,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+    ) as i64;
+    if r < 0 {
+        Err(r)
+    } else {
+        Ok(r as usize)
+    }
 }
 pub fn listen(fd: i64, backlog: u64) -> i64 {
     sc2(shared::SYS_LISTEN, fd as u64, backlog) as i64
@@ -1413,6 +1468,58 @@ impl UdpFd {
     }
 }
 impl Drop for UdpFd {
+    fn drop(&mut self) {
+        close(self.0);
+    }
+}
+
+/// fd-based AF_UNIX stream socket — bind_path+listen+accept or connect_path,
+/// then plain read/write/poll like any fd.
+pub struct UnixFd(pub i64);
+impl UnixFd {
+    pub fn new() -> Result<Self, i64> {
+        let fd = socketx(SOCK_STREAM, shared::AF_UNIX);
+        if fd < 0 {
+            Err(fd)
+        } else {
+            Ok(Self(fd))
+        }
+    }
+    pub fn listen(path: &str) -> Result<Self, i64> {
+        let fd = socketx(SOCK_STREAM, shared::AF_UNIX);
+        if fd < 0 {
+            return Err(fd);
+        }
+        if bind_path(fd, path) != 0 || listen(fd, 4) != 0 {
+            close(fd);
+            return Err(-1);
+        }
+        Ok(Self(fd))
+    }
+    pub fn connect(path: &str) -> Result<Self, i64> {
+        let fd = socketx(SOCK_STREAM, shared::AF_UNIX);
+        if fd < 0 {
+            return Err(fd);
+        }
+        match connect_path(fd, path) {
+            0 => Ok(Self(fd)),
+            e => {
+                close(fd);
+                Err(e)
+            }
+        }
+    }
+    pub fn accept(&self) -> Result<Self, i64> {
+        accept(self.0).map(|(fd, _, _)| Self(fd))
+    }
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, i64> {
+        read(self.0, buf)
+    }
+    pub fn write(&self, data: &[u8]) -> Result<usize, i64> {
+        write(self.0, data)
+    }
+}
+impl Drop for UnixFd {
     fn drop(&mut self) {
         close(self.0);
     }

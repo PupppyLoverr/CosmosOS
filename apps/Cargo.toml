@@ -1,5 +1,5 @@
 [workspace]
-members = ["ustd", "init", "winserver", "terminal", "files", "settings", "editor", "sysmon", "demo", "calc", "paint", "view", "selftest", "selftest-child"]
+members = ["ustd", "init", "winserver", "terminal", "files", "settings", "editor", "sysmon", "demo", "calc", "paint", "view", "selftest", "selftest-child", "ucat"]
 resolver = "2"
 
 [profile.release]

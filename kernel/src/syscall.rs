@@ -727,40 +727,61 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_READV => sys_iov(ctx, a1, a2, a3, true),
         shared::SYS_WRITEV => sys_iov(ctx, a1, a2, a3, false),
         shared::SYS_SOCKET => {
-            // (SOCK_STREAM|SOCK_DGRAM) -> fd
+            // (SOCK_STREAM|SOCK_DGRAM, domain=AF_INET|AF_UNIX) -> fd
             if a1 != shared::SOCK_STREAM && a1 != shared::SOCK_DGRAM {
                 ctx.rax = ERR;
                 return;
             }
-            let path = crate::sockfd::create(a1 == shared::SOCK_STREAM);
-            task::with_current(|t| {
-                let s = alloc_slot(t);
-                t.fds[s] = Some(task::FileDesc { path, pos: 0, flags: shared::O_RDWR });
-                s as u64
-            })
+            match crate::sockfd::create(a1 == shared::SOCK_STREAM, a2) {
+                Err(e) => {
+                    ctx.rax = e as u64;
+                    return;
+                }
+                Ok(path) => task::with_current(|t| {
+                    let s = alloc_slot(t);
+                    t.fds[s] = Some(task::FileDesc { path, pos: 0, flags: shared::O_RDWR });
+                    s as u64
+                }),
+            }
         }
         shared::SYS_BIND => {
+            // (fd, port|name_ptr, name_len) — unix sockets take a path
             let id = task::with_current(|t| match t.fds.get(a1 as usize) {
                 Some(Some(f)) => crate::sockfd::parse(&f.path),
                 _ => None,
             });
-            match id {
-                Some(id) => crate::sockfd::bind(id, a2 as u16) as u64,
-                None => ERR,
+            let Some(id) = id else {
+                ctx.rax = ERR;
+                return;
+            };
+            if crate::sockfd::is_unix(id) {
+                let Some(name) = copy_in(a2, a3.min(108)) else {
+                    ctx.rax = ERR;
+                    return;
+                };
+                crate::sockfd::bind(id, 0, &name) as u64
+            } else {
+                crate::sockfd::bind(id, a2 as u16, &[]) as u64
             }
         }
         shared::SYS_CONNECT => {
+            // (fd, ip|name_ptr, port|name_len)
             let id = task::with_current(|t| match t.fds.get(a1 as usize) {
                 Some(Some(f)) => crate::sockfd::parse(&f.path),
                 _ => None,
             });
-            match id {
-                Some(id) => crate::sockfd::connect(
-                    id,
-                    (a2 as u32).to_be_bytes(),
-                    a3 as u16,
-                ) as u64,
-                None => ERR,
+            let Some(id) = id else {
+                ctx.rax = ERR;
+                return;
+            };
+            if crate::sockfd::is_unix(id) {
+                let Some(name) = copy_in(a2, a3.min(108)) else {
+                    ctx.rax = ERR;
+                    return;
+                };
+                crate::sockfd::connect(id, 0, 0, &name) as u64
+            } else {
+                crate::sockfd::connect(id, a2 as u32, a3 as u16, &[]) as u64
             }
         }
         shared::SYS_LISTEN => {
@@ -769,7 +790,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 _ => None,
             });
             match id {
-                Some(id) => crate::sockfd::listen(id) as u64,
+                Some(id) => crate::sockfd::listen(id, a2 as usize) as u64,
                 None => ERR,
             }
         }
@@ -859,6 +880,73 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 }
             }
             return;
+        }
+        shared::SYS_SHUTDOWN => {
+            // (fd, how) -> 0 — half-close: rd->EOF, wr->FIN/EPIPE + peer EOF
+            let path = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => f.path.clone(),
+                _ => String::new(),
+            });
+            if let Some(id) = crate::sockfd::parse(&path) {
+                crate::sockfd::shutdown(id, a2) as u64
+            } else if crate::sockpair::handles(&path) {
+                crate::sockpair::shutdown(&path, a2) as u64
+            } else {
+                (-88i64) as u64 // ENOTSOCK
+            }
+        }
+        shared::SYS_GETSOCKNAME | shared::SYS_GETPEERNAME => {
+            // (fd, out, cap) -> n written: [fam u16le][inet: ip4|port2be]
+            // [unix: name bytes + NUL]. non-sockets -> -88 ENOTSOCK.
+            let path = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => f.path.clone(),
+                _ => String::new(),
+            });
+            let named = |fam: u16, ip: [u8; 4], port: u16, name: Option<String>| -> u64 {
+                let mut b: Vec<u8> = Vec::new();
+                b.extend_from_slice(&fam.to_le_bytes());
+                match fam {
+                    2 => {
+                        b.extend_from_slice(&ip);
+                        b.extend_from_slice(&port.to_be_bytes());
+                    }
+                    1 => {
+                        if let Some(n) = name {
+                            b.extend_from_slice(n.as_bytes());
+                        }
+                        b.push(0);
+                    }
+                    _ => {}
+                }
+                let n = b.len().min(a3 as usize);
+                match copy_out(a2, &b[..n]) {
+                    Some(_) => n as u64,
+                    None => ERR,
+                }
+            };
+            let getpeer = nr == shared::SYS_GETPEERNAME;
+            let r: Result<u64, i64> = if let Some(id) = crate::sockfd::parse(&path) {
+                let g = if getpeer {
+                    crate::sockfd::peername(id)
+                } else {
+                    crate::sockfd::sockname(id).ok_or(-9i64)
+                };
+                g.map(|(d, ip, port, name)| {
+                    let fam: u16 = match d {
+                        crate::sockfd::Dom::Inet => 2,
+                        crate::sockfd::Dom::Unix => 1,
+                    };
+                    named(fam, ip, port, name)
+                })
+            } else if crate::sockpair::handles(&path) {
+                Ok(named(1, [0; 4], 0, None))
+            } else {
+                Err(-88)
+            };
+            match r {
+                Ok(v) => v,
+                Err(e) => e as u64,
+            }
         }
         shared::SYS_ARP => {
             let s = net::arp_stat();

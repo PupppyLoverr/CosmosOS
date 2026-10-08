@@ -972,6 +972,7 @@ pub struct TcpSock {
     state: TcpState,
     q: VecDeque<Vec<u8>>, // in-order payload chunks
     owner: u32,           // task id that opened/accepted it (0 = kernel side)
+    wr_off: bool,         // shutdown(SHUT_WR): FIN sent, no more sends
 }
 
 static TCP_SOCKS: Mutex<BTreeMap<u16, TcpSock>> = Mutex::new(BTreeMap::new());
@@ -1062,6 +1063,7 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
             q: VecDeque::new(),
             cid: lport,
             owner: crate::task::with_current(|t| t.id),
+            wr_off: false,
         },
     );
     let deadline = now_ms() + timeout_ms;
@@ -1139,6 +1141,7 @@ fn accept_syn(s: &TcpSeg, src_ip: [u8; 4]) {
             state: TcpState::SynRecv,
             q: VecDeque::new(),
             owner: 0,
+            wr_off: false,
         },
     );
     send_tcp(mac, src_ip, s.dport, s.sport, isn, s.seq + 1, TCP_SYN | TCP_ACK, &[]);
@@ -1317,6 +1320,20 @@ pub fn tcp_send_nowait(cid: u16, data: &[u8]) -> Result<usize, i64> {
         k.snd_nxt = seq.wrapping_add(n as u32);
     }
     Ok(n)
+}
+
+/// Real FIN on the wire without dropping the socket — shutdown(SHUT_WR).
+/// The peer sees EOF once it drains what we already sent; our reads keep
+/// working until close. Idempotent (one FIN).
+pub fn tcp_shutdown_wr(cid: u16) {
+    let mut t = TCP_SOCKS.lock();
+    let Some(k) = t.get_mut(&cid) else { return };
+    if k.wr_off || k.state == TcpState::Closed {
+        return;
+    }
+    k.wr_off = true;
+    send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_FIN | TCP_ACK, &[]);
+    k.snd_nxt = k.snd_nxt.wrapping_add(1); // FIN consumes one sequence number
 }
 
 /// Nonblocking partial read: at most `cap` bytes of the front queued chunk;
