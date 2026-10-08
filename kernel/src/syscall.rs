@@ -5326,6 +5326,13 @@ fn sys_chdir(pptr: u64, plen: u64) -> u64 {
         task::with_current(|t| t.cwd = full);
         return 0;
     }
+    if let Some((_sz, is_dir, _m, _c, _a)) = crate::tmpfs::stat(&full) {
+        if !is_dir {
+            return ERR;
+        }
+        task::with_current(|t| t.cwd = full);
+        return 0;
+    }
     let mut g = vfs::FS.lock();
     let ok = match g.as_mut() {
         Some(fs) => fs.stat(&full).map(|e| e.is_dir).unwrap_or(false),

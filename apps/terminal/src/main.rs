@@ -9005,6 +9005,16 @@ impl Term {
                 owned_args = Some(v);
                 cmd = target;
             }
+            // dir = ls; vdir = ls -l (GNU aliases)
+            "dir" | "vdir" => {
+                let mut v = Vec::new();
+                if cmd == "vdir" {
+                    v.push(String::from("-l"));
+                }
+                v.extend(args.iter().map(|s| String::from(*s)));
+                owned_args = Some(v);
+                cmd = "ls";
+            }
             _ => {}
         }
         let args: Vec<&str> = match &owned_args {
@@ -9490,18 +9500,23 @@ impl Term {
             }
             "realpath" => {
                 // resolve . .. // against cwd; result must exist (GNU -e)
-                // unless -m (logical normalize, no existence check)
+                // unless -m (logical normalize, no existence check). -s /
+                // --no-symlinks: canonicalize the name but do not resolve
+                // symlinks (existence still required unless -m)
                 let mut logical = false;
+                let mut nosym = false;
                 let mut paths: Vec<&str> = Vec::new();
                 for a in &args {
                     if *a == "-m" {
                         logical = true;
+                    } else if *a == "-s" || *a == "--no-symlinks" {
+                        nosym = true;
                     } else {
                         paths.push(a);
                     }
                 }
                 if paths.is_empty() {
-                    self.fail("usage: realpath [-m] <path>...");
+                    self.fail("usage: realpath [-ms] <path>...");
                     return;
                 }
                 let cwd = ustd::getcwd();
@@ -9537,6 +9552,12 @@ impl Term {
                             self.emit(&norm);
                         } else {
                             self.fail(&alloc::format!("realpath: {}: escapes root", a));
+                        }
+                    } else if nosym {
+                        if logical || ustd::stat(&norm).is_ok() || norm == "/" {
+                            self.emit(&norm);
+                        } else {
+                            self.fail(&alloc::format!("realpath: {}: no such file", a));
                         }
                     } else if logical || ustd::stat(&resolved).is_ok() || resolved == "/" {
                         self.emit(if logical { &norm } else { &resolved });
@@ -10286,15 +10307,46 @@ impl Term {
                 }
             }
             "mkdir" => {
+                // mkdir [-p] [-v] [-m MODE] <dir>...: -m applies an octal
+                // mode to the final component (tmpfs honors modes)
                 let mkpath = args.first() == Some(&"-p");
                 let verb = args.iter().any(|a| a == &"-v");
+                let mut mode: Option<u32> = None;
+                let mut skip_next = false;
                 let dirs: Vec<&str> = args
                     .iter()
-                    .filter(|a| !a.starts_with('-') || *a == &"-")
+                    .filter(|a| {
+                        if skip_next {
+                            skip_next = false;
+                            return false;
+                        }
+                        if **a == "-m" || **a == "--mode" {
+                            skip_next = true;
+                            return false;
+                        }
+                        !a.starts_with('-') || *a == &"-"
+                    })
                     .copied()
                     .collect();
+                {
+                    let mut it = args.iter().peekable();
+                    while let Some(a) = it.next() {
+                        if *a == "-m" || *a == "--mode" {
+                            mode = it
+                                .next()
+                                .and_then(|v| u32::from_str_radix(v, 8).ok());
+                        } else if let Some(v) = a
+                            .strip_prefix("--mode=")
+                            .or_else(|| a.strip_prefix("-m"))
+                        {
+                            if !v.is_empty() {
+                                mode = u32::from_str_radix(v, 8).ok();
+                            }
+                        }
+                    }
+                }
                 if dirs.is_empty() {
-                    self.fail("usage: mkdir [-pv] <dir>...");
+                    self.fail("usage: mkdir [-pv] [-m MODE] <dir>...");
                     return;
                 }
                 for p in dirs {
@@ -10311,18 +10363,25 @@ impl Term {
                             acc.push_str(part);
                             let _ = ustd::mkdir(&acc);
                         }
+                        if let Some(m) = mode {
+                            let _ = ustd::chmod(p, m);
+                        }
                         if verb {
                             self.emit(&alloc::format!("mkdir: created '{}'", p));
                         }
                     } else {
                         match ustd::mkdir(p) {
-                            Ok(()) if verb => {
-                                self.emit(&alloc::format!("mkdir: created '{}'", p))
+                            Ok(()) => {
+                                if let Some(m) = mode {
+                                    let _ = ustd::chmod(p, m);
+                                }
+                                if verb {
+                                    self.emit(&alloc::format!("mkdir: created '{}'", p))
+                                }
                             }
                             Err(e) => {
                                 self.fail(&alloc::format!("mkdir: {}: err {}", p, e))
                             }
-                            _ => {}
                         }
                     }
                 }
@@ -10462,12 +10521,180 @@ impl Term {
                 }
             }
             "tty" => {
-                // the terminal window IS the tty; a piped line has none
+                // the terminal window IS the tty; a piped line has none.
+                // -s: silent — report only via exit status.
+                let silent = args.iter().any(|a| a.starts_with('-') && a.contains('s'));
                 if self.pipe_in.is_some() {
-                    self.emit("not a tty");
+                    if !silent {
+                        self.emit("not a tty");
+                    }
                     self.last_ok = false;
-                } else {
+                } else if !silent {
                     self.emit("/dev/console");
+                }
+            }
+            "colrm" => {
+                // colrm <start> [end]: remove 1-based columns start..=end
+                // (start alone = through end of line) from each input line;
+                // reads stdin/pipe input like GNU colrm
+                let pos: Vec<&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                let start: Option<usize> = pos.first().and_then(|v| v.parse().ok());
+                let end: Option<usize> = pos.get(1).and_then(|v| v.parse().ok());
+                match (start, self.pipe_in.take()) {
+                    (None, _) => self.fail("usage: colrm <start> [end]"),
+                    (Some(0), _) => self.fail("colrm: column must be >= 1"),
+                    (Some(st), Some(s)) => {
+                        let en = end.unwrap_or(usize::MAX);
+                        for l in s.split('\n') {
+                            let mut out = String::new();
+                            for (i, c) in l.chars().enumerate() {
+                                let col = i + 1;
+                                if col < st || col > en {
+                                    out.push(c);
+                                }
+                            }
+                            self.emit(&out);
+                        }
+                    }
+                    (Some(_), None) => {
+                        self.fail("usage: colrm <start> [end]  (reads stdin)")
+                    }
+                }
+            }
+            "mountpoint" => {
+                // mountpoint [-q] [-d] <path>: real mount-table membership
+                // check via /proc/mounts (field 2 = mount point)
+                let quiet = args.iter().any(|a| a.starts_with('-') && a.contains('q'));
+                let dev = args.iter().any(|a| a.starts_with('-') && a.contains('d'));
+                let pos: Vec<&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                match pos.first() {
+                    None => self.fail("usage: mountpoint [-q] [-d] <path>"),
+                    Some(p) => {
+                        // logical normalize: join cwd + fold . and ..
+                        let joined = if p.starts_with('/') {
+                            String::from(*p)
+                        } else {
+                            let cwd = ustd::getcwd();
+                            alloc::format!("{}{}{}", cwd, if cwd.ends_with('/') { "" } else { "/" }, p)
+                        };
+                        let mut parts: Vec<&str> = Vec::new();
+                        for seg in joined.split('/') {
+                            match seg {
+                                "" | "." => {}
+                                ".." => {
+                                    parts.pop();
+                                }
+                                s => parts.push(s),
+                            }
+                        }
+                        let norm = alloc::format!("/{}", parts.join("/"));
+                        let tbl = ustd::read_all("/proc/mounts")
+                            .map(|d| String::from_utf8_lossy(&d).into_owned())
+                            .unwrap_or_default();
+                        let mut hit: Option<String> = None;
+                        for l in tbl.lines() {
+                            let mut it = l.split_whitespace();
+                            if let (Some(d), Some(m)) = (it.next(), it.next()) {
+                                if m == norm {
+                                    hit = Some(String::from(d));
+                                    break;
+                                }
+                            }
+                        }
+                        match hit {
+                            Some(d) => {
+                                if !quiet {
+                                    if dev {
+                                        self.emit(&alloc::format!("{} is a mountpoint ({})", norm, d));
+                                    } else {
+                                        self.emit(&alloc::format!("{} is a mountpoint", norm));
+                                    }
+                                }
+                            }
+                            None => {
+                                if !quiet {
+                                    self.emit(&alloc::format!("{} is not a mountpoint", norm));
+                                }
+                                self.last_ok = false;
+                            }
+                        }
+                    }
+                }
+            }
+            "elfinfo" => {
+                // elfinfo <file>: real ELF header dump — e_ident, type,
+                // machine, entry, phdr/shdr counts
+                match args.first() {
+                    None => self.fail("usage: elfinfo <file>"),
+                    Some(p) => match ustd::read_all(p) {
+                        Err(e) => self.fail(&alloc::format!("elfinfo: {}: err {}", p, e)),
+                        Ok(d) => {
+                            if d.len() < 64 || &d[0..4] != b"\x7fELF" {
+                                self.fail(&alloc::format!("elfinfo: {}: not an ELF", p));
+                            } else {
+                                let ru16 = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]);
+                                let ru32 = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+                                let ru64 = |o: usize| {
+                                    let mut b = [0u8; 8];
+                                    b.copy_from_slice(&d[o..o + 8]);
+                                    u64::from_le_bytes(b)
+                                };
+                                let cls = if d[4] == 2 { "ELF64" } else { "ELF32" };
+                                let data = if d[5] == 2 { "big-endian" } else { "little-endian" };
+                                let ty = ru16(16);
+                                let ty_name = match ty {
+                                    0 => "NONE", 1 => "REL", 2 => "EXEC", 3 => "DYN", 4 => "CORE",
+                                    _ => "?",
+                                };
+                                let mach = ru16(18);
+                                let mach_name = match mach {
+                                    0x3e => "x86-64", 0x28 => "aarch64", 0xf3 => "riscv",
+                                    _ => "?",
+                                };
+                                self.emit(&alloc::format!("Class:      {}", cls));
+                                self.emit(&alloc::format!("Data:       {}", data));
+                                self.emit(&alloc::format!("Type:       {} ({})", ty_name, ty));
+                                self.emit(&alloc::format!("Machine:    {} ({})", mach_name, mach));
+                                self.emit(&alloc::format!("Version:    {}", ru32(20)));
+                                if d[4] == 2 {
+                                    self.emit(&alloc::format!("Entry:      0x{:x}", ru64(24)));
+                                    self.emit(&alloc::format!("Phdr off:   0x{:x} ({} x {}B)", ru64(32), ru16(56), ru16(54)));
+                                    self.emit(&alloc::format!("Shdr off:   0x{:x} ({} x {}B)", ru64(40), ru16(60), ru16(58)));
+                                    self.emit(&alloc::format!("Shstrndx:   {}", ru16(62)));
+                                } else {
+                                    self.emit(&alloc::format!("Entry:      0x{:x}", ru32(24)));
+                                    self.emit(&alloc::format!("Phdr num:   {}", ru16(44)));
+                                    self.emit(&alloc::format!("Shdr num:   {}", ru16(48)));
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+            "utmpdump" => {
+                // utmpdump: raw dump of the /utmp spawn log (pid exe epoch)
+                match ustd::read_all("/utmp") {
+                    Ok(d) => {
+                        let s = String::from_utf8_lossy(&d).into_owned();
+                        let n = s.lines().count();
+                        self.emit(&alloc::format!("utmp: {} record(s)", n));
+                        for l in s.lines() {
+                            let mut it = l.split_whitespace();
+                            if let (Some(p), Some(x), Some(t)) =
+                                (it.next(), it.next(), it.next())
+                            {
+                                let (y, mo, dd, h, mi, se) =
+                                    epoch_to_dt(t.parse().unwrap_or(0));
+                                self.emit(&alloc::format!(
+                                    "UTMP pid={:<6} exe={:<24} login={:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                                    p, x, y, mo, dd, h, mi, se
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => self.fail(&alloc::format!("utmpdump: err {}", e)),
                 }
             }
             "ln" => {
@@ -11070,6 +11297,30 @@ impl Term {
                         "nohup: {} spawned (pid {})", args[0], p
                     )),
                     _ => self.fail("nohup: fork failed"),
+                }
+            }
+            "setsid" => {
+                // setsid CMD...: fork, setsid() in the child (new session,
+                // drops the controlling terminal), exec — real via SYS_SETSID
+                if args.is_empty() {
+                    self.fail("usage: setsid <cmd> [args...]");
+                    return;
+                }
+                let path = alloc::format!("/bin/{}", args[0]);
+                if ustd::stat(&path).is_err() {
+                    self.fail(&alloc::format!("setsid: {}: not a binary", args[0]));
+                    return;
+                }
+                match ustd::fork() {
+                    0 => {
+                        let _ = ustd::setsid();
+                        ustd::execve(&path, &args[1..].join(" "));
+                        ustd::exit(127);
+                    }
+                    p if p > 0 => self.emit(&alloc::format!(
+                        "setsid: {} spawned (pid {})", args[0], p
+                    )),
+                    _ => self.fail("setsid: fork failed"),
                 }
             }
             "install" => {
@@ -13629,6 +13880,10 @@ impl Term {
                                 flags |= 0x1000;
                                 pos += 1;
                             }
+                            "--move" => {
+                                flags |= 0x2000;
+                                pos += 1;
+                            }
                             _ => break,
                         }
                     }
@@ -13842,10 +14097,17 @@ impl Term {
                         }
                     }
                 }
+                let rec = args.iter().any(|a| a == &"-R" || a == &"--recursive");
                 for f in &pos[1..] {
                     let e = ustd::chown(f, uid, gid);
                     if e != 0 {
                         self.fail(&alloc::format!("{}: {}: err {}", cmd, f, e));
+                    }
+                    if rec && ustd::stat(f).map(|s| s.is_dir != 0).unwrap_or(false) {
+                        let all = self.find_collect(f, "*", None, usize::MAX, None, false);
+                        for p in all {
+                            let _ = ustd::chown(p.trim_end_matches('/'), uid, gid);
+                        }
                     }
                 }
             }
@@ -14994,10 +15256,21 @@ impl Term {
                 // df [-h] [-T]: -h human sizes, -T adds the fs type column
                 let human = args.iter().any(|a| *a == "-h");
                 let typ = args.iter().any(|a| *a == "-T" || *a == "--print-type");
+                let posix = args.iter().any(|a| *a == "-P" || *a == "--portability");
                 match ustd::df() {
                     Some((total, free)) => {
                         let used = total - free;
                         let pct = if total > 0 { used * 100 / total } else { 0 };
+                        if posix {
+                            // POSIX format: 1024-block units, mount col
+                            self.emit("Filesystem     1024-blocks      Used   Available Capacity Mounted on");
+                            self.emit(&alloc::format!(
+                                "{:<13} {:>10} {:>10} {:>10} {:>7} {}",
+                                "/dev/vda", total / 1024, used / 1024,
+                                free / 1024, alloc::format!("{}%", pct), "/"
+                            ));
+                            return;
+                        }
                         if typ {
                             self.emit("Filesystem     Type   Size      Used      Avail   Use%");
                         } else {
@@ -19015,6 +19288,7 @@ impl Term {
             "stat" => {
                 // stat [-c FMT] path... — FMT: %n name %s size %F type
                 // %a attr-octal %y mtime-iso %% literal
+                let terse = args.iter().any(|a| *a == "-t" || *a == "--terse");
                 let ci = args.iter().position(|a| *a == "-c");
                 let fmt = ci.and_then(|i| args.get(i + 1)).copied();
                 let pos: Vec<&&str> = args
@@ -19033,6 +19307,20 @@ impl Term {
                     match ustd::stat(p) {
                         Ok(st) => {
                             let (y, mo, d, h, mi, se) = epoch_to_dt(st.mtime);
+                            if terse {
+                                // stat -t: single-line terse dump via statx
+                                match ustd::statx(p) {
+                                    Ok(x) => self.emit(&alloc::format!(
+                                        "{} {} {} {} {} {} {} {} {} {}",
+                                        p, x.size, x.blocks, x.blksize, x.mode,
+                                        x.uid, x.gid, x.ino, x.mtime, x.ctime
+                                    )),
+                                    Err(e) => self.fail(&alloc::format!(
+                                        "stat: {}: statx err {}", p, e
+                                    )),
+                                }
+                                continue;
+                            }
                             if let Some(f) = fmt {
                                 let mut out = String::new();
                                 let mut it = f.chars().peekable();
@@ -22863,6 +23151,7 @@ impl Term {
             "lsmod", "merge", "diff3", "compress", "uncompress", "sdiff",
             "egrep", "fgrep",
         "rusage", "ts", "sync", "inotifywait", "inotifywatch",
+        "colrm", "mountpoint", "elfinfo", "utmpdump", "setsid", "dir", "vdir",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -22918,6 +23207,8 @@ impl Term {
                     "          cal <year>  cp -i/rm -i/mv -i  history -c/-d/-w  type -a",
                     "          vmstat -s  iostat [s [n]]  csplit <f> /pat/  getent hosts  host",
                     "          reboot shutdown exit",
+                    "          colrm <s> [e]  mountpoint <d>  elfinfo <elf>  utmpdump",
+                    "          setsid <cmd>  dir/vdir  mkdir -m  df -P  stat -t  chown -R",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];
 

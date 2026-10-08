@@ -688,6 +688,26 @@ pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
     Ok(())
 }
 
+/// Symlink body: "LNK>" + target when attr has 0x40 — same convention as FAT.
+pub fn readlink(path: &str) -> Option<String> {
+    let ng = NODES.lock();
+    let n = ng.get(path)?;
+    if n.is_dir || n.attr & 0x40 == 0 || n.size > 4096 || n.size < 4 {
+        return None;
+    }
+    let mut b = [0u8; 4096];
+    let got = read_pages(n, 0, &mut b);
+    if !b[..got].starts_with(b"LNK>") {
+        return None;
+    }
+    let t = String::from(String::from_utf8_lossy(&b[4..got]).trim());
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
 pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
     // attribute flips are owner/root only — same bar as chmod
     let (eu, _) = crate::task::cred();

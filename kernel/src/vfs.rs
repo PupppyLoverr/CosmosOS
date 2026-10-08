@@ -258,6 +258,20 @@ fn resolve_links(
     full: &mut String,
 ) -> Result<(), i64> {
     for _ in 0..8 {
+        // tmpfs symlinks: same LNK>-body convention, resolved per mount
+        if crate::tmpfs::handles(full) {
+            match crate::tmpfs::readlink(full) {
+                Some(tgt) => {
+                    let base = match full.rfind('/') {
+                        Some(i) => String::from(&full[..i + 1]),
+                        None => String::from("/"),
+                    };
+                    *full = normalize(&base, &tgt);
+                    continue;
+                }
+                None => return Ok(()),
+            }
+        }
         let st = match fs.stat(full) {
             Ok(s) => s,
             Err(_) => return Ok(()), // dangling: open/stat report ENOENT on the link itself
@@ -287,6 +301,9 @@ fn resolve_links(
 pub fn readlink(path: &str) -> Result<String, i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if crate::tmpfs::handles(&full) {
+        return crate::tmpfs::readlink(&full).ok_or(-22);
+    }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     let st = fs.stat(&full).map_err(err_to_i64)?;
