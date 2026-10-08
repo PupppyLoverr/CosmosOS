@@ -1155,6 +1155,27 @@ fn cal_render(m: u8, y: u16) -> Vec<String> {
     out
 }
 
+/// cal -j: same grid but cells are day-of-year (real Julian-date cal).
+fn cal_render_j(m: u8, y: u16) -> Vec<String> {
+    let mut out = Vec::new();
+    let title = alloc::format!("{} {}", MONTHS[(m - 1) as usize], y);
+    let pad = (28usize.saturating_sub(title.len())) / 2;
+    out.push(alloc::format!("{}{}", " ".repeat(pad), title));
+    out.push(String::from(" Sun  Mon  Tue  Wed  Thu  Fri  Sat"));
+    let first_wd = ((cal_days(y, m, 1) + 4) % 7) as usize;
+    let dim = DIM_CAL[(m - 1) as usize] + if m == 2 && cal_leap(y) { 1 } else { 0 };
+    let doy1 = cal_days(y, m, 1) - cal_days(y, 1, 1); // 0-based doy of the 1st
+    let mut line = String::from("    ".repeat(first_wd));
+    for d in 0..dim {
+        line.push_str(&alloc::format!("{:>3} ", doy1 + d as u64 + 1));
+        if (first_wd + d as usize + 1) % 7 == 0 || d + 1 == dim {
+            out.push(String::from(line.trim_end()));
+            line.clear();
+        }
+    }
+    out
+}
+
 /// Integer expression evaluator: + - * / % ( ) unary-minus.
 /// No floats (userspace has no SSE state switching).
 fn expr_eval(s: &str) -> Result<i64, &'static str> {
@@ -8827,10 +8848,15 @@ impl Term {
                                     alloc::format!("  {}  ({} B)", name, e.size)
                                 };
                                 if classify {
+                                    // real ls -F: / for dirs, @ for links
+                                    // (* is executables — no exec bit here).
+                                    // dir rows already end in '/', don't
+                                    // double it.
                                     if is_link {
                                         line.push('@');
-                                    } else if e.is_dir != 0 {
-                                        line.push('*');
+                                    } else if e.is_dir != 0 && !line.ends_with('/')
+                                    {
+                                        line.push('/');
                                     }
                                 }
                                 self.emit(&line);
@@ -13407,22 +13433,31 @@ impl Term {
                 }
             },
             "cal" => {
-                // cal [month] [year] | cal <year> (arg > 12 = full year,
-                // three months per row like real cal -y)
+                // cal [-j] [month] [year] | cal <year> (arg > 12 = full year,
+                // three months per row like real cal -y; -j = Julian dates)
                 let now = ustd::datetime();
-                let a0 = args.first().and_then(|s| s.parse::<u32>().ok());
-                let a1 = args.get(1).and_then(|s| s.parse::<u32>().ok());
-                if a0.is_none() && args.first().is_some() {
+                let julian = args.iter().any(|a| a == &"-j");
+                let num: Vec<&str> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .copied()
+                    .collect();
+                let a0 = num.first().and_then(|s| s.parse::<u32>().ok());
+                let a1 = num.get(1).and_then(|s| s.parse::<u32>().ok());
+                if a0.is_none() && !num.is_empty() {
                     self.fail("cal: bad month/year");
                     return;
                 }
+                let render = |m: u8, y: u16| {
+                    if julian { cal_render_j(m, y) } else { cal_render(m, y) }
+                };
                 match (a0, a1) {
                     (Some(yr), None) if yr > 12 => {
                         let yr = yr as u16;
                         self.emit(&alloc::format!("{:^64}", alloc::format!("{}", yr)));
                         for row in (1u8..=12).collect::<Vec<u8>>().chunks(3) {
                             let blocks: Vec<Vec<String>> =
-                                row.iter().map(|m| cal_render(*m, yr)).collect();
+                                row.iter().map(|m| render(*m, yr)).collect();
                             let h = blocks.iter().map(|b| b.len()).max().unwrap_or(0);
                             for ln in 0..h {
                                 let mut line = String::new();
@@ -13445,7 +13480,7 @@ impl Term {
                         if !(1..=12).contains(&mo) {
                             self.fail("cal: month must be 1-12 (year view: cal <year>)");
                         } else {
-                            for l in cal_render(mo, yr) {
+                            for l in render(mo, yr) {
                                 self.emit(&l);
                             }
                         }
@@ -13522,6 +13557,43 @@ impl Term {
                                     "{}", cal_days(d.year, d.month, d.day) * 86400
                                         + d.hour as u64 * 3600 + d.minute as u64 * 60 + d.second as u64
                                 )),
+                                Some('j') => out.push_str(&alloc::format!(
+                                    "{:03}",
+                                    cal_days(d.year, d.month, d.day)
+                                        - cal_days(d.year, 1, 1) + 1
+                                )),
+                                Some('u') => out.push_str(&alloc::format!(
+                                    "{}", (dow + 6) % 7 + 1
+                                )),
+                                Some('w') => out.push_str(&alloc::format!("{}", dow)),
+                                Some('U') | Some('W') => {
+                                    // POSIX week-of-year: %U Sunday-based,
+                                    // %W Monday-based. (doy0 - wd + 13)/7
+                                    let doy0 = (cal_days(d.year, d.month, d.day)
+                                        - cal_days(d.year, 1, 1))
+                                        as i64;
+                                    let wd = {
+                                        // arm-specific: the conversion letter
+                                        // sits right before ch's cursor (count
+                                        // remaining bytes so multibyte fmt
+                                        // text can't skew the index)
+                                        let rest: usize = ch
+                                            .clone()
+                                            .map(|c| c.len_utf8())
+                                            .sum();
+                                        let conv =
+                                            f.as_bytes()[f.len() - rest - 1];
+                                        if conv == b'W' {
+                                            ((dow + 6) % 7) as i64 // Mon=0
+                                        } else {
+                                            dow as i64 // Sun=0
+                                        }
+                                    };
+                                    out.push_str(&alloc::format!(
+                                        "{:02}",
+                                        (doy0 - wd + 13) / 7
+                                    ));
+                                }
                                 Some('z') => out.push_str("+0000"),
                                 Some('Z') => out.push_str("UTC"),
                                 Some('%') => out.push('%'),
