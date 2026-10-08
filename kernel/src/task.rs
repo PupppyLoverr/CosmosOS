@@ -4185,6 +4185,32 @@ pub fn futex_wake(key: u64, n: u64) -> u64 {
     woke
 }
 
+/// `/proc/<pid>/limits`: Linux-format rlimit table (soft = hard here).
+pub fn pid_limits(pid: u32) -> Option<String> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    let t = s.tasks.iter().find(|t| t.id == pid)?;
+    let inf = |v: u64| -> String {
+        if v == u64::MAX {
+            alloc::string::String::from("unlimited")
+        } else {
+            alloc::format!("{}", v)
+        }
+    };
+    let row = |name: &str, cur: &str, unit: &str| -> String {
+        alloc::format!("{:<26}{:<21}{:<21}{}\n", name, cur, cur, unit)
+    };
+    let mut out = alloc::string::String::from(
+        "Limit                     Soft Limit           Hard Limit           Units\n",
+    );
+    out.push_str(&row("Max cpu time", &inf(t.rlim_cpu), "seconds"));
+    out.push_str(&row("Max stack size", &inf(t.rlim_stack), "bytes"));
+    out.push_str(&row("Max address space", &inf(t.rlim_as), "bytes"));
+    out.push_str(&row("Max processes", &inf(t.rlim_nproc), "processes"));
+    out.push_str(&row("Max open files", &inf(t.rlim_nofile), "files"));
+    Some(out)
+}
+
 /// `/proc/<pid>/wchan` — the kernel function the task sleeps in ("0" if running).
 pub fn pid_wchan(pid: u32) -> Option<String> {
     let g = SCHED.lock();

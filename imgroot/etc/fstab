@@ -1,0 +1,6 @@
+# /etc/fstab — static mount table. Fields:
+#   <source> <mountpoint> <type> <options> <dump> <pass>
+# init mounts /tmp itself at boot; `mount -a` applies everything here
+# that isn't marked noauto.
+tmpfs   /var/tmp        tmpfs   defaults        0 0
+# example opt-out: tmpfs /scratch tmpfs noauto  0 0
