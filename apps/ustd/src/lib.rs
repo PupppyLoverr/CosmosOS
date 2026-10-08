@@ -291,9 +291,30 @@ pub const SIG_IGN: u64 = 1;
 
 /// Register a userspace handler for `sig` (0=DFL 1=IGN else fn addr).
 /// Returns the previous disposition. SIGKILL/SIGSTOP can't be caught.
+pub const SA_RESTART: u64 = 1;
+pub const SA_ONSTACK: u64 = 2;
+pub const SA_NODEFER: u64 = 4;
+pub const SS_DISABLE: u64 = 2;
+
 pub fn sigaction(sig: u64, handler: u64) -> i64 {
-    sc2(shared::SYS_SIGACTION, sig, handler) as i64
+    sigaction_fl(sig, handler, 0)
 }
+
+/// sigaction with sa_flags: SA_RESTART restarts interrupted slow
+/// syscalls instead of EINTR; SA_ONSTACK runs the handler on the
+/// stack registered with sigaltstack; SA_NODEFER leaves the signal
+/// unmasked inside its own handler.
+pub fn sigaction_fl(sig: u64, handler: u64, flags: u64) -> i64 {
+    sc3(shared::SYS_SIGACTION, sig, handler, flags) as i64
+}
+
+/// Register an alternate signal stack (sa_flags=SA_ONSTACK handlers run
+/// on it). Pass SS_DISABLE as flags to unregister.
+pub fn sigaltstack(sp: u64, size: u64) -> i64 {
+    sc4(shared::SYS_SIGALTSTACK, sp, size, 0, 0) as i64
+}
+
+
 
 /// C-friendly alias — pass the function's address.
 pub fn signal(sig: u64, handler: extern "C" fn(u64)) -> i64 {
