@@ -4573,6 +4573,87 @@ fn sha224(data: &[u8]) -> [u8; 28] {
     out
 }
 
+/// BLAKE2s-256 (RFC 7693): 64-byte blocks, 10 rounds, u32 state.
+fn b2s256(data: &[u8]) -> [u8; 32] {
+    const IV: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    const SIGMA: [[u8; 16]; 10] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+        [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+        [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+        [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+        [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+        [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+        [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+        [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+        [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+    ];
+    fn rotr(v: u32, n: u32) -> u32 {
+        (v >> n) | (v << (32 - n))
+    }
+    fn g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u32, y: u32) {
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
+        v[d] = rotr(v[d] ^ v[a], 16);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = rotr(v[b] ^ v[c], 12);
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
+        v[d] = rotr(v[d] ^ v[a], 8);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = rotr(v[b] ^ v[c], 7);
+    }
+    // param block: digest_length=32, key=0, fanout=1, depth=1
+    let mut h = IV;
+    h[0] ^= 0x0101_0020;
+    let nblocks = if data.is_empty() {
+        1
+    } else {
+        (data.len() + 63) / 64
+    };
+    let mut t: u64 = 0;
+    for i in 0..nblocks {
+        let last = i == nblocks - 1;
+        let blk_start = i * 64;
+        let blk_len = (data.len() - blk_start).min(64);
+        let mut blk = [0u8; 64];
+        blk[..blk_len].copy_from_slice(&data[blk_start..blk_start + blk_len]);
+        t = t.wrapping_add(blk_len as u64);
+        let mut m = [0u32; 16];
+        for j in 0..16 {
+            m[j] = u32::from_le_bytes(blk[4 * j..4 * j + 4].try_into().unwrap());
+        }
+        let mut v = [0u32; 16];
+        v[..8].copy_from_slice(&h);
+        v[8..].copy_from_slice(&IV);
+        v[12] ^= t as u32;
+        v[13] ^= (t >> 32) as u32;
+        if last {
+            v[14] ^= 0xffff_ffff;
+        }
+        for r in 0..10 {
+            let s = &SIGMA[r];
+            g(&mut v, 0, 4, 8, 12, m[s[0] as usize], m[s[1] as usize]);
+            g(&mut v, 1, 5, 9, 13, m[s[2] as usize], m[s[3] as usize]);
+            g(&mut v, 2, 6, 10, 14, m[s[4] as usize], m[s[5] as usize]);
+            g(&mut v, 3, 7, 11, 15, m[s[6] as usize], m[s[7] as usize]);
+            g(&mut v, 0, 5, 10, 15, m[s[8] as usize], m[s[9] as usize]);
+            g(&mut v, 1, 6, 11, 12, m[s[10] as usize], m[s[11] as usize]);
+            g(&mut v, 2, 7, 8, 13, m[s[12] as usize], m[s[13] as usize]);
+            g(&mut v, 3, 4, 9, 14, m[s[14] as usize], m[s[15] as usize]);
+        }
+        for j in 0..8 {
+            h[j] ^= v[j] ^ v[j + 8];
+        }
+    }
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        out[4 * i..4 * i + 4].copy_from_slice(&h[i].to_le_bytes());
+    }
+    out
+}
+
 fn sha512_core(data: &[u8], mut h: [u64; 8]) -> [u64; 8] {
     const K: [u64; 80] = [
         0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f,
@@ -9071,9 +9152,10 @@ impl Term {
             "show", "tar", "md5sum", "uuencode", "uudecode", "grep", "find", "file",
             "sha1sum", "cksum", "comm", "zgrep", "zip", "unzip", "chmod", "touch",
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look",
+        "pwck", "grpck", "pathchk", "nslookup", "b2sum",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
             "egrep", "fgrep", "sdiff", "diff3", "merge", "compress",
-            "uncompress", "sum", "sha224sum", "namei", "ts", "pr", "numfmt",
+            "uncompress", "sum", "sha224sum", "namei", "ts", "pr", "numfmt", "b2sum",
         ];
         let glob_tok = |t: &str| {
             t.contains('*')
@@ -15762,6 +15844,101 @@ impl Term {
                     None => self.fail(&alloc::format!("{}: can't resolve '{}'", cmd, name)),
                 }
             }
+            "nslookup" => {
+                // nslookup <name>: BIND-flavored report over the real resolver
+                // (slirp DNS at 10.0.2.3 via ustd::net_dns)
+                let name = match args.iter().find(|a| !a.starts_with('-')) {
+                    Some(n) => *n,
+                    None => {
+                        self.fail("usage: nslookup <name>");
+                        return;
+                    }
+                };
+                self.emit("Server:\t\t10.0.2.3");
+                self.emit("Address:\t10.0.2.3#53");
+                match ustd::net_dns(name) {
+                    Some(ip) => {
+                        self.emit("");
+                        self.emit("Non-authoritative answer:");
+                        self.emit(&alloc::format!("Name:\t{}", name));
+                        self.emit(&alloc::format!(
+                            "Address: {}.{}.{}.{}",
+                            ip[0], ip[1], ip[2], ip[3]
+                        ));
+                    }
+                    None => {
+                        self.emit("");
+                        self.emit(&alloc::format!(
+                            "** server can't find {}: NXDOMAIN",
+                            name
+                        ));
+                        self.last_ok = false;
+                    }
+                }
+            }
+            "pathchk" => {
+                // pathchk [-p] [-P] path... — portability checks.
+                // default: each component <=255 bytes, path <=4096, non-empty.
+                // -p POSIX-portable: components <=14 bytes, only the portable
+                //   filename charset [A-Za-z0-9._-], path <=255.
+                // -P: additionally reject components starting with '-'.
+                // diagnostics per offending path; exit 1 on any finding.
+                let posix = args.iter().any(|a| a.contains('p'));
+                let dash = args.iter().any(|a| a.contains('P'));
+                let paths: Vec<&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                if paths.is_empty() {
+                    self.fail("usage: pathchk [-p] [-P] <path>...");
+                    return;
+                }
+                let (max_comp, max_path) = if posix { (14, 255) } else { (255, 4096) };
+                for p in paths {
+                    let mut msgs: Vec<String> = Vec::new();
+                    if p.is_empty() {
+                        msgs.push(alloc::format!(
+                            "pathchk: {}: empty file name", p
+                        ));
+                    }
+                    for comp in p.split('/') {
+                        if comp.len() > max_comp {
+                            msgs.push(alloc::format!(
+                                "pathchk: {}: component '{}' limit {} exceeded",
+                                p, comp, max_comp
+                            ));
+                            break;
+                        }
+                        if posix
+                            && comp.chars().any(|c| {
+                                !(c.is_ascii_alphanumeric()
+                                    || c == '.' || c == '_' || c == '-')
+                            })
+                        {
+                            msgs.push(alloc::format!(
+                                "pathchk: {}: nonportable character in component '{}'",
+                                p, comp
+                            ));
+                            break;
+                        }
+                        if dash && comp.starts_with('-') {
+                            msgs.push(alloc::format!(
+                                "pathchk: {}: leading '-' in a component",
+                                p
+                            ));
+                            break;
+                        }
+                    }
+                    if p.len() > max_path {
+                        msgs.push(alloc::format!(
+                            "pathchk: {}: limit {} exceeded",
+                            p, max_path
+                        ));
+                    }
+                    for m in msgs {
+                        self.emit(&m);
+                        self.last_ok = false;
+                    }
+                }
+            }
             "usleep" => match args.first().and_then(|a| a.parse::<u64>().ok()) {
                 Some(us) => ustd::sleep_ms(us.div_ceil(1000).max(1)),
                 None => self.fail("usage: usleep <microseconds>"),
@@ -17465,7 +17642,7 @@ impl Term {
                 }
             }
             "uniq" | "tr" | "cut" | "tee" | "base64" | "sha256sum" | "sha384sum"
-            | "sha512sum" | "mknod" | "tar" => {
+            | "sha512sum" | "b2sum" | "mknod" | "tar" => {
                 match cmd {
                     "mknod" => {
                         // mknod PATH p — create a fifo; c/b dev nodes are not
@@ -17496,6 +17673,15 @@ impl Term {
                         }
                     }
                     "sha512sum" | "sha384sum" => {
+                        if args.iter().any(|a| *a == "-c") {
+                            match args.iter().find(|a| !a.starts_with('-')) {
+                                Some(listf) => self.sum_check(cmd, listf),
+                                None => self.fail(&alloc::format!(
+                                    "usage: {} -c <listfile>", cmd
+                                )),
+                            }
+                            return;
+                        }
                         let dg512 = cmd == "sha512sum";
                         let mut any = false;
                         for a in args.iter() {
@@ -17541,6 +17727,13 @@ impl Term {
                         }
                     }
                     "sha256sum" => {
+                        if args.iter().any(|a| *a == "-c") {
+                            match args.iter().find(|a| !a.starts_with('-')) {
+                                Some(listf) => self.sum_check(cmd, listf),
+                                None => self.fail("usage: sha256sum -c <listfile>"),
+                            }
+                            return;
+                        }
                         let mut any = false;
                         for a in args.iter() {
                             match ustd::read_all(a) {
@@ -17569,6 +17762,44 @@ impl Term {
                                     self.emit(&alloc::format!("{}  -", hx));
                                 }
                                 None => self.fail("usage: sha256sum <file...>"),
+                            }
+                        }
+                    }
+                    "b2sum" => {
+                        // b2sum [file...]: real BLAKE2s-256 (RFC 7693).
+                        if args.iter().any(|a| *a == "-c") {
+                            match args.iter().find(|a| !a.starts_with('-')) {
+                                Some(listf) => self.sum_check(cmd, listf),
+                                None => self.fail("usage: b2sum -c <listfile>"),
+                            }
+                            return;
+                        }
+                        let mut any = false;
+                        for a in args.iter().filter(|a| !a.starts_with('-')) {
+                            match ustd::read_all(a) {
+                                Ok(d) => {
+                                    any = true;
+                                    let dg = b2s256(&d);
+                                    let mut hx = String::new();
+                                    for b in dg {
+                                        hx.push_str(&alloc::format!("{:02x}", b));
+                                    }
+                                    self.emit(&alloc::format!("{}  {}", hx, a));
+                                }
+                                Err(e) => self.fail(&alloc::format!("b2sum: {}: err {}", a, e)),
+                            }
+                        }
+                        if !any {
+                            match &self.pipe_in {
+                                Some(s) => {
+                                    let dg = b2s256(s.as_bytes());
+                                    let mut hx = String::new();
+                                    for b in dg {
+                                        hx.push_str(&alloc::format!("{:02x}", b));
+                                    }
+                                    self.emit(&alloc::format!("{}  -", hx));
+                                }
+                                None => self.fail("usage: b2sum <file...>"),
                             }
                         }
                     }
@@ -20383,40 +20614,14 @@ impl Term {
                 let dry = args.iter().any(|a| *a == "--dry-run" || *a == "-N" && false);
                 self.run_patch(&text, rev, dry);
             }
-            "md5sum" | "sha256sum" | "sha1sum" if args.iter().any(|a| *a == "-c") => {
-                // sum -c <listfile>: lines "hash  name" -> verify each
+            "md5sum" | "sha1sum" | "sha256sum" | "sha384sum" | "sha512sum" | "b2sum"
+                if args.iter().any(|a| *a == "-c") =>
+            {
+                // sum -c <listfile>: verify "hash  name" lines (shared method;
+                // sha-family commands in the pipe table short-circuit to the
+                // same code before their arg loops)
                 match args.iter().find(|a| !a.starts_with('-')) {
-                    Some(listf) => match ustd::read_all(listf) {
-                        Ok(d) => {
-                            let mut bad = 0;
-                            for l in String::from_utf8_lossy(&d).lines() {
-                                let l = l.trim();
-                                if l.is_empty() {
-                                    continue;
-                                }
-                                let mut it = l.splitn(2, "  ");
-                                let want = it.next().unwrap_or("");
-                                let name = it.next().unwrap_or("").trim_start_matches('*');
-                                let got = ustd::read_all(name).map(|data| {
-                                    match cmd {
-                                        "md5sum" => hexs(&ustd::md5(&data)),
-                                        "sha1sum" => hexs(&ustd::sha1(&data)),
-                                        _ => hexs(&sha256(&data)),
-                                    }
-                                }).unwrap_or_default();
-                                if got == want {
-                                    self.emit(&alloc::format!("{}: OK", name));
-                                } else {
-                                    self.emit(&alloc::format!("{}: FAILED", name));
-                                    bad += 1;
-                                }
-                            }
-                            if bad > 0 {
-                                self.fail(&alloc::format!("{}: {} failed", cmd, bad));
-                            }
-                        }
-                        Err(e) => self.fail(&alloc::format!("{}: {}: err {}", cmd, listf, e)),
-                    },
+                    Some(listf) => self.sum_check(cmd, listf),
                     None => self.fail(&alloc::format!("usage: {} -c <listfile>", cmd)),
                 }
             }
@@ -25389,7 +25594,7 @@ impl Term {
             "egrep", "fgrep",
         "rusage", "ts", "sync", "inotifywait", "inotifywatch",
         "colrm", "mountpoint", "elfinfo", "utmpdump", "setsid", "dir", "vdir",
-        "iconv", "ascii",
+        "iconv", "ascii", "b2sum", "pathchk", "nslookup", "pwck", "grpck",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -25454,9 +25659,50 @@ impl Term {
                     "          grep -z  find -print0  shuf -z  sed -z  cut -z",
                     "          sed -f FILE  awk -f FILE  sh -c CMD name args",
                     "          pwck [file]  grpck [file]  strings -n N -f",
+                    "          b2sum [-c] <file..>  pathchk -p/-P  nslookup <name>",
                     "          setsid <cmd>  dir/vdir  mkdir -m  df -P  stat -t  chown -R",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];
+
+    /// `<sum> -c <listfile>`: lines "hash  name" -> verify each, GNU
+    /// output + exit status. Shared by the dispatch arm and the pipe-table
+    /// commands (whose arg parsing would otherwise shadow -c).
+    fn sum_check(&mut self, cmd: &str, listf: &str) {
+        match ustd::read_all(listf) {
+            Ok(d) => {
+                let mut bad = 0;
+                for l in String::from_utf8_lossy(&d).lines() {
+                    let l = l.trim();
+                    if l.is_empty() {
+                        continue;
+                    }
+                    let mut it = l.splitn(2, "  ");
+                    let want = it.next().unwrap_or("");
+                    let name = it.next().unwrap_or("").trim_start_matches('*');
+                    let got = ustd::read_all(name)
+                        .map(|data| match cmd {
+                            "md5sum" => hexs(&ustd::md5(&data)),
+                            "sha1sum" => hexs(&ustd::sha1(&data)),
+                            "b2sum" => hexs(&b2s256(&data)),
+                            "sha384sum" => hexs(&sha384(&data)),
+                            "sha512sum" => hexs(&sha512(&data)),
+                            _ => hexs(&sha256(&data)),
+                        })
+                        .unwrap_or_default();
+                    if got == want {
+                        self.emit(&alloc::format!("{}: OK", name));
+                    } else {
+                        self.emit(&alloc::format!("{}: FAILED", name));
+                        bad += 1;
+                    }
+                }
+                if bad > 0 {
+                    self.fail(&alloc::format!("{}: {} failed", cmd, bad));
+                }
+            }
+            Err(e) => self.fail(&alloc::format!("{}: {}: err {}", cmd, listf, e)),
+        }
+    }
 
     /// Register a spawned process in the jobs table + set $!.
     fn track(&mut self, pid: u32, cmdline: &str) {
