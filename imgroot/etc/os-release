@@ -1,0 +1,6 @@
+NAME="CosmosOS"
+PRETTY_NAME="CosmosOS"
+ID=cosmos
+VERSION_ID=0.1
+VERSION_CODENAME=orbit
+HOME_URL="https://github.com/PupppyLoverr/CosmosOS"
