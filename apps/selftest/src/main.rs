@@ -1555,6 +1555,38 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let dead = ustd::read(r, &mut b).is_err() && ustd::write(f, b"x").is_err();
         rc == 0 && dead
     });
+    check("pty-open", {
+        let m = ustd::openpt();
+        let sp = if m >= 0 { ustd::ptsname(m) } else { None };
+        let s = sp.as_ref().map(|p| ustd::open(p, ustd::O_RDWR).unwrap_or(-1)).unwrap_or(-1);
+        let _ = ustd::close(m);
+        let _ = ustd::close(s);
+        m >= 0 && sp.is_some() && s >= 0
+    });
+    check("pty-io", {
+        let m = ustd::openpt();
+        let Some(sp) = (if m >= 0 { ustd::ptsname(m) } else { None }) else {
+            panic!("ptsname");
+        };
+        let s = ustd::open(&sp, ustd::O_RDWR).unwrap_or(-1);
+        let _ = ustd::write(m, b"hi\n");
+        let mut eb = [0u8; 16];
+        let en = ustd::read(m, &mut eb).unwrap_or(0);
+        let mut lb = [0u8; 16];
+        let ln = ustd::read(s, &mut lb).unwrap_or(0);
+        let mut ob = [0u8; 16];
+        let _ = ustd::write(s, b"out");
+        let on = ustd::read(m, &mut ob).unwrap_or(0);
+        let _ = ustd::tcsets(s, 0);
+        let _ = ustd::write(m, b"xy");
+        let mut rb = [0u8; 16];
+        let rn = ustd::read(s, &mut rb).unwrap_or(0);
+        let _ = ustd::close(m);
+        let eio = ustd::read(s, &mut rb) == Err(-5);
+        let _ = ustd::close(s);
+        en == 3 && &eb[..3] == b"hi\n" && ln == 3 && &lb[..3] == b"hi\n"
+            && on == 3 && &ob[..3] == b"out" && rn == 2 && &rb[..2] == b"xy" && eio
+    });
     check("pidfd-signal", {
         // pidfd probe + real signal delivery through the fd
         let Some((r, w)) = ustd::pipe() else { panic!("pipe") };
