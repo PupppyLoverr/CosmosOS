@@ -110,6 +110,7 @@ struct S {
     launcher: Launcher,
     workspace: u32,
     dirty: bool,
+    damage: Option<(i32, i32, i32, i32)>, // union of damaged rects (x,y,w,h)
     last_tick: u64,
     wall: Vec<u32>, // wallpaper cache (fh-TBAR_H rows)
 }
@@ -181,6 +182,7 @@ fn main_loop() -> ! {
         },
         workspace: 0,
         dirty: true,
+        damage: None,
         last_tick: 0,
     };
 
@@ -203,18 +205,24 @@ fn main_loop() -> ! {
             progressed = true;
             handle_req(&mut s, &buf[..n]);
         }
-        // per-second taskbar refresh — mark dirty and let the single
-        // composite path below do the drawing (composite() itself draws
-        // taskbar + cursor). Never clear dirty without compositing: a
-        // dropped composite leaves stale window pixels ("ghost" windows).
+        // per-second taskbar refresh — damage the taskbar strip; the single
+        // composite path below draws it (never clear dirty without
+        // compositing — a dropped composite leaves "ghost" windows).
         let up = ustd::uptime_ms();
         if up / 1000 != s.last_tick {
             s.last_tick = up / 1000;
-            s.dirty = true;
+            let (fh, fw) = (s.fh, s.fw);
+            dmg(&mut s, 0, fh - TBAR_H, fw, TBAR_H);
         }
         if s.dirty {
+            s.fb.reset_clip();
             composite(&mut s);
             s.dirty = false;
+            s.damage = None;
+        } else if let Some((dx, dy, dw, dh)) = s.damage.take() {
+            s.fb.set_clip(dx, dy, dw, dh);
+            composite(&mut s);
+            s.fb.reset_clip();
         }
         if !progressed {
             // wait for more input — the message that wakes us still counts
@@ -249,6 +257,23 @@ fn handle_input(s: &mut S, msg: &[u8]) -> bool {
         _ => return false,
     }
     true
+}
+
+/// Union a rect into the damage accumulator (cheaper than a full dirty).
+fn dmg(s: &mut S, x: i32, y: i32, w: i32, h: i32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    match s.damage {
+        Some((dx, dy, dw, dh)) => {
+            let x0 = x.min(dx);
+            let y0 = y.min(dy);
+            let x1 = (x + w).max(dx + dw);
+            let y1 = (y + h).max(dy + dh);
+            s.damage = Some((x0, y0, x1 - x0, y1 - y0));
+        }
+        None => s.damage = Some((x, y, w, h)),
+    }
 }
 
 fn spawn_app(path: &str) {
@@ -359,9 +384,10 @@ fn on_mouse(s: &mut S, m: &InputMouse) {
         return;
     }
 
-    // motion: cursor moved — cheap redraw
+    // motion: cursor moved — damage only the two 16px cursor cells
     if nx != px || ny != py {
-        s.dirty = true;
+        dmg(s, px, py, 16, 16);
+        dmg(s, nx, ny, 16, 16);
     }
     // forward motion to the window under the cursor (or focused)
     if let Some(i) = s.win_at(nx, ny) {
@@ -675,8 +701,9 @@ fn handle_req(s: &mut S, msg: &[u8]) {
                 return;
             }
             let r: ReqPresent = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
-            if s.win_idx(r.window_id).is_some() {
-                s.dirty = true; // simple: whole-frame redraw
+            if let Some(w) = s.wins.iter().find(|w| w.id == r.window_id) {
+                let (wx, wy, ww, wh) = (w.x, w.y, w.w, w.h);
+                dmg(s, wx, wy, ww, wh); // damage just this window's rect
             }
         }
         REQ_SET_TITLE => {
@@ -728,12 +755,19 @@ fn handle_req(s: &mut S, msg: &[u8]) {
 // ---- rendering ----------------------------------------------------------------
 fn composite(s: &mut S) {
     let fb = s.fb;
-    // wallpaper (cached)
-    let rows = (s.fh - TBAR_H).max(0) as usize;
-    for y in 0..rows.min(s.wall.len() / s.fw.max(1) as usize) {
-        let dst = unsafe { fb.ptr.add(y * fb.stride as usize) };
-        let src = unsafe { s.wall.as_ptr().add(y * s.fw as usize) };
-        unsafe { core::ptr::copy_nonoverlapping(src, dst, s.fw as usize) };
+    // wallpaper (cached), clipped to fb.clip
+    let (cx, cy, cw, ch) = fb.clip;
+    let rx0 = cx.max(0);
+    let ry0 = cy.max(0);
+    let rx1 = (cx + cw).min(s.fw);
+    let ry1 = (cy + ch).min(s.fh - TBAR_H);
+    let wall_rows = s.wall.len() / s.fw.max(1) as usize;
+    if rx1 > rx0 && ry1 > ry0 {
+        for y in (ry0 as usize)..wall_rows.min(ry1 as usize) {
+            let dst = unsafe { fb.ptr.add(y * fb.stride as usize + rx0 as usize) };
+            let src = unsafe { s.wall.as_ptr().add(y * s.fw as usize + rx0 as usize) };
+            unsafe { core::ptr::copy_nonoverlapping(src, dst, (rx1 - rx0) as usize) };
+        }
     }
     // windows bottom-to-top on this workspace
     for i in 0..s.wins.len() {
@@ -800,10 +834,11 @@ fn draw_window(s: &S, w: &Win) {
     let cy = w.client_y();
     let sw = w.cw;
     let sh = w.ch;
-    let x0 = cx.max(0);
-    let y0 = cy.max(0);
-    let x1 = (cx + sw).min(s.fw);
-    let y1 = (cy + sh).min(s.fh - TBAR_H);
+    let (clx, cly, clw, clh) = s.fb.clip;
+    let x0 = cx.max(0).max(clx);
+    let y0 = cy.max(0).max(cly);
+    let x1 = (cx + sw).min(s.fw).min(clx + clw);
+    let y1 = (cy + sh).min(s.fh - TBAR_H).min(cly + clh);
     if x1 <= x0 || y1 <= y0 {
         return;
     }
