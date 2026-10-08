@@ -734,3 +734,12 @@ pub fn df() -> (u64, u64) {
     let u = used_bytes(&ng);
     (QUOTA, QUOTA.saturating_sub(u))
 }
+
+/// (files, ffree) for statfs/df -i: every node (dirs included) is a real
+/// inode; free inodes are bound by the quota — one inode per minimal node.
+pub fn ifree() -> (u64, u64) {
+    let ng = NODES.lock();
+    let used = ng.len() as u64;
+    let free = QUOTA.saturating_sub(used_bytes(&ng)) / 64;
+    (used, free.max(used))
+}
