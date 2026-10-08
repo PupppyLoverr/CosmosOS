@@ -297,6 +297,33 @@ pub fn translate(pml4: PhysFrame, vaddr: u64) -> Option<u64> {
     Some(pt[i1].addr().as_u64() + (vaddr & 0xFFF))
 }
 
+/// Count present 4KiB leaf mappings in the user half (PML4[0] only — the
+/// shared kernel upper-half entries are not the task's own pages).
+pub fn count_mapped(pml4: PhysFrame) -> u64 {
+    let l4 = unsafe { &*(mem::phys_to_virt(pml4.start_address().as_u64()) as *const PageTable) };
+    let mut n = 0u64;
+    for i4 in 0..1usize {
+        if l4[i4].is_unused() {
+            continue;
+        }
+        let pdpt = unsafe { &*(mem::phys_to_virt(l4[i4].addr().as_u64()) as *const PageTable) };
+        for i3 in 0..512usize {
+            if pdpt[i3].is_unused() {
+                continue;
+            }
+            let pd = unsafe { &*(mem::phys_to_virt(pdpt[i3].addr().as_u64()) as *const PageTable) };
+            for i2 in 0..512usize {
+                if pd[i2].is_unused() {
+                    continue;
+                }
+                let pt = unsafe { &*(mem::phys_to_virt(pd[i2].addr().as_u64()) as *const PageTable) };
+                n += pt.iter().filter(|e| !e.is_unused()).count() as u64;
+            }
+        }
+    }
+    n
+}
+
 /// Unmap one user page in `pml4`; returns its physical frame address when it
 /// was mapped (the caller decides whether the frame is owned or borrowed).
 pub fn unmap_user_page(pml4: PhysFrame, vaddr: u64) -> Option<u64> {

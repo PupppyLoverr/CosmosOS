@@ -369,6 +369,42 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         ok
     });
     check("nice-bad-pid", ustd::set_nice(0xFFFF_FFFE, 0) == -1000);
+    check("stack-growdown", {
+        // deep recursion over big per-frame arrays forces the user stack to
+        // demand-grow pages below the single eager top page
+        #[inline(never)]
+        fn chew(depth: u32) -> u64 {
+            let mut frame = [0u8; 4096];
+            unsafe {
+                core::ptr::write_volatile(frame.as_mut_ptr(), (depth & 0xFF) as u8);
+            }
+            if depth == 0 {
+                frame[0] as u64
+            } else {
+                chew(depth - 1) + frame[0] as u64
+            }
+        }
+        // 40 frames x 4KiB+ each >> the one eagerly mapped stack page
+        chew(40) == (0..=40).sum::<u32>() as u64
+    });
+    check("proc-self-faults", {
+        // our own image demand-pages in (maj) and the stack chew above
+        // grew pages on fault (min) — counters must be real and nonzero
+        let pid = ustd::getpid();
+        ustd::read_all(&alloc::format!("/proc/{}/status", pid))
+            .map(|d| {
+                let s = String::from_utf8_lossy(&d);
+                let num = |k: &str| -> u64 {
+                    s.lines()
+                        .find(|l| l.starts_with(k))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0)
+                };
+                num("MinFlt:") > 0 && num("MajFlt:") > 0 && num("VmRSS:") > 0
+            })
+            .unwrap_or(false)
+    });
     check("vrun-charge", {
         // scheduler charges virtual runtime while we burn cpu:
         // stay Running for >=40ms so PIT ticks land between reads

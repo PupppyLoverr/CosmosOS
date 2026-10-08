@@ -16,6 +16,7 @@ pub static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
 
 pub const USER_STACK_TOP: u64 = 0x7F00_0000;
 pub const USER_STACK_PAGES: u64 = 64; // 256 KiB
+pub const USER_STACK_MIN: u64 = USER_STACK_TOP - USER_STACK_PAGES * 0x1000;
 pub const USER_MMAP_BASE: u64 = 0x2000_0000;
 pub const USER_ARG_PAGE: u64 = 0x7EFF_F000;
 
@@ -90,6 +91,8 @@ pub struct Task {
     pub exe: String,         // full path the task was spawned from (/proc/<pid>/exe)
     pub maps: Vec<MapEnt>,   // tracked user-space mappings
     pub filemaps: Vec<FileMap>, // file-backed regions for demand paging
+    pub min_flt: u64,       // minor faults: zero-fill/bss/stack demand pages
+    pub maj_flt: u64,       // major faults: pages read in from the image file
     pub rbytes: u64,         // bytes read via vfs (/proc/<pid>/io)
     pub wbytes: u64,         // bytes written via vfs
 }
@@ -142,6 +145,8 @@ pub fn init() {
         exe: String::from("kernel"),
         maps: Vec::new(),
         filemaps: Vec::new(),
+        min_flt: 0,
+        maj_flt: 0,
         rbytes: 0,
         wbytes: 0,
     };
@@ -393,17 +398,14 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         m.name = String::from(path);
     }
 
-    // user stack
-    let stack_frames = crate::elf::map_user_range(
-        pml4,
-        USER_STACK_TOP - USER_STACK_PAGES * 0x1000,
-        USER_STACK_PAGES * 0x1000,
-        &mut frames,
-    )
-    .ok_or(!0u64)?;
+    // user stack: only the top page is mapped eagerly; the region below
+    // demand-grows down to USER_STACK_MIN on first touch (#PF)
+    let stack_lo = USER_STACK_TOP - 0x1000;
+    let stack_frames = crate::elf::map_user_range(pml4, stack_lo, 0x1000, &mut frames)
+        .ok_or(!0u64)?;
     let _ = stack_frames;
     umaps.push(MapEnt {
-        start: USER_STACK_TOP - USER_STACK_PAGES * 0x1000,
+        start: stack_lo,
         end: USER_STACK_TOP,
         perm: 1 | 2,
         name: String::from("[stack]"),
@@ -479,6 +481,8 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         exe: String::from(path),
         maps: umaps,
         filemaps,
+        min_flt: 0,
+        maj_flt: 0,
         rbytes: 0,
         wbytes: 0,
     };
@@ -543,6 +547,8 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         exe: String::from("kernel-thread"),
         maps: Vec::new(),
         filemaps: Vec::new(),
+        min_flt: 0,
+        maj_flt: 0,
         rbytes: 0,
         wbytes: 0,
     }));
@@ -1077,6 +1083,15 @@ pub fn pid_maps(pid: u32) -> Option<String> {
 }
 
 /// `/proc/<pid>/io` — real vfs byte counters.
+/// (min_flt, maj_flt, resident user pages) for /proc/<pid>/status.
+pub fn pid_faults(pid: u32) -> Option<(u64, u64, u64)> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    let t = s.tasks.iter().find(|t| t.id == pid)?;
+    let rss = t.pml4.map(|p| crate::elf::count_mapped(p)).unwrap_or(0);
+    Some((t.min_flt, t.maj_flt, rss))
+}
+
 pub fn pid_io(pid: u32) -> Option<(u64, u64)> {
     let g = SCHED.lock();
     let s = g.as_ref()?;
@@ -1223,8 +1238,33 @@ pub fn filemap_hit(va: u64) -> Option<(String, u64)> {
 /// file (zero-padded past EOF) and maps it. true = the fault is
 /// satisfied and the instruction may retry.
 pub fn demand_page(va: u64) -> bool {
+    let page = va & !0xFFFu64;
+    // demand-grown user stack: any unmapped page inside the stack region
+    // maps a fresh zero page (the eager top page is seeded at spawn; the
+    // region bound itself is the guard — a fault below USER_STACK_MIN is
+    // a genuine overflow and falls through to kill the task)
+    if page >= USER_STACK_MIN && page < USER_STACK_TOP {
+        let Some(pml4) = with_current(|t| t.pml4) else {
+            return false;
+        };
+        let mut scratch = Vec::new();
+        let Some(phys) = crate::elf::map_user_page_flags(pml4, page, true, false, &mut scratch)
+        else {
+            return false;
+        };
+        if scratch.is_empty() {
+            return false; // already mapped — real protection fault
+        }
+        with_current(|t| {
+            t.frames.push(phys);
+            t.min_flt += 1;
+            if let Some(m) = t.maps.iter_mut().find(|m| m.name == "[stack]") {
+                m.start = m.start.min(page);
+            }
+        });
+        return true;
+    }
     let (pml4, hit) = with_current(|t| {
-        let page = va & !0xFFFu64;
         (
             t.pml4,
             t.filemaps
@@ -1252,7 +1292,14 @@ pub fn demand_page(va: u64) -> bool {
         return false; // already mapped — this was a real fault
     }
     // the demand-alloc'd frame belongs to the task (freed at exit)
-    with_current(|t| t.frames.push(phys));
+    with_current(|t| {
+        t.frames.push(phys);
+        if path.is_empty() {
+            t.min_flt += 1;
+        } else {
+            t.maj_flt += 1;
+        }
+    });
     let mut buf = [0u8; 4096];
     let fill = if path.is_empty() {
         Ok(0) // bss sentinel: pure zero page
