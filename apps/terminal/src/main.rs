@@ -2855,12 +2855,16 @@ fn awk_eval(
         // BEGIN runs with an empty $0/fields; sub/gsub targets get temps
         let mut b0 = String::from(input);
         let mut bf: Vec<String> = Vec::new();
-        awk_stmts(&begin, &mut b0, &mut nr, &mut bf, &mut vars, &mut gl,
-                  &lines, &mut li, &mut out, fs)?;
+        match awk_stmts(&begin, &mut b0, &mut nr, &mut bf, &mut vars,
+                        &mut gl, &lines, &mut li, &mut out, fs) {
+            // `exit` in BEGIN skips the main rule pass entirely
+            Err(e) if e == "\x01EXIT" => li = lines.len(),
+            r => r?,
+        }
     }
     // `pat1,pat2` range rules hold per-rule in-range state
     let mut rng: Vec<bool> = alloc::vec![false; rules.len()];
-    while li < lines.len() {
+    'main: while li < lines.len() {
         // mutable per-record $0/fields so sub/gsub can rewrite them
         let mut cur = lines[li].clone();
         li += 1;
@@ -2898,6 +2902,8 @@ fn awk_eval(
                                 &mut vars, &mut gl, &lines, &mut li,
                                 &mut out, fs) {
                     Err(e) if e == "\x01NEXT" => break, // `next`: next record
+                    // `exit`: stop the rule pass and all input, run END
+                    Err(e) if e == "\x01EXIT" => break 'main,
                     r => r?,
                 }
             }
@@ -2906,8 +2912,12 @@ fn awk_eval(
     {
         let mut b0 = String::new();
         let mut bf: Vec<String> = Vec::new();
-        awk_stmts(&end, &mut b0, &mut nr, &mut bf, &mut vars, &mut gl,
-                  &lines, &mut li, &mut out, fs)?;
+        match awk_stmts(&end, &mut b0, &mut nr, &mut bf, &mut vars,
+                        &mut gl, &lines, &mut li, &mut out, fs) {
+            // `exit` inside END is just the end
+            Err(e) if e == "\x01EXIT" => {}
+            r => r?,
+        }
     }
     Ok(out)
 }
@@ -3544,6 +3554,11 @@ fn awk_stmts(
         } else if st == "next" {
             // `next`: skip the remaining rules for this record
             return Err(String::from("\x01NEXT"));
+        } else if st == "exit" || st.starts_with("exit ") {
+            // `exit [expr]`: stop input processing; END still runs
+            // (the exit-status operand is dropped — mini-awk reports
+            // command failure through the shell's exit flag instead)
+            return Err(String::from("\x01EXIT"));
         } else {
             return Err(alloc::format!("awk: unknown stmt '{}'", st));
         }
@@ -4121,6 +4136,10 @@ enum SedK {
     PrintF, // P: print up to the first embedded newline
     DelF,   // D: delete up to the first newline, restart the cycle
     List,   // l: print the pattern space unambiguously (escaped + $)
+    Label(String),   // `:name` — branch target marker
+    Branch(String),  // b name — jump unconditionally
+    BranchT(String), // t name — jump if an s/// succeeded
+    BranchF(String), // T name — jump if no s/// succeeded
 }
 
 /// Parse one sed address: N | $ | /re/ (a `\/` inside the regex stays an
@@ -4256,6 +4275,27 @@ fn sed_parse(
         };
         if i >= b.len() {
             break;
+        }
+        // `:name`, `b name`, `t name`, `T name` — labels and branches
+        if b[i] == b':' || b[i] == b'b' || b[i] == b't' || b[i] == b'T' {
+            let c0 = b[i];
+            i += 1;
+            while i < b.len() && b[i] == b' ' {
+                i += 1;
+            }
+            let a0 = i;
+            while i < b.len() && b[i] != b';' && b[i] != b'\n' {
+                i += 1;
+            }
+            let name = String::from(spec[a0..i].trim());
+            let k = match c0 {
+                b':' => SedK::Label(name),
+                b'b' => SedK::Branch(name),
+                b't' => SedK::BranchT(name),
+                _ => SedK::BranchF(name),
+            };
+            out.push((addr, neg, k));
+            continue;
         }
         match b[i] {
             b's' | b'y' => {
@@ -22866,6 +22906,14 @@ impl Term {
                 let mut rstate: Vec<bool> =
                     alloc::vec![false; cmds.len()];
                 let mut hold = String::new();
+                // `:name` markers resolve once to command indices
+                let mut labels: alloc::collections::BTreeMap<String, usize> =
+                    Default::default();
+                for (i, (_, _, k)) in cmds.iter().enumerate() {
+                    if let SedK::Label(n) = k {
+                        labels.insert(n.clone(), i);
+                    }
+                }
                 // `N` consumes following lines, `D` restarts the cycle —
                 // the input position is a manual index
                 let mut li = 0usize;
@@ -22880,21 +22928,28 @@ impl Term {
                     // and the pattern space are dropped, queued `a` text
                     // still flushes
                     let mut kill = false;
+                    // t/T flag: set by a successful s///, reset by a new
+                    // input line (including N/n) and by each t/T test
+                    let mut subst_done = false;
                     'cycle: loop {
-                    for (ci, (addr, neg, k)) in cmds.iter().enumerate() {
+                    let mut ci = 0usize;
+                    while ci < cmds.len() {
+                        let (addr, neg, k) = &cmds[ci];
+                        let ridx = ci; // range state is per command slot
+                        ci += 1;
                         let inr = match addr {
                             None => true,
                             Some(SedAddr::One(e)) => {
                                 sed_hit(ere, e, ln, last, &cur, true)
                             }
                             Some(SedAddr::RR(a, e2)) => {
-                                if rstate[ci] {
+                                if rstate[ridx] {
                                     // POSIX: addr2 is tested from the
                                     // line after the opening line
                                     if sed_hit(
                                         ere, e2, ln, last, &cur, false,
                                     ) {
-                                        rstate[ci] = false;
+                                        rstate[ridx] = false;
                                     }
                                     true
                                 } else if sed_hit(
@@ -22903,7 +22958,7 @@ impl Term {
                                     // numeric/$ addr2 <= the opener
                                     // closes immediately; a regexp
                                     // addr2 starts checking next line
-                                    rstate[ci] = !matches!(
+                                    rstate[ridx] = !matches!(
                                         e2,
                                         SedEnd::N(m) if ln >= *m
                                     ) && !matches!(e2, SedEnd::Last if last);
@@ -22918,6 +22973,57 @@ impl Term {
                             continue;
                         }
                         match k {
+                            // `:name` is only a jump target
+                            SedK::Label(_) => {}
+                            // b name — unconditional jump; a bare `b`
+                            // skips to the end of the script
+                            SedK::Branch(n) => {
+                                match labels.get(n) {
+                                    Some(p) => ci = *p,
+                                    None if n.is_empty() => break 'cycle,
+                                    None => {
+                                        return self.fail(&alloc::format!(
+                                            "sed: can't find label '{}'",
+                                            n
+                                        ))
+                                    }
+                                }
+                            }
+                            // t name — jump when an s/// succeeded since
+                            // the last input line or t/T test
+                            SedK::BranchT(n) => {
+                                if subst_done {
+                                    subst_done = false;
+                                    match labels.get(n) {
+                                        Some(p) => ci = *p,
+                                        None if n.is_empty() => break 'cycle,
+                                        None => {
+                                            return self.fail(&alloc::format!(
+                                                "sed: can't find label '{}'",
+                                                n
+                                            ))
+                                        }
+                                    }
+                                }
+                            }
+                            // T name — the t complement: jump when NO
+                            // s/// succeeded this cycle
+                            SedK::BranchF(n) => {
+                                if subst_done {
+                                    subst_done = false;
+                                } else {
+                                    match labels.get(n) {
+                                        Some(p) => ci = *p,
+                                        None if n.is_empty() => break 'cycle,
+                                        None => {
+                                            return self.fail(&alloc::format!(
+                                                "sed: can't find label '{}'",
+                                                n
+                                            ))
+                                        }
+                                    }
+                                }
+                            }
                             SedK::Sub(old, new, g, pf, nth) => {
                                 // POSIX: plain s/// is BRE — real regex
                                 // (anchors, classes, \(\) groups).
@@ -22957,6 +23063,9 @@ impl Term {
                                     re_sub(&cur, &brep, new, *g)
                                 };
                                 let changed = r != cur;
+                                if changed {
+                                    subst_done = true;
+                                }
                                 cur = r;
                                 // -n: print only lines a substitution changed;
                                 // the s///p flag prints them regardless
@@ -22997,6 +23106,7 @@ impl Term {
                                     last = ln == nlines;
                                     cur.push('\n');
                                     cur.push_str(&lines[li]);
+                                    subst_done = false; // new input line
                                 } else {
                                     break 'outer;
                                 }
@@ -23014,6 +23124,7 @@ impl Term {
                                     last = ln == nlines;
                                     cur = lines[li].clone();
                                     print = !quiet;
+                                    subst_done = false; // new input line
                                 } else {
                                     break 'outer;
                                 }
