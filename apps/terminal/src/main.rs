@@ -5300,6 +5300,7 @@ struct GrepOpts {
     files: u8,   // 0 normal, 1 = -l (with matches), 2 = -L (without)
     fname: u8,   // 0 auto, 1 = -h (never prefix), 2 = -H (always prefix)
     multi: bool, // >1 file operand: auto filename prefixes
+    quieterr: bool, // -s: suppress unreadable-file errors
     before: usize,
     after: usize,
     maxm: usize,
@@ -14797,6 +14798,7 @@ impl Term {
                                     b'F' | b'e' => {}        // already literal / -e nop
                                     b'h' => o.fname = 1,      // never prefix
                                     b'H' => o.fname = 2,      // always prefix
+                                    b's' => o.quieterr = true, // -s: no file errors
                                     _ => {}
                                 }
                             }
@@ -17644,42 +17646,210 @@ impl Term {
                     let mut want_print = false;
                     let mut size_test: Option<(i8, u64)> = None;
                     let mut mmin: Option<(i8, u64)> = None;
+                    let mut perm_test: Option<(u8, u32)> = None;
+                    let mut want_uid: Option<u32> = None;
+                    let mut want_gid: Option<u32> = None;
+                    let mut nouser = false;
+                    let mut nogroup = false;
+                    let mut want_ino: Option<u64> = None;
+                    let mut mtime_test: Option<(i8, u64)> = None;
+                    let mut ctime_test: Option<(i8, u64)> = None;
+                    // `!`/`-not` negates the next primary; `neg` is a bitmask
+                    // of negated predicates; negating an action kills the arm
+                    let mut neg_next = false;
+                    let mut neg: u32 = 0;
+                    let mut group_dead = false;
                     for (i, a) in g.iter().enumerate() {
                         match *a {
+                            "!" | "-not" => neg_next = true,
+                            "-a" | "-and" => {}
+                            "-perm" => {
+                                if let Some(v) = g.get(i + 1) {
+                                    let (mode, spec) = match v.as_bytes().first()
+                                    {
+                                        Some(b'-') => (1u8, &v[1..]),
+                                        Some(b'/') => (2u8, &v[1..]),
+                                        _ => (0u8, *v),
+                                    };
+                                    match u32::from_str_radix(spec, 8) {
+                                        Ok(m) => {
+                                            perm_test = Some((mode, m));
+                                            if neg_next {
+                                                neg |= 1 << 8;
+                                                neg_next = false;
+                                            }
+                                        }
+                                        Err(_) => {
+                                            self.fail("find: bad -perm mode");
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            "-user" => {
+                                if let Some(v) = g.get(i + 1) {
+                                    want_uid = Some(
+                                        passwd_ent(v)
+                                            .map(|e| e.0)
+                                            .unwrap_or_else(|| {
+                                                v.parse().unwrap_or(u32::MAX)
+                                            }),
+                                    );
+                                    if neg_next {
+                                        neg |= 1 << 9;
+                                        neg_next = false;
+                                    }
+                                }
+                            }
+                            "-nouser" => {
+                                nouser = true;
+                                if neg_next {
+                                    neg |= 1 << 9;
+                                    neg_next = false;
+                                }
+                            }
+                            "-group" => {
+                                if let Some(v) = g.get(i + 1) {
+                                    want_gid = Some(
+                                        if v.parse::<u32>().is_ok() {
+                                            v.parse().unwrap()
+                                        } else {
+                                            gid_of(v)
+                                        },
+                                    );
+                                    if neg_next {
+                                        neg |= 1 << 10;
+                                        neg_next = false;
+                                    }
+                                }
+                            }
+                            "-nogroup" => {
+                                nogroup = true;
+                                if neg_next {
+                                    neg |= 1 << 10;
+                                    neg_next = false;
+                                }
+                            }
+                            "-inum" => {
+                                if let Some(v) = g.get(i + 1) {
+                                    match v.parse::<u64>() {
+                                        Ok(n) => {
+                                            want_ino = Some(n);
+                                            if neg_next {
+                                                neg |= 1 << 11;
+                                                neg_next = false;
+                                            }
+                                        }
+                                        Err(_) => {
+                                            self.fail("find: bad -inum value");
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            "-mtime" | "-ctime" => {
+                                // [-+]N: whole days like -mmin but /86400
+                                if let Some(v) = g.get(i + 1) {
+                                    let b = v.as_bytes();
+                                    let (mode, num) = match b.first() {
+                                        Some(b'+') => (1i8, &v[1..]),
+                                        Some(b'-') => (-1i8, &v[1..]),
+                                        _ => (0i8, *v),
+                                    };
+                                    match num.parse::<u64>() {
+                                        Ok(n) => {
+                                            if *a == "-mtime" {
+                                                mtime_test = Some((mode, n));
+                                                if neg_next {
+                                                    neg |= 1 << 6;
+                                                    neg_next = false;
+                                                }
+                                            } else {
+                                                ctime_test = Some((mode, n));
+                                                if neg_next {
+                                                    neg |= 1 << 7;
+                                                    neg_next = false;
+                                                }
+                                            }
+                                        }
+                                        Err(_) => {
+                                            self.fail("find: bad -mtime value");
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            "-exec" | "-delete" | "-print"
+                                if neg_next =>
+                            {
+                                // `! ACTION` — the arm matches nothing (GNU)
+                                group_dead = true;
+                                neg_next = false;
+                            }
                             "-size" => {
                                 if let Some(v) = g.get(i + 1) {
                                     size_test = parse_size_spec(v);
+                                    if neg_next {
+                                        neg |= 1 << 4;
+                                        neg_next = false;
+                                    }
                                 }
                             }
-                            "-path" => {
-                                if let Some(v) = g.get(i + 1) {
-                                    pathpat = Some(String::from(*v));
+                            "-empty" => {
+                                want_empty = true;
+                                if neg_next {
+                                    neg |= 1 << 3;
+                                    neg_next = false;
                                 }
                             }
-                            "-empty" => want_empty = true,
                             "-delete" => del = true,
                             "-print" => want_print = true,
                             "-name" => {
                                 if let Some(v) = g.get(i + 1) {
                                     pat = v;
                                     pat_ci = false;
+                                    if neg_next {
+                                        neg |= 1;
+                                        neg_next = false;
+                                    }
                                 }
                             }
                             "-iname" => {
                                 if let Some(v) = g.get(i + 1) {
                                     pat = v;
                                     pat_ci = true;
+                                    if neg_next {
+                                        neg |= 1;
+                                        neg_next = false;
+                                    }
                                 }
                             }
                             "-ipath" => {
                                 if let Some(v) = g.get(i + 1) {
                                     pathpat = Some(String::from(*v));
                                     path_ci = true;
+                                    if neg_next {
+                                        neg |= 1 << 1;
+                                        neg_next = false;
+                                    }
+                                }
+                            }
+                            "-path" => {
+                                if let Some(v) = g.get(i + 1) {
+                                    pathpat = Some(String::from(*v));
+                                    if neg_next {
+                                        neg |= 1 << 1;
+                                        neg_next = false;
+                                    }
                                 }
                             }
                             "-mindepth" => {
                                 if let Some(v) = g.get(i + 1) {
                                     mind = v.parse().unwrap_or(0);
+                                    if neg_next {
+                                        neg |= 1 << 13;
+                                        neg_next = false;
+                                    }
                                 }
                             }
                             "-type" => {
@@ -17691,22 +17861,40 @@ impl Term {
                                         }
                                         _ => want_dir = Some(*v == "d"),
                                     }
+                                    if neg_next {
+                                        neg |= 1 << 2;
+                                        neg_next = false;
+                                    }
                                 }
                             }
                             "-regex" => {
                                 if let Some(v) = g.get(i + 1) {
                                     repat = Some(String::from(*v));
+                                    if neg_next {
+                                        neg |= 1 << 12;
+                                        neg_next = false;
+                                    }
                                 }
                             }
                             "-maxdepth" => {
                                 if let Some(v) = g.get(i + 1) {
                                     maxd = v.parse().unwrap_or(usize::MAX);
+                                    if neg_next {
+                                        neg |= 1 << 14;
+                                        neg_next = false;
+                                    }
                                 }
                             }
                             "-newer" => {
                                 if let Some(v) = g.get(i + 1) {
                                     match ustd::stat(v) {
-                                        Ok(st) => newer = Some(st.mtime),
+                                        Ok(st) => {
+                                            newer = Some(st.mtime);
+                                            if neg_next {
+                                                neg |= 1 << 15;
+                                                neg_next = false;
+                                            }
+                                        }
                                         Err(e) => {
                                             self.fail(&alloc::format!(
                                                 "find: -newer: {}: err {}",
@@ -17729,7 +17917,13 @@ impl Term {
                                         _ => (0i8, *v),
                                     };
                                     match num.parse::<u64>() {
-                                        Ok(n) => mmin = Some((mode, n)),
+                                        Ok(n) => {
+                                            mmin = Some((mode, n));
+                                            if neg_next {
+                                                neg |= 1 << 5;
+                                                neg_next = false;
+                                            }
+                                        }
                                         Err(_) => {
                                             self.fail("find: bad -mmin value");
                                             return;
@@ -17741,23 +17935,67 @@ impl Term {
                         }
                     }
                     if dir_is_dir {
-                        let mut ms =
-                            self.find_collect(dir, pat, want_dir, maxd, newer, pat_ci);
-                        // -path PAT: match the full path, not the basename
-                        // (-ipath is its case-insensitive form)
-                        if let Some(pp) = &pathpat {
-                            if path_ci {
-                                let pl = pp.to_lowercase();
-                                ms.retain(|m| {
-                                    wild_match(&pl, &m.trim_end_matches('/').to_lowercase())
-                                });
-                            } else {
-                                ms.retain(|m| wild_match(pp, m.trim_end_matches('/')));
-                            }
+                        // negated collection-level predicates are collected
+                        // unfiltered and inverted as post-filters instead
+                        let coll_pat = if neg & 1 != 0 { "*" } else { pat };
+                        let coll_ci = pat_ci && neg & 1 == 0;
+                        let coll_type = if neg & (1 << 2) != 0 { None } else { want_dir };
+                        let coll_maxd =
+                            if neg & (1 << 14) != 0 { usize::MAX } else { maxd };
+                        let coll_newer =
+                            if neg & (1 << 15) != 0 { None } else { newer };
+                        let mut ms = self.find_collect(
+                            dir, coll_pat, coll_type, coll_maxd, coll_newer,
+                            coll_ci,
+                        );
+                        // `! ACTION` matched nothing in this arm (GNU)
+                        if group_dead {
+                            ms.clear();
                         }
-                        // -mindepth N: only entries at least N levels below
-                        // dir — depth = slash count minus the root's own
-                        if mind > 0 {
+                        // `! -name` / `! -iname`: invert the basename glob
+                        if neg & 1 != 0 {
+                            ms.retain(|m| {
+                                let b = m
+                                    .trim_end_matches('/')
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or("");
+                                let hit = if pat_ci {
+                                    wild_match(
+                                        &pat.to_lowercase(),
+                                        &b.to_lowercase(),
+                                    )
+                                } else {
+                                    wild_match(pat, b)
+                                };
+                                !hit
+                            });
+                        }
+                        // `! -type` / `! -type l`: invert dir-ness or link-ness
+                        if neg & (1 << 2) != 0 {
+                            ms.retain(|m| {
+                                let t = m.trim_end_matches('/');
+                                let st = ustd::stat(t).ok();
+                                let is_link = st
+                                    .map(|s| s.attr & 0x40 != 0)
+                                    .unwrap_or(false)
+                                    || ustd::readlink(t).is_some();
+                                let hit = if want_link {
+                                    is_link
+                                } else {
+                                    match want_dir {
+                                        Some(d) => st
+                                            .map(|s| s.is_dir != 0)
+                                            .unwrap_or(false)
+                                            == d,
+                                        None => false,
+                                    }
+                                };
+                                !hit
+                            });
+                        }
+                        // `! -maxdepth N`: keep entries deeper than N
+                        if neg & (1 << 14) != 0 && maxd != usize::MAX {
                             let base = dir
                                 .trim_end_matches('/')
                                 .bytes()
@@ -17769,15 +18007,64 @@ impl Term {
                                     .filter(|b| *b == b'/')
                                     .count()
                                     .saturating_sub(base)
-                                    >= mind
+                                    > maxd
+                            });
+                        }
+                        // `! -newer F`: keep entries not strictly newer
+                        if neg & (1 << 15) != 0 {
+                            if let Some(r) = newer {
+                                ms.retain(|m| {
+                                    ustd::stat(m.trim_end_matches('/'))
+                                        .map(|s| s.mtime <= r)
+                                        .unwrap_or(false)
+                                });
+                            }
+                        }
+                        // -path PAT: match the full path, not the basename
+                        // (-ipath is its case-insensitive form)
+                        if let Some(pp) = &pathpat {
+                            let n1 = neg & 2 != 0;
+                            if path_ci {
+                                let pl = pp.to_lowercase();
+                                ms.retain(|m| {
+                                    wild_match(&pl, &m.trim_end_matches('/').to_lowercase())
+                                        != n1
+                                });
+                            } else {
+                                ms.retain(|m| {
+                                    wild_match(pp, m.trim_end_matches('/')) != n1
+                                });
+                            }
+                        }
+                        // -mindepth N: only entries at least N levels below
+                        // dir — depth = slash count minus the root's own
+                        if mind > 0 {
+                            let n13 = neg & (1 << 13) != 0;
+                            let base = dir
+                                .trim_end_matches('/')
+                                .bytes()
+                                .filter(|b| *b == b'/')
+                                .count();
+                            ms.retain(|m| {
+                                (m.trim_end_matches('/')
+                                    .bytes()
+                                    .filter(|b| *b == b'/')
+                                    .count()
+                                    .saturating_sub(base)
+                                    >= mind)
+                                    != n13
                             });
                         }
                         // -regex PAT: full-path match through the regex engine
                         if let Some(rp) = &repat {
-                            ms.retain(|m| re_full(rp, m.trim_end_matches('/')));
+                            let n12 = neg & (1 << 12) != 0;
+                            ms.retain(|m| {
+                                re_full(rp, m.trim_end_matches('/')) != n12
+                            });
                         }
-                        // -type l: FAT symlink attr bit 0x40
-                        if want_link {
+                        // -type l: FAT symlink attr bit 0x40 (skipped when
+                        // negated — the `! -type` block already handled it)
+                        if want_link && neg & (1 << 2) == 0 {
                             ms.retain(|m| {
                                 ustd::stat(m.trim_end_matches('/'))
                                     .map(|st| st.attr & 0x40 != 0)
@@ -17788,6 +18075,7 @@ impl Term {
                         }
                         // -size [-+]N[c|k|M|G] (bare N = 512B blocks, POSIX)
                         if let Some((mode, bytes)) = size_test {
+                            let n4 = neg & (1 << 4) != 0;
                             ms.retain(|m| {
                                 let t = m.trim_end_matches('/');
                                 ustd::stat(t)
@@ -17797,10 +18085,12 @@ impl Term {
                                         _ => st.size > bytes,
                                     })
                                     .unwrap_or(false)
+                                    != n4
                             });
                         }
                         // -mmin [-+]N: modification age in whole minutes
                         if let Some((mode, mins)) = mmin {
+                            let n5 = neg & (1 << 5) != 0;
                             let dn = ustd::datetime();
                             let now = cal_days(dn.year, dn.month, dn.day)
                                 * 86400
@@ -17822,13 +18112,112 @@ impl Term {
                                         }
                                     })
                                     .unwrap_or(false)
+                                    != n5
+                            });
+                        }
+                        // -mtime/-ctime [-+]N: whole days on mtime or ctime
+                        for (bit, test) in
+                            [(6u8, mtime_test), (7u8, ctime_test)]
+                        {
+                            if let Some((mode, days)) = test {
+                                let nn = neg & (1u32 << bit) != 0;
+                                let dn = ustd::datetime();
+                                let now = cal_days(dn.year, dn.month, dn.day)
+                                    * 86400
+                                    + dn.hour as u64 * 3600
+                                    + dn.minute as u64 * 60
+                                    + dn.second as u64;
+                                let ctime = bit == 7;
+                                ms.retain(|m| {
+                                    let t = m.trim_end_matches('/');
+                                    ustd::statx(t)
+                                        .map(|st| {
+                                            let ts =
+                                                if ctime { st.ctime } else { st.mtime };
+                                            let age =
+                                                now.saturating_sub(ts) / 86400;
+                                            match mode {
+                                                1 => age > days,
+                                                -1 => age < days
+                                                    && now >= ts,
+                                                _ => age == days,
+                                            }
+                                        })
+                                        .unwrap_or(false)
+                                        != nn
+                                });
+                            }
+                        }
+                        // -perm MODE|-MODE|/MODE on the real mode bits
+                        if let Some((mode, bits)) = perm_test {
+                            let n8 = neg & (1 << 8) != 0;
+                            ms.retain(|m| {
+                                ustd::statx(m.trim_end_matches('/'))
+                                    .map(|st| {
+                                        let mbits = st.mode & 0o7777;
+                                        match mode {
+                                            0 => mbits == bits,
+                                            1 => mbits & bits == bits,
+                                            _ => mbits & bits != 0,
+                                        }
+                                    })
+                                    .unwrap_or(false)
+                                    != n8
+                            });
+                        }
+                        // -user NAME|UID / -nouser / -group / -nogroup
+                        if let Some(u) = want_uid {
+                            let n9 = neg & (1 << 9) != 0;
+                            ms.retain(|m| {
+                                ustd::statx(m.trim_end_matches('/'))
+                                    .map(|st| st.uid == u)
+                                    .unwrap_or(false)
+                                    != n9
+                            });
+                        }
+                        if nouser {
+                            let n9 = neg & (1 << 9) != 0;
+                            ms.retain(|m| {
+                                ustd::statx(m.trim_end_matches('/'))
+                                    .map(|st| user_name(st.uid).is_none())
+                                    .unwrap_or(false)
+                                    != n9
+                            });
+                        }
+                        if let Some(gd) = want_gid {
+                            let n10 = neg & (1 << 10) != 0;
+                            ms.retain(|m| {
+                                ustd::statx(m.trim_end_matches('/'))
+                                    .map(|st| st.gid == gd)
+                                    .unwrap_or(false)
+                                    != n10
+                            });
+                        }
+                        if nogroup {
+                            let n10 = neg & (1 << 10) != 0;
+                            ms.retain(|m| {
+                                ustd::statx(m.trim_end_matches('/'))
+                                    .map(|st| group_name(st.gid).is_none())
+                                    .unwrap_or(false)
+                                    != n10
+                            });
+                        }
+                        // -inum N: real stable inode (FNV-1a of the path)
+                        if let Some(ino) = want_ino {
+                            let n11 = neg & (1 << 11) != 0;
+                            ms.retain(|m| {
+                                ustd::statx(m.trim_end_matches('/'))
+                                    .map(|st| st.ino == ino)
+                                    .unwrap_or(false)
+                                    != n11
                             });
                         }
                         // -empty: zero-size file or dir with no entries
                         if want_empty {
+                            let n3 = neg & (1 << 3) != 0;
                             ms.retain(|m| {
                                 let t = m.trim_end_matches('/');
-                                match ustd::stat(t) {
+                                (match ustd::stat(t) {
                                     Ok(st) if st.is_dir != 0 => ustd::readdir(t)
                                         .map(|e| {
                                             e.iter().all(|x| {
@@ -17842,7 +18231,7 @@ impl Term {
                                         .unwrap_or(false),
                                     Ok(st) => st.size == 0,
                                     Err(_) => false,
-                                }
+                                }) != n3
                             });
                         }
                         // action phase: this arm's action binds to its matches
@@ -23131,7 +23520,12 @@ impl Term {
                 hits
             }
             Err(e) => {
-                self.fail(&alloc::format!("grep: {}: err {}", path, e));
+                // -s: suppress unreadable-file errors (still a miss)
+                if !o.quieterr {
+                    self.fail(&alloc::format!("grep: {}: err {}", path, e));
+                } else {
+                    self.last_ok = false;
+                }
                 0
             }
         }
