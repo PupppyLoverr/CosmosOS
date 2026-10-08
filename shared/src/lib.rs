@@ -233,9 +233,13 @@ pub const REQ_PRESENT: u16 = 2;
 pub const REQ_SET_TITLE: u16 = 3;
 pub const REQ_CLOSE_WIN: u16 = 4;
 pub const REQ_PING: u16 = 5;
+pub const REQ_LIST_WINS: u16 = 7;  // () -> RSP_WIN_LIST (WinInfo[])
+pub const REQ_FOCUS_WIN: u16 = 8;  // (window_id u32) raise + focus + unmin
+pub const REQ_MOVE_WIN: u16 = 9;   // (ReqMoveWin) reposition top-left
 // response kinds (winserver -> app)
 pub const RSP_WIN_CREATED: u16 = 100;
 pub const RSP_ERROR: u16 = 101;
+pub const RSP_WIN_LIST: u16 = 110;
 // event kinds (winserver -> app)
 pub const EV_KEY: u16 = 200;
 pub const EV_POINTER: u16 = 201;
@@ -289,6 +293,34 @@ pub struct ReqSetTitle {
     pub window_id: u32,
     pub title: [u8; 48],
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ReqMoveWin {
+    pub window_id: u32,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// One row of the REQ_LIST_WINS reply (payload = WinInfo[] of all windows,
+/// focused workspace first is NOT implied -- order is z-order).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WinInfo {
+    pub id: u32,
+    pub pid: u32,
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    pub ws: u32,
+    pub state: u8, // bit0 minimized, bit1 focused, bit2 maximized
+    pub _pad: [u8; 3],
+    pub title: [u8; 48],
+}
+pub const WIN_ST_MIN: u8 = 1;
+pub const WIN_ST_FOCUS: u8 = 2;
+pub const WIN_ST_MAX: u8 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

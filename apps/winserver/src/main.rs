@@ -1233,6 +1233,66 @@ fn handle_req(s: &mut S, msg: &[u8]) {
                 }
             }
         }
+        REQ_LIST_WINS => {
+            // Dump every window as a WinInfo[] blob on the caller's reply port.
+            let mut buf: Vec<u8> = Vec::with_capacity(s.wins.len() * core::mem::size_of::<WinInfo>());
+            for w in s.wins.iter() {
+                let mut st = 0u8;
+                if w.min { st |= WIN_ST_MIN; }
+                if w.id == s.focus { st |= WIN_ST_FOCUS; }
+                if w.maxed { st |= WIN_ST_MAX; }
+                let mut info = WinInfo {
+                    id: w.id,
+                    pid: ustd::ipc_owner(w.owner),
+                    x: w.x,
+                    y: w.y,
+                    w: w.w.max(0) as u32,
+                    h: w.h.max(0) as u32,
+                    ws: w.ws,
+                    state: st,
+                    _pad: [0; 3],
+                    title: [0; 48],
+                };
+                let n = w.title.len().min(48);
+                info.title[..n].copy_from_slice(&w.title.as_bytes()[..n]);
+                buf.extend_from_slice(unsafe {
+                    core::slice::from_raw_parts(&info as *const _ as *const u8, core::mem::size_of::<WinInfo>())
+                });
+            }
+            send_ev(reply, RSP_WIN_LIST, &buf);
+        }
+        REQ_FOCUS_WIN => {
+            // focus+raise a window by id; hops to its workspace and unminimizes
+            // so the target is actually visible (wmfocus <id> from a shell).
+            if pl.len() >= 4 {
+                let id = u32::from_le_bytes([pl[0], pl[1], pl[2], pl[3]]);
+                if let Some(i) = s.win_idx(id) {
+                    s.wins[i].min = false;
+                    if s.wins[i].ws != s.workspace {
+                        s.workspace = s.wins[i].ws;
+                        s.dirty = true;
+                    }
+                    focus_raise(s, id);
+                    s.dirty = true;
+                }
+            }
+        }
+        REQ_MOVE_WIN => {
+            // reposition a window's outer top-left; damages old + new rects.
+            if pl.len() >= core::mem::size_of::<ReqMoveWin>() {
+                let r: ReqMoveWin = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
+                if let Some(w) = s.win_mut(r.window_id) {
+                    let (ox, oy, ow, oh) = (w.x, w.y, w.w, w.h);
+                    w.x = r.x;
+                    w.y = r.y;
+                    w.maxed = false; // an explicit move un-maximizes
+                    let (nx, ny, nw, nh) = (w.x, w.y, w.w, w.h);
+                    dmg(s, ox, oy, ow, oh);
+                    dmg(s, nx, ny, nw, nh);
+                    s.dirty = true;
+                }
+            }
+        }
         _ => {}
     }
 }

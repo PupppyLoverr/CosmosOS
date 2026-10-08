@@ -1,6 +1,6 @@
 //! Window-server client: connect, create windows, present dirty rects,
 //! and receive input/focus/resize events.
-use crate::{ipc_connect, ipc_listen, ipc_recv, ipc_send, shm_map};
+use crate::{ipc_close, ipc_connect, ipc_listen, ipc_recv, ipc_send, shm_map};
 use alloc::vec::Vec;
 use shared::*;
 
@@ -32,6 +32,58 @@ fn pack(kind: u16, reply: u32, payload: &[u8]) -> Vec<u8> {
 
 fn send_req(srv: u32, reply: u32, kind: u16, payload: &[u8]) {
     let _ = ipc_send(srv, &pack(kind, reply, payload));
+}
+
+/// One-shot window-server call on a throwaway reply port — management
+/// commands (wmls/wmfocus/wmclose/wmmove) use this so a window-owning app's
+/// event port never loses a real EV_* while polling for a response.
+fn mgmt_call(kind: u16, payload: &[u8], want_reply: bool) -> Option<(u16, Vec<u8>)> {
+    let srv = ipc_connect(WS_PORT)?;
+    let ev = ipc_listen("");
+    if ev == 0 {
+        return None;
+    }
+    send_req(srv, ev, kind, payload);
+    let r = if want_reply { poll(ev, 1500) } else { Some((0, Vec::new())) };
+    ipc_close(ev); // throwaway reply port -- don't leak one per call
+    r
+}
+
+/// All windows in z-order (bottom first). Each row is a `WinInfo`.
+pub fn list_windows() -> Option<Vec<WinInfo>> {
+    let (k, pl) = mgmt_call(REQ_LIST_WINS, &[], true)?;
+    if k != RSP_WIN_LIST {
+        return None;
+    }
+    let sz = core::mem::size_of::<WinInfo>();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + sz <= pl.len() {
+        let w: WinInfo = unsafe { core::ptr::read_unaligned(pl.as_ptr().add(i) as *const _) };
+        out.push(w);
+        i += sz;
+    }
+    Some(out)
+}
+
+/// Raise + focus + unminimize a window (hops to its workspace if needed).
+pub fn focus_window(id: u32) -> bool {
+    mgmt_call(REQ_FOCUS_WIN, &id.to_le_bytes(), false).is_some()
+}
+
+/// Ask the server to close a window (sends EV_CLOSE to its owner, like
+/// clicking its caption x).
+pub fn close_window(id: u32) -> bool {
+    mgmt_call(REQ_CLOSE_WIN, &id.to_le_bytes(), false).is_some()
+}
+
+/// Move a window's outer top-left to (x,y); un-maximizes it.
+pub fn move_window(id: u32, x: i32, y: i32) -> bool {
+    let r = ReqMoveWin { window_id: id, x, y };
+    let pl = unsafe {
+        core::slice::from_raw_parts(&r as *const _ as *const u8, core::mem::size_of::<ReqMoveWin>())
+    };
+    mgmt_call(REQ_MOVE_WIN, pl, false).is_some()
 }
 
 /// Connect to the window server. Returns None if it isn't up yet.
