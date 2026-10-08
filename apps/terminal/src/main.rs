@@ -463,6 +463,7 @@ impl Term {
                     "          a | b   cmd > file   cmd >> file   watch [-n s] cmd",
                     "          df  (volume usage)  more  cal  tree  seq  sleep  sh  calc  ntp",
                     "          httpd <port>  arp  dmesg  nc <ip> <port>  true  false",
+                    "          fserve <port> <file>  fget <ip> <port> <out>",
                     "          ops: a ; b   a && b   a || b",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
@@ -955,6 +956,87 @@ impl Term {
                 },
                 None => self.fail("usage: httpd <port>  (serves a status page, Esc stops)"),
             },
+            "fserve" => {
+                // fserve <port> <file>: serve the file to ONE client then stop
+                match (
+                    args.first().and_then(|s| s.parse::<u16>().ok()),
+                    args.get(1),
+                ) {
+                    (Some(port), Some(path)) => match ustd::read_all(path) {
+                        Ok(data) => match ustd::TcpListener::bind(port) {
+                            Some(l) => {
+                                self.emit(&alloc::format!(
+                                    "fserve: {} ({}B) on :{} — waiting up to 30s for a client",
+                                    path, data.len(), port
+                                ));
+                                match l.accept(30000) {
+                                    Some((sock, rip, rport)) => {
+                                        self.emit(&alloc::format!(
+                                            "fserve: client {}.{}.{}.{}:{}",
+                                            rip[0], rip[1], rip[2], rip[3], rport
+                                        ));
+                                        // brief pump: let the peer's opening chatter
+                                        // settle (mirrors httpd's recv-before-send)
+                                        let _ = sock.recv(300);
+                                        let mut ok = true;
+                                        for ch in data.chunks(1400) {
+                                            if sock.send(ch).is_none() {
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                        if ok {
+                                            self.emit(&alloc::format!(
+                                                "fserve: sent {}B",
+                                                data.len()
+                                            ));
+                                        } else {
+                                            self.fail("fserve: send aborted (peer went away)");
+                                        }
+                                    }
+                                    None => self.fail("fserve: no client within 30s"),
+                                }
+                            }
+                            None => self.fail(&alloc::format!("fserve: :{} already in use", port)),
+                        },
+                        Err(e) => self.fail(&alloc::format!("fserve: {}: err {}", path, e)),
+                    },
+                    _ => self.fail("usage: fserve <port> <file>  (serves one client then stops)"),
+                }
+            }
+            "fget" => {
+                // fget <ip> <port> <out>: TCP-download whatever the peer sends
+                match (
+                    args.first().and_then(|s| parse_ipv4(s)),
+                    args.get(1).and_then(|s| s.parse::<u16>().ok()),
+                    args.get(2),
+                ) {
+                    (Some(ip), Some(port), Some(out)) => {
+                        let lport = 42000u16 + (ustd::uptime_ms() % 2000) as u16;
+                        match ustd::TcpSock::connect(lport, ip, port) {
+                            Some(sock) => {
+                                let mut data: Vec<u8> = Vec::new();
+                                loop {
+                                    match sock.recv(5000) {
+                                        Some(d) => data.extend_from_slice(&d),
+                                        None => break,
+                                    }
+                                }
+                                match ustd::write_all(out, &data) {
+                                    Ok(_) => self.emit(&alloc::format!(
+                                        "fget: {}B -> {}",
+                                        data.len(),
+                                        out
+                                    )),
+                                    Err(e) => self.fail(&alloc::format!("fget: {}: err {}", out, e)),
+                                }
+                            }
+                            None => self.fail(&alloc::format!("fget: connect to :{} failed", port)),
+                        }
+                    }
+                    _ => self.fail("usage: fget <a.b.c.d> <port> <out>  (TCP download to file)"),
+                }
+            }
             "nc" => {
                 match (
                     args.first().and_then(|s| parse_ipv4(s)),
@@ -1310,7 +1392,7 @@ impl Term {
             "uptime", "reboot", "shutdown", "exit", "history", "time",
             "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
             "set", "env", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
-            "dmesg", "arp", "httpd", "ntp", "nc", "true", "false",
+            "dmesg", "arp", "httpd", "ntp", "nc", "fserve", "fget", "true", "false",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
