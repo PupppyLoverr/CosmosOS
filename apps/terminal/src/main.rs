@@ -23563,8 +23563,10 @@ impl Term {
                 // objcopy -O binary <elf> <out> — dump PT_LOAD content as a
                 // flat binary (vaddr-sorted, gap-filled) like the real tool.
                 let files: Vec<&&str> =
-                    args.iter().filter(|a| !a.starts_with('-')).collect();
-                let ob = args.iter().any(|a| *a == "-O" || a.contains("binary"));
+                    args.iter().filter(|a| {
+                        !a.starts_with('-') && **a != "binary"
+                    }).collect();
+                let ob = args.iter().any(|a| *a == "-O" || *a == "binary");
                 if !ob || files.len() < 2 {
                     self.fail("usage: objcopy -O binary <in> <out>");
                     return;
