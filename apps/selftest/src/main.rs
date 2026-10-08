@@ -4400,6 +4400,85 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let bad2 = ustd::sc3(shared::SYS_REBOOT, 0xfee1dead, 0, 0x4321fedc) as i64;
         bad == -22 && bad2 == -22
     });
+    check("uid-basic", {
+        // identity syscalls answer the real task creds; /proc/self/status
+        // reports them in the Linux Uid:/Gid: rows.
+        let ids = ustd::getuid() == 0
+            && ustd::geteuid() == 0
+            && ustd::getgid() == 0
+            && ustd::getegid() == 0;
+        let st = ustd::read_all("/proc/self/status")
+            .map(|d| {
+                let s = String::from_utf8_lossy(&d).into_owned();
+                s.lines().any(|l| l.starts_with("Uid:\t0"))
+            })
+            .unwrap_or(false);
+        ids && st
+    });
+    check("dac-deny", {
+        // vfat ownership model: a non-root task has the "other" bits —
+        // every write on the FAT volume is EACCES, while a 1777 /tmp
+        // tmpfs mount still lets it create.
+        let pid = ustd::fork();
+        if pid == 0 {
+            if ustd::setgid(1000) != 0 || ustd::setuid(1000) != 0 {
+                ustd::exit(15);
+            }
+            let denied = ustd::write_all("/dac-x", b"x") == Err(-13);
+            let tmp_ok = ustd::write_all("/tmp/dac-x", b"x").is_ok()
+                && ustd::mkdir("/tmp/dacd").is_ok();
+            let back = ustd::setuid(999) == -1; // EPERM to another id
+            ustd::exit(if denied && tmp_ok && back { 0 } else { 16 });
+        }
+        let ok = ustd::waitpid(pid as u32, 10_000) == Ok(0)
+            && ustd::stat("/dac-x").is_err();
+        let _ = ustd::remove("/tmp/dac-x");
+        let _ = ustd::remove("/tmp/dacd");
+        ok
+    });
+    check("chown-chmod", {
+        // tmpfs carries real uid/gid/mode; chown is root-only and FAT
+        // refuses it outright (vfat has no owners).
+        let _ = ustd::write_all("/tmp/cc", b"A");
+        let _ = ustd::write_all("/cc-fat", b"A");
+        let fat_deny = ustd::chown("/cc-fat", 1000, 0) != 0;
+        let mut ok = ustd::chown("/tmp/cc", 1000, 1000) == 0
+            && ustd::statx("/tmp/cc")
+                .map(|s| s.uid == 1000 && s.gid == 1000)
+                .unwrap_or(false)
+            && ustd::chmod("/tmp/cc", 0o600) == 0
+            && ustd::statx("/tmp/cc")
+                .map(|s| s.mode & 0o777 == 0o600)
+                .unwrap_or(false)
+            && fat_deny;
+        let pid = ustd::fork();
+        if pid == 0 {
+            if ustd::setgid(1000) != 0 || ustd::setuid(1000) != 0 {
+                ustd::exit(15);
+            }
+            // owner keeps write at 0600 but can't chown back to root
+            let own = ustd::write_all("/tmp/cc", b"B").is_ok();
+            let perm = ustd::chown("/tmp/cc", 0, 0) == -1;
+            ustd::exit(if own && perm { 0 } else { 16 });
+        }
+        ok = ok && ustd::waitpid(pid as u32, 10_000) == Ok(0);
+        let _ = ustd::write_all("/tmp/ro", b"x");
+        let pid2 = ustd::fork();
+        if pid2 == 0 {
+            let _ = ustd::setgid(1000);
+            let _ = ustd::setuid(1000);
+            ustd::exit(if ustd::write_all("/tmp/ro", b"y").is_err() {
+                0
+            } else {
+                16
+            });
+        }
+        ok = ok && ustd::waitpid(pid2 as u32, 10_000) == Ok(0);
+        let _ = ustd::remove("/tmp/cc");
+        let _ = ustd::remove("/tmp/ro");
+        let _ = ustd::remove("/cc-fat");
+        ok
+    });
     check("gettimeofday", {
         let (s, u) = ustd::gettimeofday();
         s > 1_700_000_000 && u < 1_000_000

@@ -14,6 +14,63 @@ use ustd::draw::{self, Canvas};
 use ustd::wm::{self, Window};
 use ustd::println;
 
+/// /etc/passwd row for `user` -> (uid, gid). Missing file = root only.
+fn passwd_ent(user: &str) -> Option<(u32, u32)> {
+    if user == "root" {
+        return Some((0, 0));
+    }
+    let d = ustd::read_all("/etc/passwd").ok()?;
+    let s = String::from_utf8_lossy(&d).into_owned();
+    for l in s.lines() {
+        let f: Vec<&str> = l.split(':').collect();
+        if f.len() >= 4 && f[0] == user {
+            return Some((f[2].parse().ok()?, f[3].parse().ok()?));
+        }
+    }
+    None
+}
+
+/// uid -> name via /etc/passwd (root never needs the file).
+fn user_name(uid: u32) -> Option<String> {
+    if uid == 0 {
+        return Some(String::from("root"));
+    }
+    let d = ustd::read_all("/etc/passwd").ok()?;
+    let s = String::from_utf8_lossy(&d).into_owned();
+    let want = alloc::format!("{}", uid);
+    s.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(':').collect();
+        (f.len() >= 3 && f[2] == want).then(|| String::from(f[0]))
+    })
+}
+
+/// group name -> gid via /etc/group (u32::MAX when unknown).
+fn gid_of(name: &str) -> u32 {
+    let d = ustd::read_all("/etc/group").unwrap_or_default();
+    let s = String::from_utf8_lossy(&d).into_owned();
+    s.lines()
+        .find_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.len() >= 3 && f[0] == name).then(|| f[2].parse().ok())
+        })
+        .flatten()
+        .unwrap_or(u32::MAX)
+}
+
+/// gid -> name via /etc/group.
+fn group_name(gid: u32) -> Option<String> {
+    if gid == 0 {
+        return Some(String::from("root"));
+    }
+    let d = ustd::read_all("/etc/group").ok()?;
+    let s = String::from_utf8_lossy(&d).into_owned();
+    let want = alloc::format!("{}", gid);
+    s.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(':').collect();
+        (f.len() >= 3 && f[2] == want).then(|| String::from(f[0]))
+    })
+}
+
 const COLS: usize = 90;
 const ROWS: usize = 40;
 const CW: i32 = 8;
@@ -12916,6 +12973,40 @@ impl Term {
                     e => self.fail(&alloc::format!("unshare: err {}", e)),
                 }
             }
+            "su" => {
+                // su <user> [-c <cmd...>]: fork a child that drops to the
+                // target's ids (from /etc/passwd) and runs the command —
+                // its failures and writes are real for that uid.
+                let Some(user) = args.first().copied() else {
+                    self.fail("usage: su <user> [-c <cmd...>]");
+                    return;
+                };
+                let Some((uid, gid)) = passwd_ent(user) else {
+                    self.fail(&alloc::format!("su: unknown user {}", user));
+                    return;
+                };
+                let cmdline: String = if args.get(1) == Some(&"-c") && args.len() > 2 {
+                    args[2..].join(" ")
+                } else {
+                    String::from("id")
+                };
+                match ustd::fork() {
+                    0 => {
+                        if ustd::setgid(gid) != 0 || ustd::setuid(uid) != 0 {
+                            ustd::exit(126);
+                        }
+                        self.run(&cmdline);
+                        ustd::exit(0);
+                    }
+                    p if p > 0 => {
+                        let c = ustd::waitpid(p as u32, 120_000).unwrap_or(-1);
+                        if c != 0 {
+                            self.fail(&alloc::format!("su: child exited {}", c));
+                        }
+                    }
+                    _ => self.fail("su: fork failed"),
+                }
+            }
             "pivot_root" => match (args.first(), args.get(1)) {
                 (Some(n), Some(o)) => match ustd::pivot_root(n, o) {
                     0 => self.emit(&alloc::format!("root moved to {}; old root at {}", n, o)),
@@ -12966,7 +13057,46 @@ impl Term {
                     (ms / 1000) % 60
                 ));
             }
-            "whoami" => self.emit("cosmos"),
+            "chown" | "chgrp" => {
+                // chown U[:G] f... / chgrp G f... — real on tmpfs, EPERM on FAT.
+                let (pos, group_mode) = (args.iter().filter(|a| !a.starts_with('-')).copied().collect::<Vec<_>>(), cmd == "chgrp");
+                if pos.len() < 2 {
+                    self.fail(&alloc::format!("usage: {} <owner>[/<group>] <file>...", cmd));
+                    return;
+                }
+                let (mut uid, mut gid) = (u32::MAX, u32::MAX);
+                if group_mode {
+                    gid = gid_of(pos[0]);
+                    if gid == u32::MAX {
+                        gid = pos[0].parse().unwrap_or(u32::MAX);
+                    }
+                } else {
+                    let (up, gp) = match pos[0].split_once(':') {
+                        Some((u, g)) => (u, g),
+                        None => (pos[0], ""),
+                    };
+                    uid = passwd_ent(up).map(|e| e.0).unwrap_or_else(|| up.parse().unwrap_or(u32::MAX));
+                    if !gp.is_empty() {
+                        gid = gid_of(gp);
+                        if gid == u32::MAX {
+                            gid = gp.parse().unwrap_or(u32::MAX);
+                        }
+                    }
+                }
+                for f in &pos[1..] {
+                    let e = ustd::chown(f, uid, gid);
+                    if e != 0 {
+                        self.fail(&alloc::format!("{}: {}: err {}", cmd, f, e));
+                    }
+                }
+            }
+            "whoami" => {
+                let u = ustd::geteuid();
+                match user_name(u) {
+                    Some(n) => self.emit(&n),
+                    None => self.emit(&alloc::format!("{}", u)),
+                }
+            }
             "tree" => {
                 let root = match args.first() {
                     Some(p) if *p != "." => String::from(*p),
@@ -18415,7 +18545,29 @@ impl Term {
                     }
                 }
             },
-            "id" => self.emit("uid=0(cosmos) gid=0(cosmos)"),
+            "id" => {
+                // id [user]: real/eff ids from the kernel, names resolved
+                // through /etc/passwd + /etc/group.
+                if let Some(u) = args.first() {
+                    match passwd_ent(u) {
+                        Some((uid, gid)) => {
+                            let un = user_name(uid).unwrap_or_else(|| alloc::format!("{}", uid));
+                            let gn = group_name(gid).unwrap_or_else(|| alloc::format!("{}", gid));
+                            self.emit(&alloc::format!("uid={}({}) gid={}({})", uid, un, gid, gn));
+                        }
+                        None => self.fail(&alloc::format!("id: {}: no such user", u)),
+                    }
+                } else {
+                    let (u, g, eu, eg) =
+                        (ustd::getuid(), ustd::getgid(), ustd::geteuid(), ustd::getegid());
+                    let un = |i: u32| user_name(i).unwrap_or_else(|| alloc::format!("{}", i));
+                    let gn = |i: u32| group_name(i).unwrap_or_else(|| alloc::format!("{}", i));
+                    self.emit(&alloc::format!(
+                        "uid={}({}) gid={}({}) euid={}({}) egid={}({})",
+                        u, un(u), g, gn(g), eu, un(eu), eg, gn(eg)
+                    ));
+                }
+            }
             "printf" => {
                 // printf [-v VAR] 'fmt' [args]: %s %d %i %x %o %c %b %% +
                 // \n \t \\ escapes; the format re-cycles when args
@@ -20596,7 +20748,7 @@ impl Term {
         "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
         "alias", "unalias", "type", "hostname", "id", "printf", "dd", "split",
         "source", "comm", "join", "paste", "expand", "unexpand", "at", "file",
-        "test", "[", "rand", "mount", "umount", "chroot", "pivot_root", "unshare", "reboot", "rmdir",
+        "test", "[", "rand", "mount", "umount", "chroot", "pivot_root", "unshare", "reboot", "su", "chown", "chgrp", "rmdir",
         "export", "unset", "man",
         "lspci", "lscpu", "factor", "shuf", "cksum",
         "eval", "break", "continue", "return",

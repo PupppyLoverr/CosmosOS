@@ -372,6 +372,21 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     if is_dev && crate::dev::is_dir(&full) {
         return Err(-4);
     }
+    let is_fat = !is_dev && !is_proc && !is_pipe && !crate::pty::handles(&full);
+    // vfat ownership model: every file is root:root — a non-root caller
+    // gets the "other" bits only, so nothing on the volume is writable.
+    if is_fat
+        && task::cred().0 != 0
+        && flags
+            & (shared::O_WRONLY
+                | shared::O_RDWR
+                | shared::O_CREATE
+                | shared::O_TRUNC
+                | shared::O_APPEND)
+            != 0
+    {
+        return Err(-13);
+    }
     let exists = if is_dev {
         true
     } else if is_proc {
@@ -857,6 +872,11 @@ pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
     if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
     }
+    // vfat ownership: files are root:root, so a non-root caller gets
+    // the "other" bits only — writes are EPERM across the volume.
+    if task::cred().0 != 0 {
+        return Err(-1);
+    }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     fs.set_meta(&full, Some(secs), None).map_err(err_to_i64)?;
@@ -874,6 +894,11 @@ pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
     }
     if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
+    }
+    // vfat ownership: files are root:root, so a non-root caller gets
+    // the "other" bits only — writes are EPERM across the volume.
+    if task::cred().0 != 0 {
+        return Err(-1);
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
@@ -940,6 +965,11 @@ pub fn mkdir(path: &str) -> Result<(), i64> {
     if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
     }
+    // vfat ownership: files are root:root, so a non-root caller gets
+    // the "other" bits only — writes are EPERM across the volume.
+    if task::cred().0 != 0 {
+        return Err(-1);
+    }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     fs.mkdir(&full).map_err(err_to_i64)?;
@@ -966,6 +996,11 @@ pub fn remove(path: &str) -> Result<(), i64> {
     }
     if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
+    }
+    // vfat ownership: files are root:root, so a non-root caller gets
+    // the "other" bits only — writes are EPERM across the volume.
+    if task::cred().0 != 0 {
+        return Err(-1);
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
@@ -994,6 +1029,11 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
         || crate::pipes::handles(&t2)
     {
         return Err(-4);
+    }
+    // vfat ownership: files are root:root, so a non-root caller gets
+    // the "other" bits only — writes are EPERM across the volume.
+    if task::cred().0 != 0 {
+        return Err(-1);
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;

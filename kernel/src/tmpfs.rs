@@ -22,7 +22,102 @@ pub struct Node {
     /// inode change/birth time (unix secs) — statx ctime/btime.
     pub ctime: u64,
     pub attr: u8,
+    /// Owner ids + unix perm bits — the real DAC fields statx reports
+    /// and the open/mutate paths check. Defaults: creator's euid/egid,
+    /// 0755 dir / 0644 file minus umask.
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u16,
     pub children: Vec<String>, // entry names (dirs only)
+}
+
+/// (uid, gid, mode) for a fresh node: creator creds + umask-masked mode.
+fn fresh(is_dir: bool) -> (u32, u32, u16) {
+    let (eu, eg) = crate::task::cred();
+    let um = crate::task::with_current(|t| t.umask as u16);
+    (
+        eu,
+        eg,
+        (if is_dir { 0o755 } else { 0o644 }) & !um,
+    )
+}
+
+/// Owner/group/other perm check: `want` is one owner-position bit
+/// (0o400 read / 0o200 write / 0o100 exec). Root (euid 0) passes all.
+pub fn allows(n: &Node, want: u16) -> bool {
+    let (eu, eg) = crate::task::cred();
+    eu == 0
+        || (eu == n.uid && n.mode & want != 0)
+        || (eg == n.gid && n.mode & (want >> 3) != 0)
+        || n.mode & (want >> 6) != 0
+}
+
+/// Write-permission on the node at `path` (or, for creates, its parent).
+pub fn may_write(path: &str) -> bool {
+    if !any() {
+        return true;
+    }
+    let g = NODES.lock();
+    match g.get(path) {
+        Some(n) => allows(n, 0o200),
+        None => match g.get(parent_of(path).as_deref().unwrap_or("")) {
+            Some(p) => allows(p, 0o200),
+            None => true,
+        },
+    }
+}
+
+/// Read-permission on the node at `path` (exec shares it: our tmpfs has
+/// no noexec-per-file distinction beyond mount flags).
+pub fn may_read(path: &str) -> bool {
+    if !any() {
+        return true;
+    }
+    let g = NODES.lock();
+    match g.get(path) {
+        Some(n) => allows(n, 0o400),
+        None => true,
+    }
+}
+
+/// owner_of -> (uid, gid, perm bits) for statx; missing = root:root 0.
+pub fn owner(path: &str) -> (u32, u32, u16) {
+    if !any() {
+        return (0, 0, 0);
+    }
+    let g = NODES.lock();
+    g.get(path).map(|n| (n.uid, n.gid, n.mode)).unwrap_or((0, 0, 0))
+}
+
+/// chmod: set perm bits; EPERM unless root or the owner.
+pub fn chmod(path: &str, mode: u16) -> Result<(), i64> {
+    let mut g = NODES.lock();
+    let n = g.get_mut(path).ok_or(-2i64)?;
+    let (eu, _) = crate::task::cred();
+    if eu != 0 && eu != n.uid {
+        return Err(-1);
+    }
+    n.mode = mode & 0o7777;
+    n.ctime = crate::vfs::now_unix();
+    Ok(())
+}
+
+/// chown: root only, like Linux; gid u32::MAX keeps the current one.
+pub fn chown(path: &str, uid: u32, gid: u32) -> Result<(), i64> {
+    let (eu, _) = crate::task::cred();
+    if eu != 0 {
+        return Err(-1);
+    }
+    let mut g = NODES.lock();
+    let n = g.get_mut(path).ok_or(-2i64)?;
+    if uid != u32::MAX {
+        n.uid = uid;
+    }
+    if gid != u32::MAX {
+        n.gid = gid;
+    }
+    n.ctime = crate::vfs::now_unix();
+    Ok(())
 }
 
 static NODES: Mutex<BTreeMap<String, Node>> = Mutex::new(BTreeMap::new());
@@ -179,6 +274,7 @@ pub fn mount(target: &str, opts: u64) -> Result<(), i64> {
     // globally, so the purge belongs in the mount itself)
     let under = alloc::format!("{}/", target);
     ng.retain(|k, _| !k.starts_with(&under));
+    let (cu, cg, cm) = fresh(true);
     ng.insert(
         String::from(target),
         Node {
@@ -188,6 +284,9 @@ pub fn mount(target: &str, opts: u64) -> Result<(), i64> {
             mtime: crate::vfs::now_unix(),
             ctime: crate::vfs::now_unix(),
             attr: 0,
+            uid: cu,
+            gid: cg,
+            mode: cm,
             children: Vec::new(),
         },
     );
@@ -310,6 +409,7 @@ pub fn open(path: &str, flags: u64) -> Result<u64, i64> {
             }
             let name = String::from(name_of(path));
             p.children.push(name);
+            let (cu, cg, cm) = fresh(false);
             ng.insert(
                 String::from(path),
                 Node {
@@ -317,8 +417,11 @@ pub fn open(path: &str, flags: u64) -> Result<u64, i64> {
                     pages: Vec::new(),
                     size: 0,
                     mtime: crate::vfs::now_unix(),
-            ctime: crate::vfs::now_unix(),
+                    ctime: crate::vfs::now_unix(),
                     attr: 0x20,
+                    uid: cu,
+                    gid: cg,
+                    mode: cm,
                     children: Vec::new(),
                 },
             );
@@ -328,6 +431,9 @@ pub fn open(path: &str, flags: u64) -> Result<u64, i64> {
 }
 
 pub fn read_range(path: &str, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    if !may_read(path) {
+        return Err(-13);
+    }
     let ng = NODES.lock();
     let Some(n) = ng.get(path) else { return Err(-2) };
     if n.is_dir {
@@ -368,6 +474,9 @@ pub fn read_range_pf(path: &str, off: u64, buf: &mut [u8]) -> Option<Result<usiz
 }
 
 pub fn read_all(path: &str) -> Result<Vec<u8>, i64> {
+    if !may_read(path) {
+        return Err(-13);
+    }
     let ng = NODES.lock();
     let Some(n) = ng.get(path) else { return Err(-2) };
     if n.is_dir {
@@ -382,6 +491,10 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, i64> {
 /// Write `buf` at `off` (caller handles O_APPEND by passing off=len).
 /// ENOSPC past QUOTA.
 pub fn write_range(path: &str, off: u64, buf: &[u8]) -> Result<usize, i64> {
+    // DAC: the node (or its parent on create) must grant the caller write
+    if !may_write(path) {
+        return Err(-13);
+    }
     if ro(path) {
         return Err(-30);
     }
@@ -433,6 +546,9 @@ pub fn stat(path: &str) -> Option<(u64, bool, u64, u64, u8)> {
 }
 
 pub fn mkdir(path: &str) -> Result<(), i64> {
+    if !may_write(path) {
+        return Err(-13);
+    }
     if ro(path) {
         return Err(-30);
     }
@@ -448,6 +564,7 @@ pub fn mkdir(path: &str) -> Result<(), i64> {
         return Err(-20);
     }
     p.children.push(String::from(name_of(path)));
+    let (cu, cg, cm) = fresh(true);
     ng.insert(
         String::from(path),
         Node {
@@ -457,6 +574,9 @@ pub fn mkdir(path: &str) -> Result<(), i64> {
             mtime: crate::vfs::now_unix(),
             ctime: crate::vfs::now_unix(),
             attr: 0,
+            uid: cu,
+            gid: cg,
+            mode: cm,
             children: Vec::new(),
         },
     );
@@ -465,6 +585,9 @@ pub fn mkdir(path: &str) -> Result<(), i64> {
 
 /// unlink/rmdir: files drop on unlink; dirs only when empty (-39 ENOTEMPTY).
 pub fn remove(path: &str) -> Result<(), i64> {
+    if !may_write(path) {
+        return Err(-13);
+    }
     if ro(path) {
         return Err(-30);
     }
@@ -485,6 +608,9 @@ pub fn remove(path: &str) -> Result<(), i64> {
 
 /// Same-mount rename (dirs or files); cross-mount is EXDEV(-18).
 pub fn rename(from: &str, to: &str) -> Result<(), i64> {
+    if !may_write(from) || !may_write(to) {
+        return Err(-13);
+    }
     {
         let ns = crate::task::ns_of();
         let mg = ns.lock();
@@ -558,6 +684,14 @@ pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
 }
 
 pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
+    // attribute flips are owner/root only — same bar as chmod
+    let (eu, _) = crate::task::cred();
+    if eu != 0 {
+        let g = NODES.lock();
+        if g.get(path).map(|n| n.uid != eu).unwrap_or(false) {
+            return Err(-1);
+        }
+    }
     if ro(path) {
         return Err(-30);
     }

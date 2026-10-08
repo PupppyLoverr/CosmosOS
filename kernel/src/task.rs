@@ -130,6 +130,12 @@ pub struct Task {
     pub sigmask: u64,           // blocked-signal bitmask (sigprocmask)
     pub alarm_at: u64,          // SIGALRM deadline (ms ticks; 0 = disarmed)
     pub pgid: u32,              // process-group id (kill(-pgid) targets it)
+    /// Real/effective user+group ids — every task starts 0 (root);
+    /// su/setuid are the only ways down.
+    pub uid: u32,
+    pub gid: u32,
+    pub euid: u32,
+    pub egid: u32,
     pub sid: u32,               // session id (setsid detaches)
     pub ctty: u64,              // controlling tty: /dev/pts/{id} index (0 = none)
     pub ctid_va: u64,           // clear_child_tid: user u64 zeroed+futex-woken on exit
@@ -312,6 +318,10 @@ pub fn init() {
         sigmask: 0,
         alarm_at: 0,
         pgid: 0,
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
         sid: 0,
         ctty: 0,
         ctid_va: 0,
@@ -807,6 +817,10 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         alarm_at: 0,
         // POSIX: the child lands in the parent's process group + session
         pgid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.pgid).unwrap_or(0),
+        uid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.uid).unwrap_or(0),
+        gid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.gid).unwrap_or(0),
+        euid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.euid).unwrap_or(0),
+        egid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.egid).unwrap_or(0),
         sid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.sid).unwrap_or(0),
         ctty: s.tasks.iter().find(|t| t.id == parent).map(|t| t.ctty).unwrap_or(0),
         ctid_va: 0,
@@ -912,6 +926,10 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         sigmask: 0,
         alarm_at: 0,
         pgid: 0,
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
         sid: 0,
         ctty: 0,
         ctid_va: 0,
@@ -1026,6 +1044,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
     let root = cur.root.clone();
     let nsr = cur.ns.clone();
     let utsr = cur.uts.clone();
+    let creds = (cur.uid, cur.gid, cur.euid, cur.egid);
     let borrowed = cur.borrowed.clone();
     let shm_ids = cur.shm.clone();
     let (nice, rt, vrun, umask, exe, pfs, rnf, rnp, rstk, rcu, ras) = (
@@ -1062,6 +1081,10 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         root,
         ns: nsr,
         uts: utsr,
+        uid: creds.0,
+        gid: creds.1,
+        euid: creds.2,
+        egid: creds.3,
         ports: Vec::new(),
         shm: shm_ids,
         frames: kframes,
@@ -1620,6 +1643,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         cur.ns.clone(),
         cur.uts.clone(),
     );
+    let creds = (cur.uid, cur.gid, cur.euid, cur.egid);
     let (maps, filemaps) = (cur.maps.clone(), cur.filemaps.clone());
     let (nice, umask, exe) = (cur.nice, cur.umask, cur.exe.clone());
     let (smin, smax, mnext, apage) = (cur.stack_min, cur.stack_max, cur.mmap_next, cur.arg_page);
@@ -1648,6 +1672,10 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         root,
         ns: nsr,
         uts: utsr,
+        uid: cur.uid,
+        gid: cur.gid,
+        euid: cur.euid,
+        egid: cur.egid,
         ports: Vec::new(),
         shm: shm_ids,
         frames: kframes,
@@ -2473,6 +2501,24 @@ pub fn exit_group(code: i64) -> ! {
     kill_at(s, idx, code);
     drop(g);
     park_dead_task();
+}
+
+/// (euid, egid) of the current task — the DAC identity the VFS checks.
+pub fn cred() -> (u32, u32) {
+    with_current(|t| (t.euid, t.egid))
+}
+
+/// (uid, gid, euid, egid) — proc status dump + syscall answers.
+pub fn creds() -> (u32, u32, u32, u32) {
+    with_current(|t| (t.uid, t.gid, t.euid, t.egid))
+}
+
+/// creds of another task by pid — /proc/<pid>/status.
+pub fn pid_creds(pid: u32) -> Option<(u32, u32, u32, u32)> {
+    let mut g = SCHED.lock();
+    let s = g.as_mut()?;
+    let t = s.tasks.iter_mut().find(|t| t.id == pid && t.state != State::Dead)?;
+    Some((t.uid, t.gid, t.euid, t.egid))
 }
 
 /// tgkill(tgid, tid, sig): signal a specific thread. tgid 0 skips the
