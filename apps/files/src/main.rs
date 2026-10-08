@@ -319,6 +319,18 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             }
             Some((EV_POINTER, pl)) if pl.len() >= 16 => {
                 let p: EvPointer = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
+                if p.wheel != 0 {
+                    // wheel: >0 up, <0 down — 3 rows per tick
+                    let vis = ((f.c.h as i32 - 44) / ROW_H).max(1);
+                    let rows = f.ents.len() as i32 + if f.cwd != "/" { 1 } else { 0 };
+                    let max = (rows - vis).max(0) * ROW_H;
+                    if p.wheel > 0 {
+                        f.scroll = (f.scroll - 3 * ROW_H).max(0);
+                    } else {
+                        f.scroll = (f.scroll + 3 * ROW_H).min(max);
+                    }
+                    f.dirty = true;
+                }
                 f.click(p.x, p.y, p.buttons);
             }
             Some((EV_CLOSE, _)) => return 0,
