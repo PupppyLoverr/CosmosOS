@@ -2019,6 +2019,49 @@ fn re_sub(line: &str, pat: &str, new: &str, g: bool) -> String {
     }
 }
 
+/// Substitute only the `n`th (1-based) match of `pat` — GNU sed s///N.
+/// Empty matches advance one byte like re_sub does. Same `&`/`\N` expansion.
+fn re_sub_nth(line: &str, pat: &str, new: &str, n: usize) -> String {
+    let mut rest: &str = line;
+    let mut base = 0usize;
+    let mut seen = 0usize;
+    while let Some((a, b, caps)) = re_search_caps(pat, rest) {
+        seen += 1;
+        if seen == n {
+            let (ga, gb) = (base + a, base + b);
+            let mut out = String::from(&line[..ga]);
+            let mut nb = new.as_bytes().iter().peekable();
+            while let Some(&c) = nb.next() {
+                if c == b'&' {
+                    out.push_str(&line[ga..gb]);
+                } else if c == b'\\' {
+                    match nb.next() {
+                        Some(&b'&') => out.push('&'),
+                        Some(&d) if d.is_ascii_digit() && d != b'0' => {
+                            if let Some(Some((gs, ge))) = caps.get((d - b'0') as usize) {
+                                out.push_str(&rest[*gs..*ge]);
+                            }
+                        }
+                        Some(&d) => {
+                            out.push('\\');
+                            out.push(d as char);
+                        }
+                        None => out.push('\\'),
+                    }
+                } else {
+                    out.push(c as char);
+                }
+            }
+            out.push_str(&line[gb..]);
+            return out;
+        }
+        let adv = if b == a { b + 1 } else { b };
+        base += adv;
+        rest = &rest[adv..];
+    }
+    String::from(line)
+}
+
 /// Translate a BRE pattern to this engine's ERE syntax (POSIX: plain sed and
 /// plain grep are BRE, `-r`/`-E` are ERE). `\(\)`/`\+`/`\?`/`\|`/`\{\}` are
 /// operators in BRE while their bare forms are literals — the reverse of ERE.
@@ -3901,7 +3944,7 @@ enum SedAddr {
     Last,
 }
 enum SedK {
-    Sub(String, String, bool, bool), // old,new,g-flag,p-flag
+    Sub(String, String, bool, bool, usize), // old,new,g-flag,p-flag,nth(0=first)
     Yank(String, String),
     P,
     D,
@@ -3990,11 +4033,21 @@ fn sed_parse(spec: &str) -> Result<Vec<(Option<SedAddr>, SedK)>, String> {
                     .ok_or("sed: unterminated first field")?;
                 let f2 = sed_field(spec, &mut i, d)
                     .ok_or("sed: unterminated second field")?;
-                let (mut g, mut pf) = (false, false);
+                let (mut g, mut pf, mut nth) = (false, false, 0usize);
                 while i < b.len() && b[i] != b';' && b[i] != b'\n' {
                     match b[i] {
                         b'g' => g = true,
                         b'p' => pf = true,
+                        // s///N: replace only the Nth match (GNU)
+                        b'1'..=b'9' => {
+                            let mut n = 0usize;
+                            while i < b.len() && b[i].is_ascii_digit() {
+                                n = n * 10 + (b[i] - b'0') as usize;
+                                i += 1;
+                            }
+                            nth = n;
+                            continue;
+                        }
                         b' ' | b'\t' => {}
                         _ => return Err(alloc::format!("sed: bad flag {}", b[i] as char)),
                     }
@@ -4003,7 +4056,7 @@ fn sed_parse(spec: &str) -> Result<Vec<(Option<SedAddr>, SedK)>, String> {
                 out.push((
                     addr,
                     if is_s {
-                        SedK::Sub(f1, f2, g, pf)
+                        SedK::Sub(f1, f2, g, pf, nth)
                     } else {
                         SedK::Yank(f1, f2)
                     },
@@ -9210,7 +9263,7 @@ impl Term {
             "sha256sum", "strings", "sort", "uniq", "cut", "more", "diff", "base64",
             "show", "tar", "md5sum", "uuencode", "uudecode", "grep", "find", "file",
             "sha1sum", "cksum", "comm", "zgrep", "zip", "unzip", "chmod", "touch",
-            "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look",
+            "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look", "fmt",
         "pwck", "grpck", "pathchk", "nslookup", "b2sum",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
             "egrep", "fgrep", "sdiff", "diff3", "merge", "compress",
@@ -13838,6 +13891,105 @@ impl Term {
                     }
                     self.emit(rest);
                 }
+            }
+            "fmt" => {
+                // fmt [-w N|-N] [-s] [-u] [file] — greedy paragraph fill:
+                // words packed to width (default 75) preserving each
+                // paragraph's indent; blank lines end a paragraph.
+                // -s: split only (never join). -u: one space between words,
+                // two after sentence end (. ! ?).
+                let (mut w, mut split_only, mut uni) = (75usize, false, false);
+                let mut file: Option<&str> = None;
+                for a in args.iter() {
+                    if *a == "-w" || *a == "--width" {
+                        // -w N two-token handled below via index scan
+                        continue;
+                    }
+                    if let Some(v) = a.strip_prefix("-w").or_else(|| a.strip_prefix("--width=")) {
+                        w = v.parse().unwrap_or(75);
+                    } else if a.len() > 1 && a[1..].chars().all(|c| c.is_ascii_digit())
+                        && a.starts_with('-')
+                    {
+                        w = a[1..].parse().unwrap_or(75); // GNU fmt -N
+                    } else if *a == "-s" || *a == "--split-only" {
+                        split_only = true;
+                    } else if *a == "-u" || *a == "--uniform-spacing" {
+                        uni = true;
+                    } else if !a.starts_with('-') {
+                        file = Some(*a);
+                    }
+                }
+                if let Some(i) = args.iter().position(|a| *a == "-w" || *a == "--width") {
+                    if let Some(v) = args.get(i + 1) {
+                        w = v.parse().unwrap_or(w);
+                    }
+                }
+                let data = match file {
+                    Some(p) => ustd::read_all(p).unwrap_or_default(),
+                    None => self.pipe_in.clone().unwrap_or_default().into_bytes(),
+                };
+                let s = String::from_utf8_lossy(&data);
+                let mut words: Vec<String> = Vec::new();
+                let mut indent = String::new();
+                let flush = |me: &mut Self, words: &mut Vec<String>, ind: &str| {
+                    if words.is_empty() {
+                        return;
+                    }
+                    let mut line = String::from(ind);
+                    let mut i = 0usize;
+                    while i < words.len() {
+                        let wd = &words[i];
+                        let sep = if i == 0 {
+                            String::new()
+                        } else if uni
+                            && line
+                                .trim_end()
+                                .ends_with(|c| c == '.' || c == '!' || c == '?')
+                        {
+                            String::from("  ")
+                        } else {
+                            String::from(" ")
+                        };
+                        if i > 0 && line.len() + sep.len() + wd.len() > w
+                            && line.len() > ind.len()
+                        {
+                            me.emit(&line);
+                            line = String::from(ind);
+                            line.push_str(wd);
+                        } else {
+                            line.push_str(&sep);
+                            line.push_str(wd);
+                        }
+                        i += 1;
+                    }
+                    me.emit(&line);
+                    words.clear();
+                };
+                for l in s.lines() {
+                    let ind: String = l
+                        .chars()
+                        .take_while(|c| *c == ' ' || *c == '\t')
+                        .collect();
+                    let body = l.trim();
+                    if body.is_empty() {
+                        flush(self, &mut words, &indent);
+                        self.emit("");
+                        indent.clear();
+                        continue;
+                    }
+                    if words.is_empty() {
+                        indent = ind;
+                    } else if ind != indent || split_only {
+                        // new indent = new paragraph; -s never joins lines
+                        flush(self, &mut words, &indent);
+                        indent = ind;
+                    }
+                    words.extend(body.split_whitespace().map(String::from));
+                    if split_only {
+                        flush(self, &mut words, &indent);
+                    }
+                }
+                flush(self, &mut words, &indent);
             }
             "expand" | "unexpand" => {
                 // expand [-t N]: tabs -> spaces at stops of N (default 8).
@@ -22448,13 +22600,43 @@ impl Term {
                             continue;
                         }
                         match k {
-                            SedK::Sub(old, new, g, pf) => {
+                            SedK::Sub(old, new, g, pf, nth) => {
                                 // POSIX: plain s/// is BRE — real regex
                                 // (anchors, classes, \(\) groups).
-                                let r = if ere {
-                                    re_sub(&cur, old, new, *g)
+                                let brep = if ere {
+                                    old.clone()
                                 } else {
-                                    re_sub(&cur, &bre_to_ere(old), new, *g)
+                                    bre_to_ere(old)
+                                };
+                                let r = if *nth > 0 {
+                                    // s///N: only the Nth match; s///Ng:
+                                    // the Nth match and every later one
+                                    let mut rest: &str = cur.as_str();
+                                    let (mut base, mut seen, mut cut) =
+                                        (0usize, 0usize, None);
+                                    while let Some((a, b)) = re_search(&brep, rest) {
+                                        seen += 1;
+                                        if seen == *nth {
+                                            cut = Some(base + a);
+                                            break;
+                                        }
+                                        let adv = if b == a { b + 1 } else { b };
+                                        base += adv;
+                                        rest = &rest[adv..];
+                                    }
+                                    match (cut, *g) {
+                                        (Some(s), true) => alloc::format!(
+                                            "{}{}",
+                                            &cur[..s],
+                                            re_sub(&cur[s..], &brep, new, true)
+                                        ),
+                                        (Some(_), false) => {
+                                            re_sub_nth(&cur, &brep, new, *nth)
+                                        }
+                                        (None, _) => cur.clone(),
+                                    }
+                                } else {
+                                    re_sub(&cur, &brep, new, *g)
                                 };
                                 let changed = r != cur;
                                 cur = r;
@@ -23640,6 +23822,7 @@ impl Term {
                 let mut paste_dl = String::from("\t");
                 let mut paste_s = false;
                 let mut join_v: u8 = 0; // 1=file1 unpairables, 2=file2, 3=both
+                let mut join_a: u8 = 0; // -aN: unpairables as joined format
                 let mut join_e = String::new(); // -e EMPTY: fill for -o fields
                 let mut join_o: Option<String> = None; // -o FORMAT: F.N list
                 let mut pos: Vec<&str> = Vec::new();
@@ -23660,6 +23843,9 @@ impl Term {
                         "-v1" => join_v |= 1,
                         "-v2" => join_v |= 2,
                         "-v" => join_v = 3,
+                        "-a1" => join_a |= 1,
+                        "-a2" => join_a |= 2,
+                        "-a" => join_a = 3,
                         a if a.starts_with("-t") && a.len() > 2 => {
                             join_sep = String::from(&a[2..]);
                         }
@@ -23822,15 +24008,45 @@ impl Term {
                                                 .collect()
                                         })
                                         .unwrap_or_default();
+                                    // emit an unpaired line in -a mode:
+                                    // formatted like a joined row — own
+                                    // fields, -o positions from the missing
+                                    // file get the -e fill (GNU)
+                                    let emit_unpaired = |me: &mut Self,
+                                                         fs: &Vec<String>,
+                                                         side: usize| {
+                                        let out = if !ofields.is_empty() {
+                                            let cells: Vec<String> = ofields
+                                                .iter()
+                                                .map(|(fi, n)| {
+                                                    if *n == 0 {
+                                                        return fs[0].clone();
+                                                    }
+                                                    if *fi != side {
+                                                        return join_e.clone();
+                                                    }
+                                                    fs.get(*n - 1)
+                                                        .cloned()
+                                                        .unwrap_or_else(|| join_e.clone())
+                                                })
+                                                .collect();
+                                            cells.join(sep)
+                                        } else {
+                                            fs.join(sep)
+                                        };
+                                        me.emit_rec(&out, cz);
+                                    };
                                     if join_v == 0 {
                                         for l1 in &la {
                                             let f1 = f(l1);
                                             if f1.is_empty() {
                                                 continue;
                                             }
+                                            let mut paired = false;
                                             for l2 in &lb {
                                                 let f2 = f(l2);
                                                 if f2.first() == f1.first() {
+                                                    paired = true;
                                                     let out = if !ofields.is_empty() {
                                                         let cells: Vec<String> = ofields
                                                             .iter()
@@ -23860,6 +24076,23 @@ impl Term {
                                                     };
                                                     self.emit_rec(&out, cz);
                                                 }
+                                            }
+                                            if !paired && join_a & 1 != 0 {
+                                                emit_unpaired(self, &f1, 1);
+                                            }
+                                        }
+                                        if join_a & 2 != 0 {
+                                            'u2: for l2 in &lb {
+                                                let f2 = f(l2);
+                                                if f2.is_empty() {
+                                                    continue;
+                                                }
+                                                for l1 in &la {
+                                                    if f(l1).first() == f2.first() {
+                                                        continue 'u2;
+                                                    }
+                                                }
+                                                emit_unpaired(self, &f2, 2);
                                             }
                                         }
                                     } else {
@@ -25755,7 +25988,7 @@ impl Term {
         "lspci", "lscpu", "factor", "shuf", "cksum",
         "eval", "break", "continue", "return",
         "for", "while", "until", "if", "do", "done", "then", "else", "elif", "fi",
-        "tac", "fold", "column", "truncate", "mktemp", "clip", "pushd", "popd",
+        "tac", "fold", "fmt", "column", "truncate", "mktemp", "clip", "pushd", "popd",
         "dirs", "zip", "unzip", "zipinfo", "beep", "play", "gzip", "gunzip", "zcat",
         "patch", "awk", "case", "esac",
         "md5sum", "uuencode", "uudecode", "zgrep", "portscan", "dig",
