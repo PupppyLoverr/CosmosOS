@@ -2841,48 +2841,62 @@ fn awk_eval(
     for (n, v) in preseed {
         vars.insert(n.clone(), v.parse().unwrap_or(0));
     }
+    // input records + the shared read cursor: `li` is the index of the
+    // NEXT unread record so `getline` (in BEGIN too) and the main loop
+    // consume the same stream
+    let lines: Vec<String> = input.lines().map(String::from).collect();
+    // per-path read offsets behind `getline < "file"`
+    let mut gl: alloc::collections::BTreeMap<String, (Vec<String>, usize)> =
+        Default::default();
+    let mut li = 0usize;
+    let mut nr = 0usize;
     let mut out: Vec<String> = Vec::new();
     {
         // BEGIN runs with an empty $0/fields; sub/gsub targets get temps
         let mut b0 = String::from(input);
         let mut bf: Vec<String> = Vec::new();
-        awk_stmts(&begin, &mut b0, 0, &mut bf, &mut vars, &mut out, fs)?;
+        awk_stmts(&begin, &mut b0, &mut nr, &mut bf, &mut vars, &mut gl,
+                  &lines, &mut li, &mut out, fs)?;
     }
     // `pat1,pat2` range rules hold per-rule in-range state
     let mut rng: Vec<bool> = alloc::vec![false; rules.len()];
-    for (ln, line) in input.lines().enumerate() {
+    while li < lines.len() {
         // mutable per-record $0/fields so sub/gsub can rewrite them
-        let mut cur = String::from(line);
+        let mut cur = lines[li].clone();
+        li += 1;
+        nr += 1;
         let mut fields: Vec<String> = match fs {
-            Some(c) => line.split(c).map(String::from).collect(),
-            None => line.split_whitespace().map(String::from).collect(),
+            Some(c) => cur.split(c).map(String::from).collect(),
+            None => cur.split_whitespace().map(String::from).collect(),
         };
         for (ri, (pat, body)) in rules.iter().enumerate() {
             let hit = if let Some((pa, pb)) = awk_range_split(pat) {
                 if rng[ri] {
                     // in range: every record hits; a pat2 match closes it
-                    if awk_pat_matches(&pb, ln + 1, &cur, &fields, &mut vars)?
+                    if awk_pat_matches(&pb, nr, &cur, &fields, &mut vars)?
                     {
                         rng[ri] = false;
                     }
                     true
                 } else if awk_pat_matches(
-                    &pa, ln + 1, &cur, &fields, &mut vars,
+                    &pa, nr, &cur, &fields, &mut vars,
                 )? {
                     // awk tests pat2 on the opening record too — a line
                     // matching both selects just itself
                     rng[ri] = !awk_pat_matches(
-                        &pb, ln + 1, &cur, &fields, &mut vars,
+                        &pb, nr, &cur, &fields, &mut vars,
                     )?;
                     true
                 } else {
                     false
                 }
             } else {
-                awk_pat_matches(pat, ln + 1, &cur, &fields, &mut vars)?
+                awk_pat_matches(pat, nr, &cur, &fields, &mut vars)?
             };
             if hit {
-                match awk_stmts(body, &mut cur, ln + 1, &mut fields, &mut vars, &mut out, fs) {
+                match awk_stmts(body, &mut cur, &mut nr, &mut fields,
+                                &mut vars, &mut gl, &lines, &mut li,
+                                &mut out, fs) {
                     Err(e) if e == "\x01NEXT" => break, // `next`: next record
                     r => r?,
                 }
@@ -2892,7 +2906,8 @@ fn awk_eval(
     {
         let mut b0 = String::new();
         let mut bf: Vec<String> = Vec::new();
-        awk_stmts(&end, &mut b0, input.lines().count(), &mut bf, &mut vars, &mut out, fs)?;
+        awk_stmts(&end, &mut b0, &mut nr, &mut bf, &mut vars, &mut gl,
+                  &lines, &mut li, &mut out, fs)?;
     }
     Ok(out)
 }
@@ -3274,9 +3289,12 @@ fn awk_cond(
 fn awk_stmts(
     body: &str,
     line: &mut String,
-    nr: usize,
+    nr: &mut usize,
     fields: &mut Vec<String>,
     vars: &mut alloc::collections::BTreeMap<String, i64>,
+    gl: &mut alloc::collections::BTreeMap<String, (Vec<String>, usize)>,
+    lines: &[String],
+    li: &mut usize,
     out: &mut Vec<String>,
     fs: Option<char>,
 ) -> Result<(), String> {
@@ -3310,20 +3328,20 @@ fn awk_stmts(
                 let (cond, body_s, els) = awk_ctrl_parts(st)?;
                 match kw {
                     "if" => {
-                        if awk_cond(&cond, line, nr, fields, vars)? {
-                            awk_stmts(&body_s, line, nr, fields, vars, out, fs)?;
+                        if awk_cond(&cond, line, *nr, fields, vars)? {
+                            awk_stmts(&body_s, line, nr, fields, vars, gl, lines, li, out, fs)?;
                         } else if let Some(e) = els {
-                            awk_stmts(&e, line, nr, fields, vars, out, fs)?;
+                            awk_stmts(&e, line, nr, fields, vars, gl, lines, li, out, fs)?;
                         }
                     }
                     "while" => {
                         let mut it = 0u32;
-                        while awk_cond(&cond, line, nr, fields, vars)? {
+                        while awk_cond(&cond, line, *nr, fields, vars)? {
                             it += 1;
                             if it > 100_000 {
                                 return Err(String::from("awk: while loop limit"));
                             }
-                            awk_stmts(&body_s, line, nr, fields, vars, out, fs)?;
+                            awk_stmts(&body_s, line, nr, fields, vars, gl, lines, li, out, fs)?;
                         }
                     }
                     _ => {
@@ -3332,15 +3350,15 @@ fn awk_stmts(
                         if parts.len() != 3 {
                             return Err(String::from("awk: for needs init;cond;step"));
                         }
-                        awk_stmts(parts[0].trim(), line, nr, fields, vars, out, fs)?;
+                        awk_stmts(parts[0].trim(), line, nr, fields, vars, gl, lines, li, out, fs)?;
                         let mut it = 0u32;
-                        while awk_cond(parts[1].trim(), line, nr, fields, vars)? {
+                        while awk_cond(parts[1].trim(), line, *nr, fields, vars)? {
                             it += 1;
                             if it > 100_000 {
                                 return Err(String::from("awk: for loop limit"));
                             }
-                            awk_stmts(&body_s, line, nr, fields, vars, out, fs)?;
-                            awk_stmts(parts[2].trim(), line, nr, fields, vars, out, fs)?;
+                            awk_stmts(&body_s, line, nr, fields, vars, gl, lines, li, out, fs)?;
+                            awk_stmts(parts[2].trim(), line, nr, fields, vars, gl, lines, li, out, fs)?;
                         }
                     }
                 }
@@ -3363,10 +3381,10 @@ fn awk_stmts(
             if parts.is_empty() {
                 return Err(String::from("awk: printf needs a fmt"));
             }
-            let fmt = awk_strexp(parts[0], line, nr, fields, vars)?;
+            let fmt = awk_strexp(parts[0], line, *nr, fields, vars)?;
             let mut vals: Vec<String> = Vec::new();
             for a in &parts[1..] {
-                vals.push(awk_show(a.trim(), line, nr, fields, vars)?);
+                vals.push(awk_show(a.trim(), line, *nr, fields, vars)?);
             }
             let refs: Vec<&str> = vals.iter().map(|s| s.as_str()).collect();
             out.push(printf_render(&fmt, &refs));
@@ -3379,18 +3397,95 @@ fn awk_stmts(
             let parts = awk_argsplit(e);
             let vals: Result<Vec<String>, String> = parts
                 .iter()
-                .map(|p| awk_show(p.trim(), line, nr, fields, vars))
+                .map(|p| awk_show(p.trim(), line, *nr, fields, vars))
                 .collect();
             out.push(vals?.join(" "));
+        } else if st == "getline" || st.starts_with("getline ") {
+            // getline [var] [< "file"]: bare pulls the next INPUT record
+            // (shares the main loop's cursor; bumps NR, resets $0/NF —
+            // `var` form bumps NR only); `getline < f` reads a per-path
+            // stream without touching NR
+            let arg = st["getline".len()..].trim();
+            let (var, file) = match arg.find('<') {
+                Some(p) => {
+                    let v = arg[..p].trim();
+                    let f = awk_strexp(arg[p + 1..].trim(), line, *nr, fields, vars)?;
+                    (if v.is_empty() { None } else { Some(String::from(v)) }, Some(f))
+                }
+                None => {
+                    (if arg.is_empty() { None } else { Some(String::from(arg)) }, None)
+                }
+            };
+            match file {
+                Some(path) => {
+                    let ent = gl.entry(path.clone()).or_insert_with(|| {
+                        let d = ustd::read_all(&path).unwrap_or_default();
+                        (
+                            String::from_utf8_lossy(&d)
+                                .lines()
+                                .map(String::from)
+                                .collect(),
+                            0,
+                        )
+                    });
+                    if ent.1 < ent.0.len() {
+                        let rec = ent.0[ent.1].clone();
+                        ent.1 += 1;
+                        match var {
+                            Some(v) => {
+                                vars.insert(v, rec.trim().parse().unwrap_or(0));
+                            }
+                            None => {
+                                *line = rec;
+                                *fields = match fs {
+                                    Some(c) => line
+                                        .split(c)
+                                        .map(String::from)
+                                        .collect(),
+                                    None => line
+                                        .split_whitespace()
+                                        .map(String::from)
+                                        .collect(),
+                                };
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if *li < lines.len() {
+                        let rec = lines[*li].clone();
+                        *li += 1;
+                        *nr += 1;
+                        match var {
+                            Some(v) => {
+                                vars.insert(v, rec.trim().parse().unwrap_or(0));
+                            }
+                            None => {
+                                *line = rec;
+                                *fields = match fs {
+                                    Some(c) => line
+                                        .split(c)
+                                        .map(String::from)
+                                        .collect(),
+                                    None => line
+                                        .split_whitespace()
+                                        .map(String::from)
+                                        .collect(),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
         } else if let Some(p) = st.find("+=") {
             let name = st[..p].trim();
             let rhs = st[p + 2..].trim();
-            let v = awk_num(rhs, line, nr, fields, vars)?;
+            let v = awk_num(rhs, line, *nr, fields, vars)?;
             *vars.entry(String::from(name)).or_insert(0) += v;
         } else if let Some(p) = st.find("-=") {
             let name = st[..p].trim();
             let rhs = st[p + 2..].trim();
-            let v = awk_num(rhs, line, nr, fields, vars)?;
+            let v = awk_num(rhs, line, *nr, fields, vars)?;
             *vars.entry(String::from(name)).or_insert(0) -= v;
         } else if let Some(name) = st.strip_suffix("++") {
             *vars.entry(String::from(name.trim())).or_insert(0) += 1;
@@ -3399,7 +3494,7 @@ fn awk_stmts(
         } else if let Some(p) = st.find('=') {
             let name = st[..p].trim();
             let rhs = st[p + 1..].trim();
-            let v = awk_num(rhs, line, nr, fields, vars)?;
+            let v = awk_num(rhs, line, *nr, fields, vars)?;
             vars.insert(String::from(name), v);
         } else if st.starts_with("sub(") || st.starts_with("gsub(") {
             // sub(/re/, "rep" [, target]) / gsub(...): regex substitution on
@@ -3421,7 +3516,7 @@ fn awk_stmts(
                 raw
             };
             let rep = if parts.len() > 1 {
-                awk_strexp(parts[1], line, nr, fields, vars)?
+                awk_strexp(parts[1], line, *nr, fields, vars)?
             } else {
                 String::new()
             };
