@@ -20,6 +20,7 @@ struct Editor {
     cx: usize, // caret byte idx
     sel: Option<(usize, usize)>, // selected byte range [start,end)
     find_q: Option<String>, // Ctrl-F: live find query (None = not finding)
+    goto_q: Option<String>, // Ctrl-G: line-number prompt
     scroll: usize, // first visible line
     dirty_text: bool,
     dirty_ui: bool,
@@ -74,7 +75,7 @@ impl Editor {
         // header
         c.fill(0, 0, c.w as i32, 26, draw::PANEL);
         c.text(8, 5, &alloc::format!("{}{}", self.path, if self.dirty_text { " *" } else { "" }), draw::TEXT, None);
-        c.text(c.w as i32 - 228, 5, "Ctrl-S save  Ctrl-A/C/X/V", draw::DIM, None);
+        c.text(c.w as i32 - 228, 5, "Ctrl-S save  Ctrl-F/G find/goto", draw::DIM, None);
         // text area
         let lines = self.lines();
         let vis = ((c.h as i32 - 34) / 16) as usize;
@@ -112,6 +113,8 @@ impl Editor {
         c.fill(0, c.h as i32 - 22, c.w as i32, 22, draw::PANEL);
         if let Some(q) = &self.find_q {
             c.text(8, c.h as i32 - 19, &alloc::format!("find: {}_", q), draw::TEXT, None);
+        } else if let Some(q) = &self.goto_q {
+            c.text(8, c.h as i32 - 19, &alloc::format!("goto line: {}_", q), draw::TEXT, None);
         } else {
             c.text(8, c.h as i32 - 19, &alloc::format!("{}:{}  {} bytes  {}", r + 1, col + 1, self.text.len(), self.status), draw::DIM, None);
         }
@@ -153,6 +156,34 @@ impl Editor {
         if k.down == 0 {
             return;
         }
+        // goto-line mode: digits go to the line prompt
+        if self.goto_q.is_some() {
+            match k.key as u32 {
+                x if x == KeyCode::Char as u32 => {
+                    if k.chr.is_ascii_digit() {
+                        self.goto_q.as_mut().unwrap().push(k.chr as char);
+                    }
+                }
+                x if x == KeyCode::Backspace as u32 => {
+                    self.goto_q.as_mut().unwrap().pop();
+                }
+                x if x == KeyCode::Enter as u32 => {
+                    let q = core::mem::take(&mut self.goto_q).unwrap_or_default();
+                    if let Ok(n) = q.parse::<usize>() {
+                        let rows = self.lines().len();
+                        let row = n.saturating_sub(1).min(rows.saturating_sub(1));
+                        self.cx = self.idx_of(row, 0);
+                        self.sel = None;
+                        self.ensure_caret_visible();
+                        self.status = alloc::format!("line {}", row + 1);
+                    }
+                }
+                x if x == KeyCode::Escape as u32 => self.goto_q = None,
+                _ => {}
+            }
+            self.dirty_ui = true;
+            return;
+        }
         // find mode: keys go to the query
         if self.find_q.is_some() {
             match k.key as u32 {
@@ -191,6 +222,11 @@ impl Editor {
             match k.chr.to_ascii_lowercase() {
                 b'f' => {
                     self.find_q = Some(String::new());
+                    self.dirty_ui = true;
+                    return;
+                }
+                b'g' => {
+                    self.goto_q = Some(String::new());
                     self.dirty_ui = true;
                     return;
                 }
@@ -357,6 +393,7 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         cx: 0,
         sel: None,
         find_q: None,
+        goto_q: None,
         scroll: 0,
         dirty_text: false,
         dirty_ui: true,
