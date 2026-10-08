@@ -608,6 +608,69 @@ pub fn dispatch(ctx: &mut CpuContext) {
             crate::epoll::ctl(&ep_path, a2, a3 as u32, &m_path, a4 as u32) as u64
         }
         shared::SYS_EPOLL_WAIT => sys_epoll_wait(ctx, a1, a2, a3, a4),
+        shared::SYS_SOCKETPAIR => {
+            // () -> fdA | fdB<<32: two ends of one bidirectional socket
+            match crate::sockpair::create() {
+                Some((pa, pb)) => task::with_current(|t| {
+                    let sa = alloc_slot(t);
+                    t.fds[sa] = Some(task::FileDesc { path: pa, pos: 0, flags: shared::O_RDWR });
+                    let sb = alloc_slot(t);
+                    t.fds[sb] = Some(task::FileDesc { path: pb, pos: 0, flags: shared::O_RDWR });
+                    sa as u64 | (sb as u64) << 32
+                }),
+                None => ERR,
+            }
+        }
+        shared::SYS_PIDFD => {
+            // (pid) -> fd readable when the task dies; read = 8B status
+            match crate::pidfd::create(a1 as u32) {
+                Some(p) => task::with_current(|t| {
+                    let s = alloc_slot(t);
+                    t.fds[s] = Some(task::FileDesc { path: p, pos: 0, flags: shared::O_RDONLY });
+                    s as u64
+                }),
+                None => ERR,
+            }
+        }
+        shared::SYS_FCNTL => task::with_current(|t| {
+            // (fd,cmd,arg): F_DUPFD dups into the first slot >= arg (shares
+            // pos like POSIX); F_GETFL/F_SETFL read/write status bits
+            let i = a1 as usize;
+            match a2 {
+                shared::F_DUPFD => {
+                    let Some(Some(src)) = t.fds.get(i) else { return ERR };
+                    let nf = task::FileDesc { path: src.path.clone(), pos: src.pos, flags: src.flags };
+                    let mut s = a3 as usize;
+                    while s < t.fds.len() && t.fds[s].is_some() {
+                        s += 1;
+                    }
+                    if s > 4096 {
+                        return ERR;
+                    }
+                    if s == t.fds.len() {
+                        t.fds.push(Some(nf));
+                    } else {
+                        t.fds[s] = Some(nf);
+                    }
+                    s as u64
+                }
+                shared::F_GETFL => match t.fds.get(i) {
+                    Some(Some(f)) => f.flags,
+                    _ => ERR,
+                },
+                shared::F_SETFL => {
+                    const SETTABLE: u64 = shared::O_APPEND | shared::O_NONBLOCK;
+                    match t.fds.get_mut(i) {
+                        Some(Some(f)) => {
+                            f.flags = (f.flags & !SETTABLE) | (a3 & SETTABLE);
+                            0
+                        }
+                        _ => ERR,
+                    }
+                }
+                _ => ERR,
+            }
+        }),
         shared::SYS_ARP => {
             let s = net::arp_stat();
             let n = s.len().min(a2 as usize);
@@ -940,9 +1003,16 @@ fn sys_read(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
         _ => None,
     });
     let mut tmp = vec![0u8; len as usize];
+    let nonblock = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) => f.flags & shared::O_NONBLOCK != 0,
+        _ => false,
+    });
     if let Some(p) = pipe_path {
         match crate::pipes::try_read(&p, &mut tmp) {
             crate::pipes::TryRead::WouldBlock => {
+                if nonblock {
+                    return (-11i64) as u64; // EAGAIN instead of blocking
+                }
                 block_reenter(ctx, task::ticks() + 2, 0); // poll every ~20ms
             }
             crate::pipes::TryRead::Eof => return 0,
@@ -959,7 +1029,9 @@ fn sys_read(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
         Some(Some(f))
             if crate::notify::handles(&f.path)
                 || crate::timerfd::handles(&f.path)
-                || crate::eventfd::handles(&f.path) =>
+                || crate::eventfd::handles(&f.path)
+                || crate::sockpair::handles(&f.path)
+                || crate::pidfd::handles(&f.path) =>
         {
             Some(f.path.clone())
         }
@@ -970,10 +1042,15 @@ fn sys_read(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
             crate::notify::try_read(&p, &mut tmp)
         } else if crate::eventfd::handles(&p) {
             crate::eventfd::try_read(&p, &mut tmp)
+        } else if crate::sockpair::handles(&p) {
+            crate::sockpair::try_read(&p, &mut tmp)
+        } else if crate::pidfd::handles(&p) {
+            crate::pidfd::try_read(&p, &mut tmp)
         } else {
             crate::timerfd::try_read(&p, &mut tmp)
         };
         return match r {
+            Err(-11) if nonblock => (-11i64) as u64,
             Err(-11) => block_reenter(ctx, task::ticks() + 2, 0),
             Err(e) => e as u64,
             Ok(n) => match copy_out(buf, &tmp[..n]) {
@@ -1011,8 +1088,35 @@ fn sys_write(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
             Ok(n) => n as u64,
         };
     }
+    // socketpair objects: full buffer re-blocks, closed peer is EPIPE
+    let sp_path = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) if crate::sockpair::handles(&f.path) => Some(f.path.clone()),
+        _ => None,
+    });
+    if let Some(p) = sp_path {
+        let nb = task::with_current(|t| match t.fds.get(fd as usize) {
+            Some(Some(f)) => f.flags & shared::O_NONBLOCK != 0,
+            _ => false,
+        });
+        return match crate::sockpair::try_write(&p, &data) {
+            Err(-11) if nb => (-11i64) as u64,
+            Err(-11) => block_reenter(ctx, task::ticks() + 2, 0),
+            Err(e) => e as u64,
+            Ok(n) => n as u64,
+        };
+    }
     match vfs::write(fd as i64, &data) {
-        Err(-11) if is_pipe => block_reenter(ctx, task::ticks() + 2, 0),
+        Err(-11) if is_pipe => {
+            let nb = task::with_current(|t| match t.fds.get(fd as usize) {
+                Some(Some(f)) => f.flags & shared::O_NONBLOCK != 0,
+                _ => false,
+            });
+            if nb {
+                (-11i64) as u64
+            } else {
+                block_reenter(ctx, task::ticks() + 2, 0)
+            }
+        }
         Ok(n) => n as u64,
         Err(e) => e as u64,
     }
@@ -1134,6 +1238,11 @@ pub fn fd_ready(path: &str, ev: u32) -> bool {
     } else if crate::eventfd::handles(path) {
         (ev & 1 != 0 && crate::eventfd::ready(path, true))
             || (ev & 2 != 0 && crate::eventfd::ready(path, false))
+    } else if crate::sockpair::handles(path) {
+        (ev & 1 != 0 && crate::sockpair::ready(path, true))
+            || (ev & 2 != 0 && crate::sockpair::ready(path, false))
+    } else if crate::pidfd::handles(path) {
+        ev & 1 != 0 && crate::pidfd::ready(path, true)
     } else if crate::epoll::handles(path) {
         false // epoll fds are wait targets, not readable/writable streams
     } else {

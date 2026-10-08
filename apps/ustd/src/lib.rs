@@ -1189,3 +1189,39 @@ pub fn epoll_wait(epfd: i64, out: &mut [(u32, u32)], timeout_ms: u64) -> i64 {
         timeout_ms,
     ) as i64
 }
+
+/// socketpair: bidirectional connected fds (AF_UNIX SOCK_STREAM semantics).
+/// Returns (fdA, fdB); bytes written to one are read from the other.
+pub fn socketpair() -> Option<(i64, i64)> {
+    let v = sc0(shared::SYS_SOCKETPAIR);
+    if v == u64::MAX {
+        return None;
+    }
+    Some(((v & 0xffff_ffff) as i64, (v >> 32) as i64))
+}
+
+/// pidfd_create: an fd that becomes readable when `pid` exits; reading it
+/// yields the 8-byte exit status. -1 if the task is absent/already dead.
+pub fn pidfd(pid: u32) -> i64 {
+    sc1(shared::SYS_PIDFD, pid as u64) as i64
+}
+
+/// Read a pidfd's 8-byte exit status (poll() first — blocks while alive).
+pub fn pidfd_read(fd: i64) -> Option<i64> {
+    let mut b = [0u8; 8];
+    match read(fd, &mut b) {
+        Ok(8) => Some(i64::from_le_bytes(b)),
+        _ => None,
+    }
+}
+
+pub const F_DUPFD: u64 = shared::F_DUPFD;
+pub const F_GETFL: u64 = shared::F_GETFL;
+pub const F_SETFL: u64 = shared::F_SETFL;
+pub const O_NONBLOCK: u64 = shared::O_NONBLOCK;
+
+/// fcntl(fd, cmd, arg): F_DUPFD (dup into first slot >= arg, shared pos),
+/// F_GETFL (fd status flags), F_SETFL (set O_APPEND|O_NONBLOCK bits).
+pub fn fcntl(fd: i64, cmd: u64, arg: u64) -> i64 {
+    sc3(shared::SYS_FCNTL, fd as u64, cmd, arg) as i64
+}

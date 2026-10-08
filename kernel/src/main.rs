@@ -19,6 +19,8 @@ mod net;
 mod notify;
 mod epoll;
 mod eventfd;
+mod sockpair;
+mod pidfd;
 mod pci;
 mod dev;
 mod pcap;

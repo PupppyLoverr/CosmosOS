@@ -681,6 +681,15 @@ pub fn exists(pid: u32) -> bool {
     g.as_ref().map(|s| s.tasks.iter().any(|t| t.id == pid)).unwrap_or(false)
 }
 
+/// True when `pid` has exited (still a zombie) or no longer exists at all —
+/// the pidfd readiness condition.
+pub fn dead_or_gone(pid: u32) -> bool {
+    let g = SCHED.lock();
+    g.as_ref()
+        .map(|s| !s.tasks.iter().any(|t| t.id == pid && t.state != State::Dead))
+        .unwrap_or(false)
+}
+
 /// Kill task `pid` (userspace only). Returns false if absent/kernel.
 pub fn kill_pid(pid: u32) -> bool {
     kill_pid_code(pid, -9)

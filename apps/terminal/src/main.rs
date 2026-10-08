@@ -4911,6 +4911,25 @@ fn tar_add(arc: &mut Vec<u8>, path: &str) -> usize {
 }
 
 /// Options for one grep pass (file or stdin).
+/// One file being followed by `tail -f/-F`.
+#[derive(Clone)]
+struct TailEnt {
+    path: String,
+    fd: i64,      // open read fd (seeked to follow offset); -1 while missing
+    missing: bool,
+    wd: i64,      // inotify watch id of the file's parent dir
+}
+
+/// `tail -f` state: N files watched through a single inotify fd; `last` is
+/// the index of the file output most recently came from (==> headers).
+#[derive(Clone)]
+struct TailFollow {
+    ifd: i64,
+    ents: Vec<TailEnt>,
+    last: Option<usize>,
+}
+
+/// Options for one grep pass (file or stdin).
 #[derive(Clone, Copy, Default)]
 struct GrepOpts {
     rec: bool,
@@ -4960,8 +4979,8 @@ struct Term {
     sel_drag: bool,                                    // left button currently held
     pq: String,                                        // pager search query
     pg_input: bool,                                    // pager `/` input active
-    // `tail -f`/`tail -F`: (path, fd, inotify-fd or -1, file-missing)
-    tailf: Option<(String, i64, i64, bool)>,
+    // `tail -f`/`tail -F`: one shared inotify fd + the followed files
+    tailf: Option<TailFollow>,
     // `inotifywait`/`inotifywatch`: (ifd, deadline_ms or MAX, counts, monitor)
     inotw: Option<(i64, u64, alloc::collections::BTreeMap<String, u64>, bool)>,
     top: Option<u64>,           // top mode: refresh interval ms
@@ -5137,6 +5156,85 @@ impl Term {
                 None => self.push_line(s),
             }
         }
+    }
+
+    // `tail -F a b c…`: emit GNU-style `==> file <==` sections for the
+    // current tails, then arm one TailFollow covering every file through a
+    // single shared inotify fd (one watch per unique parent dir).
+    fn tail_follow_multi(&mut self, files: &[&str], n: usize, n_from: bool, big_f: bool) {
+        let mut ents: Vec<TailEnt> = Vec::new();
+        let mut first = true;
+        for p in files {
+            if !first {
+                self.emit("");
+            }
+            first = false;
+            self.emit(&alloc::format!("==> {} <==", p));
+            let mut fd: i64 = -1;
+            match ustd::read_all(p) {
+                Ok(d) => {
+                    let blen = d.len();
+                    let text = String::from_utf8_lossy(&d).into_owned();
+                    let ls: Vec<&str> = text.lines().collect();
+                    let start = if n_from {
+                        n.saturating_sub(1).min(ls.len())
+                    } else {
+                        ls.len().saturating_sub(n)
+                    };
+                    for l in ls.iter().skip(start) {
+                        self.emit(l);
+                    }
+                    if let Ok(f) = ustd::open(p, ustd::O_RDONLY) {
+                        let _ = ustd::seek(f, blen as u64, 0);
+                        fd = f;
+                    }
+                }
+                Err(e) => {
+                    if big_f {
+                        self.emit(&alloc::format!("tail: {}: not found — waiting", p));
+                    } else {
+                        self.fail(&alloc::format!("tail: {}: err {}", p, e));
+                    }
+                }
+            }
+            ents.push(TailEnt {
+                path: String::from(*p),
+                fd,
+                missing: fd < 0,
+                wd: -1,
+            });
+        }
+        // one shared inotify fd; one watch per unique parent dir
+        let mut ifd: i64 = -1;
+        if big_f {
+            let i = ustd::inotify_init();
+            if i >= 0 {
+                let mut dirs: alloc::collections::BTreeMap<String, i64> =
+                    alloc::collections::BTreeMap::new();
+                for e in ents.iter_mut() {
+                    let dir = match e.path.rfind('/') {
+                        Some(0) | None => String::from("/"),
+                        Some(i2) => String::from(&e.path[..i2]),
+                    };
+                    e.wd = match dirs.get(&dir) {
+                        Some(&w) => w,
+                        None => {
+                            let w = ustd::inotify_add(i, &dir, ustd::IN_ALL);
+                            dirs.insert(dir, w);
+                            w
+                        }
+                    };
+                }
+                ifd = i;
+            }
+        }
+        self.tailf = Some(TailFollow {
+            ifd,
+            ents,
+            last: None,
+        });
+        self.tailf_last = 0;
+        self.emit("  (following -- Esc/Enter to stop)");
     }
 
     /// Emit an error line and mark the current statement failed (for
@@ -14079,6 +14177,25 @@ impl Term {
                     Some(v) => (v.trim_start_matches('+').parse().unwrap_or(10), false, false),
                     None => (10, false, false),
                 };
+                // multi-file tail -f/-F: GNU ==>-headers, one shared inotify fd
+                let follow = args.iter().any(|a| *a == "-f" || *a == "-F");
+                if cmd == "tail" && follow {
+                    let files: Vec<&str> = args
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, a)| !a.starts_with('-') && !valpos.contains(i))
+                        .map(|(_, a)| *a)
+                        .collect();
+                    if files.len() > 1 {
+                        self.tail_follow_multi(
+                            &files,
+                            n,
+                            n_from,
+                            args.iter().any(|a| *a == "-F"),
+                        );
+                        return;
+                    }
+                }
                 let mut blen = 0usize;
                 let content = match popt {
                     Some(p) => match ustd::read_all(p) {
@@ -14311,6 +14428,7 @@ impl Term {
                                         }
                                     }
                                     let mut ifd: i64 = -1;
+                                    let mut wd: i64 = -1;
                                     if big_f {
                                         let i = ustd::inotify_init();
                                         if i >= 0 {
@@ -14320,12 +14438,20 @@ impl Term {
                                                 Some(0) | None => "/",
                                                 Some(i2) => &p[..i2],
                                             };
-                                            let _ = ustd::inotify_add(i, dir, ustd::IN_ALL);
+                                            wd = ustd::inotify_add(i, dir, ustd::IN_ALL);
                                             ifd = i;
                                         }
                                     }
-                                    self.tailf =
-                                        Some((String::from(p), fd, ifd, fd < 0));
+                                    self.tailf = Some(TailFollow {
+                                        ifd,
+                                        ents: alloc::vec![TailEnt {
+                                            path: String::from(p),
+                                            fd,
+                                            missing: fd < 0,
+                                            wd,
+                                        }],
+                                        last: None,
+                                    });
                                     self.tailf_last = 0;
                                     self.emit("  (following -- Esc/Enter to stop)");
                                 } else {
@@ -14341,16 +14467,26 @@ impl Term {
                         match (follow_f, popt) {
                             (true, Some(p)) => {
                                 let mut ifd: i64 = -1;
+                                let mut wd: i64 = -1;
                                 let i = ustd::inotify_init();
                                 if i >= 0 {
                                     let dir = match p.rfind('/') {
                                         Some(0) | None => "/",
                                         Some(i2) => &p[..i2],
                                     };
-                                    let _ = ustd::inotify_add(i, dir, ustd::IN_ALL);
+                                    wd = ustd::inotify_add(i, dir, ustd::IN_ALL);
                                     ifd = i;
                                 }
-                                self.tailf = Some((String::from(p), -1, ifd, true));
+                                self.tailf = Some(TailFollow {
+                                    ifd,
+                                    ents: alloc::vec![TailEnt {
+                                        path: String::from(p),
+                                        fd: -1,
+                                        missing: true,
+                                        wd,
+                                    }],
+                                    last: None,
+                                });
                                 self.tailf_last = 0;
                                 self.emit(&alloc::format!(
                                     "tail: {}: not found — waiting for it", p
@@ -19528,12 +19664,14 @@ impl Term {
                     self.push_line("watch stopped");
                 }
                 if self.tailf.is_some() {
-                    if let Some((_, fd, ifd, _)) = self.tailf.take() {
-                        if fd >= 0 {
-                            ustd::close(fd);
+                    if let Some(tf) = self.tailf.take() {
+                        for e in &tf.ents {
+                            if e.fd >= 0 {
+                                ustd::close(e.fd);
+                            }
                         }
-                        if ifd >= 0 {
-                            ustd::close(ifd);
+                        if tf.ifd >= 0 {
+                            ustd::close(tf.ifd);
                         }
                     }
                     self.push_line("tail: stopped");
@@ -21448,47 +21586,55 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         // tail -f/-F mode: poll the file fd (and the inotify fd for -F),
         // print bytes appended since last read
-        if let Some((path, fd, ifd, missing)) = t.tailf.clone() {
+        if let Some(tf) = t.tailf.clone() {
             if now - t.tailf_last >= 400 {
                 t.tailf_last = now;
-                let mut fd2 = fd;
-                let mut missing2 = missing;
-                // -F: drain pending watch events for our basename
-                if ifd >= 0 && ustd::poll(&[ifd as u32], &[1], 0) > 0 {
+                let mut tf = tf;
+                // -F: drain pending watch events; wd identifies the parent
+                // dir, the record's name the basename of the changed file
+                if tf.ifd >= 0 && ustd::poll(&[tf.ifd as u32], &[1], 0) > 0 {
                     let mut ebuf = [0u8; 2048];
-                    if let Ok(n) = ustd::read(ifd, &mut ebuf) {
-                        let base = path.rsplit('/').next().unwrap_or(&path);
+                    if let Ok(n) = ustd::read(tf.ifd, &mut ebuf) {
                         for l in String::from_utf8_lossy(&ebuf[..n]).lines() {
                             let mut it = l.split_whitespace();
-                            let _wd = it.next();
+                            let wd: i64 =
+                                it.next().and_then(|m| m.parse().ok()).unwrap_or(-1);
                             let mask: u64 =
                                 it.next().and_then(|m| m.parse().ok()).unwrap_or(0);
                             let name = it.next().unwrap_or("");
-                            if name != base {
-                                continue;
-                            }
                             const IN_DELETE: u64 = 0x200;
                             const IN_MOVED_FROM: u64 = 0x40;
                             const IN_CREATE: u64 = 0x100;
                             const IN_MOVED_TO: u64 = 0x80;
-                            if mask & (IN_DELETE | IN_MOVED_FROM) != 0 {
-                                if fd2 >= 0 {
-                                    ustd::close(fd2);
-                                    fd2 = -1;
+                            for e in tf.ents.iter_mut() {
+                                if e.wd != wd {
+                                    continue;
                                 }
-                                missing2 = true;
-                                t.push_line(&alloc::format!(
-                                    "tail: {}: file deleted — waiting", path
-                                ));
-                            } else if missing2
-                                && mask & (IN_CREATE | IN_MOVED_TO | 0x2) != 0
-                            {
-                                if let Ok(f) = ustd::open(&path, ustd::O_RDONLY) {
-                                    fd2 = f;
-                                    missing2 = false;
+                                let base = e.path.rsplit('/').next().unwrap_or(&e.path);
+                                if name != base {
+                                    continue;
+                                }
+                                if mask & (IN_DELETE | IN_MOVED_FROM) != 0 {
+                                    if e.fd >= 0 {
+                                        ustd::close(e.fd);
+                                        e.fd = -1;
+                                    }
+                                    e.missing = true;
                                     t.push_line(&alloc::format!(
-                                        "tail: {}: (re)created — following", path
+                                        "tail: {}: file deleted — waiting",
+                                        e.path
                                     ));
+                                } else if e.missing
+                                    && mask & (IN_CREATE | IN_MOVED_TO | 0x2) != 0
+                                {
+                                    if let Ok(f) = ustd::open(&e.path, ustd::O_RDONLY) {
+                                        e.fd = f;
+                                        e.missing = false;
+                                        t.push_line(&alloc::format!(
+                                            "tail: {}: (re)created — following",
+                                            e.path
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -21496,27 +21642,36 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 }
                 // gate on poll(): an empty fifo reports not-ready so the
                 // read below never blocks the terminal task
-                if fd2 >= 0 && ustd::poll(&[fd2 as u32], &[1], 0) > 0 {
-                    let mut buf = [0u8; 8192];
-                    match ustd::read(fd2, &mut buf) {
-                        Ok(n) if n > 0 => {
-                            let txt = String::from_utf8_lossy(&buf[..n]);
-                            for l in txt.lines().take(20) {
-                                t.push_line(l);
+                let multi = tf.ents.len() > 1;
+                for (ei, e) in tf.ents.iter_mut().enumerate() {
+                    if e.fd >= 0 && ustd::poll(&[e.fd as u32], &[1], 0) > 0 {
+                        let mut buf = [0u8; 8192];
+                        match ustd::read(e.fd, &mut buf) {
+                            Ok(n) if n > 0 => {
+                                // ==> header when output switches files
+                                // (only with more than one file followed)
+                                if multi && tf.last != Some(ei) {
+                                    t.push_line(&alloc::format!("==> {} <==", e.path));
+                                }
+                                tf.last = Some(ei);
+                                let txt = String::from_utf8_lossy(&buf[..n]);
+                                for l in txt.lines().take(20) {
+                                    t.push_line(l);
+                                }
                             }
-                        }
-                        _ => {
-                            // truncated? regular files: reseek to keep following
-                            if let Ok(st) = ustd::stat(&path) {
-                                let cur = ustd::seek(fd2, 0, 1).unwrap_or(0);
-                                if st.size < cur {
-                                    let _ = ustd::seek(fd2, 0, 0);
+                            _ => {
+                                // truncated? reseek to keep following
+                                if let Ok(st) = ustd::stat(&e.path) {
+                                    let cur = ustd::seek(e.fd, 0, 1).unwrap_or(0);
+                                    if st.size < cur {
+                                        let _ = ustd::seek(e.fd, 0, 0);
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                t.tailf = Some((path, fd2, ifd, missing2));
+                t.tailf = Some(tf);
                 t.dirty_all = true;
             }
         }

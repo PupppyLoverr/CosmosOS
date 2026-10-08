@@ -437,6 +437,8 @@ pub fn release_desc(f: &task::FileDesc) {
     crate::timerfd::close_obj(&f.path);
     crate::eventfd::close_obj(&f.path);
     crate::epoll::close_obj(&f.path);
+    crate::sockpair::close_obj(&f.path);
+    crate::pidfd::close_obj(&f.path);
 }
 
 pub fn close(fd: i64) {

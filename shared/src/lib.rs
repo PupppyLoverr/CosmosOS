@@ -113,6 +113,12 @@ pub const SYS_EVENTFD: u64 = 107;        // (initval,flags) -> fd | ERR    event
 pub const SYS_EPOLL_CREATE: u64 = 108;   // () -> fd | ERR                 epoll interest-set fd
 pub const SYS_EPOLL_CTL: u64 = 109;      // (epfd,op,fd,events) -> 0 | ERR add/del/mod an interest
 pub const SYS_EPOLL_WAIT: u64 = 110;     // (epfd,out_ptr,max,timeout_ms) -> nready | ERR
+pub const SYS_SOCKETPAIR: u64 = 111;     // () -> fdA | fdB<<32 | ERR
+pub const SYS_PIDFD: u64 = 112;          // (pid) -> fd | ERR
+pub const SYS_FCNTL: u64 = 113;          // (fd,cmd,arg) -> per-cmd | ERR
+pub const F_DUPFD: u64 = 0;
+pub const F_GETFL: u64 = 3;
+pub const F_SETFL: u64 = 4;
 pub const PROT_READ: u64 = 1;
 pub const PROT_WRITE: u64 = 2;
 pub const PROT_EXEC: u64 = 4;
@@ -127,6 +133,7 @@ pub const O_RDWR: u64 = 2;
 pub const O_CREATE: u64 = 4;
 pub const O_TRUNC: u64 = 8;
 pub const O_APPEND: u64 = 16;
+pub const O_NONBLOCK: u64 = 64;
 
 // seek whence
 pub const SEEK_SET: u64 = 0;
