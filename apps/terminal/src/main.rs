@@ -54,6 +54,8 @@ struct Term {
     capture: Option<Vec<String>>, // output capture for pipes/redirects
     pipe_in: Option<String>,     // stdin text delivered by the previous stage
     watch: Option<(String, u64, u64)>, // (cmd, interval_ms, last_run_ms)
+    vars: alloc::collections::BTreeMap<String, String>, // shell vars ($NAME)
+    prev_cwd: String,                                  // for `cd -`
 }
 
 impl Term {
@@ -101,6 +103,30 @@ impl Term {
         self.run(cmd);
         let out = self.capture.take().unwrap_or_default();
         self.capture = saved;
+        out
+    }
+
+    /// Expand $NAME tokens from the shell var table (whole-word vars).
+    fn expand_vars(&self, s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'$' && i + 1 < b.len() && (b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_') {
+                let mut j = i + 1;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                let name = core::str::from_utf8(&b[i + 1..j]).unwrap_or("");
+                if let Some(v) = self.vars.get(name) {
+                    out.push_str(v);
+                }
+                i = j;
+            } else {
+                out.push(b[i] as char);
+                i += 1;
+            }
+        }
         out
     }
 
@@ -207,6 +233,9 @@ impl Term {
         self.hist.push(String::from(input));
         self.hi = self.hist.len();
         self.save_hist();
+        // $VAR expansion (whole-token vars; $ followed by name chars)
+        let expanded = self.expand_vars(input);
+        let input = expanded.as_str();
         let mut it = input.split_whitespace();
         let cmd = it.next().unwrap_or("");
         let args: Vec<&str> = it.collect();
@@ -248,12 +277,59 @@ impl Term {
                 }
             }
             "cd" => {
-                let p = args.first().copied().unwrap_or("/");
-                if !ustd::chdir(p) {
-                    self.emit(&alloc::format!("cd: {}: no such dir", p));
+                let cur = ustd::getcwd();
+                let dest = if args.first() == Some(&"-") {
+                    if self.prev_cwd.is_empty() {
+                        self.emit("cd: no previous dir");
+                        return;
+                    }
+                    self.prev_cwd.clone()
+                } else {
+                    String::from(*args.first().unwrap_or(&"/"))
+                };
+                if ustd::chdir(&dest) {
+                    self.prev_cwd = cur;
+                } else {
+                    self.emit(&alloc::format!("cd: {}: no such dir", dest));
                 }
             }
             "pwd" => self.emit(&ustd::getcwd()),
+            "set" => {
+                // set NAME=value | set   (list) | set -u NAME (unset)
+                if args.is_empty() {
+                    for i in 0..self.vars.len() {
+                        let (k, v) = self.vars.iter().nth(i).unwrap();
+                        let line = alloc::format!("{}={}", k, v);
+                        self.emit(&line);
+                    }
+                } else if args.first() == Some(&"-u") {
+                    if let Some(n) = args.get(1) {
+                        self.vars.remove(*n);
+                    }
+                } else if let Some(eq) = args[0].find('=') {
+                    let (n, v) = args[0].split_at(eq);
+                    self.vars.insert(String::from(n), String::from(&v[1..]));
+                } else {
+                    self.emit("usage: set NAME=value | set -u NAME");
+                }
+            }
+            "env" => {
+                for i in 0..self.vars.len() {
+                    let (k, v) = self.vars.iter().nth(i).unwrap();
+                    let line = alloc::format!("{}={}", k, v);
+                    self.emit(&line);
+                }
+            }
+            "which" => match args.first() {
+                Some(c) => {
+                    let p = alloc::format!("/bin/{}", c);
+                    match ustd::stat(&p) {
+                        Ok(_) => self.emit(&p),
+                        Err(_) => self.emit(&alloc::format!("which: {} not found", c)),
+                    }
+                }
+                None => self.emit("usage: which <cmd>"),
+            },
             "cat" => match args.first() {
                 Some(p) => match ustd::read_all(p) {
                     Ok(d) => {
@@ -744,6 +820,7 @@ impl Term {
             "resolve", "httpget", "ifconfig", "dhcp", "netstat", "kill", "grep",
             "uptime", "reboot", "shutdown", "exit", "history", "time",
             "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
+            "set", "env", "which",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
@@ -937,6 +1014,8 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         capture: None,
         pipe_in: None,
         watch: None,
+        vars: alloc::collections::BTreeMap::new(),
+        prev_cwd: String::new(),
     };
     t.load_hist();
     t.push_line("CosmosOS terminal - type 'help'");
