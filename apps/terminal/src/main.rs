@@ -2848,6 +2848,8 @@ fn awk_eval(
         let mut bf: Vec<String> = Vec::new();
         awk_stmts(&begin, &mut b0, 0, &mut bf, &mut vars, &mut out, fs)?;
     }
+    // `pat1,pat2` range rules hold per-rule in-range state
+    let mut rng: Vec<bool> = alloc::vec![false; rules.len()];
     for (ln, line) in input.lines().enumerate() {
         // mutable per-record $0/fields so sub/gsub can rewrite them
         let mut cur = String::from(line);
@@ -2855,8 +2857,31 @@ fn awk_eval(
             Some(c) => line.split(c).map(String::from).collect(),
             None => line.split_whitespace().map(String::from).collect(),
         };
-        for (pat, body) in &rules {
-            if awk_pat_matches(pat, ln + 1, &cur, &fields, &mut vars)? {
+        for (ri, (pat, body)) in rules.iter().enumerate() {
+            let hit = if let Some((pa, pb)) = awk_range_split(pat) {
+                if rng[ri] {
+                    // in range: every record hits; a pat2 match closes it
+                    if awk_pat_matches(&pb, ln + 1, &cur, &fields, &mut vars)?
+                    {
+                        rng[ri] = false;
+                    }
+                    true
+                } else if awk_pat_matches(
+                    &pa, ln + 1, &cur, &fields, &mut vars,
+                )? {
+                    // awk tests pat2 on the opening record too — a line
+                    // matching both selects just itself
+                    rng[ri] = !awk_pat_matches(
+                        &pb, ln + 1, &cur, &fields, &mut vars,
+                    )?;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                awk_pat_matches(pat, ln + 1, &cur, &fields, &mut vars)?
+            };
+            if hit {
                 match awk_stmts(body, &mut cur, ln + 1, &mut fields, &mut vars, &mut out, fs) {
                     Err(e) if e == "\x01NEXT" => break, // `next`: next record
                     r => r?,
@@ -2923,6 +2948,32 @@ fn match_brace(s: &str) -> Option<usize> {
                 if d == 0 {
                     return Some(i);
                 }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split an awk `pat1,pat2` range pattern on its top-level comma —
+/// commas inside /re/, parens, or brackets don't count.
+fn awk_range_split(pat: &str) -> Option<(String, String)> {
+    let b = pat.as_bytes();
+    let (mut in_re, mut depth, mut i) = (false, 0i64, 0usize);
+    while i < b.len() {
+        match b[i] {
+            b'\\' if in_re => i += 1, // skip the escaped char inside /re/
+            b'/' => in_re = !in_re,
+            b'(' | b'[' if !in_re => depth += 1,
+            b')' | b']' if !in_re => depth -= 1,
+            b',' if !in_re && depth == 0 => {
+                let a = pat[..i].trim();
+                let c = pat[i + 1..].trim();
+                if !a.is_empty() && !c.is_empty() {
+                    return Some((String::from(a), String::from(c)));
+                }
+                return None;
             }
             _ => {}
         }
@@ -3938,10 +3989,20 @@ fn awk_num(
 }
 
 /// sed command: optional address prefix + operation.
-enum SedAddr {
+/// One side of a sed address: line number, last-line `$`, or a `/re/` that
+/// tests the (current) pattern space.
+enum SedEnd {
     N(usize),
-    R(usize, usize),
     Last,
+    Re(String),
+}
+enum SedAddr {
+    One(SedEnd),
+    // addr1,addr2 — POSIX stateful range: opens at addr1, closes on the
+    // first line AFTER the opener that matches addr2; a regexp addr1 may
+    // reopen for the next match; a numeric addr2 <= opener selects only
+    // the opening line.
+    RR(SedEnd, SedEnd),
 }
 enum SedK {
     Sub(String, String, bool, bool, usize), // old,new,g-flag,p-flag,nth(0=first)
@@ -3955,6 +4016,85 @@ enum SedK {
     Rf(String),
     Wf(String),
     LineNo, // `=` prints the current line number
+    Hold,   // h: hold space = pattern space
+    HoldAp, // H: append pattern space to hold space
+    Get,    // g: pattern space = hold space
+    GetAp,  // G: append hold space to pattern space
+    Swap,   // x: exchange pattern and hold spaces
+}
+
+/// Parse one sed address: N | $ | /re/ (a `\/` inside the regex stays an
+/// escaped slash). Returns Ok(None) when no address character follows.
+fn sed_end(b: &[u8], i: &mut usize, spec: &str) -> Result<Option<SedEnd>, String> {
+    if *i >= b.len() {
+        return Ok(None);
+    }
+    if b[*i] == b'/' {
+        *i += 1;
+        let mut p = String::new();
+        while *i < b.len() {
+            if b[*i] == b'\\' && *i + 1 < b.len() {
+                p.push('\\');
+                p.push(b[*i + 1] as char);
+                *i += 2;
+                continue;
+            }
+            if b[*i] == b'/' {
+                *i += 1;
+                return Ok(Some(SedEnd::Re(p)));
+            }
+            p.push(b[*i] as char);
+            *i += 1;
+        }
+        return Err(String::from("sed: unclosed /re/ address"));
+    }
+    if b[*i] == b'$' {
+        *i += 1;
+        return Ok(Some(SedEnd::Last));
+    }
+    let a0 = *i;
+    while *i < b.len() && b[*i].is_ascii_digit() {
+        *i += 1;
+    }
+    if a0 == *i {
+        return Ok(None);
+    }
+    spec[a0..*i]
+        .parse::<usize>()
+        .map(|n| Some(SedEnd::N(n)))
+        .map_err(|_| String::from("sed: bad numeric address"))
+}
+
+/// Does a sed address end select the current pattern space? `open` picks
+/// `== n` for a numeric first address (it can only match one line) and
+/// `>= n` for a numeric second (it stays in range once reached).
+fn sed_hit(
+    ere: bool,
+    e: &SedEnd,
+    ln: usize,
+    last: bool,
+    s: &str,
+    open: bool,
+) -> bool {
+    match e {
+        SedEnd::N(n) => {
+            if open {
+                ln == *n
+            } else {
+                ln >= *n
+            }
+        }
+        SedEnd::Last => last,
+        SedEnd::Re(re) => {
+            // /re/ addresses follow the s/// mode: BRE unless -E
+            let p = if ere {
+                re.clone()
+            } else {
+                bre_to_ere(re)
+            };
+            re_search(&p, s).is_some()
+        }
+    }
 }
 
 /// Read one delimiter-terminated sed field (\\x escapes pass through).
@@ -3981,7 +4121,9 @@ fn sed_field(s: &str, i: &mut usize, d: char) -> Option<String> {
 /// Parse a sed script into (address, command) pairs; `;` or newlines
 /// separate commands. `s`/`y` read two delimiter fields + flags;
 /// `a/i/c` consume text to `;`; `r/w` a path; `p/d/q` are bare.
-fn sed_parse(spec: &str) -> Result<Vec<(Option<SedAddr>, SedK)>, String> {
+fn sed_parse(
+    spec: &str,
+) -> Result<Vec<(Option<SedAddr>, bool, SedK)>, String> {
     let b = spec.as_bytes();
     let mut i = 0usize;
     let mut out = Vec::new();
@@ -3994,28 +4136,23 @@ fn sed_parse(spec: &str) -> Result<Vec<(Option<SedAddr>, SedK)>, String> {
         if i >= b.len() {
             break;
         }
-        let a0 = i;
-        while i < b.len()
-            && (b[i].is_ascii_digit() || b[i] == b',' || b[i] == b'$')
-        {
+        // address prefix: N | $ | /re/, optionally `,` + a second one
+        let a1 = sed_end(b, &mut i, spec)?;
+        let addr = if a1.is_some() && i < b.len() && b[i] == b',' {
             i += 1;
-        }
-        let atext = &spec[a0..i];
-        let addr = if atext.is_empty() {
-            None
-        } else if atext == "$" {
-            Some(SedAddr::Last)
-        } else {
-            match atext.split_once(',') {
-                Some((x, y)) => match (x.parse(), y.parse()) {
-                    (Ok(a), Ok(bv)) => Some(SedAddr::R(a, bv)),
-                    _ => return Err(alloc::format!("sed: bad address {}", atext)),
-                },
-                None => match atext.parse() {
-                    Ok(n) => Some(SedAddr::N(n)),
-                    _ => return Err(alloc::format!("sed: bad address {}", atext)),
-                },
+            match sed_end(b, &mut i, spec)? {
+                Some(e2) => Some(SedAddr::RR(a1.unwrap(), e2)),
+                None => {
+                    return Err(String::from("sed: bad range address"))
+                }
             }
+        } else {
+            a1.map(SedAddr::One)
+        };
+        // `addr!` negates the address (GNU): needs a real address
+        let neg = addr.is_some() && i < b.len() && b[i] == b'!' && {
+            i += 1;
+            true
         };
         if i >= b.len() {
             break;
@@ -4054,7 +4191,7 @@ fn sed_parse(spec: &str) -> Result<Vec<(Option<SedAddr>, SedK)>, String> {
                     i += 1;
                 }
                 out.push((
-                    addr,
+                    addr, neg,
                     if is_s {
                         SedK::Sub(f1, f2, g, pf, nth)
                     } else {
@@ -4062,15 +4199,21 @@ fn sed_parse(spec: &str) -> Result<Vec<(Option<SedAddr>, SedK)>, String> {
                     },
                 ));
             }
-            b'p' | b'd' | b'q' | b'=' => {
+            b'p' | b'd' | b'q' | b'=' | b'h' | b'H' | b'g' | b'G'
+            | b'x' => {
                 let k = match b[i] {
                     b'p' => SedK::P,
                     b'd' => SedK::D,
                     b'=' => SedK::LineNo,
+                    b'h' => SedK::Hold,
+                    b'H' => SedK::HoldAp,
+                    b'g' => SedK::Get,
+                    b'G' => SedK::GetAp,
+                    b'x' => SedK::Swap,
                     _ => SedK::Q,
                 };
                 i += 1;
-                out.push((addr, k));
+                out.push((addr, neg, k));
             }
             b'a' | b'i' | b'c' | b'r' | b'w' => {
                 let k = b[i];
@@ -4093,7 +4236,7 @@ fn sed_parse(spec: &str) -> Result<Vec<(Option<SedAddr>, SedK)>, String> {
                     b'r' => SedK::Rf(t),
                     _ => SedK::Wf(t),
                 };
-                out.push((addr, cmd));
+                out.push((addr, neg, cmd));
             }
             _ => return Err(alloc::format!("sed: bad command {}", b[i] as char)),
         }
@@ -22480,55 +22623,86 @@ impl Term {
                 // -z/--null-data: records are NUL-separated in and out
                 // -i[SUFFIX] / --in-place[=SUFFIX]: GNU backup semantics —
                 // the original is copied to <file><SUFFIX> before rewrite.
-                let isuf = args.iter().find_map(|a| {
-                    if *a == "-i" { Some("") }
-                    else if a.starts_with("-i") && a.len() > 2 {
-                        Some(&a[2..])
-                    } else if let Some(v) = a.strip_prefix("--in-place=") {
-                        Some(v)
-                    } else { None }
-                });
-                let inplace = isuf.is_some();
-                let quiet = args.iter().any(|a| a == &"-n");
-                let ere = args.iter().any(|a| a == &"-E" || a == &"-r");
-                let zrec = args.iter().any(|a| a == &"-z" || a == &"--null-data");
+                // Short flags bundle: -nE, -ni, -i.bak, -eSCRIPT, -fFILE.
+                let mut quiet = false;
+                let mut ere = false;
+                let mut zrec = false;
+                let mut isuf: Option<String> = None;
                 let mut scripts: Vec<String> = Vec::new();
                 let mut files: Vec<&str> = Vec::new();
                 let mut it = args.iter().peekable();
                 while let Some(a) = it.next() {
-                    if *a == "-e" {
-                        match it.next() {
-                            Some(v) => scripts.push(String::from(*v)),
-                            None => {
-                                self.fail("sed: -e needs a script");
-                                return;
-                            }
+                    if a.starts_with("--") {
+                        if let Some(v) = a.strip_prefix("--in-place=") {
+                            isuf = Some(String::from(v));
+                        } else if *a == "--in-place" {
+                            isuf = Some(String::new());
+                        } else if *a == "--null-data" {
+                            zrec = true;
                         }
-                    } else if *a == "-f" {
-                        // sed -f FILE: script text from a file (concatenates
-                        // across multiple -f like GNU)
-                        match it.next() {
-                            Some(pf) => match ustd::read_all(pf) {
-                                Ok(d) => scripts.push(
-                                    String::from_utf8_lossy(&d).into_owned(),
-                                ),
-                                Err(e) => {
-                                    self.fail(&alloc::format!(
-                                        "sed: {}: err {}",
-                                        pf, e
-                                    ));
-                                    return;
+                        continue;
+                    }
+                    if a.starts_with('-') && a.len() > 1 {
+                        let bs = a.as_bytes();
+                        let mut j = 1usize;
+                        while j < bs.len() {
+                            match bs[j] {
+                                b'n' => quiet = true,
+                                b'E' | b'r' => ere = true,
+                                b'z' => zrec = true,
+                                b'i' => {
+                                    // -i[SUF]: the rest of the token is
+                                    // the optional backup suffix
+                                    isuf = Some(String::from(&a[j + 1..]));
+                                    break;
                                 }
-                            },
-                            None => {
-                                self.fail("sed: -f needs a script file");
-                                return;
+                                b'e' | b'f' => {
+                                    // -eSCRIPT / -fFILE attach inline or
+                                    // consume the next arg
+                                    let v: String = if j + 1 < bs.len() {
+                                        String::from(&a[j + 1..])
+                                    } else {
+                                        match it.next() {
+                                            Some(v) => String::from(*v),
+                                            None => {
+                                                self.fail(&alloc::format!(
+                                                    "sed: -{} needs an arg",
+                                                    bs[j] as char
+                                                ));
+                                                return;
+                                            }
+                                        }
+                                    };
+                                    if bs[j] == b'e' {
+                                        scripts.push(v);
+                                    } else {
+                                        match ustd::read_all(&v) {
+                                            Ok(d) => scripts.push(
+                                                String::from_utf8_lossy(&d)
+                                                    .into_owned(),
+                                            ),
+                                            Err(e) => {
+                                                self.fail(&alloc::format!(
+                                                    "sed: {}: err {}",
+                                                    v, e
+                                                ));
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
+                                _ => {}
                             }
+                            j += 1;
                         }
-                    } else if !a.starts_with('-') {
+                        continue;
+                    }
+                    if !a.starts_with('-') {
                         files.push(*a);
                     }
                 }
+                let inplace = isuf.is_some();
                 if scripts.is_empty() {
                     if files.is_empty() {
                         self.fail("usage: sed [-i] [-n] [-e] 'script' [file]");
@@ -22536,7 +22710,8 @@ impl Term {
                     }
                     scripts.push(String::from(files.remove(0)));
                 }
-                let mut cmds: Vec<(Option<SedAddr>, SedK)> = Vec::new();
+                let mut cmds: Vec<(Option<SedAddr>, bool, SedK)> =
+                    Vec::new();
                 for sc in &scripts {
                     match sed_parse(sc) {
                         Ok(mut v) => cmds.append(&mut v),
@@ -22582,6 +22757,10 @@ impl Term {
                 let nlines = lines.len();
                 let mut out: Vec<String> = Vec::new();
                 let mut quit = false;
+                // per-command `/re/,/re/` range state + the hold space
+                let mut rstate: Vec<bool> =
+                    alloc::vec![false; cmds.len()];
+                let mut hold = String::new();
                 'outer: for (i, l0) in lines.iter().enumerate() {
                     let ln = i + 1;
                     let last = ln == nlines;
@@ -22589,14 +22768,40 @@ impl Term {
                     let mut pre: Vec<String> = Vec::new();
                     let mut post: Vec<String> = Vec::new();
                     let mut print = !quiet;
-                    for (addr, k) in &cmds {
+                    for (ci, (addr, neg, k)) in cmds.iter().enumerate() {
                         let inr = match addr {
                             None => true,
-                            Some(SedAddr::N(n)) => ln == *n,
-                            Some(SedAddr::R(a, b)) => ln >= *a && ln <= *b,
-                            Some(SedAddr::Last) => last,
+                            Some(SedAddr::One(e)) => {
+                                sed_hit(ere, e, ln, last, &cur, true)
+                            }
+                            Some(SedAddr::RR(a, e2)) => {
+                                if rstate[ci] {
+                                    // POSIX: addr2 is tested from the
+                                    // line after the opening line
+                                    if sed_hit(
+                                        ere, e2, ln, last, &cur, false,
+                                    ) {
+                                        rstate[ci] = false;
+                                    }
+                                    true
+                                } else if sed_hit(
+                                    ere, a, ln, last, &cur, true,
+                                ) {
+                                    // numeric/$ addr2 <= the opener
+                                    // closes immediately; a regexp
+                                    // addr2 starts checking next line
+                                    rstate[ci] = !matches!(
+                                        e2,
+                                        SedEnd::N(m) if ln >= *m
+                                    ) && !matches!(e2, SedEnd::Last if last);
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
                         };
-                        if !inr {
+                        // `addr!` selects the lines the address misses
+                        if inr == *neg {
                             continue;
                         }
                         match k {
@@ -22669,6 +22874,21 @@ impl Term {
                             }
                             SedK::A(t) => post.push(t.clone()),
                             SedK::I(t) => pre.push(t.clone()),
+                            // hold space: h/H set/append it from the
+                            // pattern space, g/G the reverse, x swaps
+                            SedK::Hold => hold = cur.clone(),
+                            SedK::HoldAp => {
+                                hold.push('\n');
+                                hold.push_str(&cur);
+                            }
+                            SedK::Get => cur = hold.clone(),
+                            SedK::GetAp => {
+                                cur.push('\n');
+                                cur.push_str(&hold);
+                            }
+                            SedK::Swap => {
+                                core::mem::swap(&mut cur, &mut hold);
+                            }
                             SedK::C(t) => {
                                 pre.push(t.clone());
                                 print = false;
