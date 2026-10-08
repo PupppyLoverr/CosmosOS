@@ -2658,6 +2658,237 @@ fn diff_ops(am: &[String], bm: &[String]) -> Vec<DiffOp> {
 /// ones. `Na` appends after line N (`0a` = top), `N,Md` deletes, `N,Mc`
 /// changes — add/change bodies end with `.`; a literal `.` line is written
 /// then `s/.//` (the GNU quirk: ed scripts can't carry a lone dot).
+
+/// System V `ar` archive: `!<arch>\n` then 60-byte member headers
+/// (name/16 mtime/12 uid/6 gid/6 mode/8 size/10 "`\n") + even-aligned data.
+fn ar_pack(members: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"!<arch>\n");
+    for (name, data) in members {
+        let mut nm = name.clone();
+        nm.push('/');
+        if nm.len() > 16 {
+            nm.truncate(16); // simple-form names; long names not used here
+        }
+        let hdr = alloc::format!(
+            "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            nm,
+            0,
+            0,
+            0,
+            "100644",
+            data.len()
+        );
+        out.extend_from_slice(hdr.as_bytes());
+        out.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+/// Parse an `ar` archive into (name, contents) members; Err if not an ar.
+fn ar_parse(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    if !data.starts_with(b"!<arch>\n") {
+        return Err(String::from("ar: not an archive"));
+    }
+    let mut out = Vec::new();
+    let mut i = 8usize;
+    while i + 60 <= data.len() {
+        let hdr = &data[i..i + 60];
+        if &hdr[58..60] != b"`\n" {
+            return Err(alloc::format!("ar: bad header at {}", i));
+        }
+        let name_raw = core::str::from_utf8(&hdr[0..16])
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let name = name_raw.trim_end_matches('/').to_string();
+        let size: usize = core::str::from_utf8(&hdr[48..58])
+            .unwrap_or("0")
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        i += 60;
+        if i + size > data.len() {
+            return Err(alloc::format!("ar: truncated member {}", name));
+        }
+        out.push((name, data[i..i + size].to_vec()));
+        i += size + (size % 2); // pad to even
+    }
+    Ok(out)
+}
+
+/// ctags: regex-style extraction for Rust + C-ish sources. Tag format is
+/// the exuberant one: `name<TAB>file<TAB>/^line$/;"<TAB>kind`.
+fn ctags_scan(path: &str, text: &str, tags: &mut Vec<String>) {
+    let mut tag = |name: &str, line: &str, kind: char| {
+        // the ex-address is the literal source line between /^...$/
+        let mut pat = String::from("/^");
+        for c in line.chars() {
+            if c == '\\' || c == '/' {
+                pat.push('\\');
+            }
+            pat.push(c);
+        }
+        pat.push_str("$/");
+        tags.push(alloc::format!(
+            "{}\t{}\t{};\"\t{}", name, path, pat, kind
+        ));
+    };
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // Rust: fn/struct/enum/trait/impl/type/const/static/macro_rules
+        for (pfx, kind) in [
+            ("fn ", 'f'),
+            ("struct ", 's'),
+            ("enum ", 'e'),
+            ("trait ", 't'),
+            ("type ", 'T'),
+            ("const ", 'c'),
+            ("static ", 'v'),
+            ("mod ", 'm'),
+        ] {
+            // find the keyword at token start (after pub/unsafe qualifiers)
+            let mut seg = t;
+            for q in ["pub ", "pub(crate) ", "unsafe ", "async ", "extern \"C\" "] {
+                if let Some(r) = seg.strip_prefix(q) {
+                    seg = r;
+                }
+            }
+            if let Some(r) = seg.strip_prefix(pfx) {
+                let name: String = r
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    tag(&name, t, kind);
+                }
+                break;
+            }
+        }
+        if let Some(r) = t.strip_prefix("macro_rules!") {
+            let name: String = r
+                .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                tag(&name, t, 'm');
+            }
+        }
+        // C: #define NAME, typedef/struct/enum tail names, fns at col 0
+        if let Some(r) = t.strip_prefix("#define") {
+            let name: String = r
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                tag(&name, t, 'd');
+            }
+        }
+        if t.starts_with("typedef") {
+            let name: String = t
+                .trim_end_matches(|c| c == ';' || c == '{' || c == ' ')
+                .rsplit(|c: char| c == ' ' || c == '*' || c == '}')
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                tag(&name, t, 't');
+            }
+        }
+        // C function: word+ type word*name(args) at column 0
+        if line.as_bytes().first() != Some(&b' ')
+            && line.as_bytes().first() != Some(&b'\t')
+            && t.contains('(')
+            && !t.starts_with('#')
+            && !t.starts_with("//")
+        {
+            let pre = t.split('(').next().unwrap_or("");
+            let name = pre
+                .rsplit(|c: char| c == ' ' || c == '*')
+                .next()
+                .unwrap_or("")
+                .trim();
+            let kw = [
+                "if", "for", "while", "switch", "return", "sizeof", "do",
+            ];
+            if !name.is_empty()
+                && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && name.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
+                && !kw.contains(&name)
+                && pre.contains(' ')
+            {
+                tag(name, t, 'f');
+            }
+        }
+    }
+}
+
+/// unifdef expression eval: Option<bool> — None when a symbol is unknown
+/// (GNU keeps the directive AND the text for undecidable groups).
+fn unifdef_eval(
+    expr: &str,
+    syms: &alloc::collections::BTreeMap<String, i64>,
+) -> Option<bool> {
+    let t = expr.trim();
+    // defined(X) / defined X
+    if let Some(r) = t.strip_prefix("defined") {
+        let n = r.trim().trim_start_matches('(').trim_end_matches(')').trim();
+        return Some(syms.contains_key(n));
+    }
+    if let Some(r) = t.strip_prefix('!') {
+        return unifdef_eval(r, syms).map(|b| !b);
+    }
+    if let Some(p) = t.find("||") {
+        let (a, b) = (unifdef_eval(&t[..p], syms), unifdef_eval(&t[p + 2..], syms));
+        return match (a, b) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            _ => None,
+        };
+    }
+    if let Some(p) = t.find("&&") {
+        let (a, b) = (unifdef_eval(&t[..p], syms), unifdef_eval(&t[p + 2..], syms));
+        return match (a, b) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), Some(true)) => Some(true),
+            _ => None,
+        };
+    }
+    // comparison: X == N | X != N | X < N | X > N | bare X
+    for op in ["==", "!=", "<=", ">=", "<", ">"] {
+        if let Some(p) = t.find(op) {
+            let l = t[..p].trim();
+            let rv: i64 = t[p + op.len()..].trim().parse().unwrap_or(0);
+            let lv = syms.get(l)?;
+            return Some(match op {
+                "==" => *lv == rv,
+                "!=" => *lv != rv,
+                "<=" => *lv <= rv,
+                ">=" => *lv >= rv,
+                "<" => *lv < rv,
+                _ => *lv > rv,
+            });
+        }
+    }
+    if let Some(v) = syms.get(t) {
+        return Some(*v != 0);
+    }
+    if let Ok(v) = t.parse::<i64>() {
+        return Some(v != 0);
+    }
+    None // unknown symbol -> undecidable
+}
+
 fn diff_ed(a: &[String], b: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut lo = 0usize;
@@ -22036,6 +22267,7 @@ impl Term {
                 // -r diffs two directory trees ("Only in" + per-file diffs)
                 let unified = args.iter().any(|a| *a == "-u");
                 let edmode = args.iter().any(|a| *a == "-e" || *a == "--ed");
+                let newf = args.iter().any(|a| *a == "-N" || *a == "--new-file");
                 let side = args.iter().any(|a| *a == "-y" || *a == "--side-by-side");
                 let brief = args.iter().any(|a| *a == "-q" || *a == "--brief");
                 let rpt_id = args.iter().any(|a| {
@@ -22055,6 +22287,44 @@ impl Term {
                         self.diff_trees(pa, pb, unified, brief, ci, nows, noblank);
                     }
                     (Some(pa), Some(pb)) => match (ustd::read_all(pa), ustd::read_all(pb)) {
+                        // -N / --new-file: a missing side compares as empty
+                        (Err(_), Ok(db)) if newf => {
+                            let sa = String::new();
+                            let sb = String::from_utf8_lossy(&db).into_owned();
+                            let rb: Vec<String> =
+                                sb.lines().map(String::from).collect();
+                            let out = if edmode {
+                                diff_ed(&[], &rb)
+                            } else {
+                                diff_lines(&[], &rb)
+                            };
+                            if out.is_empty() {
+                                self.emit("(identical)");
+                            } else {
+                                self.last_ok = false;
+                            }
+                            for l in out {
+                                self.emit(&l);
+                            }
+                        }
+                        (Ok(da), Err(_)) if newf => {
+                            let sa = String::from_utf8_lossy(&da).into_owned();
+                            let ra: Vec<String> =
+                                sa.lines().map(String::from).collect();
+                            let out = if edmode {
+                                diff_ed(&ra, &[])
+                            } else {
+                                diff_lines(&ra, &[])
+                            };
+                            if out.is_empty() {
+                                self.emit("(identical)");
+                            } else {
+                                self.last_ok = false;
+                            }
+                            for l in out {
+                                self.emit(&l);
+                            }
+                        }
                         (Ok(da), Ok(db)) => {
                             let sa = String::from_utf8_lossy(&da).into_owned();
                             let sb = String::from_utf8_lossy(&db).into_owned();
@@ -22122,18 +22392,346 @@ impl Term {
                     _ => self.fail("usage: diff [-u|-q|-i|-w|-B] <fileA> <fileB>"),
                 }
             }
+            "ar" => {
+                // ar [flags] archive [members...] — real System V .a format
+                let flags = args.first().copied().unwrap_or("");
+                let pos: Vec<&&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).skip(
+                        if flags.starts_with('-') { 0 } else { 0 },
+                    ).collect();
+                // flags is args[0] (no dash in classic form)
+                let op = flags.trim_start_matches('-');
+                let archive = if op.is_empty() || op == flags && false {
+                    None
+                } else {
+                    args.get(1).copied()
+                };
+                let members: Vec<&&str> = args.iter().skip(2).collect();
+                let Some(af) = archive else {
+                    self.fail("usage: ar <flags> <archive> [members...]");
+                    return;
+                };
+                if op.contains('r') || op.contains('c') && op == "c" {
+                    // r: add/replace members, c: create silently
+                    let mut mem: Vec<(String, Vec<u8>)> =
+                        match ustd::read_all(af) {
+                            Ok(d) => ar_parse(&d).unwrap_or_default(),
+                            Err(_) => Vec::new(),
+                        };
+                    for m in members.iter() {
+                        match ustd::read_all(m) {
+                            Ok(d) => {
+                                let base = m.rsplit('/').next().unwrap_or(m);
+                                if let Some(e) = mem.iter_mut().find(|(n, _)| n == base) {
+                                    e.1 = d;
+                                } else {
+                                    mem.push((String::from(base), d));
+                                }
+                            }
+                            Err(e) => self.fail(&alloc::format!(
+                                "ar: {}: err {}", m, e
+                            )),
+                        }
+                    }
+                    match ustd::write_all(af, &ar_pack(&mem)) {
+                        Ok(_) => {}
+                        Err(e) => self.fail(&alloc::format!(
+                            "ar: {}: err {}", af, e
+                        )),
+                    }
+                } else if op.contains('t') {
+                    match ustd::read_all(af).ok().and_then(|d| ar_parse(&d).ok()) {
+                        Some(mem) => {
+                            let v = op.contains('v');
+                            for (n, d) in mem {
+                                if members.is_empty() || members.iter().any(|m| **m == n) {
+                                    if v {
+                                        self.emit(&alloc::format!(
+                                            "{} bytes  {}", d.len(), n
+                                        ));
+                                    } else {
+                                        self.emit(&n);
+                                    }
+                                }
+                            }
+                        }
+                        None => self.fail(&alloc::format!(
+                            "ar: {}: not an archive", af
+                        )),
+                    }
+                } else if op.contains('x') || op.contains('p') {
+                    match ustd::read_all(af).ok().and_then(|d| ar_parse(&d).ok()) {
+                        Some(mem) => {
+                            for (n, d) in mem {
+                                if members.is_empty() || members.iter().any(|m| **m == n) {
+                                    if op.contains('p') {
+                                        self.emit(&String::from_utf8_lossy(&d));
+                                    } else {
+                                        match ustd::write_all(&n, &d) {
+                                            Ok(_) => self.emit(&alloc::format!("x - {}", n)),
+                                            Err(e) => self.fail(&alloc::format!(
+                                                "ar: {}: err {}", n, e
+                                            )),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None => self.fail(&alloc::format!(
+                            "ar: {}: not an archive", af
+                        )),
+                    }
+                } else if op.contains('d') {
+                    match ustd::read_all(af).ok().and_then(|d| ar_parse(&d).ok()) {
+                        Some(mem) => {
+                            let keep: Vec<(String, Vec<u8>)> = mem
+                                .into_iter()
+                                .filter(|(n, _)| !members.iter().any(|m| **m == *n))
+                                .collect();
+                            let _ = ustd::write_all(af, &ar_pack(&keep));
+                        }
+                        None => self.fail(&alloc::format!(
+                            "ar: {}: not an archive", af
+                        )),
+                    }
+                } else {
+                    self.fail("ar: flags r[c] t[v] x p d");
+                }
+            }
+            "ctags" => {
+                // ctags [-R] [-o file] files... — exuberant-format tags
+                let mut outfile = String::from("tags");
+                let mut rec = false;
+                let mut files: Vec<String> = Vec::new();
+                let mut ai = 0usize;
+                while ai < args.len() {
+                    match args[ai] {
+                        "-R" | "--recurse" => rec = true,
+                        "-o" | "--output" => {
+                            ai += 1;
+                            outfile = args.get(ai).map(|s| String::from(*s))
+                                .unwrap_or_else(|| String::from("tags"));
+                        }
+                        f => files.push(String::from(f)),
+                    }
+                    ai += 1;
+                }
+                if files.is_empty() {
+                    files.push(String::from("."));
+                }
+                let mut targets: Vec<String> = Vec::new();
+                for f in &files {
+                    if rec && ustd::stat(f).map(|s| s.is_dir != 0).unwrap_or(false) {
+                        for p in self.find_collect(f, "*", None, 64, None, false, false, &Default::default()) {
+                            if p.ends_with(".rs") || p.ends_with(".c") || p.ends_with(".h") {
+                                targets.push(p);
+                            }
+                        }
+                    } else {
+                        targets.push(f.clone());
+                    }
+                }
+                let mut tags: Vec<String> = vec![
+                    String::from("!_TAG_FILE_FORMAT\t2\t/extended format/"),
+                ];
+                let mut n = 0usize;
+                for t in &targets {
+                    if let Ok(d) = ustd::read_all(t) {
+                        let before = tags.len();
+                        ctags_scan(t, &String::from_utf8_lossy(&d), &mut tags);
+                        n += tags.len() - before;
+                    }
+                }
+                match ustd::write_all(&outfile, (tags.join("\n") + "\n").as_bytes()) {
+                    Ok(_) => self.emit(&alloc::format!(
+                        "ctags: {} tags from {} files -> {}", n, targets.len(), outfile
+                    )),
+                    Err(e) => self.fail(&alloc::format!(
+                        "ctags: {}: err {}", outfile, e
+                    )),
+                }
+            }
+            "unifdef" => {
+                // unifdef [-Dsym[=v]|-Usym]... file — evaluate #if groups
+                // with the given symbols; undecidable groups keep both the
+                // directive and the text (real GNU behavior).
+                let mut syms: alloc::collections::BTreeMap<String, i64> =
+                    Default::default();
+                let mut file: Option<String> = None;
+                for a in args.iter() {
+                    if let Some(d) = a.strip_prefix("-D") {
+                        let (n, v) = match d.split_once('=') {
+                            Some((n, v)) => (n, v.parse().unwrap_or(0)),
+                            None => (d, 1),
+                        };
+                        syms.insert(String::from(n), v);
+                    } else if let Some(u) = a.strip_prefix("-U") {
+                        syms.insert(String::from(u), 0);
+                    } else if let Some(u) = a.strip_prefix("-u") {
+                        // -u: keep the directive lines too — NYI no-op
+                    } else if !a.starts_with('-') {
+                        file = Some(String::from(*a));
+                    }
+                }
+                let Some(file) = file else {
+                    self.fail("usage: unifdef [-Dsym[=v]]... <file>");
+                    return;
+                };
+                let Ok(d) = ustd::read_all(&file) else {
+                    self.fail(&alloc::format!("unifdef: {}: err", file));
+                    return;
+                };
+                // stack entries: (parent_active, this_active, decided)
+                let mut stack: Vec<(bool, bool, bool)> = Vec::new();
+                let mut out: Vec<String> = Vec::new();
+                let active = |st: &Vec<(bool, bool, bool)>| {
+                    st.iter().all(|e| e.1)
+                };
+                let mut changed = false;
+                for line in String::from_utf8_lossy(&d).lines() {
+                    let t = line.trim_start();
+                    if t.starts_with('#') {
+                        let d2 = t[1..].trim_start();
+                        if let Some(e) = d2.strip_prefix("ifdef") {
+                            let name = e.trim();
+                            let v = syms.get(name).map(|v| *v != 0);
+                            let par = active(&stack);
+                            stack.push((
+                                par,
+                                par && v.unwrap_or(false),
+                                v.is_some(),
+                            ));
+                            if v.is_none() {
+                                out.push(String::from(line)); // keep undecidable
+                            } else {
+                                changed = true;
+                            }
+                            continue;
+                        }
+                        if let Some(e) = d2.strip_prefix("ifndef") {
+                            let name = e.trim();
+                            let v = syms.get(name).map(|v| *v != 0);
+                            let par = active(&stack);
+                            stack.push((
+                                par,
+                                par && !v.unwrap_or(true),
+                                v.is_some(),
+                            ));
+                            if v.is_none() {
+                                out.push(String::from(line));
+                            } else {
+                                changed = true;
+                            }
+                            continue;
+                        }
+                        if let Some(e) = d2.strip_prefix("if ") {
+                            let v = unifdef_eval(e.trim(), &syms);
+                            let par = active(&stack);
+                            stack.push((
+                                par,
+                                par && v.unwrap_or(false),
+                                v.is_some(),
+                            ));
+                            if v.is_none() {
+                                out.push(String::from(line));
+                            } else {
+                                changed = true;
+                            }
+                            continue;
+                        }
+                        if let Some(e) = d2.strip_prefix("elif") {
+                            let (par, _was, dec) =
+                                stack.pop().unwrap_or((true, false, true));
+                            let v = if dec {
+                                unifdef_eval(e.trim(), &syms)
+                            } else {
+                                None
+                            };
+                            stack.push((
+                                par,
+                                par && v.unwrap_or(false),
+                                dec && v.is_some(),
+                            ));
+                            if !dec || v.is_none() {
+                                out.push(String::from(line));
+                            } else {
+                                changed = true;
+                            }
+                            continue;
+                        }
+                        if d2.starts_with("else") {
+                            let (par, was, dec) =
+                                stack.pop().unwrap_or((true, false, true));
+                            stack.push((par, par && !was, dec));
+                            if !dec {
+                                out.push(String::from(line));
+                            } else {
+                                changed = true;
+                            }
+                            continue;
+                        }
+                        if d2.starts_with("endif") {
+                            let (_, _, dec) =
+                                stack.pop().unwrap_or((true, true, true));
+                            if !dec {
+                                out.push(String::from(line));
+                            } else {
+                                changed = true;
+                            }
+                            continue;
+                        }
+                    }
+                    if active(&stack) || stack.iter().any(|e| !e.2) {
+                        out.push(String::from(line));
+                    } else {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    match ustd::write_all(&file, (out.join("\n") + "\n").as_bytes()) {
+                        Ok(_) => self.emit(&alloc::format!("unifdef: {} rewritten", file)),
+                        Err(e) => self.fail(&alloc::format!(
+                            "unifdef: {}: err {}", file, e
+                        )),
+                    }
+                } else {
+                    self.emit("unifdef: no conditional changes");
+                }
+            }
             "patch" => {
                 // patch [-R] [--dry-run] [file.diff] — apply a unified diff.
                 // Reads the diff file given, or stdin (pipe heredoc) when none.
-                let text = match args.iter().find(|a| !a.starts_with('-')) {
-                    Some(p) => match ustd::read_all(p) {
-                        Ok(d) => String::from_utf8_lossy(&d).into_owned(),
-                        Err(e) => {
-                            self.fail(&alloc::format!("patch: {}: err {}", p, e));
-                            return;
-                        }
-                    },
-                    None => self.pipe_in.clone().unwrap_or_default(),
+                let edscr = args.iter().any(|a| *a == "-e" || *a == "--ed");
+                // -e form: first non-flag arg is the TARGET, script is the
+                // second arg or stdin
+                let text = if edscr {
+                    let nf: Vec<&&str> =
+                        args.iter().filter(|a| !a.starts_with('-')).collect();
+                    match nf.get(1) {
+                        Some(sp) => match ustd::read_all(sp) {
+                            Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                            Err(e) => {
+                                self.fail(&alloc::format!(
+                                    "patch: {}: err {}", sp, e
+                                ));
+                                return;
+                            }
+                        },
+                        None => self.pipe_in.clone().unwrap_or_default(),
+                    }
+                } else {
+                    match args.iter().find(|a| !a.starts_with('-')) {
+                        Some(p) => match ustd::read_all(p) {
+                            Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                            Err(e) => {
+                                self.fail(&alloc::format!(
+                                    "patch: {}: err {}", p, e
+                                ));
+                                return;
+                            }
+                        },
+                        None => self.pipe_in.clone().unwrap_or_default(),
+                    }
                 };
                 if text.is_empty() {
                     self.fail("usage: patch <file.diff>   (or pipe a unified diff)");
@@ -22141,6 +22739,73 @@ impl Term {
                 }
                 let rev = args.iter().any(|a| *a == "-R" || *a == "--reverse");
                 let dry = args.iter().any(|a| *a == "--dry-run" || *a == "-N" && false);
+                if edscr {
+                    // patch -e: the script is a real ed command stream; the
+                    // non-flag arg is the TARGET file (not the patch)
+                    let tgt = args.iter().find(|a| !a.starts_with('-'));
+                    match tgt {
+                        Some(tp) => match ustd::read_all(tp) {
+                            Ok(d) => {
+                                let mut st = EdSt {
+                                    buf: String::from_utf8_lossy(&d)
+                                        .lines()
+                                        .map(String::from)
+                                        .collect(),
+                                    dot: 0,
+                                    fname: String::from(*tp),
+                                    modified: false,
+                                    marks: Default::default(),
+                                    last_re: String::new(),
+                                    last_rep: String::new(),
+                                    saved: Vec::new(),
+                                    ins: None,
+                                    prompt: false,
+                                    silent: true,
+                                    errh: false,
+                                    last_err: String::new(),
+                                    warned: false,
+                                    quit: false,
+                                };
+                                for cl in text.lines() {
+                                    if !self.ed_feed(&mut st, cl) {
+                                        break;
+                                    }
+                                }
+                                if !dry && st.modified {
+                                    let mut out = String::new();
+                                    for (i, l) in st.buf.iter().enumerate() {
+                                        if i > 0 {
+                                            out.push('\n');
+                                        }
+                                        out.push_str(l);
+                                    }
+                                    if !st.buf.is_empty() {
+                                        out.push('\n');
+                                    }
+                                    match ustd::write_all(tp, out.as_bytes()) {
+                                        Ok(_) => self.emit(&alloc::format!(
+                                            "patched {}", tp
+                                        )),
+                                        Err(e) => self.fail(&alloc::format!(
+                                            "patch: {}: err {}", tp, e
+                                        )),
+                                    }
+                                } else if dry {
+                                    self.emit(&alloc::format!(
+                                        "patch {} would apply ({} lines)",
+                                        tp,
+                                        st.buf.len()
+                                    ));
+                                }
+                            }
+                            Err(e) => self.fail(&alloc::format!(
+                                "patch: {}: err {}", tp, e
+                            )),
+                        },
+                        None => self.fail("usage: patch -e <target> <script>"),
+                    }
+                    return;
+                }
                 self.run_patch(&text, rev, dry);
             }
             "md5sum" | "sha1sum" | "sha256sum" | "sha384sum" | "sha512sum" | "b2sum"
