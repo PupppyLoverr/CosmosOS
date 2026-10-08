@@ -21,7 +21,7 @@ static HEAP: LockedHeap = LockedHeap::empty();
 pub static HEAP_SIZE: AtomicU64 = AtomicU64::new(0);
 
 pub const HEAP_START: u64 = 0x4444_4444_0000;
-pub const HEAP_PAGES: u64 = 1024; // 4 MiB kernel heap
+pub const HEAP_PAGES: u64 = 2048; // 8 MiB kernel heap (tmpfs data lives here)
 
 /// Bump allocator over the UEFI memory map's Usable regions.
 /// Used frames are never reclaimed (kernel structures are long-lived);

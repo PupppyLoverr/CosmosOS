@@ -37,6 +37,7 @@ mod timerfd;
 mod mqueue;
 mod pty;
 mod memfd;
+mod tmpfs;
 mod signalfd;
 mod vfs;
 mod virtio;

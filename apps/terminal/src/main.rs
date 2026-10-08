@@ -12852,13 +12852,41 @@ impl Term {
                     }
                 }
             }
-            "mount" => match ustd::df() {
-                Some((tot, free)) => self.emit(&alloc::format!(
-                    "cosmos-data.img on / type fat32 (rw) -- {} total, {} free",
-                    human_size(tot),
-                    human_size(free)
-                )),
-                None => self.emit("mount: no volumes mounted"),
+            "mount" => {
+                // mount | mount -t tmpfs <src> <dir> | umount <dir>
+                if args.is_empty() {
+                    match ustd::read_all("/proc/mounts") {
+                        Ok(d) => {
+                            let s = String::from_utf8_lossy(&d).into_owned();
+                            self.emit(s.trim_end());
+                        }
+                        Err(e) => self.fail(&alloc::format!("mount: err {}", e)),
+                    }
+                } else {
+                    // mount -t <type> <src> <target>
+                    let a: Vec<&str> = args.iter().map(|s| *s).collect();
+                    if a.len() == 4 && a[0] == "-t" {
+                        match ustd::mount(a[2], a[3], a[1]) {
+                            0 => self.emit(&alloc::format!("{} on {}", a[1], a[3])),
+                            e => self.fail(&alloc::format!("mount: err {}", e)),
+                        }
+                    } else if a.len() == 2 {
+                        // mount <src> <dir>: guess tmpfs
+                        match ustd::mount(a[0], a[1], "tmpfs") {
+                            0 => self.emit(&alloc::format!("tmpfs on {}", a[1])),
+                            e => self.fail(&alloc::format!("mount: err {}", e)),
+                        }
+                    } else {
+                        self.fail("usage: mount [-t tmpfs <src>] <dir>");
+                    }
+                }
+            }
+            "umount" => match args.first() {
+                Some(p) => match ustd::umount(p) {
+                    0 => self.emit(&alloc::format!("unmounted {}", p)),
+                    e => self.fail(&alloc::format!("umount: {}: err {}", p, e)),
+                },
+                None => self.fail("usage: umount <dir>"),
             },
             "rmdir" => match args.first() {
                 Some(p) => match ustd::remove(p) {
@@ -20506,7 +20534,7 @@ impl Term {
         "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
         "alias", "unalias", "type", "hostname", "id", "printf", "dd", "split",
         "source", "comm", "join", "paste", "expand", "unexpand", "at", "file",
-        "test", "[", "rand", "mount", "rmdir",
+        "test", "[", "rand", "mount", "umount", "rmdir",
         "export", "unset", "man",
         "lspci", "lscpu", "factor", "shuf", "cksum",
         "eval", "break", "continue", "return",

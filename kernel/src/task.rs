@@ -1923,6 +1923,30 @@ pub fn fd_path_in_use(path: &str) -> bool {
     })
 }
 
+/// `path` is a *prefix* match: any live fd whose path sits at or under it.
+/// Used by umount's EBUSY check (open handles below the mount).
+pub fn fd_path_prefix_in_use(prefix: &str) -> bool {
+    let g = SCHED.lock();
+    let Some(s) = g.as_ref() else { return false };
+    s.tasks.iter().any(|t| {
+        t.state != State::Dead
+            && t.fds.iter().any(|f| {
+                f.as_ref()
+                    .map(|d| d.path.starts_with(prefix))
+                    .unwrap_or(false)
+            })
+    })
+}
+
+/// Any live task whose cwd is under `prefix` — also makes a mount busy.
+pub fn cwd_under(prefix: &str) -> bool {
+    let g = SCHED.lock();
+    let Some(s) = g.as_ref() else { return false };
+    s.tasks
+        .iter()
+        .any(|t| t.state != State::Dead && t.cwd.starts_with(prefix))
+}
+
 /// User frames are all freed via elf::free_user_space; Task::frames only
 /// tracks kernel stack frames (kernel-virtual mappings, not in user tree).
 fn kframes_too(all: &Vec<u64>) -> Vec<u64> {
