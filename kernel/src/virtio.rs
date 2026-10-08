@@ -371,13 +371,10 @@ impl BlkDev {
     }
 }
 
-<<<<<<< HEAD
 /// Sector counters for /proc/diskstats.
 pub static BLK_RD_SECTORS: AtomicU64 = AtomicU64::new(0);
 pub static BLK_WR_SECTORS: AtomicU64 = AtomicU64::new(0);
 
-||||||| 16ee5a5
-=======
 /// Direct-mapped read-through sector cache. FAT/dir sectors get re-read on
 /// every open/stat/cluster-chain walk; without this each one costs a full
 /// synchronous virtqueue round trip (~ms). Write-through keeps it coherent.
@@ -392,16 +389,8 @@ static SECTOR_CACHE: Mutex<SectorCache> = Mutex::new(SectorCache {
     valid: [false; CACHE_WAYS],
     data: [[0u8; 512]; CACHE_WAYS],
 });
-
->>>>>>> de57e2eeb2d5ba02ca67bdb770d143108d537677
 impl BlockDevice for BlkDev {
     fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> fat32::Result<()> {
-<<<<<<< HEAD
-        BLK_RD_SECTORS.fetch_add(1, Ordering::Relaxed);
-        self.inner.rw_sector(lba, buf, false).map_err(|_| fat32::Error::Io)
-||||||| 16ee5a5
-        self.inner.rw_sector(lba, buf, false).map_err(|_| fat32::Error::Io)
-=======
         let idx = (lba as usize) % CACHE_WAYS;
         {
             let c = SECTOR_CACHE.lock();
@@ -410,13 +399,14 @@ impl BlockDevice for BlkDev {
                 return Ok(());
             }
         }
+        // cache miss: real device read — count it, then fill the way
         self.inner.rw_sector(lba, buf, false).map_err(|_| fat32::Error::Io)?;
+        BLK_RD_SECTORS.fetch_add(1, Ordering::Relaxed);
         let mut c = SECTOR_CACHE.lock();
         c.data[idx].copy_from_slice(&buf[..512]);
         c.tag[idx] = lba;
         c.valid[idx] = true;
         Ok(())
->>>>>>> de57e2eeb2d5ba02ca67bdb770d143108d537677
     }
     fn write_sector(&mut self, lba: u64, buf: &[u8]) -> fat32::Result<()> {
         BLK_WR_SECTORS.fetch_add(1, Ordering::Relaxed);
