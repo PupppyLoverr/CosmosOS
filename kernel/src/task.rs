@@ -3736,6 +3736,36 @@ pub fn set_nice(pid: u32, nice: i64) -> i64 {
 
 const TRACE_MAX_RECS: usize = 128;
 
+/// Freeze or thaw every pid in `pids`: frozen members go Stopped
+/// (skipped by the pick loop like SIGSTOP), thawed ones return to
+/// Running. One SCHED hold for the whole group. Returns members moved.
+pub fn freeze_pids(pids: &[u32], freeze: bool) -> usize {
+    let mut g = SCHED.lock();
+    let Some(s) = g.as_mut() else { return 0 };
+    let mut n = 0;
+    for t in s.tasks.iter_mut() {
+        if !pids.contains(&t.id) || t.state == State::Dead {
+            continue;
+        }
+        match (freeze, t.state) {
+            // a frozen task that was Blocked keeps its wait bookkeeping;
+            // thawed back to Running it re-enters the syscall and
+            // re-blocks if the condition still holds — same resume
+            // model SIGCONT already uses
+            (true, State::Running) | (true, State::Blocked) => {
+                t.state = State::Stopped;
+                n += 1;
+            }
+            (false, State::Stopped) => {
+                t.state = State::Running;
+                n += 1;
+            }
+            _ => {}
+        }
+    }
+    n
+}
+
 pub fn with_pid_mut<F: FnOnce(&mut Task) -> i64>(pid: u32, f: F) -> i64 {
     let mut g = SCHED.lock();
     match g.as_mut() {
@@ -4018,6 +4048,17 @@ pub fn pid_threads(pid: u32) -> Option<Vec<u32>> {
 }
 
 /// (min_flt, maj_flt, resident user pages) for /proc/<pid>/status.
+/// Per-task io counters (rbytes, wbytes) for cgroup io.stat on the
+/// root group (which sums over live tasks).
+pub fn io_bytes(pid: u32) -> Option<(u64, u64)> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    s.tasks
+        .iter()
+        .find(|t| t.id == pid && t.state != State::Dead)
+        .map(|t| (t.rbytes, t.wbytes))
+}
+
 /// Live rss in frames for `pid` (its owned t.frames count; tombstones
 /// report 0 — dead members stop counting immediately).
 pub fn frames_len(pid: u32) -> Option<u64> {
@@ -4074,6 +4115,17 @@ pub fn io_charge(read: bool, n: u64) {
             t.rbytes += n;
         } else {
             t.wbytes += n;
+        }
+        let cg = t.cgroup;
+        if cg != 0 {
+            crate::cgroup::io_charge(cg, read, n);
+            // io.max: over the window's byte budget -> the task can't do
+            // its next I/O until the window rolls (real pacing, like
+            // cgroup v2 throttling).
+            if let Some(wake) = crate::cgroup::io_wait_until(cg) {
+                t.state = State::Blocked;
+                t.wake_at = wake;
+            }
         }
     });
 }
