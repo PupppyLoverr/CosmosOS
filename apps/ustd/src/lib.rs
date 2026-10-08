@@ -1927,6 +1927,11 @@ pub fn madvise(addr: u64, len: u64, advice: u64) -> i64 {
     sc3(shared::SYS_MADVISE, addr, len, advice) as i64
 }
 
+/// unshare(flags): CLONE_NEWNS(0x20000) privatizes the mount namespace.
+pub fn unshare(flags: u64) -> i64 {
+    sc1(shared::SYS_UNSHARE, flags) as i64
+}
+
 /// chroot(dir): jail this task's path resolution under `dir`.
 pub fn chroot(dir: &str) -> i64 {
     sc2(218, dir.as_ptr() as u64, dir.len() as u64) as i64

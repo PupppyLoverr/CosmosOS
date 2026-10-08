@@ -27,11 +27,10 @@ pub struct Node {
 
 static NODES: Mutex<BTreeMap<String, Node>> = Mutex::new(BTreeMap::new());
 /// (mount path, read-only) — longest-prefix-first on insert.
-static MOUNTS: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
-/// Lazy-detached prefixes (umount2 MNT_DETACH while busy): the mount is
-/// gone but nodes under it keep serving already-resolved paths until a
-/// force unmount purges them — real lazy-umount semantics.
-static DETACHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Mount tables live per-task in task::MountNs (mount namespaces); the
+/// only tmpfs global is this counter — >0 while ANY namespace has a
+/// tmpfs mount, so the #PF path can skip the namespace probe entirely
+/// (mount()/umount() fetch_add/fetch_sub it).
 /// Lock-free "anything mounted?" flag — lets `handles` short-circuit
 /// without taking MOUNTS, which matters on the page-fault read path.
 static ANY: AtomicUsize = AtomicUsize::new(0);
@@ -50,37 +49,48 @@ fn under(m: &str, path: &str) -> bool {
     path == m || (path.len() > m.len() && path.starts_with(m) && path.as_bytes()[m.len()] == b'/')
 }
 
-fn mounted(g: &Vec<(String, bool)>, path: &str) -> bool {
+fn mounted(g: &[(String, bool)], path: &str) -> bool {
     g.iter().any(|m| under(&m.0, path))
 }
 
 /// Is `path` under a READ-ONLY mount? EROFS gate for all mutators.
-fn ro_of(g: &Vec<(String, bool)>, path: &str) -> bool {
+fn ro_of(g: &[(String, bool)], path: &str) -> bool {
     g.iter().any(|m| m.1 && under(&m.0, path))
 }
 
-fn detached_has(path: &str) -> bool {
-    DETACHED.lock().iter().any(|p| under(p, path))
+/// Convenience: ro check against the current task's namespace.
+fn ro(path: &str) -> bool {
+    if !any() {
+        return false;
+    }
+    let ns = crate::task::ns_of();
+    let g = ns.lock();
+    ro_of(&g.tmpfs, path)
 }
 
 /// Is `path` at or under a tmpfs mount point (or a lazily-detached
-/// tree that must keep serving resolved paths)?
+/// tree that must keep serving resolved paths)? Namespace-aware.
 pub fn handles(path: &str) -> bool {
     if !any() {
         return false;
     }
-    mounted(&MOUNTS.lock(), path) || detached_has(path)
+    let ns = crate::task::ns_of();
+    let g = ns.lock();
+    mounted(&g.tmpfs, path) || g.detached.iter().any(|p| under(p, path))
 }
 
-/// Registered mount points with ro flag (for /proc/mounts).
+/// Mount points with ro flag in the current task's namespace.
 pub fn mounts() -> Vec<(String, bool)> {
-    MOUNTS.lock().clone()
+    let ns = crate::task::ns_of();
+    let g = ns.lock();
+    g.tmpfs.clone()
 }
 
 /// MS_REMOUNT: update the existing mount's ro flag. EINVAL if not mounted.
 pub fn remount(target: &str, ro: bool) -> Result<(), i64> {
-    let mut mg = MOUNTS.lock();
-    match mg.iter_mut().find(|m| m.0 == target) {
+    let ns = crate::task::ns_of();
+    let mut mg = ns.lock();
+    match mg.tmpfs.iter_mut().find(|m| m.0 == target) {
         Some(m) => {
             m.1 = ro;
             Ok(())
@@ -157,11 +167,17 @@ pub fn mount(target: &str, ro: bool) -> Result<(), i64> {
     if target == "/" {
         return Err(-22);
     }
-    let mut mg = MOUNTS.lock();
-    if mg.iter().any(|m| m.0 == target) {
+    let ns = crate::task::ns_of();
+    let mut mg = ns.lock();
+    if mg.tmpfs.iter().any(|m| m.0 == target) {
         return Err(-16);
     }
     let mut ng = NODES.lock();
+    // a fresh mount is a fresh superblock: purge any stale node tree a
+    // dead namespace left under this prefix (nodes are path-keyed
+    // globally, so the purge belongs in the mount itself)
+    let under = alloc::format!("{}/", target);
+    ng.retain(|k, _| !k.starts_with(&under));
     ng.insert(
         String::from(target),
         Node {
@@ -174,9 +190,9 @@ pub fn mount(target: &str, ro: bool) -> Result<(), i64> {
             children: Vec::new(),
         },
     );
-    mg.push((String::from(target), ro));
-    mg.sort_by(|a, b| b.0.len().cmp(&a.0.len())); // longest prefix wins
-    ANY.store(mg.len(), Ordering::Relaxed);
+    mg.tmpfs.push((String::from(target), ro));
+    mg.tmpfs.sort_by(|a, b| b.0.len().cmp(&a.0.len())); // longest prefix wins
+    ANY.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -186,8 +202,9 @@ pub fn mount(target: &str, ro: bool) -> Result<(), i64> {
 /// purges; MNT_DETACH(2) drops the mount point but keeps the node tree
 /// alive for already-resolved paths (lazy umount).
 pub fn umount(target: &str, flags: u64) -> Result<(), i64> {
-    let mut mg = MOUNTS.lock();
-    let Some(i) = mg.iter().position(|m| m.0 == target) else {
+    let ns = crate::task::ns_of();
+    let mut mg = ns.lock();
+    let Some(i) = mg.tmpfs.iter().position(|m| m.0 == target) else {
         return Err(-22); // EINVAL: not a mount
     };
     let under = alloc::format!("{}/", target);
@@ -195,23 +212,23 @@ pub fn umount(target: &str, flags: u64) -> Result<(), i64> {
     // MNT_DETACH (lazy) also skips busy checks — it detaches regardless.
     if !force && flags & shared::MNT_DETACH == 0 {
         // busy: a nested mount, or an open fd / cwd below it
-        if mg.iter().any(|m| m.0.starts_with(&under)) {
+        if mg.tmpfs.iter().any(|m| m.0.starts_with(&under)) {
             return Err(-16);
         }
         if crate::task::fd_path_prefix_in_use(&under) || crate::task::cwd_under(&under) {
             return Err(-16);
         }
     }
-    mg.remove(i);
-    ANY.store(mg.len(), Ordering::Relaxed);
+    mg.tmpfs.remove(i);
+    ANY.fetch_sub(1, Ordering::Relaxed);
     if flags & shared::MNT_DETACH != 0 {
         // lazy: keep the node tree serving resolved paths
-        DETACHED.lock().push(String::from(target));
+        mg.detached.push(String::from(target));
         return Ok(());
     }
     let mut ng = NODES.lock();
     ng.retain(|k, _| k.as_str() != target && !k.starts_with(&under));
-    DETACHED.lock().retain(|p| p.as_str() != target);
+    mg.detached.retain(|p| p.as_str() != target);
     Ok(())
 }
 
@@ -220,7 +237,7 @@ pub fn open(path: &str, flags: u64) -> Result<u64, i64> {
     let wants_write = flags
         & (shared::O_WRONLY | shared::O_RDWR | shared::O_CREATE | shared::O_TRUNC | shared::O_APPEND)
         != 0;
-    if wants_write && ro_of(&MOUNTS.lock(), path) {
+    if wants_write && ro(path) {
         return Err(-30); // EROFS
     }
     let mut ng = NODES.lock();
@@ -291,11 +308,12 @@ pub fn read_range_pf(path: &str, off: u64, buf: &mut [u8]) -> Option<Result<usiz
     }
     loop {
         {
-            let Some(mg) = MOUNTS.try_lock() else {
+            let ns = crate::task::ns_of();
+            let Some(mg) = ns.try_lock() else {
                 crate::task::wait_irq();
                 continue;
             };
-            if !mounted(&mg, path) {
+            if !mounted(&mg.tmpfs, path) && !mg.detached.iter().any(|p| under(p, path)) {
                 return None;
             }
         }
@@ -327,7 +345,7 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, i64> {
 /// Write `buf` at `off` (caller handles O_APPEND by passing off=len).
 /// ENOSPC past QUOTA.
 pub fn write_range(path: &str, off: u64, buf: &[u8]) -> Result<usize, i64> {
-    if ro_of(&MOUNTS.lock(), path) {
+    if ro(path) {
         return Err(-30);
     }
     let mut ng = NODES.lock();
@@ -349,7 +367,7 @@ pub fn write_range(path: &str, off: u64, buf: &[u8]) -> Result<usize, i64> {
 }
 
 pub fn truncate(path: &str, len: u64) -> Result<(), i64> {
-    if ro_of(&MOUNTS.lock(), path) {
+    if ro(path) {
         return Err(-30);
     }
     let mut ng = NODES.lock();
@@ -378,7 +396,7 @@ pub fn stat(path: &str) -> Option<(u64, bool, u64, u64, u8)> {
 }
 
 pub fn mkdir(path: &str) -> Result<(), i64> {
-    if ro_of(&MOUNTS.lock(), path) {
+    if ro(path) {
         return Err(-30);
     }
     let mut ng = NODES.lock();
@@ -410,7 +428,7 @@ pub fn mkdir(path: &str) -> Result<(), i64> {
 
 /// unlink/rmdir: files drop on unlink; dirs only when empty (-39 ENOTEMPTY).
 pub fn remove(path: &str) -> Result<(), i64> {
-    if ro_of(&MOUNTS.lock(), path) {
+    if ro(path) {
         return Err(-30);
     }
     let mut ng = NODES.lock();
@@ -431,8 +449,9 @@ pub fn remove(path: &str) -> Result<(), i64> {
 /// Same-mount rename (dirs or files); cross-mount is EXDEV(-18).
 pub fn rename(from: &str, to: &str) -> Result<(), i64> {
     {
-        let mg = MOUNTS.lock();
-        if ro_of(&mg, from) || ro_of(&mg, to) {
+        let ns = crate::task::ns_of();
+        let mg = ns.lock();
+        if ro_of(&mg.tmpfs, from) || ro_of(&mg.tmpfs, to) {
             return Err(-30);
         }
     }
@@ -492,7 +511,7 @@ pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
 }
 
 pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
-    if ro_of(&MOUNTS.lock(), path) {
+    if ro(path) {
         return Err(-30);
     }
     let mut ng = NODES.lock();
@@ -502,7 +521,7 @@ pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
 }
 
 pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
-    if ro_of(&MOUNTS.lock(), path) {
+    if ro(path) {
         return Err(-30);
     }
     let mut ng = NODES.lock();
