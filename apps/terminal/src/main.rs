@@ -11956,7 +11956,7 @@ impl Term {
             "sha256sum", "strings", "sort", "uniq", "cut", "more", "diff", "base64",
             "show", "tar", "md5sum", "uuencode", "uudecode", "grep", "find", "file",
             "sha1sum", "cksum", "comm", "zgrep", "zip", "unzip", "chmod", "touch",
-            "basenc", "addr2line", "elfedit",
+            "basenc", "addr2line", "elfedit", "tcpdump", "msgfmt",
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look", "fmt",
         "pwck", "grpck", "pathchk", "nslookup", "b2sum",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
@@ -18665,6 +18665,614 @@ impl Term {
                 for l in lines {
                     self.emit(&l);
                 }
+            }
+            "tcpdump" => {
+                // tcpdump -r <file.pcap> [-c N] — real libpcap decoder:
+                // per-record timestamp + eth/ARP/IPv4/ICMP/UDP/TCP fields.
+                let mut file: Option<&str> = None;
+                let mut cap = usize::MAX;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-r" => {
+                            file = args.get(i + 1).copied();
+                            i += 1;
+                        }
+                        "-c" => {
+                            cap = args
+                                .get(i + 1)
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(usize::MAX);
+                            i += 1;
+                        }
+                        "-n" | "-q" | "-e" | "-v" | "-tt" | "-ttt" => {}
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let Some(f) = file else {
+                    self.fail("usage: tcpdump -r <file.pcap> [-c N]");
+                    return;
+                };
+                let Ok(d) = ustd::read_all(f) else {
+                    self.fail(&alloc::format!("tcpdump: {}: err", f));
+                    return;
+                };
+                if d.len() < 24 || &d[0..4] != b"\xd4\xc3\xb2\xa1" {
+                    self.fail(&alloc::format!(
+                        "tcpdump: {}: not a pcap file",
+                        f
+                    ));
+                    return;
+                }
+                let be16 = |b: &[u8], o: usize| {
+                    u16::from_be_bytes([b[o], b[o + 1]])
+                };
+                let be32 = |b: &[u8], o: usize| {
+                    u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+                };
+                let le32 = |b: &[u8], o: usize| {
+                    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+                };
+                let ipstr = |b: &[u8], o: usize| {
+                    alloc::format!(
+                        "{}.{}.{}.{}",
+                        b[o],
+                        b[o + 1],
+                        b[o + 2],
+                        b[o + 3]
+                    )
+                };
+                let macstr = |b: &[u8], o: usize| {
+                    alloc::format!(
+                        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5]
+                    )
+                };
+                let mut off = 24usize;
+                let mut shown = 0usize;
+                let mut total = 0usize;
+                while off + 16 <= d.len() {
+                    let ts = le32(&d, off) as u64;
+                    let us = le32(&d, off + 4);
+                    let clen = le32(&d, off + 8) as usize;
+                    let wire = le32(&d, off + 12) as usize;
+                    off += 16;
+                    if off + clen > d.len() {
+                        break;
+                    }
+                    let fr = &d[off..off + clen];
+                    off += clen;
+                    total += 1;
+                    if shown >= cap {
+                        continue;
+                    }
+                    shown += 1;
+                    let (hh, mm, ss) = (
+                        (ts % 86400) / 3600,
+                        (ts % 3600) / 60,
+                        ts % 60,
+                    );
+                    let ts_s = alloc::format!(
+                        "{:02}:{:02}:{:02}.{:06}",
+                        hh, mm, ss, us
+                    );
+                    if fr.len() < 14 {
+                        continue;
+                    }
+                    let et = be16(fr, 12);
+                    match et {
+                        0x0806 if fr.len() >= 42 => {
+                            let op = be16(fr, 20);
+                            let spa = ipstr(fr, 28);
+                            let tpa = ipstr(fr, 38);
+                            let t = if op == 1 {
+                                alloc::format!(
+                                    "Request who-has {} tell {}",
+                                    tpa, spa
+                                )
+                            } else if op == 2 {
+                                alloc::format!(
+                                    "Reply {} is-at {}",
+                                    spa,
+                                    macstr(fr, 22)
+                                )
+                            } else {
+                                alloc::format!("opcode {}", op)
+                            };
+                            self.emit(&alloc::format!(
+                                "{} ARP, {}, length {}",
+                                ts_s,
+                                t,
+                                fr.len() - 14
+                            ));
+                        }
+                        0x0800 if fr.len() >= 34 => {
+                            let ihl = (fr[14] & 0xf) as usize * 4;
+                            let proto = fr[23];
+                            let sip = ipstr(fr, 26);
+                            let dip = ipstr(fr, 30);
+                            let tlen = be16(fr, 16) as usize;
+                            match proto {
+                                6 if fr.len() >= 14 + ihl + 20 => {
+                                    let p = 14 + ihl;
+                                    let sport = be16(fr, p);
+                                    let dport = be16(fr, p + 2);
+                                    let seq = be32(fr, p + 4);
+                                    let ack = be32(fr, p + 8);
+                                    let fl = fr[p + 13];
+                                    let win = be16(fr, p + 14);
+                                    let mut fs = String::new();
+                                    for (m, c) in [
+                                        (0x02, 'S'), (0x10, '.'),
+                                        (0x01, 'F'), (0x08, 'P'),
+                                        (0x04, 'R'), (0x20, 'U'),
+                                    ] {
+                                        if fl & m != 0 {
+                                            fs.push(c);
+                                        }
+                                    }
+                                    let payl =
+                                        tlen.saturating_sub(ihl + 20);
+                                    self.emit(&alloc::format!(
+                                        "{} IP {}.{} > {}.{}: Flags [{}], seq {}, ack {}, win {}, length {}",
+                                        ts_s, sip, sport, dip, dport,
+                                        fs, seq, ack, win, payl
+                                    ));
+                                }
+                                17 if fr.len() >= 14 + ihl + 8 => {
+                                    let p = 14 + ihl;
+                                    self.emit(&alloc::format!(
+                                        "{} IP {}.{} > {}.{}: UDP, length {}",
+                                        ts_s, sip, be16(fr, p),
+                                        dip, be16(fr, p + 2),
+                                        tlen.saturating_sub(ihl + 8)
+                                    ));
+                                }
+                                1 if fr.len() >= 14 + ihl + 4 => {
+                                    let p = 14 + ihl;
+                                    let tn = match (fr[p], fr[p + 1]) {
+                                        (8, 0) => "echo request",
+                                        (0, 0) => "echo reply",
+                                        (3, c) => {
+                                            match c {
+                                                3 => "destination unreachable (port)",
+                                                _ => "destination unreachable",
+                                            }
+                                        }
+                                        (11, _) => "time exceeded",
+                                        _ => "icmp",
+                                    };
+                                    self.emit(&alloc::format!(
+                                        "{} IP {} > {}: ICMP {}, id {}, seq {}, length {}",
+                                        ts_s, sip, dip, tn,
+                                        be16(fr, p + 4),
+                                        be16(fr, p + 6),
+                                        tlen.saturating_sub(ihl + 8)
+                                    ));
+                                }
+                                _ => self.emit(&alloc::format!(
+                                    "{} IP {} > {}: proto {}, length {}",
+                                    ts_s, sip, dip, proto, tlen
+                                )),
+                            }
+                        }
+                        _ => self.emit(&alloc::format!(
+                            "{} {} > {}, ethertype 0x{:04x}, length {}",
+                            ts_s,
+                            macstr(fr, 6),
+                            macstr(fr, 0),
+                            et,
+                            wire
+                        )),
+                    }
+                }
+                self.emit(&alloc::format!(
+                    "{} packets received by filter",
+                    total
+                ));
+                self.emit(&alloc::format!("{} packets shown", shown));
+            }
+            "pldd" => {
+                // pldd <pid> — real shared-object list for a running
+                // task, walked from /proc/<pid>/maps.
+                let Some(pid) =
+                    args.iter().find(|a| !a.starts_with('-'))
+                else {
+                    self.fail("usage: pldd <pid>");
+                    return;
+                };
+                let Ok(d) =
+                    ustd::read_all(&alloc::format!("/proc/{}/maps", pid))
+                else {
+                    self.fail(&alloc::format!("pldd: {}: no such process", pid));
+                    return;
+                };
+                let t = String::from_utf8_lossy(&d).into_owned();
+                let mut seen: Vec<String> = Vec::new();
+                for l in t.lines() {
+                    let path = l.rsplit(' ').next().unwrap_or("");
+                    if path.starts_with('/')
+                        && !seen.iter().any(|s| s == path)
+                    {
+                        seen.push(String::from(path));
+                    }
+                }
+                if seen.is_empty() {
+                    self.emit(&alloc::format!(
+                        "{}: no shared objects loaded",
+                        pid
+                    ));
+                }
+                for p in seen {
+                    self.emit(&p);
+                }
+            }
+            "ldconfig" => {
+                // ldconfig [-p] [dir...] — real shared-lib cache:
+                // scans dirs for *.so* files, writes /etc/ld.so.cache,
+                // -p prints the cache.
+                if args.iter().any(|a| *a == "-p") {
+                    match ustd::read_all("/etc/ld.so.cache") {
+                        Ok(d) => {
+                            let t = String::from_utf8_lossy(&d).into_owned();
+                            let n = t.lines().count();
+                            self.emit(&alloc::format!(
+                                "{} libs found in cache `/etc/ld.so.cache'",
+                                n
+                            ));
+                            for l in t.lines() {
+                                self.emit(&alloc::format!("\t{}", l));
+                            }
+                        }
+                        Err(_) => self.fail(
+                            "ldconfig: /etc/ld.so.cache: err (run ldconfig)",
+                        ),
+                    }
+                    return;
+                }
+                let mut dirs: Vec<String> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .map(|s| String::from(*s))
+                    .collect();
+                if dirs.is_empty() {
+                    dirs = ["/lib", "/usr/lib", "/usr/local/lib"]
+                        .iter()
+                        .map(|s| String::from(*s))
+                        .collect();
+                }
+                let mut found: Vec<String> = Vec::new();
+                for d in &dirs {
+                    if let Ok(ents) = ustd::readdir(d) {
+                        for e in ents {
+                            let nm = core::str::from_utf8(
+                                &e.name[..e.name_len as usize],
+                            )
+                            .unwrap_or("");
+                            if e.is_dir == 0 && nm.contains(".so") {
+                                found.push(alloc::format!(
+                                    "{}/{}",
+                                    d.trim_end_matches('/'),
+                                    nm
+                                ));
+                            }
+                        }
+                    }
+                }
+                found.sort();
+                let body = found.join("\n");
+                match ustd::write_all(
+                    "/etc/ld.so.cache",
+                    alloc::format!("{}\n", body).as_bytes(),
+                ) {
+                    Ok(_) => self.emit(&alloc::format!(
+                        "ldconfig: {} libs cached in /etc/ld.so.cache",
+                        found.len()
+                    )),
+                    Err(e) => self.fail(&alloc::format!(
+                        "ldconfig: /etc/ld.so.cache: err {}",
+                        e
+                    )),
+                }
+            }
+            "msgfmt" => {
+                // msgfmt <in.po> -o <out.mo> — real GNU .mo writer:
+                // parses msgid/msgstr pairs + continuations, sorts by
+                // msgid, emits the magic/tables/string-pool format.
+                let mut po: Option<&str> = None;
+                let mut out: Option<String> = None;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-o" => {
+                            out = args.get(i + 1).map(|s| String::from(*s));
+                            i += 1;
+                        }
+                        a if !a.starts_with('-') => po = Some(a),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let Some(f) = po else {
+                    self.fail("usage: msgfmt <in.po> [-o out.mo]");
+                    return;
+                };
+                let Ok(d) = ustd::read_all(f) else {
+                    self.fail(&alloc::format!("msgfmt: {}: err", f));
+                    return;
+                };
+                let t = String::from_utf8_lossy(&d).into_owned();
+                let unesc = |s: &str| -> String {
+                    let mut o = String::new();
+                    let mut cs = s.chars();
+                    while let Some(c) = cs.next() {
+                        if c == '\\' {
+                            match cs.next() {
+                                Some('n') => o.push('\n'),
+                                Some('t') => o.push('\t'),
+                                Some('r') => o.push('\r'),
+                                Some('"') => o.push('"'),
+                                Some('\\') => o.push('\\'),
+                                Some('0') => o.push('\0'),
+                                _ => {}
+                            }
+                        } else {
+                            o.push(c);
+                        }
+                    }
+                    o
+                };
+                let lit = |l: &str| -> Option<String> {
+                    let l = l.trim();
+                    if l.len() >= 2
+                        && l.starts_with('"')
+                        && l.ends_with('"')
+                    {
+                        Some(unesc(&l[1..l.len() - 1]))
+                    } else {
+                        None
+                    }
+                };
+                let mut entries: Vec<(String, String)> = Vec::new();
+                let (mut cur_id, mut cur_str) = (String::new(), String::new());
+                let mut state = 0u8; // 0=none 1=in msgid 2=in msgstr
+                let mut fuzzy = false;
+                let mut flush = |cur_id: &mut String,
+                                 cur_str: &mut String,
+                                 entries: &mut Vec<(String, String)>,
+                                 fuzzy: &mut bool| {
+                    if !*fuzzy && (!cur_id.is_empty() || !cur_str.is_empty())
+                    {
+                        entries.push((cur_id.clone(), cur_str.clone()));
+                    }
+                    cur_id.clear();
+                    cur_str.clear();
+                    *fuzzy = false;
+                };
+                for l in t.lines() {
+                    let l = l.trim();
+                    if l.starts_with("#, fuzzy") {
+                        fuzzy = true;
+                        continue;
+                    }
+                    if l.starts_with('#') || l.is_empty() {
+                        continue;
+                    }
+                    if let Some(v) = l.strip_prefix("msgid_plural") {
+                        // plural forms: keep singular only
+                        let _ = v;
+                    } else if let Some(v) = l.strip_prefix("msgid") {
+                        flush(&mut cur_id, &mut cur_str, &mut entries, &mut fuzzy);
+                        cur_id = v.trim().strip_prefix(' ')
+                            .map(|s| unesc(&s[1..s.len() - 1]))
+                            .unwrap_or_default();
+                        state = 1;
+                    } else if let Some(v) = l.strip_prefix("msgstr") {
+                        cur_str = lit(v).unwrap_or_default();
+                        state = 2;
+                    } else if l.starts_with('"') {
+                        if let Some(x) = lit(l) {
+                            if state == 1 {
+                                cur_id.push_str(&x);
+                            } else if state == 2 {
+                                cur_str.push_str(&x);
+                            }
+                        }
+                    }
+                }
+                flush(&mut cur_id, &mut cur_str, &mut entries, &mut fuzzy);
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                let n = entries.len() as u32;
+                let mut mo: Vec<u8> = Vec::new();
+                let put = |v: &mut Vec<u8>, x: u32| {
+                    v.extend_from_slice(&x.to_le_bytes());
+                };
+                put(&mut mo, 0x950412de);
+                put(&mut mo, 0);
+                put(&mut mo, n);
+                put(&mut mo, 28);
+                put(&mut mo, 28 + 8 * n);
+                put(&mut mo, 0);
+                put(&mut mo, 0);
+                let mut off = 28 + 16 * n;
+                for (id, _) in &entries {
+                    put(&mut mo, id.len() as u32);
+                    put(&mut mo, off);
+                    off += id.len() as u32 + 1;
+                }
+                for (_, s) in &entries {
+                    put(&mut mo, s.len() as u32);
+                    put(&mut mo, off);
+                    off += s.len() as u32 + 1;
+                }
+                for (id, _) in &entries {
+                    mo.extend_from_slice(id.as_bytes());
+                    mo.push(0);
+                }
+                for (_, s) in &entries {
+                    mo.extend_from_slice(s.as_bytes());
+                    mo.push(0);
+                }
+                let op = out.unwrap_or_else(|| String::from("messages.mo"));
+                match ustd::write_all(&op, &mo) {
+                    Ok(_) => self.emit(&alloc::format!(
+                        "msgfmt: {} message{} written to {}",
+                        n,
+                        if n == 1 { "" } else { "s" },
+                        op
+                    )),
+                    Err(e) => self.fail(&alloc::format!(
+                        "msgfmt: {}: err {}",
+                        op, e
+                    )),
+                }
+            }
+            "pwconv" | "pwunconv" | "grpconv" | "grpunconv" => {
+                // shadow conversion: pwconv moves passwd[1] hashes into
+                // /etc/shadow (passwd[1]='x'); pwunconv merges back and
+                // removes the shadow file. grpconv/grpunconv the same
+                // for /etc/gshadow.
+                let (db, shadow, conv) = match cmd {
+                    "pwconv" => ("/etc/passwd", "/etc/shadow", true),
+                    "pwunconv" => ("/etc/passwd", "/etc/shadow", false),
+                    "grpconv" => ("/etc/group", "/etc/gshadow", true),
+                    _ => ("/etc/group", "/etc/gshadow", false),
+                };
+                let now_d =
+                    ustd::clock_gettime(0).map(|(s, _)| s / 86400).unwrap_or(0);
+                if conv {
+                    let rows = db_rows(db);
+                    let mut sh = String::new();
+                    let mut out: Vec<Vec<String>> = Vec::new();
+                    for r in &rows {
+                        if r.is_empty() {
+                            continue;
+                        }
+                        let pw = r.get(1).map(|s| s.as_str()).unwrap_or("x");
+                        let real_pw =
+                            if pw == "x" { "!" } else { pw };
+                        sh.push_str(&alloc::format!(
+                            "{}:{}:{}:::::::\n",
+                            r[0], real_pw, now_d
+                        ));
+                        let mut nr = r.clone();
+                        if nr.len() > 1 {
+                            nr[1] = String::from("x");
+                        }
+                        out.push(nr);
+                    }
+                    if ustd::write_all(shadow, sh.as_bytes()).is_err() {
+                        self.fail(&alloc::format!("{}: {}: err", cmd, shadow));
+                        return;
+                    }
+                    db_write(db, &out);
+                    self.emit(&alloc::format!(
+                        "{}: {} -> {} ({} entries)",
+                        cmd,
+                        db,
+                        shadow,
+                        rows.len()
+                    ));
+                } else {
+                    let Ok(sd) = ustd::read_all(shadow) else {
+                        self.emit(&alloc::format!(
+                            "{}: {} does not exist",
+                            cmd, shadow
+                        ));
+                        return;
+                    };
+                    let st = String::from_utf8_lossy(&sd).into_owned();
+                    let mut rows = db_rows(db);
+                    for r in rows.iter_mut() {
+                        if r.is_empty() {
+                            continue;
+                        }
+                        for l in st.lines() {
+                            let f: Vec<&str> = l.split(':').collect();
+                            if f.first().copied()
+                                == Some(r[0].as_str())
+                            {
+                                if r.len() > 1 {
+                                    r[1] = String::from(
+                                        f.get(1).copied().unwrap_or("x"),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    db_write(db, &rows);
+                    let _ = ustd::remove(shadow);
+                    self.emit(&alloc::format!(
+                        "{}: {} merged into {} and removed",
+                        cmd, shadow, db
+                    ));
+                }
+            }
+            "tmpwatch" => {
+                // tmpwatch <hours> <dir>... — real age-based removal:
+                // files under each dir whose mtime is older than
+                // hours*3600s are deleted (dirs are left alone).
+                let mut hrs: Option<u64> = None;
+                let mut dirs: Vec<&str> = Vec::new();
+                for a in args {
+                    if a.starts_with('-') {
+                        continue;
+                    }
+                    if hrs.is_none() {
+                        hrs = a.parse().ok();
+                        if hrs.is_none() {
+                            dirs.push(a);
+                        }
+                    } else {
+                        dirs.push(a);
+                    }
+                }
+                let (Some(h), false) = (hrs, dirs.is_empty()) else {
+                    self.fail("usage: tmpwatch <hours> <dir>...");
+                    return;
+                };
+                let now =
+                    ustd::clock_gettime(0).map(|(s, _)| s).unwrap_or(0);
+                let cutoff = h * 3600;
+                let mut removed = 0usize;
+                for d in dirs {
+                    let Ok(ents) = ustd::readdir(d) else {
+                        self.fail(&alloc::format!(
+                            "tmpwatch: {}: err",
+                            d
+                        ));
+                        continue;
+                    };
+                    for e in ents {
+                        let nm = core::str::from_utf8(
+                            &e.name[..e.name_len as usize],
+                        )
+                        .unwrap_or("");
+                        if e.is_dir != 0 || nm.is_empty() {
+                            continue;
+                        }
+                        if now.saturating_sub(e.mtime) > cutoff {
+                            let p = alloc::format!(
+                                "{}/{}",
+                                d.trim_end_matches('/'),
+                                nm
+                            );
+                            if ustd::remove(&p).is_ok() {
+                                removed += 1;
+                                self.emit(&alloc::format!(
+                                    "removing {}",
+                                    p
+                                ));
+                            }
+                        }
+                    }
+                }
+                self.emit(&alloc::format!(
+                    "tmpwatch: {} file{} removed",
+                    removed,
+                    if removed == 1 { "" } else { "s" }
+                ));
             }
             "curl" => {
                 // curl — real HTTP/1.1 client on the raw TCP stack.
@@ -33522,6 +34130,8 @@ impl Term {
         "fallocate", "tftp", "lsmem", "findfs", "chfn", "chsh", "sg", "lsipc",
         "hostnamectl", "resolvectl", "networkctl", "addr2line", "c++filt",
         "elfedit", "setpriv", "runuser",
+        "tcpdump", "pldd", "ldconfig", "msgfmt", "pwconv", "pwunconv",
+        "grpconv", "grpunconv", "tmpwatch",
         "fortune", "uuidgen", "mcookie", "logger", "whois", "fdisk", "vol", "blkid", "script",
         "nice", "renice", "pgrep", "pkill", "top", "dc", "vmstat", "free",
         "pcap", "ftp", "lsof", "fuser", "burn", "cron", "browse",
