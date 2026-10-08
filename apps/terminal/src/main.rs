@@ -7114,12 +7114,18 @@ impl Term {
             } else if let Some(rest) = var.strip_prefix("__CPI:") {
                 // cp -i: 'y' completes the deferred copy
                 if let Some((f, t)) = rest.split_once(':') {
-                    let (t, rec) = match t.split_once(':') {
-                        Some((t, r)) => (t, r == "1"),
-                        None => (t, false),
+                    let (t, rec, verb) = match t.split_once(':') {
+                        Some((t, r)) => {
+                            let (r, vb) = match r.split_once(':') {
+                                Some((r, vb)) => (r, vb == "1"),
+                                None => (r, false),
+                            };
+                            (t, r == "1", vb)
+                        }
+                        None => (t, false, false),
                     };
                     if v.trim_start().starts_with('y') {
-                        self.cp_any(f, t, rec);
+                        self.cp_any(f, t, rec, verb);
                     } else {
                         self.emit("cp: not overwritten");
                     }
@@ -8479,7 +8485,7 @@ impl Term {
             "sha256sum", "strings", "sort", "uniq", "cut", "more", "diff", "base64",
             "show", "tar", "md5sum", "uuencode", "uudecode", "grep", "find", "file",
             "sha1sum", "cksum", "comm", "zgrep", "zip", "unzip", "chmod", "touch",
-            "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename",
+            "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
             "egrep", "fgrep", "sdiff", "diff3", "merge", "compress",
             "uncompress", "sum", "sha224sum", "namei", "ts", "pr",
@@ -11428,6 +11434,7 @@ impl Term {
                 let inter = args.iter().any(|a| a.starts_with('-') && a.contains('i'));
                 let noclob = args.iter().any(|a| a.starts_with('-') && a.contains('n'));
                 let update = args.iter().any(|a| a.starts_with('-') && a.contains('u'));
+                let verb = args.iter().any(|a| a.starts_with('-') && a.contains('v'));
                 let pos: Vec<&str> = args
                     .iter()
                     .filter(|a| !a.starts_with('-'))
@@ -11533,7 +11540,10 @@ impl Term {
                                     "cp: overwrite '{}'? ", t
                                 ));
                                 self.read_modal = Some((
-                                    alloc::format!("__CPI:{}:{}:{}", f, t, rec as u8),
+                                    alloc::format!(
+                                        "__CPI:{}:{}:{}:{}",
+                                        f, t, rec as u8, verb as u8
+                                    ),
                                     0,
                                     0,
                                     false,
@@ -11541,9 +11551,64 @@ impl Term {
                                 return;
                             }
                         }
-                        self.cp_any(f, t, rec)
+                        self.cp_any(f, t, rec, verb)
                     }
                     _ => self.fail("usage: cp [-r] [-i] <from> <to>"),
+                }
+            }
+            "nl" => {
+                // nl [-b a|t|n] [file]: number lines — default numbers only
+                // non-blank lines (nl -bt), -b a numbers all, -b n none.
+                // Reads the file or the piped stdin buffer.
+                // -b takes a separate or attached value; everything else
+                // non-flag is the file
+                let mut style = "t";
+                let mut file: Option<&str> = None;
+                let mut skip_b_val = false;
+                for a in &args {
+                    if skip_b_val {
+                        style = a;
+                        skip_b_val = false;
+                        continue;
+                    }
+                    if a == &"-b" {
+                        skip_b_val = true;
+                    } else if a.starts_with("-b") && a.len() > 2 {
+                        style = &a[2..];
+                    } else if !a.starts_with('-') && file.is_none() {
+                        file = Some(*a);
+                    }
+                }
+                let body = match file {
+                    Some(f) => match ustd::read_all(f) {
+                        Ok(d) => String::from_utf8_lossy(&d).to_string(),
+                        Err(e) => {
+                            self.fail(&alloc::format!("nl: {}: err {}", f, e));
+                            return;
+                        }
+                    },
+                    None => {
+                        if self.pipe_in.is_some() {
+                            self.pipe_in.take().unwrap_or_default()
+                        } else {
+                            self.fail("usage: nl [-b t|a|n] [file]");
+                            return;
+                        }
+                    }
+                };
+                let mut ln = 0usize;
+                for line in body.split('\n') {
+                    let number = match style {
+                        "a" => true,
+                        "n" => false,
+                        _ => !line.is_empty(),
+                    };
+                    if number {
+                        ln += 1;
+                        self.emit(&alloc::format!("{:>6}\t{}", ln, line));
+                    } else {
+                        self.emit(line);
+                    }
                 }
             }
             "echo" => {
@@ -13406,6 +13471,26 @@ impl Term {
                             }
                         }
                         self.emit(&out);
+                    }
+                    // -r/--reference: print the file's mtime (not the clock)
+                    Some(&"-r") | Some(&"--reference") => {
+                        match args.get(1) {
+                            Some(f) => match ustd::stat(f) {
+                                Ok(s) => {
+                                    let (y, mo, dd, h, mi, se) = epoch_to_dt(s.mtime);
+                                    let dw = ((cal_days(y, mo, dd) + 4) % 7) as usize;
+                                    self.emit(&alloc::format!(
+                                        "{} {} {:>2} {:02}:{:02}:{:02} UTC {}",
+                                        WDAY[dw], MON[(mo - 1) as usize], dd,
+                                        h, mi, se, y
+                                    ));
+                                }
+                                Err(e) => self.fail(&alloc::format!(
+                                    "date: {}: err {}", f, e
+                                )),
+                            },
+                            None => self.fail("usage: date -r <file>"),
+                        }
                     }
                     // -u/--utc: the RTC is UTC-only — flag is a no-op display
                 Some(&"-u") | Some(&"--utc") | Some(&"--universal") => {
@@ -20958,7 +21043,7 @@ impl Term {
         "getent", "host", "usleep", "fc", "times",
         "readonly", "expr", "tty", "link", "unlink", "pstree", "lsattr", "chattr",
         "sync", "hwclock", "pwdx", "pidstat", "lsblk", "getconf", "lshw", "nohup",
-        "install", "jot", "ipcalc", "tsort", "fdupes", "rename", "updatedb",
+        "install", "jot", "ipcalc", "tsort", "fdupes", "rename", "updatedb", "nl",
         "locate", "mapfile", "readarray", "cpio", "rsync",
         "umask", "chmod", "ulimit", "complete", "compgen", "hexdump",
             "ln", "shopt", "hash", "enable", "stty", "readlink",
@@ -22193,7 +22278,7 @@ impl Term {
 
     /// cp -r: copy a file, or a directory tree when `rec`. `to` naming
     /// follows real cp: a directory target copies INTO it.
-    fn cp_any(&mut self, from: &str, to: &str, rec: bool) {
+    fn cp_any(&mut self, from: &str, to: &str, rec: bool, verb: bool) {
         match ustd::stat(from) {
             Ok(st) if st.is_dir != 0 => {
                 if !rec {
@@ -22222,7 +22307,7 @@ impl Term {
                                 core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("?");
                             let f = alloc::format!("{}/{}", from.trim_end_matches('/'), name);
                             let t = alloc::format!("{}/{}", dst, name);
-                            self.cp_any(&f, &t, rec);
+                            self.cp_any(&f, &t, rec, verb);
                         }
                     }
                     Err(e) => self.fail(&alloc::format!("cp: {}: err {}", from, e)),
@@ -22252,6 +22337,8 @@ impl Term {
                         ustd::close(outf);
                         if n < 0 {
                             self.fail(&alloc::format!("cp: {}: err {}", dst, n));
+                        } else if verb {
+                            self.emit(&alloc::format!("'{}' -> '{}'", from, dst));
                         }
                     }
                     (Err(e), _) => {
