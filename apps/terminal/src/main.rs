@@ -12965,10 +12965,30 @@ impl Term {
                 }
             }
             "reboot" => ustd::reboot(),
+            "lsns" => {
+                // lsns: the caller's namespace links, Linux-style.
+                let nst = [
+                    ("mnt", "mntns"), ("uts", "uts"), ("pid", "pid"),
+                    ("ipc", "ipc"), ("time", "time"),
+                    ("time", "time_for_children"),
+                ];
+                println!("NS TYPE NPROCS   PID NAME");
+                for (ty, f) in nst {
+                    let p = alloc::format!("/proc/self/ns/{}", f);
+                    let t = ustd::readlink(&p).unwrap_or_default();
+                    let id = t
+                        .trim_end_matches(']')
+                        .rsplit('[')
+                        .next()
+                        .unwrap_or("0");
+                    println!("{:<14} {:<6} {:>5} {}", id, ty, ustd::getpid(), f);
+                }
+            }
             "unshare" => {
-                // unshare [-m] [-u] [-p]: -m private mount table, -u own
-                // hostname (UTS), -p children land in a fresh PID
-                // namespace — the next fork sees itself as pid 1.
+                // unshare [-m] [-u] [-p] [-i] [-T]: -m private mount
+                // table, -u own hostname, -p fresh PID ns for children,
+                // -i fresh IPC ns (moves caller), -T fresh time ns
+                // for children.
                 let mut flags = 0u64;
                 for a in args {
                     if a == "-m" {
@@ -12977,8 +12997,12 @@ impl Term {
                         flags |= shared::CLONE_NEWUTS;
                     } else if a == "-p" {
                         flags |= shared::CLONE_NEWPID;
+                    } else if a == "-i" {
+                        flags |= shared::CLONE_NEWIPC;
+                    } else if a == "-T" {
+                        flags |= shared::CLONE_NEWTIME;
                     } else {
-                        self.fail("usage: unshare [-m] [-u] [-p]");
+                        self.fail("usage: unshare [-m] [-u] [-p] [-i] [-T]");
                         return;
                     }
                 }

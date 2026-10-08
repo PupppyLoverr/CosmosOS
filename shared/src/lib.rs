@@ -311,6 +311,10 @@ pub const SYS_CAPSET: u64 = 252;      // (out u32[3]) -> 0 | err
 pub const MS_MOVE: u64 = 0x2000;
 /// CLONE_NEWUTS: unshare the UTS namespace (hostname)
 pub const CLONE_NEWUTS: u64 = 0x0400_0000;
+/// CLONE_NEWIPC: unshare a fresh IPC namespace (moves the caller).
+pub const CLONE_NEWIPC: u64 = 0x0800_0000;
+/// CLONE_NEWTIME: stage a fresh time namespace for future children.
+pub const CLONE_NEWTIME: u64 = 0x80;
 /// CLONE_NEWPID: unshare/setns a PID namespace — children land inside
 /// (pidns_for_children semantics), the caller never moves.
 pub const CLONE_NEWPID: u64 = 0x2000_0000;

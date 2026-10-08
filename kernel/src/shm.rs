@@ -13,6 +13,8 @@ pub struct Shm {
     pub owner: u32,
     pub frames: Vec<u64>,
     pub refs: u32, // number of tasks currently mapping it
+    /// IPC namespace that owns the segment (0 = the initial one).
+    pub ns: u64,
 }
 
 pub struct ShmReg {
@@ -39,11 +41,15 @@ pub fn create(size: u64, owner: u32) -> Option<u32> {
         unsafe { core::ptr::write_bytes(crate::mem::phys_to_virt(pa) as *mut u8, 0, 0x1000) };
         frames.push(pa);
     }
+    let ns = crate::task::cur_ipc_ns();
     let mut g = SHM.lock();
     let r = g.as_mut()?;
     let id = r.next_id;
     r.next_id += 1;
-    r.map.insert(id, Shm { id, owner, frames, refs: 1 });
+    r.map.insert(
+        id,
+        Shm { id, owner, frames, refs: 1, ns },
+    );
     Some(id)
 }
 
@@ -51,8 +57,12 @@ pub fn create(size: u64, owner: u32) -> Option<u32> {
 /// Returns the number of bytes mapped.
 pub fn map_into(t: &mut Task, id: u32, vaddr: u64) -> u64 {
     let frames = {
+        // t's fields are reachable under the caller's SCHED lock —
+        // never take SCHED here.
+        let ns = t.ipc_ns;
         let g = SHM.lock();
-        match g.as_ref().and_then(|r| r.map.get(&id)) {
+        match g.as_ref().and_then(|r| r.map.get(&id)).filter(|s| s.ns == ns)
+        {
             Some(s) => s.frames.clone(),
             None => return 0,
         }
@@ -74,9 +84,11 @@ pub fn map_into(t: &mut Task, id: u32, vaddr: u64) -> u64 {
 
 /// Get the size (mapped byte count) of a shm region.
 pub fn size_of(id: u32) -> u64 {
+    let ns = crate::task::cur_ipc_ns();
     let g = SHM.lock();
     g.as_ref()
         .and_then(|r| r.map.get(&id))
+        .filter(|s| s.ns == ns)
         .map(|s| (s.frames.len() as u64) * 0x1000)
         .unwrap_or(0)
 }
@@ -127,10 +139,11 @@ pub fn drop_task_shm(t: &mut Task) {
 /// Text dump of the shm registry for SYS_IPCS:
 /// "id owner size refs" per line — rendered Linux-style by `ipcs -m`.
 pub fn ipcs_text() -> String {
+    let ns = crate::task::cur_ipc_ns();
     let g = SHM.lock();
     let mut s = String::new();
     if let Some(r) = g.as_ref() {
-        for (id, seg) in r.map.iter() {
+        for (id, seg) in r.map.iter().filter(|(_, s)| s.ns == ns) {
             s.push_str(&alloc::format!(
                 "{} {} {} {}\n",
                 id,
