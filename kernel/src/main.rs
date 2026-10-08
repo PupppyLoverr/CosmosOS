@@ -17,6 +17,8 @@ mod locks;
 mod mem;
 mod net;
 mod notify;
+mod epoll;
+mod eventfd;
 mod pci;
 mod dev;
 mod pcap;

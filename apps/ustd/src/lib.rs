@@ -1123,3 +1123,69 @@ pub fn timerfd_read(fd: i64) -> Option<u64> {
         _ => None,
     }
 }
+
+/// eventfd: semaphore mode returns 1 per read and decrements instead of
+/// draining the whole counter.
+pub const EFD_SEMAPHORE: u64 = 0x1;
+
+/// eventfd(initval, flags): an fd wrapping a u64 kernel counter.
+/// write() adds a u64; read() returns and drains it (or decrements in sem
+/// mode). Empty read / overflowing write block.
+pub fn eventfd(initval: u64, flags: u64) -> i64 {
+    sc2(shared::SYS_EVENTFD, initval, flags) as i64
+}
+
+/// add `v` to an eventfd counter. 8 | ERR
+pub fn eventfd_write(fd: i64, v: u64) -> i64 {
+    match write(fd, &v.to_le_bytes()) {
+        Ok(8) => 0,
+        Ok(_) => -5,
+        Err(e) => e,
+    }
+}
+
+/// drain an eventfd counter (nonsem) or take one unit (sem mode).
+/// Blocks while the counter is zero — poll() first to check.
+pub fn eventfd_read(fd: i64) -> Option<u64> {
+    let mut b = [0u8; 8];
+    match read(fd, &mut b) {
+        Ok(8) => Some(u64::from_le_bytes(b)),
+        _ => None,
+    }
+}
+
+pub const EPOLL_CTL_ADD: u64 = 1;
+pub const EPOLL_CTL_DEL: u64 = 2;
+pub const EPOLL_CTL_MOD: u64 = 3;
+pub const EPOLLIN: u64 = 0x1;
+pub const EPOLLOUT: u64 = 0x2;
+
+/// epoll_create: an fd owning a kernel interest set.
+pub fn epoll_create() -> i64 {
+    sc0(shared::SYS_EPOLL_CREATE) as i64
+}
+
+/// epoll_ctl(epfd, op, fd, events): register/del/modify an fd's interest.
+/// events = EPOLLIN|EPOLLOUT bits. 0 | ERR
+pub fn epoll_ctl(epfd: i64, op: u64, fd: i64, events: u64) -> i64 {
+    sc4(
+        shared::SYS_EPOLL_CTL,
+        epfd as u64,
+        op,
+        fd as u64,
+        events,
+    ) as i64
+}
+
+/// epoll_wait(epfd, out, timeout_ms): fills `out` with (fd, revents) pairs
+/// for ready interests; returns how many were written. Blocks until one
+/// fires or the timeout elapses (u64::MAX = forever).
+pub fn epoll_wait(epfd: i64, out: &mut [(u32, u32)], timeout_ms: u64) -> i64 {
+    sc4(
+        shared::SYS_EPOLL_WAIT,
+        epfd as u64,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+        timeout_ms,
+    ) as i64
+}
