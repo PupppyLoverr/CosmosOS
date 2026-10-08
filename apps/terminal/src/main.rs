@@ -24336,18 +24336,33 @@ impl Term {
                     homep.clone(),
                     shell,
                 ]);
-                let mut ok = db_write("/etc/passwd", &rows).is_ok()
+                let ok = db_write("/etc/passwd", &rows).is_ok()
                     && db_write("/etc/group", &grows).is_ok();
-                if ok && mkhome {
-                    ok = ustd::mkdir(&homep).is_ok();
-                }
-                if ok {
-                    self.emit(&alloc::format!(
-                        "useradd: '{}' uid={} gid={} home={}",
-                        name, uidf, gid, homep
-                    ));
-                } else {
+                if !ok {
                     self.fail("useradd: could not write user db");
+                    return;
+                }
+                self.emit(&alloc::format!(
+                    "useradd: '{}' uid={} gid={} home={}",
+                    name, uidf, gid, homep
+                ));
+                if mkhome {
+                    // mkdir -p each missing ancestor (no parent-create in fs)
+                    let mut acc = String::new();
+                    let mut mok = true;
+                    for seg in homep.trim_matches('/').split('/') {
+                        acc.push('/');
+                        acc.push_str(seg);
+                        if ustd::stat(&acc).is_err() && ustd::mkdir(&acc).is_err()
+                        {
+                            mok = false;
+                            break;
+                        }
+                    }
+                    if !mok {
+                        self.emit(&alloc::format!(
+                            "useradd: warning: {} not created", homep));
+                    }
                 }
             }
             "userdel" => {
