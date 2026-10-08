@@ -24233,7 +24233,7 @@ impl Term {
                 let mut shell = String::from("/bin/sh");
                 let mut mkhome = false;
                 let mut name: Option<&str> = None;
-                let mut i = 1;
+                let mut i = 0;
                 while i < args.len() {
                     match args[i] {
                         "-u" | "-g" | "-c" | "-d" | "-s"
@@ -24397,17 +24397,20 @@ impl Term {
                         r
                     })
                     .collect();
-                let mut ok = db_write("/etc/passwd", &kept).is_ok()
+                let ok = db_write("/etc/passwd", &kept).is_ok()
                     && db_write("/etc/group", &gout).is_ok();
-                if ok && rm_home && !home.is_empty() {
+                if !ok {
+                    self.fail("userdel: could not update user db");
+                    return;
+                }
+                self.emit(&alloc::format!("userdel: '{}' removed", name));
+                if rm_home && !home.is_empty() {
                     let line = alloc::format!("rm -r {}", home);
                     self.run(&line);
-                    ok = self.last_ok;
-                }
-                if ok {
-                    self.emit(&alloc::format!("userdel: '{}' removed", name));
-                } else {
-                    self.fail("userdel: could not update user db");
+                    if !self.last_ok {
+                        self.emit(&alloc::format!(
+                            "userdel: warning: {} not removed", home));
+                    }
                 }
             }
             "usermod" => {
@@ -24420,7 +24423,7 @@ impl Term {
                 let mut gecos: Option<String> = None;
                 let mut home: Option<String> = None;
                 let mut shell: Option<String> = None;
-                let mut i = 1;
+                let mut i = 0;
                 while i < args.len() {
                     match args[i] {
                         "-u" | "-g" | "-c" | "-d" | "-s" | "-l"
@@ -24498,7 +24501,7 @@ impl Term {
                 // groupadd [-g gid] name
                 let mut gid = -1i64;
                 let mut name: Option<&str> = None;
-                let mut i = 1;
+                let mut i = 0;
                 while i < args.len() {
                     if args[i] == "-g" && i + 1 < args.len() {
                         i += 1;
@@ -24587,7 +24590,7 @@ impl Term {
                 let mut gid: Option<String> = None;
                 let mut newname: Option<String> = None;
                 let mut name: Option<&str> = None;
-                let mut i = 1;
+                let mut i = 0;
                 while i < args.len() {
                     match args[i] {
                         "-g" | "-n" if i + 1 < args.len() => {
@@ -24654,7 +24657,7 @@ impl Term {
                 // chsh -s shell [user] — rewrite the passwd shell field.
                 let mut shell: Option<String> = None;
                 let mut user: Option<&str> = None;
-                let mut i = 1;
+                let mut i = 0;
                 while i < args.len() {
                     if (args[i] == "-s" || args[i] == "--shell")
                         && i + 1 < args.len()
@@ -24694,7 +24697,7 @@ impl Term {
                 // chfn [-f full-name] [user] — rewrite the gecos field.
                 let mut gecos: Option<String> = None;
                 let mut user: Option<&str> = None;
-                let mut i = 1;
+                let mut i = 0;
                 while i < args.len() {
                     if (args[i] == "-f" || args[i] == "--full-name")
                         && i + 1 < args.len()
