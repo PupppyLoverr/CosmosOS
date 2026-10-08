@@ -1,5 +1,6 @@
 //! ELF64 loading into user page tables + user mapping helpers.
 use crate::mem;
+use alloc::string::String;
 use alloc::vec::Vec;
 use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
@@ -8,6 +9,7 @@ use x86_64::PhysAddr;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
+const PF_R: u32 = 4;
 
 fn user_l4(pml4: PhysFrame) -> &'static mut PageTable {
     unsafe { &mut *(mem::phys_to_virt(pml4.start_address().as_u64()) as *mut PageTable) }
@@ -40,6 +42,7 @@ pub fn map_user_page(pml4: PhysFrame, vaddr: u64, frames: &mut Vec<u64>) -> Opti
         return Some(pt[i1].addr().as_u64()); // already mapped
     }
     let f = mem::alloc_frame()?;
+    unsafe { core::ptr::write_bytes(mem::phys_to_virt(f.start_address().as_u64()) as *mut u8, 0, 0x1000) };
     frames.push(f.start_address().as_u64());
     pt[i1].set_addr(
         f.start_address(),
@@ -49,7 +52,7 @@ pub fn map_user_page(pml4: PhysFrame, vaddr: u64, frames: &mut Vec<u64>) -> Opti
 }
 
 /// Map an executable (no WRITE, has USER) user page.
-fn map_user_page_flags(pml4: PhysFrame, vaddr: u64, writable: bool, frames: &mut Vec<u64>) -> Option<u64> {
+pub fn map_user_page_flags(pml4: PhysFrame, vaddr: u64, writable: bool, exec: bool, frames: &mut Vec<u64>) -> Option<u64> {
     use x86_64::structures::paging::PageTableFlags as F;
     let l4 = user_l4(pml4);
     let i4 = ((vaddr >> 39) & 0x1FF) as usize;
@@ -63,10 +66,14 @@ fn map_user_page_flags(pml4: PhysFrame, vaddr: u64, writable: bool, frames: &mut
         return Some(pt[i1].addr().as_u64());
     }
     let f = mem::alloc_frame()?;
+    unsafe { core::ptr::write_bytes(mem::phys_to_virt(f.start_address().as_u64()) as *mut u8, 0, 0x1000) };
     frames.push(f.start_address().as_u64());
     let mut fl = F::PRESENT | F::USER_ACCESSIBLE;
     if writable {
         fl |= F::WRITABLE;
+    }
+    if !exec {
+        fl |= F::NO_EXECUTE;
     }
     pt[i1].set_addr(f.start_address(), fl);
     Some(f.start_address().as_u64())
@@ -109,9 +116,49 @@ pub fn map_phys_user(pml4: PhysFrame, vaddr: u64, phys: u64, writable: bool) -> 
     true
 }
 
+/// map_phys_user with an exec flag — fork/exec need to recreate shared
+/// or copied mappings with the source page's real permissions.
+pub fn map_phys_user_flags(
+    pml4: PhysFrame,
+    vaddr: u64,
+    phys: u64,
+    writable: bool,
+    exec: bool,
+    frames: &mut Vec<u64>,
+) -> bool {
+    use x86_64::structures::paging::PageTableFlags as F;
+    let l4 = user_l4(pml4);
+    let i4 = ((vaddr >> 39) & 0x1FF) as usize;
+    let Some(pdpt) = next_table(&mut l4[i4], frames) else { return false };
+    let i3 = ((vaddr >> 30) & 0x1FF) as usize;
+    let Some(pd) = next_table(&mut pdpt[i3], frames) else { return false };
+    let i2 = ((vaddr >> 21) & 0x1FF) as usize;
+    let Some(pt) = next_table(&mut pd[i2], frames) else { return false };
+    let i1 = ((vaddr >> 12) & 0x1FF) as usize;
+    if !pt[i1].is_unused() {
+        return false;
+    }
+    let mut fl = F::PRESENT | F::USER_ACCESSIBLE;
+    if writable {
+        fl |= F::WRITABLE;
+    }
+    if !exec {
+        fl |= F::NO_EXECUTE;
+    }
+    pt[i1].set_addr(PhysAddr::new(phys), fl);
+    true
+}
+
 /// Load ELF64 segments from `data` into the user table `pml4`.
 /// Returns entry point.
-pub fn load_into(pml4: PhysFrame, data: &[u8], frames: &mut Vec<u64>) -> Result<u64, ()> {
+/// Load an ELF image. Every PT_LOAD is also recorded in `maps` as a
+/// `MapEnt` so `/proc/<pid>/maps` reflects the real segment layout.
+pub fn load_into(
+    pml4: PhysFrame,
+    data: &[u8],
+    frames: &mut Vec<u64>,
+    maps: &mut Vec<crate::task::MapEnt>,
+) -> Result<u64, ()> {
     if data.len() < 64 || &data[0..4] != b"\x7fELF" {
         return Err(());
     }
@@ -168,8 +215,17 @@ pub fn load_into(pml4: PhysFrame, data: &[u8], frames: &mut Vec<u64>) -> Result<
         let page_lo = pvaddr & !0xFFF;
         let page_hi = (pvaddr + pmemsz as u64 + 0xFFF) & !0xFFF;
         for page in (page_lo..page_hi).step_by(0x1000) {
-            map_user_page_flags(pml4, page, writable, frames).ok_or(())?;
+            map_user_page_flags(pml4, page, writable, true, frames).ok_or(())?;
         }
+        let perm = (if pflags & PF_R != 0 { 1u8 } else { 0 })
+            | (if writable { 2u8 } else { 0 })
+            | (if pflags & PF_X != 0 { 4u8 } else { 0 });
+        maps.push(crate::task::MapEnt {
+            start: page_lo,
+            end: page_hi,
+            perm,
+            name: String::new(), // filled with the image path by the caller
+        });
         // copy file bytes via the phys map (works regardless of active CR3)
         if pfilesz > 0 {
             let mut off = 0usize;
@@ -274,6 +330,181 @@ pub fn translate(pml4: PhysFrame, vaddr: u64) -> Option<u64> {
     Some(pt[i1].addr().as_u64() + (vaddr & 0xFFF))
 }
 
+/// translate() but enforces USER_ACCESSIBLE at every level — the syscall
+/// boundary must never resolve a supervisor mapping for a user pointer.
+/// Also refuses anything outside PML4[0]: user tables share the kernel's
+/// upper entries by value, so i4 > 0 would name a shared kernel mapping.
+pub fn translate_user(pml4: PhysFrame, vaddr: u64) -> Option<u64> {
+    use x86_64::structures::paging::PageTableFlags as F;
+    let l4 = unsafe { &*(mem::phys_to_virt(pml4.start_address().as_u64()) as *const PageTable) };
+    let i4 = ((vaddr >> 39) & 0x1FF) as usize;
+    if i4 != 0 || l4[i4].is_unused() || !l4[i4].flags().contains(F::USER_ACCESSIBLE) {
+        return None;
+    }
+    let pdpt = unsafe { &*(mem::phys_to_virt(l4[i4].addr().as_u64()) as *const PageTable) };
+    let i3 = ((vaddr >> 30) & 0x1FF) as usize;
+    if pdpt[i3].is_unused() || !pdpt[i3].flags().contains(F::USER_ACCESSIBLE) {
+        return None;
+    }
+    let pd = unsafe { &*(mem::phys_to_virt(pdpt[i3].addr().as_u64()) as *const PageTable) };
+    let i2 = ((vaddr >> 21) & 0x1FF) as usize;
+    if pd[i2].is_unused() || !pd[i2].flags().contains(F::USER_ACCESSIBLE) {
+        return None;
+    }
+    let pt = unsafe { &*(mem::phys_to_virt(pd[i2].addr().as_u64()) as *const PageTable) };
+    let i1 = ((vaddr >> 12) & 0x1FF) as usize;
+    if pt[i1].is_unused() || !pt[i1].flags().contains(F::USER_ACCESSIBLE) {
+        return None;
+    }
+    Some(pt[i1].addr().as_u64() + (vaddr & 0xFFF))
+}
+
+/// Enumerate every present 4KiB user leaf: (vaddr, phys, writable, exec).
+/// fork() copies the address space by walking this and rebuilding each
+/// page in the child's own table.
+pub fn collect_user_pages(pml4: PhysFrame) -> Vec<(u64, u64, bool, bool)> {
+    use x86_64::structures::paging::PageTableFlags as F;
+    let l4 = unsafe { &*(mem::phys_to_virt(pml4.start_address().as_u64()) as *const PageTable) };
+    let mut out = Vec::new();
+    if l4[0].is_unused() {
+        return out;
+    }
+    let pdpt = unsafe { &*(mem::phys_to_virt(l4[0].addr().as_u64()) as *const PageTable) };
+    for i3 in 0..512usize {
+        if pdpt[i3].is_unused() {
+            continue;
+        }
+        let pd = unsafe { &*(mem::phys_to_virt(pdpt[i3].addr().as_u64()) as *const PageTable) };
+        for i2 in 0..512usize {
+            if pd[i2].is_unused() || pd[i2].flags().contains(F::HUGE_PAGE) {
+                continue;
+            }
+            let pt = unsafe { &*(mem::phys_to_virt(pd[i2].addr().as_u64()) as *const PageTable) };
+            for i1 in 0..512usize {
+                if pt[i1].is_unused() {
+                    continue;
+                }
+                let va = ((i3 as u64) << 30) | ((i2 as u64) << 21) | ((i1 as u64) << 12);
+                let fl = pt[i1].flags();
+                out.push((va, pt[i1].addr().as_u64(), fl.contains(F::WRITABLE), !fl.contains(F::NO_EXECUTE)));
+            }
+        }
+    }
+    out
+}
+
+/// Count present 4KiB leaf mappings in the user half (PML4[0] only — the
+/// shared kernel upper-half entries are not the task's own pages).
+pub fn count_mapped(pml4: PhysFrame) -> u64 {
+    let l4 = unsafe { &*(mem::phys_to_virt(pml4.start_address().as_u64()) as *const PageTable) };
+    let mut n = 0u64;
+    for i4 in 0..1usize {
+        if l4[i4].is_unused() {
+            continue;
+        }
+        let pdpt = unsafe { &*(mem::phys_to_virt(l4[i4].addr().as_u64()) as *const PageTable) };
+        for i3 in 0..512usize {
+            if pdpt[i3].is_unused() {
+                continue;
+            }
+            let pd = unsafe { &*(mem::phys_to_virt(pdpt[i3].addr().as_u64()) as *const PageTable) };
+            for i2 in 0..512usize {
+                if pd[i2].is_unused() {
+                    continue;
+                }
+                let pt = unsafe { &*(mem::phys_to_virt(pd[i2].addr().as_u64()) as *const PageTable) };
+                n += pt.iter().filter(|e| !e.is_unused()).count() as u64;
+            }
+        }
+    }
+    n
+}
+
+/// Unmap one user page in `pml4`; returns its physical frame address when it
+/// was mapped (the caller decides whether the frame is owned or borrowed).
+pub fn unmap_user_page(pml4: PhysFrame, vaddr: u64) -> Option<u64> {
+    let l4 = user_l4(pml4);
+    let i4 = ((vaddr >> 39) & 0x1FF) as usize;
+    if i4 != 0 {
+        return None; // never reach into the shared kernel-half tables
+    }
+    if l4[i4].is_unused() {
+        return None;
+    }
+    let pdpt = unsafe { &mut *(mem::phys_to_virt(l4[i4].addr().as_u64()) as *mut PageTable) };
+    let i3 = ((vaddr >> 30) & 0x1FF) as usize;
+    if pdpt[i3].is_unused() {
+        return None;
+    }
+    let pd = unsafe { &mut *(mem::phys_to_virt(pdpt[i3].addr().as_u64()) as *mut PageTable) };
+    let i2 = ((vaddr >> 21) & 0x1FF) as usize;
+    if pd[i2].is_unused() {
+        return None;
+    }
+    let pt = unsafe { &mut *(mem::phys_to_virt(pd[i2].addr().as_u64()) as *mut PageTable) };
+    let i1 = ((vaddr >> 12) & 0x1FF) as usize;
+    if pt[i1].is_unused() {
+        return None;
+    }
+    let phys = pt[i1].addr().as_u64();
+    pt[i1].set_unused();
+    Some(phys)
+}
+
+/// Unmap every page in `[lo, hi)`; returns the physical frames that were
+/// removed (caller decides ownership — e.g. borrowed shm frames stay).
+/// Used to reclaim a dead thread's private stack slot while the shared
+/// address space lives on.
+pub fn unmap_user_range(pml4: PhysFrame, lo: u64, hi: u64) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut a = lo;
+    while a < hi {
+        if let Some(p) = unmap_user_page(pml4, a) {
+            out.push(p);
+        }
+        a += 0x1000;
+    }
+    out
+}
+
+/// Rewrite the WRITABLE/NO_EXECUTE bits of a mapped user page (mprotect).
+/// Returns Some(()) when the page was mapped.
+pub fn protect_user_page(pml4: PhysFrame, vaddr: u64, writable: bool, executable: bool) -> Option<()> {
+    use x86_64::structures::paging::PageTableFlags as F;
+    let l4 = user_l4(pml4);
+    let i4 = ((vaddr >> 39) & 0x1FF) as usize;
+    if i4 != 0 {
+        return None; // never reach into the shared kernel-half tables
+    }
+    if l4[i4].is_unused() {
+        return None;
+    }
+    let pdpt = unsafe { &mut *(mem::phys_to_virt(l4[i4].addr().as_u64()) as *mut PageTable) };
+    let i3 = ((vaddr >> 30) & 0x1FF) as usize;
+    if pdpt[i3].is_unused() {
+        return None;
+    }
+    let pd = unsafe { &mut *(mem::phys_to_virt(pdpt[i3].addr().as_u64()) as *mut PageTable) };
+    let i2 = ((vaddr >> 21) & 0x1FF) as usize;
+    if pd[i2].is_unused() {
+        return None;
+    }
+    let pt = unsafe { &mut *(mem::phys_to_virt(pd[i2].addr().as_u64()) as *mut PageTable) };
+    let i1 = ((vaddr >> 12) & 0x1FF) as usize;
+    if pt[i1].is_unused() {
+        return None;
+    }
+    let mut fl = F::PRESENT | F::USER_ACCESSIBLE;
+    if writable {
+        fl |= F::WRITABLE;
+    }
+    if !executable {
+        fl |= F::NO_EXECUTE;
+    }
+    pt[i1].set_flags(fl);
+    Some(())
+}
+
 /// Free every user-mapped page + page-table frame under `pml4` (indices < 512
 /// except shared kernel slots). Returns all freed frame addresses.
 pub fn free_user_space(pml4: PhysFrame) -> Vec<u64> {
@@ -309,4 +540,267 @@ pub fn free_user_space(pml4: PhysFrame) -> Vec<u64> {
         }
     }
     freed
+}
+
+/// Demand-paged ELF load: PT_LOAD segments register task::FileMap
+/// regions instead of copying file bytes eagerly — each page faults in
+/// from the image on first touch. `hdr` must contain the ELF header +
+/// program headers (caller reads enough of the file to cover them).
+/// `file_size` is the whole file's size for bounds. Falls back for
+/// segments whose (vaddr,offset) aren't page-aligned.
+pub fn load_into_lazy(
+    pml4: PhysFrame,
+    path: &str,
+    hdr: &[u8],
+    file_size: u64,
+    frames: &mut Vec<u64>,
+    maps: &mut Vec<crate::task::MapEnt>,
+    filemaps: &mut Vec<crate::task::FileMap>,
+) -> Result<u64, ()> {
+    if hdr.len() < 64 || &hdr[0..4] != b"\x7fELF" || hdr[4] != 2 || hdr[5] != 1 {
+        return Err(());
+    }
+    if u16::from_le_bytes([hdr[18], hdr[19]]) != 0x3E {
+        return Err(());
+    }
+    let entry = u64::from_le_bytes(hdr[24..32].try_into().unwrap());
+    let phoff = u64::from_le_bytes(hdr[32..40].try_into().unwrap()) as usize;
+    let phentsize = u16::from_le_bytes(hdr[54..56].try_into().unwrap()) as usize;
+    let phnum = u16::from_le_bytes(hdr[56..58].try_into().unwrap()) as usize;
+    if phoff + phnum * phentsize > hdr.len() || phentsize < 56 {
+        return Err(()); // phdrs beyond the header window -> caller falls back
+    }
+    const USER_LOAD_BASE: u64 = 0x40_0000;
+    let mut min_vaddr = u64::MAX;
+    for i in 0..phnum {
+        let ph = &hdr[phoff + i * phentsize..phoff + i * phentsize + 56];
+        if u32::from_le_bytes(ph[0..4].try_into().unwrap()) != PT_LOAD {
+            continue;
+        }
+        let pv = u64::from_le_bytes(ph[16..24].try_into().unwrap());
+        if u64::from_le_bytes(ph[40..48].try_into().unwrap()) > 0 {
+            min_vaddr = min_vaddr.min(pv & !0xFFF);
+        }
+    }
+    if min_vaddr == u64::MAX {
+        return Err(());
+    }
+    let bias = USER_LOAD_BASE.saturating_sub(min_vaddr);
+    // (va_lo, va_hi, delta): va->file 1:1 for the file-backed part of
+    // every segment — used to read rela entries that live in eagerly
+    // mapped pages, outside any filemap
+    let mut vadeltas: Vec<(u64, u64, u64)> = Vec::new();
+    for i in 0..phnum {
+        let ph = &hdr[phoff + i * phentsize..phoff + i * phentsize + 56];
+        if u32::from_le_bytes(ph[0..4].try_into().unwrap()) != PT_LOAD {
+            continue;
+        }
+        let pflags = u32::from_le_bytes(ph[4..8].try_into().unwrap());
+        let poffset = u64::from_le_bytes(ph[8..16].try_into().unwrap());
+        let pvaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap()) + bias;
+        let pfilesz = u64::from_le_bytes(ph[32..40].try_into().unwrap());
+        let pmemsz = u64::from_le_bytes(ph[40..48].try_into().unwrap());
+        if pmemsz == 0 {
+            continue;
+        }
+        if pvaddr < 0x1000 || pvaddr + pmemsz > 0x7EFF_F000 {
+            return Err(());
+        }
+        if poffset + pfilesz > file_size {
+            return Err(());
+        }
+        if pfilesz > 0 {
+            vadeltas.push((pvaddr, pvaddr + pfilesz, pvaddr - poffset));
+        }
+        let writable = pflags & PF_W != 0;
+        let perm = (if pflags & PF_R != 0 { 1u8 } else { 0 })
+            | (if writable { 2u8 } else { 0 })
+            | (if pflags & PF_X != 0 { 4u8 } else { 0 });
+        let page_lo = pvaddr & !0xFFF;
+        let page_hi = (pvaddr + pmemsz + 0xFFF) & !0xFFF;
+        let file_end = pvaddr + pfilesz;
+        maps.push(crate::task::MapEnt {
+            start: page_lo,
+            end: page_hi,
+            perm,
+            name: String::new(),
+        });
+        // misaligned (vaddr,offset) can't be paged in 1:1 — eager that seg
+        if (pvaddr & 0xFFF) != (poffset & 0xFFF) {
+            let mut scratch: Vec<u64> = Vec::new();
+            for page in (page_lo..page_hi).step_by(0x1000) {
+                map_user_page_flags(pml4, page, writable, true, &mut scratch).ok_or(())?;
+            }
+            frames.extend(scratch);
+            let mut tmp = [0u8; 0x1000];
+            let mut off = 0usize;
+            while off < pfilesz as usize {
+                let va = pvaddr + off as u64;
+                let want = (0x1000 - (va as usize & 0xFFF)).min(pfilesz as usize - off);
+                let n = crate::vfs::read_range(
+                    path,
+                    poffset + off as u64,
+                    &mut tmp[..want],
+                )
+                .map_err(|_| ())?;
+                let phys = translate(pml4, va).ok_or(())?;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        tmp.as_ptr(),
+                        mem::phys_to_virt(phys) as *mut u8,
+                        n,
+                    );
+                }
+                off += n;
+                if n < want {
+                    break;
+                }
+            }
+            continue;
+        }
+        // file-backed zone: [page_lo, file_end&!0xFFF)
+        let fm_end = file_end & !0xFFF;
+        if fm_end > page_lo {
+            filemaps.push(crate::task::FileMap {
+                start: page_lo,
+                end: fm_end,
+                path: String::from(path),
+                off: poffset - (pvaddr - page_lo),
+                perm,
+            });
+        }
+        // overlap page (file tail + bss head): fill eagerly, zero the tail.
+        // The page maps file bytes 1:1 from `poffset - (pvaddr - page)`;
+        // only bytes up to file_end are real — everything past is .bss
+        // and stays zero (fresh frames are pre-zeroed).
+        if pfilesz > 0 && (file_end & 0xFFF) != 0 {
+            let mut scratch: Vec<u64> = Vec::new();
+            let page = file_end & !0xFFF;
+            map_user_page_flags(pml4, page, writable, true, &mut scratch).ok_or(())?;
+            frames.extend(scratch);
+            let file_off = (poffset as i64 + page as i64 - pvaddr as i64) as u64;
+            let copy_len = (file_end - page).min(0x1000) as usize;
+            let mut tmp = [0u8; 0x1000];
+            let n = crate::vfs::read_range(path, file_off, &mut tmp[..copy_len])
+                .map_err(|_| ())?;
+            let phys = translate(pml4, page).ok_or(())?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    tmp.as_ptr(),
+                    mem::phys_to_virt(phys) as *mut u8,
+                    n,
+                );
+            }
+        }
+        // pure-bss zone: demand-zero pages (sentinel path = "")
+        let bss_lo = if pfilesz > 0 {
+            (file_end + 0xFFF) & !0xFFF
+        } else {
+            page_lo
+        };
+        if bss_lo < page_hi {
+            filemaps.push(crate::task::FileMap {
+                start: bss_lo,
+                end: page_hi,
+                path: String::new(), // "" = zero-fill
+                off: 0,
+                perm,
+            });
+        }
+    }
+    // pass 3: R_X86_64_RELATIVE — PIE GOT slots/function pointers get
+    // addend+bias. A target on a demand page faults that page in NOW
+    // (eager fill) so the slot can be written.
+    for i in 0..phnum {
+        let ph = &hdr[phoff + i * phentsize..phoff + i * phentsize + 56];
+        if u32::from_le_bytes(ph[0..4].try_into().unwrap()) != 2 {
+            continue; // PT_DYNAMIC
+        }
+        let dyn_off = u64::from_le_bytes(ph[8..16].try_into().unwrap());
+        let dyn_sz = u64::from_le_bytes(ph[32..40].try_into().unwrap()) as usize;
+        let mut dynbuf = alloc::vec![0u8; dyn_sz.min(0x1000)];
+        let _ = crate::vfs::read_range(path, dyn_off, &mut dynbuf);
+        let (mut rela, mut relasz, mut relaent) = (0u64, 0u64, 24u64);
+        for e in dynbuf.chunks_exact(16) {
+            let tag = i64::from_le_bytes(e[0..8].try_into().unwrap());
+            let val = u64::from_le_bytes(e[8..16].try_into().unwrap());
+            match tag {
+                7 => rela = val,
+                8 => relasz = val,
+                9 => relaent = val,
+                _ => {}
+            }
+        }
+        if rela == 0 || relasz == 0 || relaent < 24 {
+            break;
+        }
+        // the RELA table is file data — find its file offset through the
+        // filemap that covers it (or fall back to va==file-offset region
+        // inside an eagerly-mapped page, which translate() will find)
+        for j in 0..(relasz / relaent) {
+            let rva = rela + bias + j * relaent;
+            // read the 24-byte rela entry — it lives in a file-backed
+            // page; translate() works only if that page is mapped, so
+            // read via the file offset using the 1:1 va<->file delta
+            let mut eb = [0u8; 24];
+            let Some(rf_off) = file_offset_of(&vadeltas, rva) else { continue };
+            if crate::vfs::read_range(path, rf_off, &mut eb).is_err() {
+                continue;
+            }
+            let r_offset = u64::from_le_bytes(eb[0..8].try_into().unwrap());
+            let r_info = u64::from_le_bytes(eb[8..16].try_into().unwrap());
+            let r_addend = i64::from_le_bytes(eb[16..24].try_into().unwrap());
+            if r_info & 0xFFFF_FFFF != 8 {
+                continue; // only R_X86_64_RELATIVE
+            }
+            let wva = r_offset + bias;
+            if translate(pml4, wva).is_none() {
+                // the reloc target page is still demand-only — fault it
+                // in eagerly so the slot can be written
+                let wpage = wva & !0xFFF;
+                if let Some((wpath, woff, wperm)) = filemaps
+                    .iter()
+                    .find(|f| wpage >= f.start && wpage < f.end)
+                    .map(|f| (f.path.clone(), f.off + (wpage - f.start), f.perm))
+                {
+                    let mut scratch: Vec<u64> = Vec::new();
+                    if let Some(wphys) = map_user_page_flags(
+                        pml4,
+                        wpage,
+                        wperm & 2 != 0,
+                        wperm & 4 != 0,
+                        &mut scratch,
+                    ) {
+                        frames.extend(scratch);
+                        let mut pb = [0u8; 0x1000];
+                        if !wpath.is_empty() {
+                            let _ = crate::vfs::read_range(path, woff, &mut pb);
+                        }
+                        unsafe {
+                            // pb is zero-initialized — a full-page copy
+                            // zeroes the tail past the file data
+                            core::ptr::copy_nonoverlapping(
+                                pb.as_ptr(),
+                                mem::phys_to_virt(wphys) as *mut u8,
+                                0x1000,
+                            );
+                        }
+                    }
+                }
+            }
+            let Some(wphys) = translate(pml4, wva) else { continue };
+            unsafe {
+                *(mem::phys_to_virt(wphys) as *mut u64) = (r_addend as u64).wrapping_add(bias);
+            }
+        }
+    }
+    Ok(entry + bias)
+}
+
+/// File offset for a VA inside a file-backed span (delta = va - file_off).
+fn file_offset_of(spans: &[(u64, u64, u64)], va: u64) -> Option<u64> {
+    spans
+        .iter()
+        .find(|(lo, hi, _)| va >= *lo && va < *hi)
+        .map(|(_, _, d)| va - *d)
 }

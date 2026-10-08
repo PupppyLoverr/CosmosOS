@@ -1,0 +1,9 @@
+strace(1) - trace syscalls
+NAME
+    strace - trace a process's syscalls
+SYNOPSIS
+    strace -p <pid> | strace <cmd>
+DESCRIPTION
+    -p attaches to a running pid (Esc/Enter detaches).
+    `strace cmd` spawns /bin/<cmd> already traced and
+    streams records: name(args) = ret.

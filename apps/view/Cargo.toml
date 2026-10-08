@@ -1,0 +1,8 @@
+[package]
+name = "cosmos-view"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ustd = { path = "../ustd" }
+shared = { package = "cosmos-shared", path = "../../shared" }

@@ -1,0 +1,11 @@
+sort(1) - sort lines of text
+NAME
+    sort - sort lines
+SYNOPSIS
+    sort [-nruf] [-t sep] [-k field] [-o file] [file]
+DESCRIPTION
+    Sorts stdin or file lexicographically.
+    -n numeric, -r reverse, -u unique, -f fold case
+    -t field separator, -k sort by Nth field
+    -o write result to file instead of stdout
+    -b ignore leading blanks, -c check only (no output when sorted)

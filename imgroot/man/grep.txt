@@ -1,0 +1,13 @@
+grep(1) - search files for a pattern
+NAME
+    grep - print lines matching a pattern
+SYNOPSIS
+    grep [-r] [-vnciwxoqlLFe] [-A n] [-B n] [-C n] [-m n] <pat> [file|dir]
+DESCRIPTION
+    Substring match (literal, no regex). Reads stdin in a
+    pipeline. Flags may be combined: -rni.
+    -r recursive, -v invert, -n line numbers, -c count only
+    -i case-insensitive, -w word, -x whole line
+    -o print only matching spans, -q quiet (status in $?)
+    -l files with matches, -L files without
+    -A/-B/-C context lines, -m max matches

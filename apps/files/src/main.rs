@@ -26,13 +26,23 @@ struct Files {
     status: String,
     new_name: String,
     editing: bool,
+    rename_from: Option<String>, // F2 rename: full path of the entry being renamed
+    menu: Option<(i32, i32, usize)>, // right-click menu: (x, y, entry index)
+    sort_by_size: bool,              // `s` toggles name<->size ordering
+    clip: Option<(bool, String)>,    // file clipboard: (cut?, full path) via c/x
     dirty: bool,
 }
 
 impl Files {
     fn reload(&mut self) {
         self.ents = ustd::readdir(&self.cwd).unwrap_or_default();
-        self.ents.sort_by(|a, b| (b.is_dir.cmp(&a.is_dir)).then(a.name.cmp(&b.name)));
+        if self.sort_by_size {
+            self.ents.sort_by(|a, b| {
+                (b.is_dir.cmp(&a.is_dir)).then(b.size.cmp(&a.size)).then(a.name.cmp(&b.name))
+            });
+        } else {
+            self.ents.sort_by(|a, b| (b.is_dir.cmp(&a.is_dir)).then(a.name.cmp(&b.name)));
+        }
         self.sel = -1;
         self.scroll = 0;
         self.dirty = true;
@@ -44,6 +54,67 @@ impl Files {
         String::from_utf8_lossy(&e.name[..e.name_len as usize]).into_owned()
     }
 
+    /// Full path of entry `i` under the current directory.
+    fn path_of(&self, i: usize) -> String {
+        alloc::format!(
+            "{}{}{}",
+            self.cwd,
+            if self.cwd.ends_with('/') { "" } else { "/" },
+            Self::entry_name(&self.ents[i])
+        )
+    }
+
+    /// Recursive copy used by the file clipboard's paste (v).
+    fn copy_tree(&mut self, src: &str, dst: &str) -> Result<(), i64> {
+        match ustd::stat(src) {
+            Ok(st) if st.is_dir != 0 => {
+                ustd::mkdir(dst)?;
+                for e in ustd::readdir(src).unwrap_or_default() {
+                    let n = Self::entry_name(&e);
+                    let s2 = alloc::format!("{}/{}", src.trim_end_matches('/'), n);
+                    let d2 = alloc::format!("{}/{}", dst.trim_end_matches('/'), n);
+                    self.copy_tree(&s2, &d2)?;
+                }
+                Ok(())
+            }
+            Ok(_) => {
+                let d = ustd::read_all(src)?;
+                ustd::write_all(dst, &d)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Rename prompt armed on the selected entry (F2 / context menu).
+    fn start_rename(&mut self) {
+        if self.sel >= 0 && (self.sel as usize) < self.ents.len() {
+            let name = Self::entry_name(&self.ents[self.sel as usize]);
+            self.rename_from = Some(self.path_of(self.sel as usize));
+            self.editing = true;
+            self.new_name = name.clone();
+            self.status = alloc::format!("rename {}", name);
+        } else {
+            self.status = String::from("nothing selected");
+        }
+    }
+
+    /// Delete the selected entry (Del / toolbar / context menu).
+    fn delete_sel(&mut self) {
+        if self.sel >= 0 && (self.sel as usize) < self.ents.len() {
+            let name = Self::entry_name(&self.ents[self.sel as usize]);
+            let path = self.path_of(self.sel as usize);
+            match ustd::remove(&path) {
+                Ok(_) => {
+                    self.status = alloc::format!("deleted {}", name);
+                    self.reload();
+                }
+                Err(e) => self.status = alloc::format!("delete failed: {}", e),
+            }
+        } else {
+            self.status = String::from("nothing selected");
+        }
+    }
+
     fn row_rect(&self, i: i32) -> (i32, i32, i32) {
         (4, 40 + i * ROW_H - self.scroll, self.c.w as i32 - 8)
     }
@@ -53,7 +124,7 @@ impl Files {
         c.fill(0, 0, c.w as i32, c.h as i32, draw::PANEL);
         // toolbar
         c.fill(0, 0, c.w as i32, 34, draw::EDGE);
-        c.text(10, 9, &alloc::format!("{}  {} items", self.cwd, self.ents.len()), draw::TEXT, None);
+        c.text(10, 9, &alloc::format!("{}  {} items  [by {}]", self.cwd, self.ents.len(), if self.sort_by_size { "size" } else { "name" }), draw::TEXT, None);
         let bw = 96;
         c.fill(c.w as i32 - bw - 8 - bw - 8, 5, bw, 24, draw::PANEL);
         c.border(c.w as i32 - bw - 8 - bw - 8, 5, bw, 24, draw::EDGE);
@@ -62,7 +133,10 @@ impl Files {
         c.border(c.w as i32 - bw - 8, 5, bw, 24, draw::EDGE);
         c.text(c.w as i32 - bw - 8 + 16, 9, "Delete", draw::TEXT, None);
         if self.editing {
-            c.text(10 + Canvas::text_w(&alloc::format!("{}  {} items", self.cwd, self.ents.len())) + 16, 9, &alloc::format!("name: {}_", self.new_name), 0xFF7FD08A, None);
+            let prompt = if self.rename_from.is_some() { "rename: " } else { "name: " };
+            c.text(10 + Canvas::text_w(&alloc::format!("{}  {} items", self.cwd, self.ents.len())) + 16, 9, &alloc::format!("{}{}", prompt, self.new_name), 0xFF7FD08A, None);
+            // caret underscore
+            c.text(10 + Canvas::text_w(&alloc::format!("{}  {} items", self.cwd, self.ents.len())) + 16 + Canvas::text_w(&alloc::format!("{}{}", prompt, self.new_name)), 9, "_", 0xFF7FD08A, None);
         }
         // list
         let vis = ((c.h as i32 - 44) / ROW_H) as i32;
@@ -76,7 +150,7 @@ impl Files {
         }
         while i < self.ents.len() as i32 && drawn < vis {
             let e = &self.ents[i as usize];
-            let (rx, ry, rw) = self.row_rect(i + if self.cwd != "/" { 1 } else { 0 } - if self.cwd != "/" { 1 } else { 0 });
+            let (rx, _y, rw) = self.row_rect(i + if self.cwd != "/" { 1 } else { 0 } - if self.cwd != "/" { 1 } else { 0 });
             let ry = 40 + drawn * ROW_H;
             if i == self.sel {
                 c.fill(rx, ry, rw, ROW_H, draw::EDGE);
@@ -97,10 +171,55 @@ impl Files {
         // status
         c.fill(0, c.h as i32 - 22, c.w as i32, 22, draw::EDGE);
         c.text(10, c.h as i32 - 19, &self.status, draw::DIM, None);
+        // right-click context menu
+        if let Some((mx, my, _)) = self.menu {
+            const MENU_W: i32 = 110;
+            const ITEMS: [&str; 3] = ["open", "rename", "delete"];
+            c.fill(mx, my, MENU_W, 22 * ITEMS.len() as i32, draw::PANEL);
+            c.border(mx, my, MENU_W, 22 * ITEMS.len() as i32, draw::EDGE);
+            for (i, it) in ITEMS.iter().enumerate() {
+                c.text(mx + 10, my + 6 + i as i32 * 22, it, draw::TEXT, None);
+            }
+        }
         self.win.present_all();
     }
 
     fn click(&mut self, x: i32, y: i32, buttons: u8) {
+        // an open context menu consumes the next left press (item or
+        // dismiss); pointer moves/releases leave it open.
+        if self.menu.is_some() && buttons & 1 != 0 {
+            if let Some((mx, my, mi)) = self.menu.take() {
+                const MENU_W: i32 = 110;
+                const MENU_H: i32 = 22 * 3;
+                if x >= mx && x < mx + MENU_W && y >= my && y < my + MENU_H {
+                    self.sel = mi as i32;
+                    match (y - my) / 22 {
+                        0 => self.open_selected(),
+                        1 => self.start_rename(),
+                        _ => self.delete_sel(),
+                    }
+                }
+                self.dirty = true;
+            }
+            return;
+        }
+        // right-click on a row: select it + open the context menu
+        if buttons & 2 != 0 {
+            if y >= 40 {
+                let row = (y - 40 + self.scroll) / ROW_H;
+                let idx = row - if self.cwd != "/" { 1 } else { 0 };
+                if idx >= 0 && (idx as usize) < self.ents.len() {
+                    const MENU_W: i32 = 110;
+                    const MENU_H: i32 = 22 * 3;
+                    let mx = x.min(self.c.w as i32 - MENU_W - 2).max(0);
+                    let my = y.min(self.c.h as i32 - MENU_H - 24).max(34);
+                    self.menu = Some((mx, my, idx as usize));
+                    self.sel = idx as i32;
+                    self.dirty = true;
+                }
+            }
+            return;
+        }
         if buttons & 1 == 0 {
             return;
         }
@@ -110,23 +229,11 @@ impl Files {
             if x >= w - bw * 2 - 16 && x < w - bw - 8 {
                 // new folder: enter name-editing mode
                 self.editing = true;
+                self.rename_from = None;
                 self.new_name.clear();
                 self.status = String::from("type folder name, Enter to create");
             } else if x >= w - bw - 8 {
-                // delete selected
-                if self.sel >= 0 && (self.sel as usize) < self.ents.len() {
-                    let name = Self::entry_name(&self.ents[self.sel as usize]);
-                    let path = alloc::format!("{}{}{}", self.cwd, if self.cwd.ends_with('/') { "" } else { "/" }, name);
-                    match ustd::remove(&path) {
-                        Ok(_) => {
-                            self.status = alloc::format!("deleted {}", name);
-                            self.reload();
-                        }
-                        Err(e) => self.status = alloc::format!("delete failed: {}", e),
-                    }
-                } else {
-                    self.status = String::from("nothing selected");
-                }
+                self.delete_sel();
             }
             self.dirty = true;
             return;
@@ -155,11 +262,33 @@ impl Files {
                 self.reload();
                 return;
             }
+            if self.sel == i as i32 && self.ents[i].is_dir == 0 {
+                // second click on a file = open it in the editor
+                self.open_selected();
+                return;
+            }
             self.sel = i as i32;
             let e = &self.ents[i];
-            self.status = alloc::format!("{} {} B", Self::entry_name(e), e.size);
+            self.status = alloc::format!("{} {} B   (F2 rename, Del delete, c/x/v clip, n new, u up)", Self::entry_name(e), e.size);
             self.dirty = true;
         }
+    }
+
+    fn open_selected(&mut self) {
+        let i = self.sel as usize;
+        let name = Self::entry_name(&self.ents[i]);
+        let path = alloc::format!("{}{}{}", self.cwd, if self.cwd.ends_with('/') { "" } else { "/" }, name);
+        let lname = name.to_ascii_lowercase();
+        let app = if lname.ends_with(".ppm") || lname.ends_with(".bmp") || lname.ends_with(".qoi") {
+            "/bin/cosmos-view"
+        } else {
+            "/bin/cosmos-editor"
+        };
+        match ustd::spawn(app, &path) {
+            Ok(_) => self.status = alloc::format!("opened {}", name),
+            Err(_) => self.status = alloc::format!("spawn failed"),
+        }
+        self.dirty = true;
     }
 
     fn on_key(&mut self, k: &EvKey) {
@@ -173,18 +302,30 @@ impl Files {
                 self.new_name.pop();
             } else if k.key == KeyCode::Enter as u32 {
                 if !self.new_name.is_empty() {
-                    let path = alloc::format!("{}{}{}", self.cwd, if self.cwd.ends_with('/') { "" } else { "/" }, self.new_name);
-                    match ustd::mkdir(&path) {
-                        Ok(_) => {
-                            self.status = alloc::format!("created {}", self.new_name);
-                            self.editing = false;
-                            self.reload();
+                    let newp = alloc::format!("{}{}{}", self.cwd, if self.cwd.ends_with('/') { "" } else { "/" }, self.new_name);
+                    if let Some(oldp) = self.rename_from.take() {
+                        match ustd::rename(&oldp, &newp) {
+                            Ok(_) => {
+                                self.status = alloc::format!("renamed to {}", self.new_name);
+                                self.editing = false;
+                                self.reload();
+                            }
+                            Err(e) => self.status = alloc::format!("rename failed: {}", e),
                         }
-                        Err(e) => self.status = alloc::format!("mkdir failed: {}", e),
+                    } else {
+                        match ustd::mkdir(&newp) {
+                            Ok(_) => {
+                                self.status = alloc::format!("created {}", self.new_name);
+                                self.editing = false;
+                                self.reload();
+                            }
+                            Err(e) => self.status = alloc::format!("mkdir failed: {}", e),
+                        }
                     }
                 }
             } else if k.key == KeyCode::Escape as u32 {
                 self.editing = false;
+                self.rename_from = None;
             }
             self.dirty = true;
             return;
@@ -205,7 +346,91 @@ impl Files {
                         self.reload();
                         return;
                     }
+                    self.open_selected();
                 }
+            }
+            x if x == KeyCode::Delete as u32 => self.delete_sel(),
+            x if x == KeyCode::F2 as u32 => self.start_rename(),
+            x if x == KeyCode::Char as u32 && k.chr.to_ascii_lowercase() == b'r' => {
+                self.status = String::from("refreshed");
+                self.reload();
+            }
+            x if x == KeyCode::Char as u32 && k.chr.to_ascii_lowercase() == b'n' => {
+                // new folder: same name prompt the toolbar button opens
+                self.editing = true;
+                self.new_name.clear();
+                self.rename_from = None;
+            }
+            x if x == KeyCode::Char as u32 && k.chr.to_ascii_lowercase() == b'u' => {
+                // parent dir (Backspace does the same)
+                if self.cwd != "/" {
+                    let mut parts: Vec<&str> = self.cwd.split('/').filter(|s| !s.is_empty()).collect();
+                    parts.pop();
+                    self.cwd = alloc::format!("/{}", parts.join("/"));
+                    if self.cwd.is_empty() {
+                        self.cwd = String::from("/");
+                    }
+                    self.reload();
+                }
+            }
+            x if x == KeyCode::Char as u32 && (k.chr.to_ascii_lowercase() == b'c' || k.chr.to_ascii_lowercase() == b'x') => {
+                // file clipboard: c copies, x marks for move; v pastes into cwd
+                if self.sel >= 0 && (self.sel as usize) < self.ents.len() {
+                    let cut = k.chr.to_ascii_lowercase() == b'x';
+                    let p = self.path_of(self.sel as usize);
+                    self.status = alloc::format!(
+                        "{}: {}",
+                        if cut { "cut" } else { "copied" },
+                        p
+                    );
+                    self.clip = Some((cut, p));
+                }
+            }
+            x if x == KeyCode::Char as u32 && k.chr.to_ascii_lowercase() == b'v' => {
+                // the clipboard is only consumed by a successful paste —
+                // a blocked or failed one keeps it armed
+                if let Some((cut, src)) = self.clip.clone() {
+                    let base = src.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
+                    let dst = alloc::format!(
+                        "{}{}{}",
+                        self.cwd,
+                        if self.cwd.ends_with('/') { "" } else { "/" },
+                        base
+                    );
+                    if dst == src || src.is_empty() {
+                        self.status = String::from("paste: same path");
+                    } else if ustd::stat(&dst).is_ok() {
+                        self.status = alloc::format!("paste: {} exists", base);
+                    } else if cut {
+                        match ustd::rename(&src, &dst) {
+                            Ok(_) => {
+                                self.clip = None;
+                                self.status = alloc::format!("moved {}", base);
+                                self.reload();
+                            }
+                            Err(e) => self.status = alloc::format!("move failed: {}", e),
+                        }
+                    } else {
+                        match self.copy_tree(&src, &dst) {
+                            Ok(()) => {
+                                self.clip = None;
+                                self.status = alloc::format!("pasted {}", base);
+                                self.reload();
+                            }
+                            Err(e) => self.status = alloc::format!("copy failed: {}", e),
+                        }
+                    }
+                } else {
+                    self.status = String::from("clipboard empty");
+                }
+            }
+            x if x == KeyCode::Char as u32 && k.chr.to_ascii_lowercase() == b's' => {
+                self.sort_by_size = !self.sort_by_size;
+                self.status = alloc::format!(
+                    "sort: {}",
+                    if self.sort_by_size { "size" } else { "name" }
+                );
+                self.reload();
             }
             x if x == KeyCode::Backspace as u32 => {
                 if self.cwd != "/" {
@@ -247,6 +472,10 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         status: String::new(),
         new_name: String::new(),
         editing: false,
+        rename_from: None,
+        menu: None,
+        sort_by_size: false,
+        clip: None,
         dirty: true,
     };
     f.reload();
@@ -258,9 +487,29 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             }
             Some((EV_POINTER, pl)) if pl.len() >= 16 => {
                 let p: EvPointer = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
+                if p.wheel != 0 {
+                    // wheel: >0 up, <0 down — 3 rows per tick
+                    let vis = ((f.c.h as i32 - 44) / ROW_H).max(1);
+                    let rows = f.ents.len() as i32 + if f.cwd != "/" { 1 } else { 0 };
+                    let max = (rows - vis).max(0) * ROW_H;
+                    if p.wheel > 0 {
+                        f.scroll = (f.scroll - 3 * ROW_H).max(0);
+                    } else {
+                        f.scroll = (f.scroll + 3 * ROW_H).min(max);
+                    }
+                    f.dirty = true;
+                }
                 f.click(p.x, p.y, p.buttons);
             }
             Some((EV_CLOSE, _)) => return 0,
+            // regaining focus = a good moment to pick up fs changes made
+            // elsewhere (e.g. files created in the terminal)
+            Some((EV_FOCUS, pl)) if pl.len() >= 8 => {
+                let e: EvFocus = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
+                if e.focused != 0 {
+                    f.reload();
+                }
+            }
             Some((EV_RESIZE_REQ, pl)) if pl.len() >= 16 => {
                 let r: EvResizeReq = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
                 if f.win.remap(r.shm_id, r.w, r.h) {

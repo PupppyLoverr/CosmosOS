@@ -1,0 +1,11 @@
+ls(1) - list directory contents
+NAME
+    ls - list directory contents
+SYNOPSIS
+    ls [-aSlr] [paths...]
+DESCRIPTION
+    Lists entries of each path (default: cwd).
+    -a  show dotfiles
+    -S  sort by size descending
+    -l  one entry per line (default layout)
+    -r  reverse order

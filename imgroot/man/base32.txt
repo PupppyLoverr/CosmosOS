@@ -1,0 +1,7 @@
+base32(1) - RFC 4648 base32
+NAME
+    base32 - base32 encode/decode
+SYNOPSIS
+    base32 [-d] [file]
+DESCRIPTION
+    Encodes stdin/file to RFC 4648 base32; -d decodes.

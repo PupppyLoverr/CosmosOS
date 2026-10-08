@@ -21,7 +21,7 @@ static HEAP: LockedHeap = LockedHeap::empty();
 pub static HEAP_SIZE: AtomicU64 = AtomicU64::new(0);
 
 pub const HEAP_START: u64 = 0x4444_4444_0000;
-pub const HEAP_PAGES: u64 = 1024; // 4 MiB kernel heap
+pub const HEAP_PAGES: u64 = 2048; // 8 MiB kernel heap (tmpfs data lives here)
 
 /// Bump allocator over the UEFI memory map's Usable regions.
 /// Used frames are never reclaimed (kernel structures are long-lived);
@@ -129,11 +129,61 @@ pub fn alloc_contig(pages: usize) -> Option<u64> {
     }
 }
 
-/// Return a frame to the free list.
+/// Return a frame to the free list. COW-shared frames decrement their
+/// sharer count instead — the last sharer's free actually reclaims it.
 pub fn free_frame(addr: u64) {
+    if !cow_release(addr) {
+        return;
+    }
     let mut g = FRAME_ALLOC.lock();
     if let Some(a) = g.as_mut() {
         a.free(addr);
+    }
+}
+
+/// Copy-on-write shared frames: phys -> number of address spaces that
+/// map it. fork() registers every private frame it shares; free_frame
+/// decrements; a count-1 entry means exactly one mm still maps it —
+/// that mm may claim it outright (cow_claim) instead of copying.
+static COW_REFS: Mutex<alloc::collections::BTreeMap<u64, u32>> =
+    Mutex::new(alloc::collections::BTreeMap::new());
+
+/// Register one more mapper of `phys` (called by fork per shared frame).
+/// A first share records 2 — the parent's existing mapping + the new
+/// child's — so the count always equals live mappers.
+pub fn cow_share(phys: u64) {
+    *COW_REFS.lock().entry(phys).or_insert(1) += 1;
+}
+
+/// How many address spaces currently map `phys` (1 = untracked/sole).
+pub fn cow_count(phys: u64) -> u32 {
+    COW_REFS.lock().get(&phys).copied().unwrap_or(1)
+}
+
+/// Drop the bookkeeping entry — the sole remaining mapper takes full
+/// ownership. The frame stays mapped; nothing is freed.
+pub fn cow_claim(phys: u64) {
+    COW_REFS.lock().remove(&phys);
+}
+
+/// Total frames currently COW-shared — surfaced via /proc/sys/kernel.
+pub fn cow_shared_total() -> u64 {
+    COW_REFS.lock().len() as u64
+}
+
+/// One sharer dropped `phys`. true = really free it now.
+fn cow_release(phys: u64) -> bool {
+    let mut m = COW_REFS.lock();
+    match m.get_mut(&phys) {
+        None => true,
+        Some(c) if *c > 1 => {
+            *c -= 1;
+            false
+        }
+        Some(_) => {
+            m.remove(&phys);
+            true
+        }
     }
 }
 

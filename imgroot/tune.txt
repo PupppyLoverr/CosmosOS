@@ -1,0 +1,8 @@
+# CosmosOS demo tune: NOTE|HZ,DUR_MS per line
+C4,180
+E4,180
+G4,180
+C5,320
+R,80
+G4,160
+E4,320

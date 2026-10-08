@@ -96,7 +96,26 @@ macro_rules! exc {
     };
 }
 exc!(divide_err, "divide error");
-exc!(debug_exc, "debug");
+/// #DB: a single-step completing on a traced task pends a real SIGTRAP
+/// (the traced-stop lands at the next delivery point). TF is cleared in
+/// the exception frame's saved rflags — the frame IS the task's kstack
+/// memory, addressed through the parameter's own address.
+extern "x86-interrupt" fn debug_exc(frame: InterruptStackFrame) {
+    if task::db_hit() {
+        unsafe {
+            let raw = &frame as *const InterruptStackFrame as *const u64;
+            // frame layout: rip, cs, rflags, rsp, ss — rflags at +2
+            *(raw.add(2) as *mut u64) &= !0x100; // TF
+        }
+        return;
+    }
+    sprintln!(
+        "\n[exc] debug rip={:#x} cs={:#x}",
+        frame.instruction_pointer.as_u64(),
+        frame.code_segment.0
+    );
+    task::kill_current_or_halt("debug");
+}
 exc!(bp_exc, "breakpoint");
 exc!(of_exc, "overflow");
 exc!(br_exc, "bound range");
@@ -144,6 +163,9 @@ extern "x86-interrupt" fn gp_exc(frame: InterruptStackFrame, ec: u64) {
 
 extern "x86-interrupt" fn pf_exc(frame: InterruptStackFrame, ec: PageFaultErrorCode) {
     let cr2 = x86_64::registers::control::Cr2::read_raw();
+    if task::demand_page(cr2) {
+        return; // demand-paged mmap page filled — retry the instruction
+    }
     sprintln!(
         "\n[exc] PAGE FAULT addr={:#x} ec={:?} rip={:#x} cs={:#x} rsp={:#x} ss={:#x}",
         cr2,

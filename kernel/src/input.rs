@@ -126,7 +126,12 @@ pub fn init() {
     sprintln!("[input] ps/2 keyboard+mouse enabled");
 }
 
+/// IRQ counters for /proc/interrupts.
+pub static KBD_IRQS: AtomicUsize = AtomicUsize::new(0);
+pub static MOUSE_IRQS: AtomicUsize = AtomicUsize::new(0);
+
 pub fn on_kbd_irq() {
+    KBD_IRQS.fetch_add(1, Ordering::Relaxed);
     let sc: u8 = unsafe { Port::new(DATA).read() };
     unsafe {
         if sc == 0xE0 {
@@ -159,6 +164,7 @@ pub fn on_kbd_irq() {
 }
 
 pub fn on_mouse_irq() {
+    MOUSE_IRQS.fetch_add(1, Ordering::Relaxed);
     let b: u8 = unsafe { Port::new(DATA).read() };
     unsafe {
         let i = MOUSE_IDX;
@@ -205,13 +211,34 @@ pub fn pump() {
             break;
         }
     }
+    // Coalesce consecutive pure moves: only the latest position matters,
+    // while button/wheel transitions must stay lossless (a dropped press
+    // edge is a lost click). This is what keeps the input port from
+    // filling with stale motion under pointer floods.
+    let mut pending: Option<InputMouse> = None;
     while let Some(m) = MICE.pop() {
+        if let Some(mut p) = pending {
+            if p.buttons == m.buttons && p.wheel == m.wheel {
+                // same button/wheel state → pure motion: accumulate deltas
+                p.dx = p.dx.saturating_add(m.dx);
+                p.dy = p.dy.saturating_add(m.dy);
+                pending = Some(p);
+                continue;
+            }
+            let pb = unsafe {
+                core::slice::from_raw_parts(&p as *const _ as *const u8, core::mem::size_of::<InputMouse>())
+            };
+            if ipc::push_named(INPUT_PORT, pb).is_err() {
+                break;
+            }
+        }
+        pending = Some(m);
+    }
+    if let Some(m) = pending {
         let bytes = unsafe {
             core::slice::from_raw_parts(&m as *const _ as *const u8, core::mem::size_of::<InputMouse>())
         };
-        if ipc::push_named(INPUT_PORT, bytes).is_err() {
-            break;
-        }
+        let _ = ipc::push_named(INPUT_PORT, bytes);
     }
 }
 

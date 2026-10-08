@@ -45,6 +45,7 @@ pub struct DirEntry {
     pub is_dir: bool,
     pub size: u64,
     pub mtime: u64, // unix seconds
+    pub attr: u8,   // FAT attribute byte (0x01 ro, 0x02 hidden, 0x04 sys, 0x10 dir)
 }
 
 #[derive(Clone, Copy)]
@@ -107,6 +108,43 @@ impl<D: BlockDevice> Fat32<D> {
             next_free: 2,
             time_fn: || 0,
         })
+    }
+
+    /// Bytes per cluster on this volume.
+    pub fn cluster_bytes(&self) -> u64 {
+        self.clus_bytes as u64
+    }
+
+    /// Total data clusters: sectors after reserved+FAT, floored to clusters.
+    pub fn total_clusters(&self) -> u64 {
+        let data_secs = self
+            .bpb
+            .total_secs
+            .saturating_sub(self.bpb.reserved as u32 + self.bpb.num_fats as u32 * self.bpb.fat_secs);
+        (data_secs / self.bpb.sec_per_clus as u32) as u64
+    }
+
+    /// Real free-cluster count: one sequential sector-walk of the FAT.
+    pub fn free_clusters(&mut self) -> Result<u64> {
+        let mut free = 0u64;
+        let mut sec = [0u8; SECTOR];
+        let nclusters = self.total_clusters();
+        for s in 0..self.bpb.fat_secs as u64 {
+            let lba = self.bpb.reserved as u64 + s;
+            self.dev.read_sector(lba, &mut sec)?;
+            for i in 0..SECTOR / 4 {
+                let idx = s * (SECTOR / 4) as u64 + i as u64;
+                if idx < 2 || idx >= 2 + nclusters {
+                    continue;
+                }
+                let v = u32::from_le_bytes([sec[i * 4], sec[i * 4 + 1], sec[i * 4 + 2], sec[i * 4 + 3]])
+                    & 0x0FFF_FFFF;
+                if v == FREE {
+                    free += 1;
+                }
+            }
+        }
+        Ok(free)
     }
 
     pub fn set_time_fn(&mut self, f: fn() -> u64) {
@@ -436,6 +474,7 @@ impl<D: BlockDevice> Fat32<D> {
                 is_dir: e.attr & ATTR_DIR != 0,
                 size: e.size as u64,
                 mtime: e.mtime,
+                attr: e.attr,
             })
             .collect())
     }
@@ -443,14 +482,35 @@ impl<D: BlockDevice> Fat32<D> {
     pub fn stat(&mut self, path: &str) -> Result<DirEntry> {
         let (_, entry) = self.resolve(path)?;
         match entry {
-            None => Ok(DirEntry { name: String::from("/"), is_dir: true, size: 0, mtime: 0 }),
+            None => Ok(DirEntry { name: String::from("/"), is_dir: true, size: 0, mtime: 0, attr: ATTR_DIR }),
             Some(e) => Ok(DirEntry {
                 name: e.name,
                 is_dir: e.attr & ATTR_DIR != 0,
                 size: e.size as u64,
                 mtime: e.mtime,
+                attr: e.attr,
             }),
         }
+    }
+
+    /// Patch a dir entry's modify-time and/or attribute byte in place.
+    /// `mtime` is unix seconds (FAT stores DOS date/time, 2s granularity).
+    /// `attr` replaces only the user-settable bits (0x01 read-only,
+    /// 0x02 hidden, 0x04 system); volume/dir/archive bits are preserved.
+    pub fn set_meta(&mut self, path: &str, mtime: Option<u64>, attr: Option<u8>) -> Result<()> {
+        let (_, entry) = self.resolve(path)?;
+        let e = entry.ok_or(Error::NotFound)?;
+        let mut raw = self.read_dir_entry(e.slot_cluster, e.slot_offset)?;
+        if let Some(unix) = mtime {
+            let (d, t) = unix_to_dos(unix);
+            raw[22..24].copy_from_slice(&t.to_le_bytes());
+            raw[24..26].copy_from_slice(&d.to_le_bytes());
+        }
+        if let Some(a) = attr {
+            // user-settable: 0x01 ro, 0x02 hidden, 0x04 sys + 0x40 symlink
+            raw[11] = (raw[11] & 0x38) | (a & 0x47);
+        }
+        self.write_dir_entry(e.slot_cluster, e.slot_offset, &raw)
     }
 
     pub fn exists(&mut self, path: &str) -> bool {
@@ -484,6 +544,41 @@ impl<D: BlockDevice> Fat32<D> {
             }
         }
         Ok(out)
+    }
+
+    /// Read `buf.len()` bytes starting at `offset` — walks the cluster
+    /// chain skipping whole clusters; short read at EOF. This is the
+    /// demand-pager's backend (no whole-file Vec).
+    pub fn read_file_range(&mut self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let (_, entry) = self.resolve(path)?;
+        let e = entry.ok_or(Error::NotFound)?;
+        if e.attr & ATTR_DIR != 0 {
+            return Err(Error::NotDir);
+        }
+        if e.first_cluster < 2 || offset >= e.size as u64 {
+            return Ok(0);
+        }
+        let want = ((e.size as u64 - offset).min(buf.len() as u64)) as usize;
+        let cb = self.clus_bytes;
+        let mut tmp = vec![0u8; cb];
+        let mut skip = offset / cb as u64;
+        let mut inner = (offset % cb as u64) as usize;
+        let mut done = 0usize;
+        for c in self.chain(e.first_cluster)? {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            if done >= want {
+                break;
+            }
+            self.read_cluster(c, &mut tmp)?;
+            let take = (want - done).min(cb - inner);
+            buf[done..done + take].copy_from_slice(&tmp[inner..inner + take]);
+            done += take;
+            inner = 0;
+        }
+        Ok(done)
     }
 
     /// Write a whole file: create if missing, grow/truncate as needed.
@@ -665,8 +760,22 @@ impl<D: BlockDevice> Fat32<D> {
                 if run >= need {
                     break;
                 }
-                // a 0x00 marker means everything after is free — enough space
+                // a 0x00 marker means everything after is free — enough
+                // space, but the dir block may not be materialized that far:
+                // grow the chain so `need` entries fit from free_start.
                 if data[i] == 0x00 {
+                    let required = free_start.unwrap_or(i) + need * 32;
+                    let mut ch = self.chain(dir_cluster)?;
+                    while ch.len() * self.clus_bytes < required {
+                        let c = self.alloc_cluster()?;
+                        let zeros = vec![0u8; self.clus_bytes];
+                        self.write_cluster(c, &zeros)?;
+                        self.fat_write(*ch.last().unwrap(), c)?;
+                        ch.push(c);
+                    }
+                    if data.len() < required {
+                        data.resize(required, 0);
+                    }
                     break;
                 }
             } else {

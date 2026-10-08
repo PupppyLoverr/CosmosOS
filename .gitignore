@@ -4,3 +4,4 @@
 *.img
 Cargo.lock
 OVMF_VARS.fd
+imgroot/selftest.flag

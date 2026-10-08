@@ -1,0 +1,8 @@
+find(1) - search the file tree
+NAME
+    find - find files by name/type
+SYNOPSIS
+    find <dir> [-name glob] [-type f|d] [-maxdepth n] [-exec cmd]
+DESCRIPTION
+    Recursive walk printing full paths. -name matches
+    shell globs (* ?); -exec runs a command per match.

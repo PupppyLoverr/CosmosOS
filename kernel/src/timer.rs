@@ -15,6 +15,56 @@ pub fn uptime_ms() -> u64 {
 }
 pub(crate) fn bump_ticks() {
     TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // PC speaker: silence when the programmed duration elapses.
+    let left = BEEP_TICKS_LEFT.load(core::sync::atomic::Ordering::Relaxed);
+    if left != 0 {
+        if left <= 1 {
+            speaker_off();
+        } else {
+            BEEP_TICKS_LEFT.store(left - 1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+// ---------------- PC speaker (PIT channel 2 + port 0x61) ----------------
+//
+// Channel 2 of the 8254 feeds a gate on port 0x61; setting bits 0 (gate from
+// PIT2) and 1 (speaker data enable) makes the cone oscillate at the channel's
+// programmed square-wave frequency. Real hardware path — on a physical PC this
+// is the classic "beep".
+static BEEP_TICKS_LEFT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+fn speaker_off() {
+    BEEP_TICKS_LEFT.store(0, core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let mut g: Port<u8> = Port::new(0x61);
+        let v = g.read();
+        g.write(v & !0x03u8);
+    }
+}
+
+/// Sound the PC speaker at `freq` Hz for `ms` milliseconds. Non-blocking: the
+/// expiry is armed in tick units and `bump_ticks` silences the gate. `freq==0`
+/// or `ms==0` silences immediately; re-arming replaces the pending beep.
+pub fn beep(freq: u32, ms: u64) {
+    if freq == 0 || ms == 0 {
+        speaker_off();
+        return;
+    }
+    let divisor = (1193182u32 / freq.max(20)).clamp(1, 0xFFFF);
+    unsafe {
+        let mut cmd: Port<u8> = Port::new(0x43);
+        cmd.write(0xB6u8); // channel 2, lobyte/hibyte, mode 3 (square wave)
+        let mut ch2: Port<u8> = Port::new(0x42);
+        ch2.write((divisor & 0xFF) as u8);
+        ch2.write(((divisor >> 8) & 0xFF) as u8);
+        let mut g: Port<u8> = Port::new(0x61);
+        let v = g.read();
+        g.write(v | 0x03);
+    }
+    let t = (ms.saturating_mul(TICK_HZ) / 1000).max(1);
+    BEEP_TICKS_LEFT.store(t.min(u64::from(u32::MAX)), core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Program PIT channel 0 for `TICK_HZ` periodic interrupts.
@@ -92,6 +142,87 @@ const DAYS_IN_MONTH: [u8; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 
 fn is_leap(y: u16) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+// Howard Hinnant's civil algorithms (public domain) — inverse of
+// days_from_civil so unix seconds can be written back to the RTC.
+fn civil_from_days(z: i64) -> (u16, u8, u8) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    ((if m <= 2 { y + 1 } else { y }) as u16, m as u8, d as u8)
+}
+
+// Hinnant's days_from_civil (public domain): unix days for y/m/d.
+fn days_from_civil(y: i64, m: u8, d: u8) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = ((m as i64) + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + (d as i64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Current wall clock as unix milliseconds (RTC base + uptime).
+pub fn rtc_ms() -> u64 {
+    let dt = datetime();
+    let days = days_from_civil(dt.year as i64, dt.month, dt.day);
+    (days as u64 * 86400 + dt.hour as u64 * 3600 + dt.minute as u64 * 60
+        + dt.second as u64) * 1000 + uptime_ms() % 1000
+}
+
+fn cmos_write(reg: u8, val: u8) {
+    unsafe {
+        let mut a: Port<u8> = Port::new(0x70);
+        a.write(reg);
+        let mut d: Port<u8> = Port::new(0x71);
+        d.write(val);
+    }
+}
+
+/// Set the wall clock to unix `secs`: rebase the in-memory clock AND write
+/// the CMOS RTC registers (BCD-aware; updates held off via the SET bit).
+pub fn set_unix(secs: u64) {
+    // rebase so datetime() = base + uptime returns `secs` right now
+    let base = (secs as i64 - (uptime_ms() / 1000) as i64).max(0) as u64;
+    let (y, m, d) = civil_from_days((base / 86400) as i64);
+    let rem = base % 86400;
+    *BASE.lock() = Some(DateTime {
+        year: y,
+        month: m,
+        day: d,
+        hour: (rem / 3600) as u8,
+        minute: ((rem % 3600) / 60) as u8,
+        second: (rem % 60) as u8,
+    });
+    // persist to the hardware RTC (what a real `hwclock --systohc` does)
+    let (ty, tm, td) = civil_from_days((secs / 86400) as i64);
+    let trem = secs % 86400;
+    let regb = cmos(0x0B);
+    let is_bcd = regb & 0x04 == 0;
+    let enc = |v: u8| -> u8 {
+        if is_bcd {
+            ((v / 10) << 4) | (v % 10)
+        } else {
+            v
+        }
+    };
+    cmos_write(0x0B, regb | 0x80); // SET: hold updates during the write
+    cmos_write(0x00, enc((trem % 60) as u8));
+    cmos_write(0x02, enc(((trem % 3600) / 60) as u8));
+    cmos_write(0x04, enc((trem / 3600) as u8));
+    cmos_write(0x07, enc(td));
+    cmos_write(0x08, enc(tm));
+    cmos_write(0x09, enc((ty % 100) as u8));
+    cmos_write(0x0B, regb & !0x80);
+    sprintln!("[rtc] set to unix {}", secs);
 }
 
 /// Current wall clock = RTC base + uptime. Enough accuracy for a status clock.
