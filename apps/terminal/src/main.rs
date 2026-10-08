@@ -2720,6 +2720,149 @@ fn ar_parse(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
     Ok(out)
 }
 
+/// Minimal ELF64 reader — enough of the format for readelf/nm/size:
+/// header, program headers, section headers (+shstrtab names), .symtab.
+struct Elf<'a> {
+    d: &'a [u8],
+}
+struct ElfSh {
+    name: u32,
+    typ: u32,
+    flags: u64,
+    addr: u64,
+    off: u64,
+    size: u64,
+    link: u32,
+    entsize: u64,
+}
+struct ElfSym {
+    name: String,
+    value: u64,
+    size: u64,
+    info: u8,
+    shndx: u16,
+}
+impl<'a> Elf<'a> {
+    fn new(d: &'a [u8]) -> Option<Elf<'a>> {
+        if d.len() < 64 || &d[0..4] != b"\x7fELF" || d[4] != 2 {
+            return None; // want ELF64
+        }
+        Some(Elf { d })
+    }
+    fn u16(&self, o: usize) -> u16 {
+        u16::from_le_bytes([self.d[o], self.d[o + 1]])
+    }
+    fn u32(&self, o: usize) -> u32 {
+        u32::from_le_bytes([self.d[o], self.d[o + 1], self.d[o + 2], self.d[o + 3]])
+    }
+    fn u64(&self, o: usize) -> u64 {
+        u64::from_le_bytes(self.d[o..o + 8].try_into().unwrap_or([0; 8]))
+    }
+    fn entry(&self) -> u64 {
+        self.u64(24)
+    }
+    fn phoff(&self) -> usize {
+        self.u64(32) as usize
+    }
+    fn shoff(&self) -> usize {
+        self.u64(40) as usize
+    }
+    fn phnum(&self) -> usize {
+        self.u16(56) as usize
+    }
+    fn shnum(&self) -> usize {
+        self.u16(60) as usize
+    }
+    fn shstrndx(&self) -> usize {
+        self.u16(62) as usize
+    }
+    // program header i: (type, flags, vaddr, filesz, memsz)
+    fn ph(&self, i: usize) -> (u32, u32, u64, u64, u64) {
+        let o = self.phoff() + i * 56;
+        (
+            self.u32(o),
+            self.u32(o + 4),
+            self.u64(o + 16),
+            self.u64(o + 32),
+            self.u64(o + 40),
+        )
+    }
+    fn sh(&self, i: usize) -> ElfSh {
+        let o = self.shoff() + i * 64;
+        ElfSh {
+            name: self.u32(o),
+            typ: self.u32(o + 4),
+            flags: self.u64(o + 8),
+            addr: self.u64(o + 16),
+            off: self.u64(o + 24),
+            size: self.u64(o + 32),
+            link: self.u32(o + 40),
+            entsize: self.u64(o + 56),
+        }
+    }
+    fn shstr(&self, off: u32) -> String {
+        let h = self.sh(self.shstrndx());
+        let base = h.off as usize;
+        let mut end = base + off as usize;
+        let mut s = Vec::new();
+        while end < self.d.len() && self.d[end] != 0 {
+            s.push(self.d[end]);
+            end += 1;
+        }
+        String::from_utf8_lossy(&s).into_owned()
+    }
+    fn sh_name(&self, s: &ElfSh) -> String {
+        self.shstr(s.name)
+    }
+    // symbols of the section at index si (SHT_SYMTAB/SHT_DYNSYM w/ linked strtab)
+    fn syms(&self, si: usize) -> Vec<ElfSym> {
+        let h = self.sh(si);
+        if h.entsize == 0 {
+            return Vec::new();
+        }
+        let strh = self.sh(h.link as usize);
+        let n = (h.size / h.entsize) as usize;
+        let mut out = Vec::new();
+        for i in 0..n {
+            let o = h.off as usize + i * h.entsize as usize;
+            if o + 24 > self.d.len() {
+                break;
+            }
+            let noff = self.u32(o) as usize;
+            let mut e = strh.off as usize + noff;
+            let mut nb = Vec::new();
+            while e < self.d.len() && self.d[e] != 0 {
+                nb.push(self.d[e]);
+                e += 1;
+            }
+            out.push(ElfSym {
+                name: String::from_utf8_lossy(&nb).into_owned(),
+                value: self.u64(o + 8),
+                size: self.u64(o + 16),
+                info: self.d[o + 4],
+                shndx: self.u16(o + 6),
+            });
+        }
+        out
+    }
+}
+fn elf_type_name(t: u16) -> &'static str {
+    match t {
+        0 => "NONE", 1 => "REL", 2 => "EXEC", 3 => "DYN", 4 => "CORE",
+        _ => "?",
+    }
+}
+fn elf_sht_name(t: u32) -> &'static str {
+    match t {
+        0 => "NULL", 1 => "PROGBITS", 2 => "SYMTAB", 3 => "STRTAB",
+        4 => "RELA", 5 => "HASH", 6 => "DYNAMIC", 7 => "NOTE",
+        8 => "NOBITS", 9 => "REL", 10 => "SHLIB", 11 => "DYNSYM",
+        14 => "INIT_ARRAY", 15 => "FINI_ARRAY", 17 => "RELRO" /* relro */,
+        0x6ffffff6 => "GNU_HASH", 0x6fffffff => "VERSYM", 0x6ffffffe => "VERNEED",
+        _ => "?",
+    }
+}
+
 /// ctags: regex-style extraction for Rust + C-ish sources. Tag format is
 /// the exuberant one: `name<TAB>file<TAB>/^line$/;"<TAB>kind`.
 fn ctags_scan(path: &str, text: &str, tags: &mut Vec<String>) {
@@ -22700,6 +22843,259 @@ impl Term {
                     }
                 } else {
                     self.emit("unifdef: no conditional changes");
+                }
+            }
+            "readelf" => {
+                // readelf -h|-l|-S|-s <file> — real ELF64 dumps
+                let mut file: Option<String> = None;
+                let (mut h, mut l, mut s, mut sym) = (false, false, false, false);
+                for a in args.iter() {
+                    match *a {
+                        "-h" | "--file-header" => h = true,
+                        "-l" | "--program-headers" => l = true,
+                        "-S" | "--section-headers" => s = true,
+                        "-s" | "--symbols" | "--syms" => sym = true,
+                        "-a" | "--all" => {
+                            h = true; l = true; s = true; sym = true;
+                        }
+                        _ if !a.starts_with('-') => file = Some(String::from(*a)),
+                        _ => {}
+                    }
+                }
+                if !(h || l || s || sym) {
+                    h = true;
+                }
+                let Some(f) = file else {
+                    self.fail("usage: readelf [-h|-l|-S|-s|-a] <elf>");
+                    return;
+                };
+                let Ok(d) = ustd::read_all(&f) else {
+                    self.fail(&alloc::format!("readelf: {}: err", f));
+                    return;
+                };
+                let Some(e) = Elf::new(&d) else {
+                    self.fail(&alloc::format!("readelf: {}: not ELF64", f));
+                    return;
+                };
+                if h {
+                    self.emit("ELF Header:");
+                    self.emit(&alloc::format!(
+                        "  Class: ELF64   Data: {}   Type: {}   Machine: {}",
+                        if d[5] == 1 { "LE" } else { "BE" },
+                        elf_type_name(e.u16(16)),
+                        match e.u16(18) {
+                            0x3e => "Advanced Micro Devices X86-64",
+                            0x28 => "ARM aarch64",
+                            0xf3 => "RISC-V",
+                            x => if x == 0 { "No machine" } else { "?" },
+                        }
+                    ));
+                    self.emit(&alloc::format!(
+                        "  Entry: 0x{:x}   phoff {} shoff {} phnum {} shnum {} shstrndx {}",
+                        e.entry(), e.phoff(), e.shoff(), e.phnum(), e.shnum(),
+                        e.shstrndx()
+                    ));
+                }
+                if l {
+                    self.emit("Program Headers:");
+                    self.emit("  Type       Vaddr              FileSize   MemSize    Flg");
+                    for i in 0..e.phnum() {
+                        let (t, fl, va, fs, ms) = e.ph(i);
+                        let tn = match t {
+                            1 => "LOAD", 2 => "DYNAMIC", 3 => "INTERP",
+                            4 => "NOTE", 6 => "PHDR", 0x6474e550 => "EHDR",
+                            0x6474e551 => "STACK", 0x6474e552 => "RELRO",
+                            0x6474e553 => "PROP", _ => "?",
+                        };
+                        let mut f2 = String::new();
+                        if fl & 4 != 0 { f2.push('R'); }
+                        if fl & 2 != 0 { f2.push('W'); }
+                        if fl & 1 != 0 { f2.push('E'); }
+                        self.emit(&alloc::format!(
+                            "  {:10} 0x{:016x} 0x{:08x} 0x{:08x} {}",
+                            tn, va, fs, ms, f2
+                        ));
+                    }
+                }
+                if s {
+                    self.emit("Section Headers:");
+                    self.emit("  [Nr] Name               Type         Addr         Off    Size     Flg");
+                    for i in 0..e.shnum() {
+                        let sh = e.sh(i);
+                        let n = e.sh_name(&sh);
+                        let mut fl = String::new();
+                        if sh.flags & 0x2 != 0 { fl.push('A'); }
+                        if sh.flags & 0x1 != 0 { fl.push('W'); }
+                        if sh.flags & 0x4 != 0 { fl.push('X'); }
+                        self.emit(&alloc::format!(
+                            "  [{:2}] {:<18.18} {:<12} {:012x} {:06x} {:08x} {}",
+                            i, n, elf_sht_name(sh.typ), sh.addr, sh.off,
+                            sh.size, fl
+                        ));
+                    }
+                }
+                if sym {
+                    for i in 0..e.shnum() {
+                        let sh = e.sh(i);
+                        if sh.typ != 2 && sh.typ != 11 {
+                            continue;
+                        }
+                        self.emit(&alloc::format!(
+                            "Symbol table '{}' ({} symbols):",
+                            e.sh_name(&sh),
+                            sh.size / sh.entsize.max(1)
+                        ));
+                        self.emit("   Num: Value            Size Type    Bind   Ndx Name");
+                        for (n, s2) in e.syms(i).iter().enumerate() {
+                            let ty = match s2.info & 0xf {
+                                0 => "NOTYPE", 1 => "OBJECT", 2 => "FUNC",
+                                3 => "SECT", 4 => "FILE", 5 => "COMMON",
+                                6 => "TLS", _ => "?",
+                            };
+                            let bd = match s2.info >> 4 {
+                                0 => "LOCAL", 1 => "GLOBAL", 2 => "WEAK",
+                                _ => "?",
+                            };
+                            let nd = if s2.shndx == 0 {
+                                String::from("UND")
+                            } else if s2.shndx == 0xfff1 {
+                                String::from("ABS")
+                            } else {
+                                alloc::format!("{}", s2.shndx)
+                            };
+                            self.emit(&alloc::format!(
+                                "   {:>3}: {:016x} {:>5} {:<7} {:<6} {:>3} {}",
+                                n, s2.value, s2.size, ty, bd, nd, s2.name
+                            ));
+                        }
+                    }
+                }
+            }
+            "nm" => {
+                // nm <file> — value + type-letter + name from .symtab
+                let mut file: Option<String> = None;
+                let mut ext_only = false;
+                for a in args.iter() {
+                    match *a {
+                        "-g" | "--extern-only" => ext_only = true,
+                        _ if !a.starts_with('-') => file = Some(String::from(*a)),
+                        _ => {}
+                    }
+                }
+                let Some(f) = file else {
+                    self.fail("usage: nm [-g] <elf>");
+                    return;
+                };
+                let Ok(d) = ustd::read_all(&f) else {
+                    self.fail(&alloc::format!("nm: {}: err", f));
+                    return;
+                };
+                let Some(e) = Elf::new(&d) else {
+                    self.fail(&alloc::format!("nm: {}: not ELF64", f));
+                    return;
+                };
+                let mut any = false;
+                for i in 0..e.shnum() {
+                    if e.sh(i).typ != 2 {
+                        continue;
+                    }
+                    for s2 in e.syms(i) {
+                        if ext_only && (s2.info >> 4) == 0 {
+                            continue;
+                        }
+                        any = true;
+                        let lc = match s2.shndx {
+                            0 => 'U',
+                            0xfff1 => 'A',
+                            _ => {
+                                let sh = e.sh(s2.shndx as usize);
+                                let w = sh.flags & 0x1 != 0;
+                                let x = sh.flags & 0x4 != 0;
+                                let nb = sh.typ == 8;
+                                let weak = (s2.info >> 4) == 2;
+                                let lcl = (s2.info >> 4) == 0;
+                                let c = if nb {
+                                    'B'
+                                } else if x {
+                                    'T'
+                                } else if w {
+                                    'D'
+                                } else {
+                                    'R'
+                                };
+                                if weak {
+                                    'W'
+                                } else if lcl {
+                                    c.to_ascii_lowercase()
+                                } else {
+                                    c
+                                }
+                            }
+                        };
+                        if lc == 'U' || lc == 'w' {
+                            self.emit(&alloc::format!(
+                                "                 {} {}", lc, s2.name
+                            ));
+                        } else {
+                            self.emit(&alloc::format!(
+                                "{:016x} {} {}", s2.value, lc, s2.name
+                            ));
+                        }
+                    }
+                }
+                if !any {
+                    self.emit("nm: no symbols");
+                }
+            }
+            "size" => {
+                // size [-A] <elf> — text/data/bss from ALLOC section sizes
+                let sysv = args.iter().any(|a| *a == "-A" || *a == "--format=sysv");
+                let file = args.iter().find(|a| !a.starts_with('-'));
+                let Some(f) = file else {
+                    self.fail("usage: size [-A] <elf>");
+                    return;
+                };
+                let Ok(d) = ustd::read_all(f) else {
+                    self.fail(&alloc::format!("size: {}: err", f));
+                    return;
+                };
+                let Some(e) = Elf::new(&d) else {
+                    self.fail(&alloc::format!("size: {}: not ELF64", f));
+                    return;
+                };
+                let (mut text, mut data, mut bss) = (0u64, 0u64, 0u64);
+                for i in 0..e.shnum() {
+                    let sh = e.sh(i);
+                    if sh.flags & 0x2 == 0 {
+                        continue; // SHF_ALLOC only
+                    }
+                    if sh.typ == 8 {
+                        bss += sh.size;
+                    } else if sh.flags & 0x1 != 0 {
+                        data += sh.size;
+                    } else {
+                        text += sh.size;
+                    }
+                }
+                if sysv {
+                    for i in 0..e.shnum() {
+                        let sh = e.sh(i);
+                        if sh.flags & 0x2 != 0 {
+                            self.emit(&alloc::format!(
+                                "{:<20} {:>10} {:>12x}",
+                                e.sh_name(&sh), sh.size, sh.addr
+                            ));
+                        }
+                    }
+                    self.emit(&alloc::format!(
+                        "Total {}", text + data + bss
+                    ));
+                } else {
+                    self.emit("   text    data     bss     dec");
+                    self.emit(&alloc::format!(
+                        "{:>7} {:>7} {:>7} {:>7}",
+                        text, data, bss, text + data + bss
+                    ));
                 }
             }
             "patch" => {
