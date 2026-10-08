@@ -15142,6 +15142,48 @@ impl Term {
                     }
                     return;
                 }
+                // sh -c 'cmd' [name [args...]]: run a command string with
+                // positional params bound ($0=name or "sh", $1..N=args)
+                if a.first() == Some(&"-c") {
+                    let cargs = &a[1..];
+                    match cargs.first() {
+                        Some(cmdstr) => {
+                            let name = cargs.get(1).copied().unwrap_or("sh");
+                            let extras = &cargs[2.min(cargs.len())..];
+                            let keys: Vec<String> = (0..extras.len() + 1)
+                                .map(|i| {
+                                    if i == 0 { String::from("#") } else { alloc::format!("{}", i - 1) }
+                                })
+                                .collect();
+                            let saved: Vec<Option<String>> =
+                                keys.iter().map(|k| self.vars.get(k).cloned()).collect();
+                            self.vars.insert(String::from("0"), String::from(name));
+                            self.vars.insert(String::from("#"), alloc::format!("{}", extras.len()));
+                            for (i, x) in extras.iter().enumerate() {
+                                self.vars.insert(alloc::format!("{}", i + 1), String::from(*x));
+                            }
+                            let (stmts, bodies, unclosed) = norm_stmts(cmdstr);
+                            if let Some(d) = unclosed {
+                                self.fail(&alloc::format!("sh: unterminated heredoc <<{}", d));
+                            } else {
+                                let saved_hd = core::mem::replace(&mut self.heredocs, bodies);
+                                self.script_depth += 1;
+                                self.run_stmts(&stmts, 0, trace);
+                                self.heredocs = saved_hd;
+                            }
+                            self.script_depth = self.script_depth.saturating_sub(1);
+                            self.flow = 0;
+                            for (k, v) in keys.iter().zip(saved) {
+                                match v {
+                                    Some(v) => { self.vars.insert(k.clone(), v); }
+                                    None => { self.vars.remove(k); }
+                                }
+                            }
+                        }
+                        None => self.fail("usage: sh -c <cmd> [name [args...]]"),
+                    }
+                    return;
+                }
                 match a.first() {
                 Some(p) => match ustd::read_all(p) {
                     Ok(d) => {
@@ -18286,13 +18328,41 @@ impl Term {
                         }
                     }
                 }
-                let (prog, file) = match rest {
-                    [p] => (Some(*p), None),
-                    [p, f, ..] => (Some(*p), Some(*f)),
+                // awk -f FILE: program text read from a file like GNU
+                let mut fprog: Option<String> = None;
+                while rest.first() == Some(&"-f") {
+                    match rest.get(1) {
+                        Some(pf) => match ustd::read_all(pf) {
+                            Ok(d) => {
+                                let s = String::from_utf8_lossy(&d).into_owned();
+                                match &mut fprog {
+                                    Some(acc) => {
+                                        acc.push('\n');
+                                        acc.push_str(&s);
+                                    }
+                                    None => fprog = Some(s),
+                                }
+                                rest = &rest[2..];
+                            }
+                            Err(e) => {
+                                self.fail(&alloc::format!("awk: {}: err {}", pf, e));
+                                return;
+                            }
+                        },
+                        _ => {
+                            self.fail("usage: awk -f progfile");
+                            return;
+                        }
+                    }
+                }
+                let (prog, file) = match (fprog, rest) {
+                    (Some(p), r) => (Some(p), r.first().copied()),
+                    (None, [p]) => (Some(String::from(*p)), None),
+                    (None, [p, f, ..]) => (Some(String::from(*p)), Some(*f)),
                     _ => (None, None),
                 };
                 let Some(prog) = prog else {
-                    self.fail("usage: awk [-F c] [-v n=v] 'prog' [file]");
+                    self.fail("usage: awk [-F c] [-v n=v] [-f prog] 'prog' [file]");
                     return;
                 };
                 let input = match file {
@@ -18307,7 +18377,7 @@ impl Term {
                     // input so BEGIN-only awk works like real awk
                     None => self.pipe_in.clone().unwrap_or_default(),
                 };
-                match awk_eval(prog, &input, fs, &preseed) {
+                match awk_eval(&prog, &input, fs, &preseed) {
                     Ok(lines) => {
                         for l in lines {
                             self.emit(&l);
@@ -21753,6 +21823,27 @@ impl Term {
                                 return;
                             }
                         }
+                    } else if *a == "-f" {
+                        // sed -f FILE: script text from a file (concatenates
+                        // across multiple -f like GNU)
+                        match it.next() {
+                            Some(pf) => match ustd::read_all(pf) {
+                                Ok(d) => scripts.push(
+                                    String::from_utf8_lossy(&d).into_owned(),
+                                ),
+                                Err(e) => {
+                                    self.fail(&alloc::format!(
+                                        "sed: {}: err {}",
+                                        pf, e
+                                    ));
+                                    return;
+                                }
+                            },
+                            None => {
+                                self.fail("sed: -f needs a script file");
+                                return;
+                            }
+                        }
                     } else if !a.starts_with('-') {
                         files.push(*a);
                     }
@@ -25164,6 +25255,7 @@ impl Term {
                     "          seq (fractional)  test -O/-G  shuf -e/-r  expr length/index/substr",
                     "          tail -c +K  head -c -N  uniq -s/-z",
                     "          grep -z  find -print0  shuf -z  sed -z  cut -z",
+                    "          sed -f FILE  awk -f FILE  sh -c CMD name args",
                     "          setsid <cmd>  dir/vdir  mkdir -m  df -P  stat -t  chown -R",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];
