@@ -42,6 +42,7 @@ pub fn map_user_page(pml4: PhysFrame, vaddr: u64, frames: &mut Vec<u64>) -> Opti
         return Some(pt[i1].addr().as_u64()); // already mapped
     }
     let f = mem::alloc_frame()?;
+    unsafe { core::ptr::write_bytes(mem::phys_to_virt(f.start_address().as_u64()) as *mut u8, 0, 0x1000) };
     frames.push(f.start_address().as_u64());
     pt[i1].set_addr(
         f.start_address(),
@@ -51,7 +52,7 @@ pub fn map_user_page(pml4: PhysFrame, vaddr: u64, frames: &mut Vec<u64>) -> Opti
 }
 
 /// Map an executable (no WRITE, has USER) user page.
-fn map_user_page_flags(pml4: PhysFrame, vaddr: u64, writable: bool, frames: &mut Vec<u64>) -> Option<u64> {
+pub fn map_user_page_flags(pml4: PhysFrame, vaddr: u64, writable: bool, exec: bool, frames: &mut Vec<u64>) -> Option<u64> {
     use x86_64::structures::paging::PageTableFlags as F;
     let l4 = user_l4(pml4);
     let i4 = ((vaddr >> 39) & 0x1FF) as usize;
@@ -65,10 +66,14 @@ fn map_user_page_flags(pml4: PhysFrame, vaddr: u64, writable: bool, frames: &mut
         return Some(pt[i1].addr().as_u64());
     }
     let f = mem::alloc_frame()?;
+    unsafe { core::ptr::write_bytes(mem::phys_to_virt(f.start_address().as_u64()) as *mut u8, 0, 0x1000) };
     frames.push(f.start_address().as_u64());
     let mut fl = F::PRESENT | F::USER_ACCESSIBLE;
     if writable {
         fl |= F::WRITABLE;
+    }
+    if !exec {
+        fl |= F::NO_EXECUTE;
     }
     pt[i1].set_addr(f.start_address(), fl);
     Some(f.start_address().as_u64())
@@ -177,7 +182,7 @@ pub fn load_into(
         let page_lo = pvaddr & !0xFFF;
         let page_hi = (pvaddr + pmemsz as u64 + 0xFFF) & !0xFFF;
         for page in (page_lo..page_hi).step_by(0x1000) {
-            map_user_page_flags(pml4, page, writable, frames).ok_or(())?;
+            map_user_page_flags(pml4, page, writable, true, frames).ok_or(())?;
         }
         let perm = (if pflags & PF_R != 0 { 1u8 } else { 0 })
             | (if writable { 2u8 } else { 0 })
@@ -390,4 +395,267 @@ pub fn free_user_space(pml4: PhysFrame) -> Vec<u64> {
         }
     }
     freed
+}
+
+/// Demand-paged ELF load: PT_LOAD segments register task::FileMap
+/// regions instead of copying file bytes eagerly — each page faults in
+/// from the image on first touch. `hdr` must contain the ELF header +
+/// program headers (caller reads enough of the file to cover them).
+/// `file_size` is the whole file's size for bounds. Falls back for
+/// segments whose (vaddr,offset) aren't page-aligned.
+pub fn load_into_lazy(
+    pml4: PhysFrame,
+    path: &str,
+    hdr: &[u8],
+    file_size: u64,
+    frames: &mut Vec<u64>,
+    maps: &mut Vec<crate::task::MapEnt>,
+    filemaps: &mut Vec<crate::task::FileMap>,
+) -> Result<u64, ()> {
+    if hdr.len() < 64 || &hdr[0..4] != b"\x7fELF" || hdr[4] != 2 || hdr[5] != 1 {
+        return Err(());
+    }
+    if u16::from_le_bytes([hdr[18], hdr[19]]) != 0x3E {
+        return Err(());
+    }
+    let entry = u64::from_le_bytes(hdr[24..32].try_into().unwrap());
+    let phoff = u64::from_le_bytes(hdr[32..40].try_into().unwrap()) as usize;
+    let phentsize = u16::from_le_bytes(hdr[54..56].try_into().unwrap()) as usize;
+    let phnum = u16::from_le_bytes(hdr[56..58].try_into().unwrap()) as usize;
+    if phoff + phnum * phentsize > hdr.len() || phentsize < 56 {
+        return Err(()); // phdrs beyond the header window -> caller falls back
+    }
+    const USER_LOAD_BASE: u64 = 0x40_0000;
+    let mut min_vaddr = u64::MAX;
+    for i in 0..phnum {
+        let ph = &hdr[phoff + i * phentsize..phoff + i * phentsize + 56];
+        if u32::from_le_bytes(ph[0..4].try_into().unwrap()) != PT_LOAD {
+            continue;
+        }
+        let pv = u64::from_le_bytes(ph[16..24].try_into().unwrap());
+        if u64::from_le_bytes(ph[40..48].try_into().unwrap()) > 0 {
+            min_vaddr = min_vaddr.min(pv & !0xFFF);
+        }
+    }
+    if min_vaddr == u64::MAX {
+        return Err(());
+    }
+    let bias = USER_LOAD_BASE.saturating_sub(min_vaddr);
+    // (va_lo, va_hi, delta): va->file 1:1 for the file-backed part of
+    // every segment — used to read rela entries that live in eagerly
+    // mapped pages, outside any filemap
+    let mut vadeltas: Vec<(u64, u64, u64)> = Vec::new();
+    for i in 0..phnum {
+        let ph = &hdr[phoff + i * phentsize..phoff + i * phentsize + 56];
+        if u32::from_le_bytes(ph[0..4].try_into().unwrap()) != PT_LOAD {
+            continue;
+        }
+        let pflags = u32::from_le_bytes(ph[4..8].try_into().unwrap());
+        let poffset = u64::from_le_bytes(ph[8..16].try_into().unwrap());
+        let pvaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap()) + bias;
+        let pfilesz = u64::from_le_bytes(ph[32..40].try_into().unwrap());
+        let pmemsz = u64::from_le_bytes(ph[40..48].try_into().unwrap());
+        if pmemsz == 0 {
+            continue;
+        }
+        if pvaddr < 0x1000 || pvaddr + pmemsz > 0x7EFF_F000 {
+            return Err(());
+        }
+        if poffset + pfilesz > file_size {
+            return Err(());
+        }
+        if pfilesz > 0 {
+            vadeltas.push((pvaddr, pvaddr + pfilesz, pvaddr - poffset));
+        }
+        let writable = pflags & PF_W != 0;
+        let perm = (if pflags & PF_R != 0 { 1u8 } else { 0 })
+            | (if writable { 2u8 } else { 0 })
+            | (if pflags & PF_X != 0 { 4u8 } else { 0 });
+        let page_lo = pvaddr & !0xFFF;
+        let page_hi = (pvaddr + pmemsz + 0xFFF) & !0xFFF;
+        let file_end = pvaddr + pfilesz;
+        maps.push(crate::task::MapEnt {
+            start: page_lo,
+            end: page_hi,
+            perm,
+            name: String::new(),
+        });
+        // misaligned (vaddr,offset) can't be paged in 1:1 — eager that seg
+        if (pvaddr & 0xFFF) != (poffset & 0xFFF) {
+            let mut scratch: Vec<u64> = Vec::new();
+            for page in (page_lo..page_hi).step_by(0x1000) {
+                map_user_page_flags(pml4, page, writable, true, &mut scratch).ok_or(())?;
+            }
+            frames.extend(scratch);
+            let mut tmp = [0u8; 0x1000];
+            let mut off = 0usize;
+            while off < pfilesz as usize {
+                let va = pvaddr + off as u64;
+                let want = (0x1000 - (va as usize & 0xFFF)).min(pfilesz as usize - off);
+                let n = crate::vfs::read_range(
+                    path,
+                    poffset + off as u64,
+                    &mut tmp[..want],
+                )
+                .map_err(|_| ())?;
+                let phys = translate(pml4, va).ok_or(())?;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        tmp.as_ptr(),
+                        mem::phys_to_virt(phys) as *mut u8,
+                        n,
+                    );
+                }
+                off += n;
+                if n < want {
+                    break;
+                }
+            }
+            continue;
+        }
+        // file-backed zone: [page_lo, file_end&!0xFFF)
+        let fm_end = file_end & !0xFFF;
+        if fm_end > page_lo {
+            filemaps.push(crate::task::FileMap {
+                start: page_lo,
+                end: fm_end,
+                path: String::from(path),
+                off: poffset - (pvaddr - page_lo),
+                perm,
+            });
+        }
+        // overlap page (file tail + bss head): fill eagerly, zero the tail.
+        // The page maps file bytes 1:1 from `poffset - (pvaddr - page)`;
+        // only bytes up to file_end are real — everything past is .bss
+        // and stays zero (fresh frames are pre-zeroed).
+        if pfilesz > 0 && (file_end & 0xFFF) != 0 {
+            let mut scratch: Vec<u64> = Vec::new();
+            let page = file_end & !0xFFF;
+            map_user_page_flags(pml4, page, writable, true, &mut scratch).ok_or(())?;
+            frames.extend(scratch);
+            let file_off = (poffset as i64 + page as i64 - pvaddr as i64) as u64;
+            let copy_len = (file_end - page).min(0x1000) as usize;
+            let mut tmp = [0u8; 0x1000];
+            let n = crate::vfs::read_range(path, file_off, &mut tmp[..copy_len])
+                .map_err(|_| ())?;
+            let phys = translate(pml4, page).ok_or(())?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    tmp.as_ptr(),
+                    mem::phys_to_virt(phys) as *mut u8,
+                    n,
+                );
+            }
+        }
+        // pure-bss zone: demand-zero pages (sentinel path = "")
+        let bss_lo = if pfilesz > 0 {
+            (file_end + 0xFFF) & !0xFFF
+        } else {
+            page_lo
+        };
+        if bss_lo < page_hi {
+            filemaps.push(crate::task::FileMap {
+                start: bss_lo,
+                end: page_hi,
+                path: String::new(), // "" = zero-fill
+                off: 0,
+                perm,
+            });
+        }
+    }
+    // pass 3: R_X86_64_RELATIVE — PIE GOT slots/function pointers get
+    // addend+bias. A target on a demand page faults that page in NOW
+    // (eager fill) so the slot can be written.
+    for i in 0..phnum {
+        let ph = &hdr[phoff + i * phentsize..phoff + i * phentsize + 56];
+        if u32::from_le_bytes(ph[0..4].try_into().unwrap()) != 2 {
+            continue; // PT_DYNAMIC
+        }
+        let dyn_off = u64::from_le_bytes(ph[8..16].try_into().unwrap());
+        let dyn_sz = u64::from_le_bytes(ph[32..40].try_into().unwrap()) as usize;
+        let mut dynbuf = alloc::vec![0u8; dyn_sz.min(0x1000)];
+        let _ = crate::vfs::read_range(path, dyn_off, &mut dynbuf);
+        let (mut rela, mut relasz, mut relaent) = (0u64, 0u64, 24u64);
+        for e in dynbuf.chunks_exact(16) {
+            let tag = i64::from_le_bytes(e[0..8].try_into().unwrap());
+            let val = u64::from_le_bytes(e[8..16].try_into().unwrap());
+            match tag {
+                7 => rela = val,
+                8 => relasz = val,
+                9 => relaent = val,
+                _ => {}
+            }
+        }
+        if rela == 0 || relasz == 0 || relaent < 24 {
+            break;
+        }
+        // the RELA table is file data — find its file offset through the
+        // filemap that covers it (or fall back to va==file-offset region
+        // inside an eagerly-mapped page, which translate() will find)
+        for j in 0..(relasz / relaent) {
+            let rva = rela + bias + j * relaent;
+            // read the 24-byte rela entry — it lives in a file-backed
+            // page; translate() works only if that page is mapped, so
+            // read via the file offset using the 1:1 va<->file delta
+            let mut eb = [0u8; 24];
+            let Some(rf_off) = file_offset_of(&vadeltas, rva) else { continue };
+            if crate::vfs::read_range(path, rf_off, &mut eb).is_err() {
+                continue;
+            }
+            let r_offset = u64::from_le_bytes(eb[0..8].try_into().unwrap());
+            let r_info = u64::from_le_bytes(eb[8..16].try_into().unwrap());
+            let r_addend = i64::from_le_bytes(eb[16..24].try_into().unwrap());
+            if r_info & 0xFFFF_FFFF != 8 {
+                continue; // only R_X86_64_RELATIVE
+            }
+            let wva = r_offset + bias;
+            if translate(pml4, wva).is_none() {
+                // the reloc target page is still demand-only — fault it
+                // in eagerly so the slot can be written
+                let wpage = wva & !0xFFF;
+                if let Some((wpath, woff, wperm)) = filemaps
+                    .iter()
+                    .find(|f| wpage >= f.start && wpage < f.end)
+                    .map(|f| (f.path.clone(), f.off + (wpage - f.start), f.perm))
+                {
+                    let mut scratch: Vec<u64> = Vec::new();
+                    if let Some(wphys) = map_user_page_flags(
+                        pml4,
+                        wpage,
+                        wperm & 2 != 0,
+                        wperm & 4 != 0,
+                        &mut scratch,
+                    ) {
+                        frames.extend(scratch);
+                        let mut pb = [0u8; 0x1000];
+                        if !wpath.is_empty() {
+                            let _ = crate::vfs::read_range(path, woff, &mut pb);
+                        }
+                        unsafe {
+                            // pb is zero-initialized — a full-page copy
+                            // zeroes the tail past the file data
+                            core::ptr::copy_nonoverlapping(
+                                pb.as_ptr(),
+                                mem::phys_to_virt(wphys) as *mut u8,
+                                0x1000,
+                            );
+                        }
+                    }
+                }
+            }
+            let Some(wphys) = translate(pml4, wva) else { continue };
+            unsafe {
+                *(mem::phys_to_virt(wphys) as *mut u64) = (r_addend as u64).wrapping_add(bias);
+            }
+        }
+    }
+    Ok(entry + bias)
+}
+
+/// File offset for a VA inside a file-backed span (delta = va - file_off).
+fn file_offset_of(spans: &[(u64, u64, u64)], va: u64) -> Option<u64> {
+    spans
+        .iter()
+        .find(|(lo, hi, _)| va >= *lo && va < *hi)
+        .map(|(_, _, d)| va - *d)
 }

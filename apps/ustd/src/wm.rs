@@ -44,7 +44,7 @@ fn mgmt_call(kind: u16, payload: &[u8], want_reply: bool) -> Option<(u16, Vec<u8
         return None;
     }
     send_req(srv, ev, kind, payload);
-    let r = if want_reply { poll(ev, 1500) } else { Some((0, Vec::new())) };
+    let r = if want_reply { poll(ev, 15000) } else { Some((0, Vec::new())) };
     ipc_close(ev); // throwaway reply port -- don't leak one per call
     r
 }
@@ -119,7 +119,9 @@ impl Wm {
             core::slice::from_raw_parts(&req as *const _ as *const u8, core::mem::size_of::<ReqCreateWin>())
         };
         send_req(self.srv, self.ev, REQ_CREATE_WIN, payload);
-        let (kind, pl) = poll(self.ev, 2000)?;
+        // bounded wait, generous: under demand-paged ELF loading a cold
+        // winserver can fault in hundreds of pages before it answers
+        let (kind, pl) = poll(self.ev, 15000)?;
         if kind != RSP_WIN_CREATED || pl.len() < core::mem::size_of::<RspWinCreated>() {
             return None;
         }
