@@ -59,6 +59,7 @@ pub struct Task {
     pub sleep_deadline: u64, // SYS_SLEEP_MS restart target (0 = not sleeping)
     pub wait_timeout: u64,   // tick deadline for timed waits (0 = none)
     pub cpu_ticks: u64,      // PIT ticks this task has run (per-task CPU time)
+    pub argv: String,        // spawn arg string (for /proc/<pid>/cmdline)
 }
 
 pub struct Sched {
@@ -76,6 +77,7 @@ pub fn init() {
     let boot = Task {
         id: 0,
         name: String::from("kernel"),
+        argv: String::new(),
         is_user: false,
         state: State::Running,
         saved_rsp: 0,
@@ -311,6 +313,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
     let t = Task {
         id: pid,
         name: String::from(name),
+        argv: String::from(args),
         is_user: true,
         state: State::Running,
         saved_rsp: ctx as u64,
@@ -363,6 +366,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
     s.tasks.push(Box::new(Task {
         id: pid,
         name: String::from(name),
+        argv: String::new(),
         is_user: false,
         state: State::Running,
         saved_rsp: ctx as u64,
@@ -607,4 +611,52 @@ pub fn proclist(buf: &mut [shared::ProcInfo]) -> usize {
         n += 1;
     }
     n
+}
+
+/// Alive task ids (for /proc/<pid> dir enumeration).
+pub fn pids() -> Vec<u32> {
+    let g = SCHED.lock();
+    g.as_ref()
+        .map(|s| {
+            s.tasks
+                .iter()
+                .filter(|t| t.state != State::Dead)
+                .map(|t| t.id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// (name, argv, mem_bytes, cpu_ticks, is_user, state) for /proc/<pid>/*.
+pub fn pid_info(pid: u32) -> Option<(String, String, u64, u64, bool, &'static str)> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    s.tasks.iter().find(|t| t.id == pid).map(|t| {
+        (
+            t.name.clone(),
+            t.argv.clone(),
+            t.mem_bytes,
+            t.cpu_ticks,
+            t.is_user,
+            match t.state {
+                State::Running => "R (running)",
+                State::Blocked => "S (sleeping)",
+                State::Dead => "Z (dead)",
+            },
+        )
+    })
+}
+
+/// `/proc/<pid>/fds` body: one line per open fd (fd: path).
+pub fn fd_list(pid: u32) -> Option<String> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    let t = s.tasks.iter().find(|t| t.id == pid)?;
+    let mut out = String::new();
+    for (i, f) in t.fds.iter().enumerate() {
+        if let Some(f) = f {
+            out.push_str(&alloc::format!("{}: {}\n", i, f.path));
+        }
+    }
+    Some(out)
 }

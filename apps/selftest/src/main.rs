@@ -315,6 +315,42 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         });
     }
 
+    // ---- sha1 known-answer + /dev/vda BPB ----
+    check("sha1-abc", {
+        // RFC 3174 KAT: sha1("abc") = a9993e364706816aba3e25717850c26c9cd0d89d
+        let h = ustd::sha1(b"abc");
+        h == [0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e,
+              0x25, 0x71, 0x78, 0x50, 0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d]
+    });
+    check("dev-vda-bpb", {
+        match ustd::open("/dev/vda", ustd::O_RDONLY) {
+            Ok(fd) => {
+                let mut b = [0u8; 512];
+                let r = ustd::read(fd, &mut b);
+                ustd::close(fd);
+                // FAT32 BPB: jump opcode + nonzero bytes/sector at [11]
+                matches!(r, Ok(512)) && (b[0] == 0xeb || b[0] == 0xe9)
+                    && u16::from_le_bytes([b[11], b[12]]) == 512
+            }
+            Err(_) => false,
+        }
+    });
+    check("proc-pid-status", {
+        // /proc/<pid>/status names a live process (selftest is pid!=0)
+        // pid 2 is this selftest in the flagged boot
+        ustd::read_all("/proc/2/status")
+            .map(|d| {
+                let s = String::from_utf8_lossy(&d);
+                s.contains("Name:\tcosmos-selftest") && s.contains("VmSize:")
+            })
+            .unwrap_or(false)
+    });
+    check("proc-pid-dirlist", {
+        ustd::readdir("/proc")
+            .map(|es| es.iter().any(|e| e.is_dir != 0 && &e.name[..e.name_len as usize] == b"1"))
+            .unwrap_or(false)
+    });
+
     // ---- md5 known-answer ----
     check("md5-abc", {
         // RFC 1321 KAT: md5("abc") = 900150983cd24fb0d6963f7d28e17f72

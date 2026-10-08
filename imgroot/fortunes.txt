@@ -1,0 +1,15 @@
+A program is never less than 90% bugs and never more than 95% features.
+%
+The only way to learn a system is to write one.
+%
+Simplicity is the soul of reliability.
+%
+Real programmers ship on Fridays.
+%
+The best kernel is the one you wrote yourself.
+%
+Every OS is just a bootloader with ambitions.
+%
+If it compiles, ship it to QEMU.
+%
+No stubs were harmed in the making of this fortune.
