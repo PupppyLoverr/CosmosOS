@@ -163,6 +163,311 @@ fn env_subst(s: &str, vars: &alloc::collections::BTreeMap<String, String>) -> St
     out
 }
 
+/// bzip2 block decompressor: BZh stream -> bytes.
+/// Header `BZh<n>` then per block: 48-bit magic, CRC32, origPtr, symbol
+/// map, 2..6 Huffman groups + MTF selectors, RUNA/RUNB run coding, inverse
+/// BWT via the LF mapping, RLE2 (4-run + count byte), end magic + combined
+/// CRC. `randomized` blocks (ancient encoder flag) are rejected.
+fn bz2_decompress(d: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if d.len() < 4 || &d[..3] != b"BZh" || !d[3].is_ascii_digit() {
+        return Err("not a bzip2 stream");
+    }
+    struct Br<'a> {
+        d: &'a [u8],
+        pos: usize,
+    }
+    impl<'a> Br<'a> {
+        fn bit(&mut self) -> Result<u32, &'static str> {
+            if self.pos / 8 >= self.d.len() {
+                return Err("truncated bz2");
+            }
+            let b = (self.d[self.pos / 8] >> (7 - (self.pos % 8))) & 1;
+            self.pos += 1;
+            Ok(b as u32)
+        }
+        fn bits(&mut self, n: usize) -> Result<u32, &'static str> {
+            let mut v = 0u32;
+            for _ in 0..n {
+                v = (v << 1) | self.bit()?;
+            }
+            Ok(v)
+        }
+    }
+    // bzip2 CRC-32: poly 0x04C11DB7, init/xorout all-ones, MSB-first.
+    fn bz_crc_tab() -> [u32; 256] {
+        let mut t = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut c = (i as u32) << 24;
+            let mut k = 0;
+            while k < 8 {
+                c = if c & 0x8000_0000 != 0 { (c << 1) ^ 0x04c1_1db7 } else { c << 1 };
+                k += 1;
+            }
+            t[i] = c;
+            i += 1;
+        }
+        t
+    }
+    fn bz_crc(crc: u32, data: &[u8], tab: &[u32; 256]) -> u32 {
+        let mut c = crc;
+        for &b in data {
+            c = (c << 8) ^ tab[(((c >> 24) as u8) ^ b) as usize];
+        }
+        c
+    }
+    let crct = bz_crc_tab();
+    let mut br = Br { d, pos: 32 };
+    let mut out: Vec<u8> = Vec::new();
+    let mut combined = 0u32;
+    loop {
+        let magic = ((br.bits(24)? as u64) << 24) | br.bits(24)? as u64;
+        if magic == 0x177245385090 {
+            let want = br.bits(32)?;
+            if want != combined {
+                return Err("bz2: combined CRC mismatch");
+            }
+            return Ok(out);
+        }
+        if magic != 0x314159265359 {
+            return Err("bz2: bad block magic");
+        }
+        let block_crc = br.bits(32)?;
+        if br.bit()? != 0 {
+            return Err("bz2: randomized block unsupported");
+        }
+        let orig_ptr = br.bits(24)? as usize;
+        // symbol map: 16 groups of 16
+        let mut used: Vec<u8> = Vec::new();
+        let mut map16 = [false; 16];
+        for g in 0..16 {
+            map16[g] = br.bit()? != 0;
+        }
+        for g in 0..16 {
+            if map16[g] {
+                for k in 0..16 {
+                    if br.bit()? != 0 {
+                        used.push((g * 16 + k) as u8);
+                    }
+                }
+            }
+        }
+        if used.is_empty() {
+            continue;
+        }
+        let n_used = used.len();
+        let n_sym = n_used + 2; // [0]=RUNA [1]=RUNB [2..] mtf idxs, last=EOB
+        let eob = n_sym - 1;
+        let n_groups = br.bits(3)? as usize;
+        if !(2..=6).contains(&n_groups) {
+            return Err("bz2: bad group count");
+        }
+        let n_sel = br.bits(15)? as usize;
+        // selectors are unary-MTF coded
+        let mut sel_list: Vec<u8> = (0..n_groups as u8).collect();
+        let mut sels: Vec<u8> = Vec::with_capacity(n_sel);
+        for _ in 0..n_sel {
+            let mut s = 0usize;
+            while br.bit()? != 0 {
+                s += 1;
+                if s >= n_groups {
+                    return Err("bz2: bad selector");
+                }
+            }
+            let v = sel_list.remove(s);
+            sel_list.insert(0, v);
+            sels.push(v);
+        }
+        // Huffman lengths per group
+        let nsel_ok = sels.len();
+        let mut codes: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..n_groups {
+            let mut cur = br.bits(5)? as i32;
+            let mut lens = Vec::with_capacity(n_sym);
+            for _ in 0..n_sym {
+                while br.bit()? != 0 {
+                    if br.bit()? == 0 {
+                        cur += 1;
+                    } else {
+                        cur -= 1;
+                    }
+                    if !(1..=20).contains(&cur) {
+                        return Err("bz2: bad code length");
+                    }
+                }
+                lens.push(cur as u8);
+            }
+            codes.push(lens);
+        }
+        // build canonical decode tables per group: limit/base/off + perm
+        struct Huf {
+            limit: [i64; 21],
+            first: [i64; 21],
+            off: [i64; 21],
+            perm: Vec<u16>,
+            minl: usize,
+        }
+        let mut tables: Vec<Huf> = Vec::new();
+        for lens in &codes {
+            let minl = *lens.iter().min().unwrap_or(&1) as usize;
+            let maxl = *lens.iter().max().unwrap_or(&1) as usize;
+            let mut count = [0i64; 22];
+            for &l in lens {
+                count[l as usize] += 1;
+            }
+            let mut perm = Vec::with_capacity(n_sym);
+            for l in minl..=maxl {
+                for (i, &x) in lens.iter().enumerate() {
+                    if x as usize == l {
+                        perm.push(i as u16);
+                    }
+                }
+            }
+            let mut first = [0i64; 21];
+            first[minl] = 0;
+            for l in minl + 1..=maxl {
+                first[l] = (first[l - 1] + count[l - 1]) << 1;
+            }
+            let mut limit = [0i64; 21];
+            for l in minl..=maxl {
+                limit[l] = first[l] + count[l] - 1;
+            }
+            let mut off = [0i64; 21];
+            let mut acc = 0i64;
+            for l in minl..=maxl {
+                off[l] = acc;
+                acc += count[l];
+            }
+            tables.push(Huf { limit, first, off, perm, minl });
+        }
+        let huf_dec = |br: &mut Br, h: &Huf| -> Result<usize, &'static str> {
+            let mut zn = h.minl;
+            let mut zv = br.bits(zn)? as i64;
+            while zv > h.limit[zn] {
+                zn += 1;
+                if zn > 20 {
+                    return Err("bz2: huffman over");
+                }
+                zv = (zv << 1) | br.bit()? as i64;
+            }
+            let idx = h.off[zn] + (zv - h.first[zn]);
+            Ok(*h.perm.get(idx as usize).ok_or("bz2: perm range")? as usize)
+        };
+        // MTF decode into block T. Symbols stream through per-group
+        // Huffman tables; the table switches every 50 symbols via sels[].
+        let mut mtf: Vec<u8> = used.clone();
+        let mut blk: Vec<u8> = Vec::new();
+        let mut es: u64 = 0;
+        let mut rshift = 0u32;
+        let mut sym_count = 0usize;
+        loop {
+            let gi = sym_count / 50;
+            if gi >= nsel_ok {
+                return Err("bz2: selector exhausted");
+            }
+            let sym = huf_dec(&mut br, &tables[sels[gi] as usize])?;
+            sym_count += 1;
+            if sym <= 1 {
+                // RUNA(0)/RUNB(1): run = sum of (sym+1)<<k
+                es += ((sym as u64) + 1) << rshift;
+                rshift += 1;
+            } else if sym == eob {
+                break;
+            } else {
+                if es > 0 {
+                    for _ in 0..es {
+                        blk.push(mtf[0]);
+                    }
+                    es = 0;
+                    rshift = 0;
+                }
+                let idx = sym - 1;
+                let b = *mtf.get(idx).ok_or("bz2: mtf range")?;
+                mtf.remove(idx);
+                mtf.insert(0, b);
+                blk.push(b);
+            }
+        }
+        if es > 0 {
+            for _ in 0..es {
+                blk.push(mtf[0]);
+            }
+        }
+        if orig_ptr >= blk.len() {
+            return Err("bz2: bad origPtr");
+        }
+        // inverse BWT via LF mapping: lf[i] = sorted-row position of T[i]
+        let mut count = [0usize; 256];
+        for &b in &blk {
+            count[b as usize] += 1;
+        }
+        let mut start = [0usize; 256];
+        let mut acc = 0usize;
+        for i in 0..256 {
+            start[i] = acc;
+            acc += count[i];
+        }
+        // tt = inverse of the LF map: tt[lf[i]] = i
+        let mut lf: Vec<usize> = vec![0; blk.len()];
+        let mut fill = start;
+        for (i, &b) in blk.iter().enumerate() {
+            lf[i] = fill[b as usize];
+            fill[b as usize] += 1;
+        }
+        let mut tt: Vec<usize> = vec![0; blk.len()];
+        for (i, &j) in lf.iter().enumerate() {
+            tt[j] = i;
+        }
+        // walk forward emitting blk[p]; the cycle enters one step ahead
+        // of origPtr so the original's first byte leads.
+        let mut p = tt[orig_ptr];
+        let n = blk.len();
+        for _ in 0..n {
+            out.push(blk[p]);
+            p = tt[p];
+        }
+        // block payload for CRC: the post-RLE2 text is what was emitted —
+        // but CRC is over the RLE2-DECODED stream; our emit already applied
+        // RLE1 only. Undo RLE2: scan for 4-run + count byte.
+        // (blk == L column; CRC was computed on the *final* block content)
+        // bzip2 CRC covers the uncompressed block bytes (post all decode).
+        // Reconstruct: the emitted slice is the block text already RLE2-
+        // decoded? No — blk is post-RLE1; out appended post-BWT bytes which
+        // still carry RLE2. Decode it now.
+        let start_out = out.len() - n;
+        let raw = out[start_out..].to_vec();
+        let mut fin: Vec<u8> = Vec::with_capacity(raw.len());
+        let mut ri = 0usize;
+        while ri < raw.len() {
+            let b = raw[ri];
+            if ri + 4 < raw.len()
+                && raw[ri + 1] == b
+                && raw[ri + 2] == b
+                && raw[ri + 3] == b
+            {
+                let cnt = raw[ri + 4] as usize;
+                for _ in 0..4 {
+                    fin.push(b);
+                }
+                for _ in 0..cnt {
+                    fin.push(b);
+                }
+                ri += 5;
+            } else {
+                fin.push(b);
+                ri += 1;
+            }
+        }
+        out.truncate(start_out);
+        out.extend_from_slice(&fin);
+        let c = bz_crc(0xffff_ffff, &fin, &crct) ^ 0xffff_ffff;
+        if c != block_crc {
+            return Err("bz2: block CRC mismatch");
+        }
+        combined = (combined << 1 | combined >> 31) ^ c;
+    }
+}
+
 /// mini-m4: expand `src` left-to-right with builtins and user macros.
 /// `define`/`undefine`/`ifdef`/`eval`/`len`/`substr`/`index`/`translit`/
 /// `include`/`incr`/`decr`, `dnl` comments-to-EOL, and '`'..'`' quoting.
@@ -16596,6 +16901,176 @@ impl Term {
                     Err(e) => self.fail(&alloc::format!("gzip: {}: err {}", p, e)),
                 }
             }
+            "bunzip2" | "bzcat" | "bzip2" => {
+                let dec = args.iter().any(|a| *a == "-d");
+                if cmd == "bzip2" && !dec {
+                    self.fail("bzip2 compression unsupported (bunzip2/bzcat decode .bz2)");
+                    return;
+                }
+                let to_stdout =
+                    cmd == "bzcat" || args.iter().any(|a| *a == "-c" || *a == "-dc");
+                let path = args.iter().find(|a| !a.starts_with('-')).copied();
+                let Some(p) = path else {
+                    self.fail("usage: bunzip2 [-c] <file.bz2>  |  bzcat <file.bz2>");
+                    return;
+                };
+                match ustd::read_all(p) {
+                    Ok(d) => match bz2_decompress(&d) {
+                        Ok(out) => {
+                            if to_stdout {
+                                self.emit_bin(&out);
+                            } else {
+                                let outp = if let Some(st) = p.strip_suffix(".bz2") {
+                                    String::from(st)
+                                } else {
+                                    alloc::format!("{}.out", p)
+                                };
+                                match ustd::write_all(&outp, &out) {
+                                    Ok(()) => self.emit(&alloc::format!("{} -> {}", p, outp)),
+                                    Err(e) => {
+                                        self.fail(&alloc::format!("bunzip2: {}: err {}", outp, e))
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => self.fail(&alloc::format!("{}: {}", cmd, e)),
+                    },
+                    Err(e) => self.fail(&alloc::format!("{}: {}: err {}", cmd, p, e)),
+                }
+            }
+            "zmore" | "zless" | "zegrep" | "zfgrep" | "zdiff" | "zcmp" => {
+                // z-wrappers: real gunzip of each file arg into a tmp file,
+                // then dispatch the underlying tool on the plain text.
+                fn zgun(d: &[u8]) -> Result<Vec<u8>, &'static str> {
+                    let off = ustd::inflate::gzip_body(d)?;
+                    ustd::inflate::inflate(&d[off..d.len().saturating_sub(8)])
+                }
+                let cmdstr = cmd;
+                if cmdstr == "zmore" || cmdstr == "zless" {
+                    let Some(&p) = args.iter().find(|a| !a.starts_with('-')) else {
+                        self.fail("usage: zmore|zless <file.gz>");
+                        return;
+                    };
+                    match ustd::read_all(p).map_err(|_| "read").and_then(|d| zgun(&d)) {
+                        Ok(out) => {
+                            let tmp = "/tmp/.zpage.tmp";
+                            let _ = ustd::write_all(tmp, &out);
+                            self.run(&alloc::format!("more {}", tmp));
+                        }
+                        Err(e) => self.fail(&alloc::format!("{}: {}: {}", cmdstr, p, e)),
+                    }
+                } else if cmdstr == "zegrep" || cmdstr == "zfgrep" {
+                    let flag = if cmdstr == "zegrep" { "-E" } else { "-F" };
+                    let mut flags: Vec<String> = Vec::new();
+                    let mut pos: Vec<String> = Vec::new();
+                    for a in args.iter() {
+                        if a.starts_with('-') {
+                            flags.push(String::from(*a));
+                        } else {
+                            pos.push(String::from(*a));
+                        }
+                    }
+                    if pos.is_empty() {
+                        self.fail(alloc::format!("usage: {} <pat> <file.gz>...", cmdstr).as_str());
+                        return;
+                    }
+                    let pat = pos.remove(0);
+                    if pos.is_empty() {
+                        // pattern-only form: grep stdin — decompress stdin?
+                        self.fail(alloc::format!("{}: no files", cmdstr).as_str());
+                        return;
+                    }
+                    let mut files: Vec<String> = Vec::new();
+                    for (k, f) in pos.iter().enumerate() {
+                        let d = match ustd::read_all(f) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                self.fail(&alloc::format!("{}: {}: err {}", cmdstr, f, e));
+                                return;
+                            }
+                        };
+                        match zgun(&d) {
+                            Ok(out) => {
+                                let t = alloc::format!("/tmp/.zw{}.tmp", k);
+                                let _ = ustd::write_all(&t, &out);
+                                files.push(t);
+                            }
+                            Err(_) => files.push(f.clone()),
+                        }
+                    }
+                    self.run(&alloc::format!(
+                        "grep {} {} '{}' {}",
+                        flag,
+                        flags.join(" "),
+                        pat,
+                        files.join(" ")
+                    ));
+                } else {
+                    // zdiff / zcmp: non-flag args are files
+                    let tool = cmdstr.trim_start_matches('z');
+                    let mut parts: Vec<String> = Vec::new();
+                    let mut k = 0usize;
+                    for a in args.iter() {
+                        if a.starts_with('-') {
+                            parts.push(String::from(*a));
+                            continue;
+                        }
+                        match ustd::read_all(a) {
+                            Ok(d) => match zgun(&d) {
+                                Ok(out) => {
+                                    let t = alloc::format!("/tmp/.zw{}.tmp", k);
+                                    let _ = ustd::write_all(&t, &out);
+                                    parts.push(t);
+                                    k += 1;
+                                }
+                                Err(_) => parts.push(String::from(*a)),
+                            },
+                            Err(e) => {
+                                self.fail(&alloc::format!("{}: {}: err {}", cmdstr, a, e));
+                                return;
+                            }
+                        }
+                    }
+                    self.run(&alloc::format!("{} {}", tool, parts.join(" ")));
+                }
+            }
+            "mesg" => match args.first().copied() {
+                None => {
+                    let on = self.vars.get("MESG").map(|v| v != "n").unwrap_or(true);
+                    self.emit(if on { "is y" } else { "is n" });
+                }
+                Some("y") | Some("n") => {
+                    self.vars.insert(String::from("MESG"), String::from(args[0]));
+                }
+                _ => self.fail("usage: mesg [y|n]"),
+            },
+            "wall" => {
+                // broadcast to every terminal session — this terminal is the
+                // only session on CosmosOS, so wall writes right here.
+                let msg = if !args.is_empty() {
+                    args.join(" ")
+                } else {
+                    match &self.pipe_in {
+                        Some(s) => s.clone(),
+                        None => {
+                            self.fail("usage: wall <message>  (or pipe stdin)");
+                            return;
+                        }
+                    }
+                };
+                let who = self
+                    .vars
+                    .get("USER")
+                    .cloned()
+                    .unwrap_or_else(|| String::from("root"));
+                for line in msg.lines() {
+                    self.emit(&alloc::format!(
+                        "Broadcast message from {}@cosmos: {}",
+                        who,
+                        line
+                    ));
+                }
+            }
             "gunzip" | "zcat" => {
                 // gunzip [-c] file.gz — real gzip/DEFLATE decompression.
                 // zcat (or -c) writes to stdout; gunzip writes <name minus .gz>.
@@ -30406,6 +30881,8 @@ impl Term {
         "rusage", "ts", "sync", "inotifywait", "inotifywatch",
         "colrm", "mountpoint", "elfinfo", "utmpdump", "setsid", "dir", "vdir",
         "iconv", "ascii", "b2sum", "pathchk", "nslookup", "pwck", "grpck",
+        "bunzip2", "bzcat", "bzip2", "zmore", "zless", "zegrep", "zfgrep",
+        "zdiff", "zcmp", "wall", "mesg",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
