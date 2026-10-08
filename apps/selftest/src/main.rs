@@ -502,6 +502,46 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::remove("/st.pipe");
     }
 
+    // ---- symlinks: LNK> file + attr 0x40, open/stat/readlink/chain ----
+    let _ = ustd::write_all("/link-target.txt", b"link-dest");
+    check("symlink-write", ustd::write_all("/st.link", b"LNK>/link-target.txt").is_ok());
+    check("symlink-attr", ustd::setattr("/st.link", 0x60).is_ok());
+    check("readlink", ustd::readlink("/st.link").as_deref() == Some("/link-target.txt"));
+    check(
+        "readlink-nonlink",
+        ustd::readlink("/link-target.txt").is_none(),
+    );
+    check("symlink-open", {
+        ustd::read_all("/st.link")
+            .map(|d| d == b"link-dest")
+            .unwrap_or(false)
+    });
+    // chained link: st2 -> st.link -> /link-target.txt
+    check("symlink-chain", {
+        let ok = ustd::write_all("/st2.link", b"LNK>st.link").is_ok()
+            && ustd::setattr("/st2.link", 0x60).is_ok();
+        ok && ustd::read_all("/st2.link")
+            .map(|d| d == b"link-dest")
+            .unwrap_or(false)
+    });
+    // link loop: stA <-> stB must fail to open (ELOOP), not hang
+    check("symlink-loop", {
+        let ok = ustd::write_all("/sta.link", b"LNK>stb.link").is_ok()
+            && ustd::setattr("/sta.link", 0x60).is_ok()
+            && ustd::write_all("/stb.link", b"LNK>sta.link").is_ok()
+            && ustd::setattr("/stb.link", 0x60).is_ok();
+        ok && ustd::open("/sta.link", ustd::O_RDONLY).is_err()
+    });
+    // relative target resolves against the link's directory
+    check("symlink-relative", {
+        let ok = ustd::mkdir("/linkdir").is_ok()
+            && ustd::write_all("/linkdir/real.txt", b"rel-ok").is_ok()
+            && ustd::write_all("/linkdir/rel.link", b"LNK>real.txt").is_ok()
+            && ustd::setattr("/linkdir/rel.link", 0x60).is_ok();
+        ok && ustd::read_all("/linkdir/rel.link")
+            .map(|d| d == b"rel-ok")
+            .unwrap_or(false)
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64
