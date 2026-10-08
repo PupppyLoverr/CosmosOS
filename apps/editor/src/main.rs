@@ -20,6 +20,8 @@ struct Editor {
     cx: usize, // caret byte idx
     sel: Option<(usize, usize)>, // selected byte range [start,end)
     find_q: Option<String>, // Ctrl-F: live find query (None = not finding)
+    rep_q: Option<String>,  // Ctrl-H phase 1: typing the search term
+    rep_with: Option<String>, // Ctrl-H phase 2: search locked, typing replacement
     goto_q: Option<String>, // Ctrl-G: line-number prompt
     saveas_q: Option<String>, // Ctrl-Shift-S: save-as path prompt
     open_q: Option<String>,   // Ctrl-O: open-file path prompt
@@ -149,7 +151,7 @@ impl Editor {
         // header
         c.fill(0, 0, c.w as i32, 26, draw::PANEL);
         c.text(8, 5, &alloc::format!("{}{}", self.path, if self.dirty_text { " *" } else { "" }), draw::TEXT, None);
-        c.text(c.w as i32 - 228, 5, "Ctrl-S save  Ctrl-F/G find/goto", draw::DIM, None); // header hint
+        c.text(c.w as i32 - 244, 5, "Ctrl-S save  Ctrl-F/G find  Ctrl-H replace", draw::DIM, None); // header hint
         // text area
         let lines = self.lines();
         let vis = ((c.h as i32 - 34) / 16) as usize;
@@ -185,7 +187,11 @@ impl Editor {
         }
         // status bar (becomes the find field while Ctrl-F is active)
         c.fill(0, c.h as i32 - 22, c.w as i32, 22, draw::PANEL);
-        if let Some(q) = &self.find_q {
+        if let Some(q) = &self.rep_q {
+            c.text(8, c.h as i32 - 19, &alloc::format!("replace: {}_", q), draw::TEXT, None);
+        } else if let Some(q) = &self.rep_with {
+            c.text(8, c.h as i32 - 19, &alloc::format!("with: {}_", q), draw::TEXT, None);
+        } else if let Some(q) = &self.find_q {
             c.text(8, c.h as i32 - 19, &alloc::format!("find: {}_", q), draw::TEXT, None);
         } else if let Some(q) = &self.goto_q {
             c.text(8, c.h as i32 - 19, &alloc::format!("goto line: {}_", q), draw::TEXT, None);
@@ -342,6 +348,72 @@ impl Editor {
             self.dirty_ui = true;
             return;
         }
+        // replace mode: Enter locks the search term, second Enter runs
+        // a real replace-all (each replacement recorded for undo)
+        if self.rep_q.is_some() || self.rep_with.is_some() {
+            match k.key as u32 {
+                x if x == KeyCode::Escape as u32 => {
+                    self.rep_q = None;
+                    self.rep_with = None;
+                    self.status = String::from("replace cancelled");
+                }
+                x if x == KeyCode::Backspace as u32 => {
+                    if let Some(w) = &mut self.rep_with {
+                        w.pop();
+                    } else if let Some(q) = &mut self.rep_q {
+                        q.pop();
+                    }
+                }
+                x if x == KeyCode::Char as u32 => {
+                    if let Some(w) = &mut self.rep_with {
+                        w.push(k.chr as char);
+                    } else if let Some(q) = &mut self.rep_q {
+                        q.push(k.chr.to_ascii_lowercase() as char);
+                    }
+                }
+                x if x == KeyCode::Enter as u32 => {
+                    if self.rep_with.is_some() {
+                        // phase 2: run the replace-all, clear both fields
+                        let q = self.rep_q.take().unwrap_or_default();
+                        let w = self.rep_with.take().unwrap_or_default();
+                        if !q.is_empty() {
+                            let hay = self.text.to_lowercase();
+                            let mut pos = Vec::new();
+                            let mut from = 0usize;
+                            while let Some(i) = hay[from..].find(&q) {
+                                pos.push(from + i);
+                                from += i + q.len();
+                            }
+                            let n = pos.len();
+                            // apply back-to-front so earlier offsets stay valid
+                            for &i in pos.iter().rev() {
+                                let del = String::from(&self.text[i..i + q.len()]);
+                                self.rec(i, del, String::from(w.as_str()));
+                                self.text.replace_range(i..i + q.len(), &w);
+                            }
+                            self.ins_tail = None;
+                            self.dirty_text = true;
+                            self.dirty_ui = true;
+                            self.status = alloc::format!("replaced {} of '{}'", n, q);
+                        }
+                    } else {
+                        // phase 1 done: keep the query in rep_q, arm rep_with
+                        match &self.rep_q {
+                            Some(q) if !q.is_empty() => {
+                                self.rep_with = Some(String::new());
+                            }
+                            _ => {
+                                self.rep_q = None;
+                                self.status = String::from("empty search");
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            self.dirty_ui = true;
+            return;
+        }
         // find mode: keys go to the query
         if self.find_q.is_some() {
             match k.key as u32 {
@@ -378,6 +450,11 @@ impl Editor {
         // ctrl chords: save + clipboard
         if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 {
             match k.chr.to_ascii_lowercase() {
+                b'h' => {
+                    self.rep_q = Some(String::new());
+                    self.dirty_ui = true;
+                    return;
+                }
                 b'f' => {
                     self.find_q = Some(String::new());
                     self.dirty_ui = true;
@@ -598,6 +675,8 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         cx: 0,
         sel: None,
         find_q: None,
+        rep_q: None,
+        rep_with: None,
         goto_q: None,
         saveas_q: None,
         open_q: None,

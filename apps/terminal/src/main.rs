@@ -260,6 +260,19 @@ fn host_arg(s: &str) -> Option<[u8; 4]> {
     parse_ipv4(s).or_else(|| ustd::net_dns(s))
 }
 
+/// Human-readable byte count for `du -h`/`df -h`: B/K/M/G suffixes.
+fn human_size(n: u64) -> String {
+    if n >= 1 << 30 {
+        alloc::format!("{}.{:01}G", n >> 30, (n % (1 << 30)) * 10 / (1 << 30))
+    } else if n >= 1 << 20 {
+        alloc::format!("{}.{:01}M", n >> 20, (n % (1 << 20)) * 10 / (1 << 20))
+    } else if n >= 1 << 10 {
+        alloc::format!("{}.{:01}K", n >> 10, (n % (1 << 10)) * 10 / (1 << 10))
+    } else {
+        alloc::format!("{}B", n)
+    }
+}
+
 /// Shell-style wildcard match: `*` (any run) and `?` (single char).
 fn wild_match(pat: &str, s: &str) -> bool {
     let (p, s) = (pat.as_bytes(), s.as_bytes());
@@ -572,6 +585,7 @@ struct Term {
     pager: Option<(Vec<String>, usize)>,               // (all lines, page top) for `more`
     httpd: Option<(ustd::TcpListener, String)>,        // `httpd <port> [root]` server mode
     nc: Option<ustd::TcpSock>,                         // `nc <ip> <port>` raw session
+    nc_listen: Option<ustd::TcpListener>,              // `nc -l <port>` waiting for a client
     last_ok: bool,                                     // success of the last statement (for && / ||)
     sel: Option<((usize, usize), (usize, usize))>,     // scrollback selection (line,col)->(line,col)
     sel_drag: bool,                                    // left button currently held
@@ -1135,6 +1149,7 @@ impl Term {
                     "          grep -A/-B/-C/-m/-w/-x  sed -i / '2,4d' / 'Np'  expand -t N",
                     "          find -name/-type/-maxdepth  Ctrl-R history search  .cosmosrc",
                     "          at <secs> <cmd>  httpd <port> [root] serves real files",
+                    "          nc -l <port> listens  file <path> magic type  du/df -h human",
                     "          more: Space/b page, / search, n next",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
@@ -1697,20 +1712,65 @@ impl Term {
                 },
                 None => self.fail("usage: hex <file>  (first 1KiB)"),
             },
-            "du" => match args.first() {
-                Some(p) => {
-                    let n = self.du_tree(p, 0);
-                    self.emit(&alloc::format!("  {} B total", n));
+            "du" => {
+                let (human, p) = if args.first().map(|s| *s) == Some("-h") {
+                    (true, args.get(1).copied())
+                } else {
+                    (false, args.first().copied())
+                };
+                match p {
+                    Some(p) => {
+                        let n = self.du_tree(p, 0, human);
+                        if human {
+                            self.emit(&alloc::format!("  {} total", human_size(n)));
+                        } else {
+                            self.emit(&alloc::format!("  {} B total", n));
+                        }
+                    }
+                    None => self.fail("usage: du [-h] <path>  (recursive bytes)"),
                 }
-                None => self.fail("usage: du <path>  (recursive bytes)"),
-            },
-            "df" => match ustd::df() {
-                Some((total, free)) => {
-                    let used = total - free;
-                    self.emit(&alloc::format!("  total {} MiB  used {} MiB  free {} MiB", total / (1024 * 1024), used / (1024 * 1024), free / (1024 * 1024)));
-                    self.emit(&alloc::format!("  ({} B / {} B used)", used, total));
+            }
+            "df" => {
+                let human = args.first().map(|s| *s) == Some("-h");
+                match ustd::df() {
+                    Some((total, free)) => {
+                        let used = total - free;
+                        if human {
+                            self.emit(&alloc::format!(
+                                "  total {}  used {}  free {}",
+                                human_size(total), human_size(used), human_size(free)
+                            ));
+                        } else {
+                            self.emit(&alloc::format!("  total {} MiB  used {} MiB  free {} MiB", total / (1024 * 1024), used / (1024 * 1024), free / (1024 * 1024)));
+                            self.emit(&alloc::format!("  ({} B / {} B used)", used, total));
+                        }
+                    }
+                    None => self.emit("df: no volume mounted"),
                 }
-                None => self.emit("df: no volume mounted"),
+            }
+            "file" => match args.first() {
+                Some(p) => match ustd::read_all(p) {
+                    Ok(d) => {
+                        let kind = if d.len() >= 4 && &d[0..4] == b"\x7fELF" {
+                            alloc::format!("ELF 64-bit executable ({} B)", d.len())
+                        } else if d.len() >= 2 && &d[0..2] == b"P6" {
+                            String::from("P6 PPM image")
+                        } else if d.len() >= 2 && d[0] == 0x1f && d[1] == 0x8b {
+                            String::from("gzip compressed data")
+                        } else if d.len() >= 262 && &d[257..262] == b"ustar" {
+                            alloc::format!("ustar archive ({} B)", d.len())
+                        } else if d.len() >= 4 && &d[0..4] == b"%PDF" {
+                            String::from("PDF document")
+                        } else if d.iter().all(|b| b.is_ascii_graphic() || *b == b' ' || *b == b'\n' || *b == b'\r' || *b == b'\t') {
+                            alloc::format!("ASCII text ({} B, {} lines)", d.len(), d.iter().filter(|&&b| b == b'\n').count())
+                        } else {
+                            alloc::format!("data ({} B)", d.len())
+                        };
+                        self.emit(&alloc::format!("{}: {}", p, kind));
+                    }
+                    Err(e) => self.fail(&alloc::format!("file: {}: err {}", p, e)),
+                },
+                None => self.fail("usage: file <path>  (identify by magic)"),
             },
             "shot" => {
                 // shot [path]: kernel dumps the live framebuffer to a P6 PPM
@@ -1860,24 +1920,40 @@ impl Term {
                 }
             }
             "nc" => {
-                match (
-                    args.first().and_then(|s| host_arg(s)),
-                    args.get(1).and_then(|s| s.parse::<u16>().ok()),
-                ) {
-                    (Some(ip), Some(port)) => {
-                        let lport = 40000u16 + (ustd::uptime_ms() % 2000) as u16;
-                        match ustd::TcpSock::connect(lport, ip, port) {
-                            Some(s) => {
+                if args.first().map(|s| *s) == Some("-l") {
+                    match args.get(1).and_then(|s| s.parse::<u16>().ok()) {
+                        Some(port) => match ustd::TcpListener::bind(port) {
+                            Some(l) => {
                                 self.emit(&alloc::format!(
-                                    "nc: connected to {}.{}.{}.{}:{} — keystrokes send, Esc closes",
-                                    ip[0], ip[1], ip[2], ip[3], port
+                                    "nc: listening on :{} — Esc cancels",
+                                    port
                                 ));
-                                self.nc = Some(s);
+                                self.nc_listen = Some(l);
                             }
-                            None => self.fail(&alloc::format!("nc: connect to :{} failed", port)),
-                        }
+                            None => self.fail(&alloc::format!("nc: listen :{} failed", port)),
+                        },
+                        None => self.fail("usage: nc -l <port>"),
                     }
-                    _ => self.fail("usage: nc <host|a.b.c.d> <port>  (raw TCP session, Esc closes)"),
+                } else {
+                    match (
+                        args.first().and_then(|s| host_arg(s)),
+                        args.get(1).and_then(|s| s.parse::<u16>().ok()),
+                    ) {
+                        (Some(ip), Some(port)) => {
+                            let lport = 40000u16 + (ustd::uptime_ms() % 2000) as u16;
+                            match ustd::TcpSock::connect(lport, ip, port) {
+                                Some(s) => {
+                                    self.emit(&alloc::format!(
+                                        "nc: connected to {}.{}.{}.{}:{} — keystrokes send, Esc closes",
+                                        ip[0], ip[1], ip[2], ip[3], port
+                                    ));
+                                    self.nc = Some(s);
+                                }
+                                None => self.fail(&alloc::format!("nc: connect to :{} failed", port)),
+                            }
+                        }
+                        _ => self.fail("usage: nc <host|a.b.c.d> <port>  |  nc -l <port>  (Esc closes)"),
+                    }
                 }
             }
             "watch" => {
@@ -3476,6 +3552,13 @@ impl Term {
             self.dirty_all = true;
             return;
         }
+        // nc -l: Esc cancels the pending listen
+        if self.nc_listen.is_some() && k.key == KeyCode::Escape as u32 {
+            self.nc_listen = None;
+            self.push_line("nc: listen cancelled");
+            self.dirty_all = true;
+            return;
+        }
         // during watch/tail -f/yes modes, Esc or Enter stops; other keys ignored
         if self.watch.is_some() || self.tailf.is_some() || self.yesing.is_some() {
             if k.key == KeyCode::Escape as u32 || k.key == KeyCode::Enter as u32 {
@@ -3601,7 +3684,7 @@ impl Term {
         "uniq", "tr", "cut", "tee", "base64", "sha256sum", "tar", "show",
         "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
         "alias", "unalias", "type", "hostname", "id", "printf", "dd", "split",
-        "source", "comm", "join", "paste", "expand", "unexpand", "at",
+        "source", "comm", "join", "paste", "expand", "unexpand", "at", "file",
     ];
 
     /// Tab-complete: command names before the first space, paths after.
@@ -3686,7 +3769,7 @@ impl Term {
     }
 
     /// Recursive byte total for `du`.
-    fn du_tree(&mut self, path: &str, depth: usize) -> u64 {
+    fn du_tree(&mut self, path: &str, depth: usize, human: bool) -> u64 {
         match ustd::readdir(path) {
             Ok(ents) => {
                 let mut total = 0u64;
@@ -3694,11 +3777,15 @@ impl Term {
                     let name = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("?");
                     let p = alloc::format!("{}{}{}", path, if path.ends_with('/') { "" } else { "/" }, name);
                     if e.is_dir != 0 {
-                        total += self.du_tree(&p, depth + 1);
+                        total += self.du_tree(&p, depth + 1, human);
                     } else {
                         total += e.size;
                         if depth == 0 {
-                            self.emit(&alloc::format!("  {:>8} {}", e.size, p));
+                            if human {
+                                self.emit(&alloc::format!("  {:>8} {}", human_size(e.size), p));
+                            } else {
+                                self.emit(&alloc::format!("  {:>8} {}", e.size, p));
+                            }
                         }
                     }
                 }
@@ -4045,6 +4132,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         watch: None,
         httpd: None,
         nc: None,
+        nc_listen: None,
         last_ok: true,
         vars: alloc::collections::BTreeMap::new(),
         prev_cwd: String::new(),
@@ -4267,6 +4355,18 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                     "httpd: {} -> {} <- {}.{}.{}.{}:{}",
                     first,
                     status,
+                    rip[0], rip[1], rip[2], rip[3], rport
+                ));
+                t.dirty_all = true;
+            }
+        }
+        // nc -l: accept a pending inbound connection into the nc session
+        if let Some(l) = &t.nc_listen {
+            if let Some((s, rip, rport)) = l.accept(0) {
+                t.nc = Some(s);
+                t.nc_listen = None;
+                t.push_line(&alloc::format!(
+                    "nc: client {}.{}.{}.{}:{} connected — keystrokes send, Esc closes",
                     rip[0], rip[1], rip[2], rip[3], rport
                 ));
                 t.dirty_all = true;

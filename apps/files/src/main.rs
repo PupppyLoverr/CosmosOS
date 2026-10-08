@@ -28,13 +28,20 @@ struct Files {
     editing: bool,
     rename_from: Option<String>, // F2 rename: full path of the entry being renamed
     menu: Option<(i32, i32, usize)>, // right-click menu: (x, y, entry index)
+    sort_by_size: bool,              // `s` toggles name<->size ordering
     dirty: bool,
 }
 
 impl Files {
     fn reload(&mut self) {
         self.ents = ustd::readdir(&self.cwd).unwrap_or_default();
-        self.ents.sort_by(|a, b| (b.is_dir.cmp(&a.is_dir)).then(a.name.cmp(&b.name)));
+        if self.sort_by_size {
+            self.ents.sort_by(|a, b| {
+                (b.is_dir.cmp(&a.is_dir)).then(b.size.cmp(&a.size)).then(a.name.cmp(&b.name))
+            });
+        } else {
+            self.ents.sort_by(|a, b| (b.is_dir.cmp(&a.is_dir)).then(a.name.cmp(&b.name)));
+        }
         self.sel = -1;
         self.scroll = 0;
         self.dirty = true;
@@ -95,7 +102,7 @@ impl Files {
         c.fill(0, 0, c.w as i32, c.h as i32, draw::PANEL);
         // toolbar
         c.fill(0, 0, c.w as i32, 34, draw::EDGE);
-        c.text(10, 9, &alloc::format!("{}  {} items", self.cwd, self.ents.len()), draw::TEXT, None);
+        c.text(10, 9, &alloc::format!("{}  {} items  [by {}]", self.cwd, self.ents.len(), if self.sort_by_size { "size" } else { "name" }), draw::TEXT, None);
         let bw = 96;
         c.fill(c.w as i32 - bw - 8 - bw - 8, 5, bw, 24, draw::PANEL);
         c.border(c.w as i32 - bw - 8 - bw - 8, 5, bw, 24, draw::EDGE);
@@ -318,6 +325,14 @@ impl Files {
             }
             x if x == KeyCode::Delete as u32 => self.delete_sel(),
             x if x == KeyCode::F2 as u32 => self.start_rename(),
+            x if x == KeyCode::Char as u32 && k.chr.to_ascii_lowercase() == b's' => {
+                self.sort_by_size = !self.sort_by_size;
+                self.status = alloc::format!(
+                    "sort: {}",
+                    if self.sort_by_size { "size" } else { "name" }
+                );
+                self.reload();
+            }
             x if x == KeyCode::Backspace as u32 => {
                 if self.cwd != "/" {
                     let mut parts: Vec<&str> = self.cwd.split('/').filter(|s| !s.is_empty()).collect();
@@ -360,6 +375,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         editing: false,
         rename_from: None,
         menu: None,
+        sort_by_size: false,
         dirty: true,
     };
     f.reload();
