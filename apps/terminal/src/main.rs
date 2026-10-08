@@ -1865,6 +1865,9 @@ struct Term {
     jobs: Vec<(u32, String)>,   // tracked spawned processes (jobs/fg/disown/$!)
     last_spawn: u32,            // pid of the most recent spawned process ($!)
     strace_p: Option<u32>,      // pid being syscall-traced (strace -p, modal)
+    setx: bool,                 // set -x: echo each statement before running
+    errexit: bool,              // set -e: abort the statement list on failure
+    no_alias_once: bool,        // builtin/command: skip alias expansion once
     top_last: u64,
     top_prev: Vec<(u32, u64)>,  // (pid, cpu_ticks) snapshot for %CPU deltas                      // `tail -f`: (path, next byte offset)
     tailf_last: u64,                                   // last poll ms
@@ -1881,6 +1884,7 @@ struct Term {
     rs: Option<(String, usize)>,                       // Ctrl-R search: (query, oldest scanned hist idx)
     rs_saved: String,                                  // edit line saved when rsearch began
     run_depth: u8,                                     // nested run() calls don't record history
+    read_modal: Option<(String, usize)>,               // interactive `read VAR` awaiting a typed line
     block_buf: String,                                 // unfinished for/while/if/heredoc input awaiting its closer
     heredocs: Vec<String>,                             // heredoc bodies extracted by norm_stmts (`<<\x01N` markers)
     flow: u8,                                          // 0 none, 1 break, 2 continue, 3 script-exit
@@ -2178,6 +2182,29 @@ impl Term {
                 // $# -- script positional-argument count (0 outside scripts)
                 out.push_str(self.vars.get("#").map(|s| s.as_str()).unwrap_or("0"));
                 i += 2;
+            } else if b[i] == b'$' && i + 2 < b.len() && b[i + 1] == b'(' && b[i + 2] == b'(' {
+                // $((expr)) -- arithmetic via the real expression evaluator
+                let mut depth = 2usize;
+                let mut j = i + 3;
+                while j < b.len() && depth > 0 {
+                    match b[j] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if depth == 0 {
+                    let inner = core::str::from_utf8(&b[i + 3..j - 2]).unwrap_or("");
+                    match expr_eval(inner) {
+                        Ok(v) => out.push_str(&alloc::format!("{}", v)),
+                        Err(e) => out.push_str(&alloc::format!("$(({}:{}))", inner, e)),
+                    }
+                    i = j;
+                } else {
+                    out.push('$');
+                    i += 1;
+                }
             } else if b[i] == b'$' && i + 1 < b.len() && (b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_') {
                 let mut j = i + 1;
                 while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
@@ -2272,6 +2299,12 @@ impl Term {
                     i += 1;
                 }
                 b'$' if !sq && i + 1 < b.len() && b[i + 1] == b'(' => {
+                    // $(( is arithmetic — expand_vars owns it, not subst
+                    if i + 2 < b.len() && b[i + 2] == b'(' {
+                        out.push('$');
+                        i += 1;
+                        continue;
+                    }
                     // find matching ')' (nesting counts)
                     let mut d = 1i32;
                     let mut j = i + 2;
@@ -2452,7 +2485,21 @@ impl Term {
     }
 
     fn prompt_str(&self) -> String {
+        if self.read_modal.is_some() {
+            return String::new();
+        }
         alloc::format!("{} $ ", ustd::getcwd())
+    }
+
+    fn finish_read(&mut self, line: String) {
+        if let Some((var, n)) = self.read_modal.take() {
+            let v = if n > 0 && line.len() > n {
+                line[..n].to_string()
+            } else {
+                line
+            };
+            self.vars.insert(var, v);
+        }
     }
 
     fn redraw(&mut self) {
@@ -2894,6 +2941,9 @@ impl Term {
                         self.emit(&alloc::format!("+ {}", s));
                     }
                     self.run(&s);
+                    if self.errexit && !self.last_ok {
+                        return;
+                    }
                 }
             }
         }
@@ -2931,8 +2981,17 @@ impl Term {
             }
             return;
         }
+        // set -x: echo each statement (bash-style '+' prefix)
+        if self.setx {
+            self.emit(&alloc::format!("+ {}", input));
+        }
         // alias expansion on the command word (chains resolve, cap 8)
-        let aliased = self.expand_alias(input);
+        let aliased = if self.no_alias_once {
+            self.no_alias_once = false;
+            String::from(input)
+        } else {
+            self.expand_alias(input)
+        };
         let input = aliased.as_str();
         // `cmd &`: spawn a /bin/<cmd> process and track it as a job.
         // (Builtins are in-process — a trailing & on one is a syntax error.)
@@ -2960,6 +3019,9 @@ impl Term {
             self.last_ok = true;
             self.run(l);
             let ok = self.last_ok;
+            if self.errexit && !ok {
+                return; // set -e: a failed stmt aborts the rest of the list
+            }
             match op {
                 b';' => self.run(r),
                 b'&' if ok => self.run(r),
@@ -2989,6 +3051,22 @@ impl Term {
         if let Some(li) = find_unquoted(input, b'<') {
             let left = input[..li].trim();
             let rest = input[li + 1..].trim();
+            // here-string: `cmd <<< text` — expanded text becomes stdin
+            if rest.starts_with("<<") {
+                let mut txt = rest[2..].trim();
+                if txt.len() >= 2
+                    && ((txt.starts_with('"') && txt.ends_with('"'))
+                        || (txt.starts_with('\'') && txt.ends_with('\'')))
+                {
+                    txt = &txt[1..txt.len() - 1];
+                }
+                let sub = self.expand_subst(txt);
+                let expanded = self.expand_vars(&sub);
+                let saved = self.pipe_in.replace(expanded);
+                self.run(left);
+                self.pipe_in = saved;
+                return;
+            }
             // heredoc: `<<\x01N` marker left by norm_stmts -> stdin = body N
             if rest.starts_with('<') {
                 let tag = rest[1..].trim_start();
@@ -3319,7 +3397,19 @@ impl Term {
                 }
             }
             "set" => {
-                // set NAME=value | set   (list) | set -u NAME (unset)
+                // set NAME=value | set | set -u NAME | set -x|+x|-e|+e
+                match args.first().map(|a| *a) {
+                    Some("-x") | Some("+x") | Some("-e") | Some("+e") => {
+                        match args[0] {
+                            "-x" => self.setx = true,
+                            "+x" => self.setx = false,
+                            "-e" => self.errexit = true,
+                            _ => self.errexit = false,
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
                 if args.is_empty() {
                     for i in 0..self.vars.len() {
                         let (k, v) = self.vars.iter().nth(i).unwrap();
@@ -3370,6 +3460,17 @@ impl Term {
                 None => self.emit("man: what manual page do you want?"),
             },
             "env" => {
+                // env [-i] [cmd...]: -i runs the command with cleared vars
+                if args.first() == Some(&"-i") {
+                    let rest: Vec<&str> = args[1..].to_vec();
+                    if rest.is_empty() {
+                        return;
+                    }
+                    let saved = core::mem::take(&mut self.vars);
+                    self.run(&rest.join(" "));
+                    self.vars = saved;
+                    return;
+                }
                 for i in 0..self.vars.len() {
                     let (k, v) = self.vars.iter().nth(i).unwrap();
                     let line = alloc::format!("{}={}", k, v);
@@ -5976,33 +6077,59 @@ impl Term {
                     self.emit(l);
                 }
             }
-            "kill" => match args.first() {
-                Some(a) => {
-                    let pid = if let Some(n) = a.strip_prefix('%') {
-                        match n.parse::<usize>().ok().and_then(|i| self.jobs.get(i.wrapping_sub(1))) {
-                            Some((p, _)) => *p,
-                            None => {
-                                self.fail(&alloc::format!("kill: %{}: no such job", n));
+            "kill" => {
+                // kill [-9|-15|-18|-19|-KILL|-TERM|-STOP|-CONT] <pid|%n>
+                let mut sig: u64 = 15;
+                let mut ti = 0usize;
+                while let Some(a) = args.get(ti) {
+                    if a.starts_with('-') && a.len() > 1 {
+                        sig = match *a {
+                            "-9" | "-KILL" => 9,
+                            "-15" | "-TERM" => 15,
+                            "-19" | "-STOP" => 19,
+                            "-18" | "-CONT" => 18,
+                            _ => {
+                                self.fail(&alloc::format!("kill: bad signal {}", a));
                                 return;
                             }
-                        }
+                        };
+                        ti += 1;
                     } else {
-                        match a.parse::<u32>() {
-                            Ok(p) => p,
-                            Err(_) => {
-                                self.fail("usage: kill <pid|%n>");
-                                return;
-                            }
-                        }
-                    };
-                    if ustd::kill(pid) {
-                        self.jobs.retain(|(p, _)| *p != pid);
-                        self.emit(&alloc::format!("killed {}", pid));
-                    } else {
-                        self.fail("kill: no such pid");
+                        break;
                     }
                 }
-                None => self.fail("usage: kill <pid|%n>"),
+                let Some(a) = args.get(ti) else {
+                    self.fail("usage: kill [-sig] <pid|%n>");
+                    return;
+                };
+                let pid = if let Some(n) = a.strip_prefix('%') {
+                    match n.parse::<usize>().ok().and_then(|i| self.jobs.get(i.wrapping_sub(1))) {
+                        Some((p, _)) => *p,
+                        None => {
+                            self.fail(&alloc::format!("kill: %{}: no such job", n));
+                            return;
+                        }
+                    }
+                } else {
+                    match a.parse::<u32>() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            self.fail("usage: kill [-sig] <pid|%n>");
+                            return;
+                        }
+                    }
+                };
+                let r = ustd::kill2(pid, sig);
+                if r == 0 {
+                    if sig == 9 || sig == 15 {
+                        self.jobs.retain(|(p, _)| *p != pid);
+                    }
+                    self.emit(&alloc::format!(
+                        "{} {}", match sig { 9 | 15 => "killed", 19 => "stopped", _ => "continued" }, pid
+                    ));
+                } else {
+                    self.fail("kill: no such pid (or protected)");
+                }
             },
             "killall" => match args.first() {
                 Some(name) => {
@@ -6800,8 +6927,18 @@ impl Term {
                 let jlist = self.jobs.clone();
                 for (i, (pid, c)) in jlist.iter().enumerate() {
                     if live.contains(pid) {
+                        // real state from the kernel via /proc, not cached
+                        let state = ustd::read_all(&alloc::format!("/proc/{}/status", pid))
+                            .map(|d| {
+                                if String::from_utf8_lossy(&d).contains("T (stopped)") {
+                                    "stopped "
+                                } else {
+                                    "running "
+                                }
+                            })
+                            .unwrap_or("running ");
                         self.emit(&alloc::format!(
-                            "[{}]{} {} running  {}", i + 1, if i + 1 == last { "+" } else { " " }, pid, c
+                            "[{}]{} {} {} {}", i + 1, if i + 1 == last { "+" } else { " " }, pid, state, c
                         ));
                         keep.push((*pid, c.clone()));
                     } else {
@@ -6813,8 +6950,26 @@ impl Term {
                 }
                 self.jobs = keep;
             }
+            "bg" => {
+                // bg [n]: SIGCONT job n — keeps running in the background
+                let idx = args
+                    .first()
+                    .map(|a| a.trim_start_matches('%').parse::<usize>().ok())
+                    .flatten()
+                    .unwrap_or(self.jobs.len());
+                match idx.checked_sub(1).and_then(|i| self.jobs.get(i).cloned()) {
+                    Some((pid, c)) => {
+                        if ustd::kill2(pid, 18) == 0 {
+                            self.emit(&alloc::format!("[{}]+ {} &", idx, c));
+                        } else {
+                            self.fail(&alloc::format!("bg: {}: gone", pid));
+                        }
+                    }
+                    None => self.fail("bg: no such job"),
+                }
+            }
             "fg" => {
-                // fg [n]: wait on job n (default: most recent) to exit
+                // fg [n]: SIGCONT (in case stopped), then wait for exit
                 let idx = args
                     .first()
                     .map(|a| a.trim_start_matches('%').parse::<usize>().ok())
@@ -6822,6 +6977,7 @@ impl Term {
                     .unwrap_or(self.jobs.len());
                 match idx.checked_sub(1).and_then(|i| self.jobs.get(i).map(|j| j.0)) {
                     Some(pid) => {
+                        ustd::kill2(pid, 18);
                         self.jobs.retain(|(p, _)| *p != pid);
                         match ustd::waitpid(pid, 60_000) {
                             Ok(code) => self.emit(&alloc::format!("[{}] exited ({})", pid, code)),
@@ -6855,7 +7011,30 @@ impl Term {
                             self.strace_p = Some(pid);
                         }
                     }
-                    None => self.fail("usage: strace -p <pid>"),
+                    None => {
+                        // strace <cmd...>: spawn the binary already traced
+                        let Some(w) = args.first() else {
+                            self.fail("usage: strace -p <pid> | strace <cmd...>");
+                            return;
+                        };
+                        let path = alloc::format!("/bin/{}", w);
+                        if ustd::stat(&path).is_err() {
+                            self.fail(&alloc::format!("strace: {}: not a binary", w));
+                            return;
+                        }
+                        match ustd::spawn(&path, &args[1..].join(" ")) {
+                            Ok(pid) => {
+                                self.track(pid, &path);
+                                if ustd::strace(0, pid, &mut []) == 0 {
+                                    self.emit(&alloc::format!("strace: attached to {} (q to detach)", pid));
+                                    self.strace_p = Some(pid);
+                                } else {
+                                    self.fail("strace: attach failed");
+                                }
+                            }
+                            Err(_) => self.fail(&alloc::format!("strace: {}: spawn failed", w)),
+                        }
+                    }
                 }
             }
             "iostat" => match ustd::read_all("/proc/iostat") {
@@ -6877,6 +7056,114 @@ impl Term {
                 Err(e) => self.fail(&alloc::format!("iostat: err {}", e)),
             },
             "halt" => ustd::poweroff(),
+            "tput" => match args.first() {
+                Some(&"cols") => self.emit(&alloc::format!("{}", COLS)),
+                Some(&"lines") => self.emit(&alloc::format!("{}", ROWS)),
+                _ => self.fail("usage: tput cols|lines"),
+            },
+            "builtin" | "command" => {
+                // run cmd bypassing alias expansion (still hits builtins)
+                if args.is_empty() {
+                    self.fail("usage: builtin|command <cmd...>");
+                    return;
+                }
+                self.no_alias_once = true;
+                self.run(&args.join(" "));
+            }
+            "exec" => {
+                // exec <cmd...>: replace the terminal process (window closes)
+                match args.first() {
+                    Some(w) => {
+                        let path = alloc::format!("/bin/{}", w);
+                        if ustd::stat(&path).is_ok() {
+                            match ustd::spawn(&path, &args[1..].join(" ")) {
+                                Ok(_) => self.win.close(),
+                                Err(_) => self.fail(&alloc::format!("exec: {}: spawn failed", w)),
+                            }
+                        } else {
+                            self.fail(&alloc::format!("exec: {}: not a binary", w));
+                        }
+                    }
+                    None => self.fail("usage: exec <cmd...>"),
+                }
+            }
+            "sysctl" => {
+                // real kernel/machine parameters
+                let mi = ustd::meminfo();
+                self.emit(&alloc::format!("kernel.hostname = {}", self.host));
+                self.emit("kernel.osrelease = 0.1");
+                self.emit("kernel.arch = x86_64");
+                self.emit(&alloc::format!("vm.page_size = {}", 4096));
+                self.emit(&alloc::format!("vm.mem_total_kb = {}", mi.total_kb));
+                self.emit(&alloc::format!("vm.mem_free_kb = {}", mi.total_kb.saturating_sub(mi.used_kb)));
+                self.emit("hw.ncpu = 1");
+            }
+            "dos2unix" | "unix2dos" => {
+                // convert CRLF<->LF on a file in place, or pipe content
+                match args.first() {
+                    Some(p) => match ustd::read_all(p) {
+                        Ok(d) => {
+                            let t = String::from_utf8_lossy(&d).into_owned();
+                            let out = if cmd == "dos2unix" {
+                                t.replace("\r\n", "\n")
+                            } else {
+                                t.replace("\r\n", "\n").replace("\n", "\r\n")
+                            };
+                            match ustd::write_all(p, out.as_bytes()) {
+                                Ok(()) => self.emit(&alloc::format!("{}: {} converted", cmd, p)),
+                                Err(e) => self.fail(&alloc::format!("{}: write err {}", cmd, e)),
+                            }
+                        }
+                        Err(e) => self.fail(&alloc::format!("{}: {}: err {}", cmd, p, e)),
+                    },
+                    None => match self.pipe_in.clone() {
+                        Some(t) => {
+                            let out = if cmd == "dos2unix" {
+                                t.replace("\r\n", "\n")
+                            } else {
+                                t.replace("\r\n", "\n").replace("\n", "\r\n")
+                            };
+                            for l in out.split('\n') {
+                                self.emit(l);
+                            }
+                        }
+                        None => self.fail(&alloc::format!("usage: {} <file>  (or pipe)", cmd)),
+                    },
+                }
+            }
+            "base32" => {
+                // RFC 4648 base32 (-d decodes); file arg or stdin
+                let dec = args.iter().any(|a| a == &"-d");
+                let src = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .and_then(|p| ustd::read_all(p).ok())
+                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                    .or_else(|| self.pipe_in.clone());
+                match src {
+                    Some(t) => {
+                        if dec {
+                            match b32_decode(t.trim()) {
+                                Some(d) => match String::from_utf8(d.clone()) {
+                                    Ok(s) => {
+                                        for l in s.lines() {
+                                            self.emit(l);
+                                        }
+                                    }
+                                    Err(_) => self.emit(&hexs(&d)),
+                                },
+                                None => self.fail("base32: bad input"),
+                            }
+                        } else {
+                            for l in b32_encode(t.as_bytes()).lines() {
+                                self.emit(l);
+                            }
+                        }
+                    }
+                    None => self.fail("usage: base32 [-d] [file]"),
+                }
+            }
+
             "arch" | "nproc" => {
                 if cmd == "arch" {
                     self.emit("x86_64");
@@ -7206,18 +7493,47 @@ impl Term {
                 }
             }
             "read" => {
-                // read VAR: consume one stdin (pipe) line into $VAR
-                match args.first() {
+                // read [-p prompt] [-n count] VAR: stdin (pipe) line -> $VAR
+                let mut prompt = "";
+                let mut ncount: usize = 0;
+                let mut ai = 0usize;
+                while ai < args.len() {
+                    match args[ai] {
+                        "-p" => {
+                            prompt = args.get(ai + 1).unwrap_or(&"");
+                            ai += 2;
+                        }
+                        "-n" => {
+                            ncount = args.get(ai + 1).and_then(|x| x.parse().ok()).unwrap_or(0);
+                            ai += 2;
+                        }
+                        _ => break,
+                    }
+                }
+                let rargs = &args[ai..];
+                if !prompt.is_empty() {
+                    self.emit(prompt);
+                }
+                match rargs.first() {
                     Some(v) => match self.pipe_in.clone() {
                         Some(s) => {
                             let mut it = s.splitn(2, '\n');
                             let line = it.next().unwrap_or("");
+                            let line = if ncount > 0 && line.len() > ncount { &line[..ncount] } else { line };
                             self.vars.insert(String::from(*v), String::from(line));
                             // remaining lines stay in stdin for the next `read`
                             self.pipe_in = it.next().map(|r| String::from(r));
                             self.emit(&alloc::format!("{}='{}'", v, line));
                         }
-                        None => self.fail("read: no input (pipe lines in)"),
+                        None => {
+                            // interactive top-level only: capture the next
+                            // line the user types (script bodies have no tty)
+                            if self.run_depth == 1 && self.script_depth == 0 {
+                                self.read_modal = Some((String::from(*v), ncount));
+                            } else {
+                                self.fail("read: no input (pipe lines in)");
+                            }
+                        }
                     },
                     None => self.fail("usage: <cmd> | read VAR"),
                 }
@@ -8105,12 +8421,29 @@ impl Term {
         } else if k.key == KeyCode::Char as u32 {
             self.cur.insert(self.cx, k.chr as char);
             self.cx += 1;
+            // `read -n N` completes the instant N chars are in — no Enter
+            if let Some((_, n)) = &self.read_modal {
+                if *n > 0 && self.cur.len() >= *n {
+                    let line = core::mem::take(&mut self.cur);
+                    self.cx = 0;
+                    self.emit(&line);
+                    self.finish_read(line);
+                }
+            }
         } else if k.key == KeyCode::Enter as u32 {
             let line = core::mem::take(&mut self.cur);
             self.cx = 0;
             let prompt = self.prompt_str();
             self.emit(&alloc::format!("{}{}", prompt, line));
-            self.run(&line);
+            if self.read_modal.is_some() {
+                self.finish_read(line);
+            } else {
+                self.run(&line);
+            }
+        } else if k.key == KeyCode::Escape as u32 && self.read_modal.is_some() {
+            self.read_modal = None;
+            self.cur.clear();
+            self.cx = 0;
         } else if k.key == KeyCode::Backspace as u32 {
             if self.cx > 0 {
                 self.cx -= 1;
@@ -8174,7 +8507,8 @@ impl Term {
         "patch", "awk", "case", "esac",
         "md5sum", "uuencode", "uudecode", "zgrep", "portscan", "dig",
         "sha1sum", "od", "xxd", "banner", "units", "pr", "apropos", "whereis",
-        "jobs", "fg", "disown", "halt", "arch", "nproc", "iostat", "strace",
+        "jobs", "fg", "bg", "disown", "halt", "arch", "nproc", "iostat", "strace",
+        "tput", "builtin", "command", "exec", "dos2unix", "unix2dos", "base32", "sysctl",
         "fortune", "uuidgen", "logger", "whois", "fdisk", "vol", "blkid", "script",
         "nice", "renice", "pgrep", "pkill", "top", "dc", "vmstat", "free",
         "pcap", "ftp", "lsof", "fuser", "burn", "cron", "browse",
@@ -8870,6 +9204,9 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         jobs: Vec::new(),
         last_spawn: 0,
         strace_p: None,
+        setx: false,
+        errexit: false,
+        no_alias_once: false,
         yank: String::new(),
         cap_bin: None,
         last_cap_bin: Vec::new(),
@@ -8879,6 +9216,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         aliases: Vec::new(),
         subst_depth: 0,
         run_depth: 0,
+        read_modal: None,
         block_buf: String::new(),
         heredocs: Vec::new(),
         flow: 0,
@@ -9387,4 +9725,53 @@ fn sys_name(nr: u64) -> &'static str {
         SYS_CHDIR => "chdir",
         _ => "?",
     }
+}
+
+/// RFC 4648 base32 encode (A-Z2-7, '=' padding, 64-col lines).
+fn b32_encode(data: &[u8]) -> String {
+    const A: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::new();
+    let mut col = 0usize;
+    for ch in data.chunks(5) {
+        let mut b = [0u8; 5];
+        b[..ch.len()].copy_from_slice(ch);
+        let v = (b[0] as u64) << 32 | (b[1] as u64) << 24 | (b[2] as u64) << 16 | (b[3] as u64) << 8 | b[4] as u64;
+        let n = match ch.len() {
+            1 => 2, 2 => 4, 3 => 5, 4 => 7, _ => 8,
+        };
+        for i in 0..n {
+            out.push(A[((v >> (35 - i * 5)) & 0x1f) as usize] as char);
+        }
+        for _ in n..8 {
+            out.push('=');
+        }
+        col += 8;
+        if col >= 64 {
+            out.push('\n');
+            col = 0;
+        }
+    }
+    out
+}
+
+/// RFC 4648 base32 decode; ignores whitespace, '=' padding. None on bad char.
+fn b32_decode(t: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut acc: u64 = 0;
+    let mut nbits = 0u32;
+    for c in t.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'2'..=b'7' => c - b'2' + 26,
+            b'=' | b'\n' | b'\r' | b' ' | b'\t' => continue,
+            _ => return None,
+        };
+        acc = (acc << 5) | v as u64;
+        nbits += 5;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
+    }
+    Some(out)
 }

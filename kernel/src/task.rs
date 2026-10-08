@@ -23,6 +23,7 @@ pub const USER_ARG_PAGE: u64 = 0x7EFF_F000;
 pub enum State {
     Running,
     Blocked, // until wake_at ticks
+    Stopped, // SIGSTOP — never scheduled until SIGCONT
     Dead,
 }
 
@@ -668,6 +669,7 @@ pub fn pid_info(pid: u32) -> Option<(String, String, u64, u64, bool, &'static st
             match t.state {
                 State::Running => "R (running)",
                 State::Blocked => "S (sleeping)",
+                State::Stopped => "T (stopped)",
                 State::Dead => "Z (dead)",
             },
             t.nice,
@@ -761,4 +763,41 @@ pub fn trace_rec(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, ret: u64)
                 .extend_from_slice(&[nr, a1, a2, a3, a4, a5, ret]);
         }
     });
+}
+
+/// POSIX-lite signals: 9/15 kill, 19 STOP, 18 CONT.
+/// Vital tasks (init, winserver, kernel threads) refuse all signals.
+pub fn signal(pid: u32, sig: u64) -> i64 {
+    match sig {
+        9 | 15 => {
+            if kill_pid(pid) {
+                0
+            } else {
+                -1
+            }
+        }
+        _ => with_pid_mut(pid, |t| {
+            if !t.is_user {
+                return -1;
+            }
+            match sig {
+                19 => {
+                    if t.state != State::Dead {
+                        t.state = State::Stopped;
+                        // a stopped waiter must not wake on its old condition
+                        t.waiting_on = 0;
+                        t.wait_port = 0;
+                    }
+                    0
+                }
+                18 => {
+                    if t.state == State::Stopped {
+                        t.state = State::Running;
+                    }
+                    0
+                }
+                _ => -22, // EINVAL
+            }
+        }),
+    }
 }
