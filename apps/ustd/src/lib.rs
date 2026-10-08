@@ -143,6 +143,56 @@ pub fn sigsuspend(mask: u64) -> i64 {
     sc1(shared::SYS_SIGSUSPEND, mask) as i64
 }
 
+/// ARCH_SET_FS: install this thread's TLS base (fs segment).
+pub fn set_fs_base(addr: u64) -> i64 {
+    sc2(shared::SYS_ARCH_PRCTL, 2, addr) as i64
+}
+
+/// ARCH_GET_FS.
+pub fn get_fs_base() -> u64 {
+    sc2(shared::SYS_ARCH_PRCTL, 3, 0)
+}
+
+/// Read the thread id the kernel stored in the TCB (fs:8).
+pub fn thread_id() -> u64 {
+    let v: u64;
+    unsafe {
+        core::arch::asm!("mov {}, fs:8", out(reg) v, options(nostack, preserves_flags));
+    }
+    v
+}
+
+/// Read the TCB self pointer (fs:0).
+pub fn tls_self() -> u64 {
+    let v: u64;
+    unsafe {
+        core::arch::asm!("mov {}, fs:0", out(reg) v, options(nostack, preserves_flags));
+    }
+    v
+}
+
+pub const RLIMIT_STACK: u64 = 3;
+pub const RLIMIT_NPROC: u64 = 6;
+pub const RLIMIT_NOFILE: u64 = 7;
+
+/// getrlimit: returns the current limit for `res` (self).
+pub fn getrlimit(res: u64) -> Option<u64> {
+    let mut old = 0u64;
+    let r = sc4(
+        shared::SYS_PRLIMIT,
+        0,
+        res,
+        u64::MAX,
+        &mut old as *mut u64 as u64,
+    );
+    if is_err(r) { None } else { Some(old) }
+}
+
+/// setrlimit: set `res` on self. Returns true on success.
+pub fn setrlimit(res: u64, lim: u64) -> bool {
+    !is_err(sc4(shared::SYS_PRLIMIT, 0, res, lim, 0))
+}
+
 /// pthread-style thread: `f(arg)` runs in the caller's address space on a
 /// private 256KiB stack; the thread exits with `f`'s return code (reap
 /// with `waitpid`, same as a process). Err = no stack slot / bad entry.
@@ -156,7 +206,16 @@ pub fn thread_spawn(f: extern "C" fn(u64) -> i64, arg: u64) -> Result<u32, ()> {
     }
     let b = alloc::boxed::Box::new((f, arg));
     let raw = alloc::boxed::Box::into_raw(b) as u64;
-    let pid = sc2(shared::SYS_CLONE, entry as u64, raw);
+    // CLONE_SETTLS: hand the thread a real TCB — [0]=self ptr, [8]=tid
+    // (the kernel fills [8] once the child exists)
+    let tcb = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u64; 2]));
+    tcb[0] = tcb.as_ptr() as u64;
+    let pid = sc3(
+        shared::SYS_CLONE,
+        entry as u64,
+        raw,
+        tcb.as_ptr() as u64,
+    );
     if is_err(pid) {
         unsafe {
             drop(alloc::boxed::Box::from_raw(raw as *mut (extern "C" fn(u64) -> i64, u64)));

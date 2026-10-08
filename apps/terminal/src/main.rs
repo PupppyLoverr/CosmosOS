@@ -15566,42 +15566,72 @@ impl Term {
                 }
             }
             "ulimit" => {
-                // ulimit [-a] [-n|-s|-u|-t|-f|-v|-m [N]] — report real limits;
-                // unbounded kernel resources report unlimited. -n N sets an
-                // advisory value stored on the shell.
+                // ulimit [-a] [-n|-s|-u [N]] — REAL kernel rlimits via
+                // prlimit; -n bound is enforced on fd allocation, -u on
+                // spawn/fork/clone. Other resources report unlimited.
                 let a_mode = args.first() == Some(&"-a") || args.first() == Some(&"-H");
                 let flag = args.first().copied().unwrap_or("-n");
-                let openlim = if self.ulimit_n > 0 { alloc::format!("{}", self.ulimit_n) } else { String::from("unlimited") };
+                let fmt_lim = |r: u64| {
+                    ustd::getrlimit(r)
+                        .map(|v| {
+                            let v = if r == ustd::RLIMIT_STACK { v / 1024 } else { v };
+                            if v >= u64::MAX / 2 { String::from("unlimited") } else { alloc::format!("{}", v) }
+                        })
+                        .unwrap_or_else(|| String::from("unlimited"))
+                };
                 if a_mode {
+                    let nf = fmt_lim(ustd::RLIMIT_NOFILE);
+                    let st = fmt_lim(ustd::RLIMIT_STACK);
+                    let np = fmt_lim(ustd::RLIMIT_NPROC);
                     for (k, v) in [
                         ("-t cpu time", "unlimited"),
                         ("-f file size", "unlimited"),
                         ("-d data size", "unlimited"),
-                        ("-s stack size", "256"),      // USER_STACK_PAGES=64
+                        ("-s stack size", st.as_str()),
                         ("-m rss", "unlimited"),
-                        ("-u processes", "unlimited"),
-                        ("-n open files", openlim.as_str()),
+                        ("-u processes", np.as_str()),
+                        ("-n open files", nf.as_str()),
                         ("-v addr space", "unlimited"),
                     ] {
                         self.emit(&alloc::format!("{}  {}", k, v));
                     }
                     return;
                 }
-                match flag {
-                    "-n" => {
-                        match args.get(1) {
-                            Some(v) => match v.parse::<u64>() {
-                                Ok(n) => {
-                                    self.ulimit_n = n;
+                let res = match flag {
+                    "-n" => ustd::RLIMIT_NOFILE,
+                    "-s" => ustd::RLIMIT_STACK,
+                    "-u" => ustd::RLIMIT_NPROC,
+                    "-t" | "-f" | "-d" | "-m" | "-v" => u64::MAX,
+                    _ => {
+                        self.fail("usage: ulimit [-a] [-n|-s|-u [N]] [-t|-f|-d|-m|-v]");
+                        return;
+                    }
+                };
+                if res == u64::MAX {
+                    self.emit("unlimited");
+                    return;
+                }
+                match args.get(1) {
+                    Some(v) => {
+                        let mut lim = if *v == "unlimited" {
+                            u64::MAX / 2
+                        } else {
+                            match v.parse::<u64>() {
+                                Ok(n) => n,
+                                _ => {
+                                    self.fail("ulimit: bad value");
+                                    return;
                                 }
-                                _ => self.fail("ulimit: bad value"),
-                            },
-                            None => self.emit(&openlim),
+                            }
+                        };
+                        if res == ustd::RLIMIT_STACK && lim != u64::MAX / 2 {
+                            lim = lim.saturating_mul(1024);
+                        }
+                        if !ustd::setrlimit(res, lim) {
+                            self.fail("ulimit: setrlimit failed");
                         }
                     }
-                    "-s" => self.emit("256"),
-                    "-t" | "-f" | "-d" | "-m" | "-u" | "-v" => self.emit("unlimited"),
-                    _ => self.fail("usage: ulimit [-a] [-n [N]] [-s|-u|-t|-f|-v|-m]"),
+                    None => self.emit(&fmt_lim(res)),
                 }
             }
             "complete" => {

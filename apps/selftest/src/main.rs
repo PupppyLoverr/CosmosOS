@@ -906,6 +906,68 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             None => false,
         }
     });
+    check("tls-fsbase", {
+        // arch_prctl SET_FS/GET_FS: real FS segment per task
+        static mut CELL: u64 = 0;
+        unsafe { CELL = 0xC0FFEE };
+        let addr = unsafe { &CELL as *const u64 as u64 };
+        let ok1 = ustd::set_fs_base(addr) == 0;
+        let got = ustd::get_fs_base();
+        // fs:0 reads the TCB self-pointer slot through the segment
+        let fs0 = ustd::tls_self();
+        let _ = ustd::set_fs_base(0);
+        ok1 && got == addr && fs0 == 0xC0FFEE
+    });
+    check("tls-thread-id", {
+        // a cloned thread gets the TCB the kernel wrote fs:8 = its tid
+        static TID: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn probe(_a: u64) -> i64 {
+            TID.store(ustd::thread_id(), core::sync::atomic::Ordering::SeqCst);
+            0
+        }
+        let mine = ustd::getpid() as u64;
+        match ustd::thread_spawn(probe, 0) {
+            Ok(tid) => {
+                let _ = ustd::waitpid(tid, 4000);
+                let seen = TID.load(core::sync::atomic::Ordering::SeqCst);
+                seen == tid as u64 && seen != mine
+            }
+            Err(_) => false,
+        }
+    });
+    check("rlimit-nofile", {
+        // RLIMIT_NOFILE bounds the fd INDEX — EMFILE past the cap.
+        // selftest's fds are packed, so the first free slot = live count.
+        let used = match ustd::open("/etc/rc.conf", ustd::O_RDONLY) {
+            Ok(fd) => {
+                ustd::close(fd);
+                fd as u64
+            }
+            Err(_) => 0,
+        };
+        let spare = ustd::open("/etc/rc.conf", ustd::O_RDONLY).ok();
+        let set_ok = ustd::setrlimit(ustd::RLIMIT_NOFILE, used + 1);
+        // 'spare' occupies index 'used' — at cap used+1 the next open EMFILEs
+        let blocked = ustd::open("/etc/rc.conf", ustd::O_RDONLY).is_err();
+        if let Some(fd) = spare {
+            ustd::close(fd);
+        }
+        let restored = ustd::setrlimit(ustd::RLIMIT_NOFILE, 1024);
+        set_ok && blocked && restored
+    });
+    {
+        let mut ok = ustd::setrlimit(ustd::RLIMIT_NPROC, 1);
+        ok = ok && ustd::fork() < 0; // at cap: EAGAIN
+        ok = ok && ustd::setrlimit(ustd::RLIMIT_NPROC, 512);
+        match ustd::fork() {
+            0 => ustd::exit(0), // restored: child must not run the suite
+            p if p > 0 => {
+                let _ = ustd::waitpid(p as u32, 4000);
+            }
+            _ => ok = false,
+        }
+        check("rlimit-nproc", ok);
+    }
     check("kern-ptr-rejected", {
         // syscall boundary must reject a kernel VA (phys-map region)
         ustd::sc1(shared::SYS_MEMINFO, 0xFFFF_8000_0000_0000) == u64::MAX
