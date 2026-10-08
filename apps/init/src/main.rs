@@ -46,6 +46,14 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
     let selftest = args.contains("selftest") || ustd::stat("/selftest.flag").is_ok();
     println!("[init] cosmos init (selftest={})", selftest);
 
+    // /tmp is a real tmpfs mount when the dir exists (or can be made).
+    // Best-effort: keep going if the mount fails.
+    let _ = ustd::mkdirat(ustd::AT_FDCWD, "/tmp");
+    match ustd::mount("tmpfs", "/tmp", "tmpfs") {
+        0 => println!("[init] tmpfs on /tmp"),
+        e => println!("[init] tmpfs on /tmp failed: {}", e),
+    }
+
     let mut services: Vec<Svc> = Vec::new();
     if selftest {
         match spawn("/bin/cosmos-selftest", "") {

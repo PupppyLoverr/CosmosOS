@@ -85,6 +85,9 @@ pub struct Task {
     pub parent: u32,
     pub fds: Vec<Option<FileDesc>>,
     pub cwd: String,
+    /// chroot jail root — physical prefix a task can't escape; "/"
+    /// means unjailed. vfs::normalize clamps `..` at this prefix.
+    pub root: String,
     pub ports: Vec<u32>,
     pub shm: Vec<u32>,
     pub frames: Vec<u64>, // owned physical frames (kernel stack frames)
@@ -265,6 +268,7 @@ pub fn init() {
         parent: 0,
         fds: Vec::new(),
         cwd: String::from("/"),
+        root: String::from("/"),
         ports: Vec::new(),
         shm: Vec::new(),
         frames: Vec::new(),
@@ -756,6 +760,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         parent,
         fds: Vec::new(),
         cwd: String::from("/"),
+        root: String::from("/"),
         ports: Vec::new(),
         shm: Vec::new(),
         frames: kframes,
@@ -859,6 +864,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         parent: 0,
         fds: Vec::new(),
         cwd: String::from("/"),
+        root: String::from("/"),
         ports: Vec::new(),
         shm: Vec::new(),
         frames: kframes,
@@ -1004,6 +1010,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         crate::vfs::acquire_desc(f);
     }
     let cwd = cur.cwd.clone();
+    let root = cur.root.clone();
     let borrowed = cur.borrowed.clone();
     let shm_ids = cur.shm.clone();
     let (nice, rt, vrun, umask, exe, pfs, rnf, rnp, rstk, rcu, ras) = (
@@ -1037,6 +1044,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         parent,
         fds,
         cwd,
+        root,
         ports: Vec::new(),
         shm: shm_ids,
         frames: kframes,
@@ -1587,7 +1595,12 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
     for id in &shm_ids {
         shm::acquire(*id);
     }
-    let (name, argv, cwd) = (cur.name.clone(), cur.argv.clone(), cur.cwd.clone());
+    let (name, argv, cwd, root) = (
+        cur.name.clone(),
+        cur.argv.clone(),
+        cur.cwd.clone(),
+        cur.root.clone(),
+    );
     let (maps, filemaps) = (cur.maps.clone(), cur.filemaps.clone());
     let (nice, umask, exe) = (cur.nice, cur.umask, cur.exe.clone());
     let (smin, smax, mnext, apage) = (cur.stack_min, cur.stack_max, cur.mmap_next, cur.arg_page);
@@ -1613,6 +1626,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         parent,
         fds,
         cwd,
+        root,
         ports: Vec::new(),
         shm: shm_ids,
         frames: kframes,
