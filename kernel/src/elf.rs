@@ -306,6 +306,35 @@ pub fn load_into(
 }
 
 /// Translate a user vaddr to a physical address under `pml4`.
+/// Like `translate`, but only resolves pages userspace may actually access:
+/// USER_ACCESSIBLE must be set at every level (hardware ANDs it). Kernel
+/// mappings shared into a user pml4 fail here — the syscall boundary uses
+/// this so copy_in/copy_out can never be aimed at kernel memory.
+pub fn translate_user(pml4: PhysFrame, vaddr: u64) -> Option<u64> {
+    use x86_64::structures::paging::PageTableFlags as F;
+    let l4 = unsafe { &*(mem::phys_to_virt(pml4.start_address().as_u64()) as *const PageTable) };
+    let i4 = ((vaddr >> 39) & 0x1FF) as usize;
+    if l4[i4].is_unused() || !l4[i4].flags().contains(F::USER_ACCESSIBLE) {
+        return None;
+    }
+    let pdpt = unsafe { &*(mem::phys_to_virt(l4[i4].addr().as_u64()) as *const PageTable) };
+    let i3 = ((vaddr >> 30) & 0x1FF) as usize;
+    if pdpt[i3].is_unused() || !pdpt[i3].flags().contains(F::USER_ACCESSIBLE) {
+        return None;
+    }
+    let pd = unsafe { &*(mem::phys_to_virt(pdpt[i3].addr().as_u64()) as *const PageTable) };
+    let i2 = ((vaddr >> 21) & 0x1FF) as usize;
+    if pd[i2].is_unused() || !pd[i2].flags().contains(F::USER_ACCESSIBLE) {
+        return None;
+    }
+    let pt = unsafe { &*(mem::phys_to_virt(pd[i2].addr().as_u64()) as *const PageTable) };
+    let i1 = ((vaddr >> 12) & 0x1FF) as usize;
+    if pt[i1].is_unused() || !pt[i1].flags().contains(F::USER_ACCESSIBLE) {
+        return None;
+    }
+    Some(pt[i1].addr().as_u64() + (vaddr & 0xFFF))
+}
+
 pub fn translate(pml4: PhysFrame, vaddr: u64) -> Option<u64> {
     let l4 = unsafe { &*(mem::phys_to_virt(pml4.start_address().as_u64()) as *const PageTable) };
     let i4 = ((vaddr >> 39) & 0x1FF) as usize;

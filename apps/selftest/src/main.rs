@@ -148,6 +148,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
     }
 
+<<<<<<< HEAD
     // --- networking: virtio-net up + real ARP/ICMP to the QEMU gateway ---
     let ni = ustd::net_info();
     check("net-info", ni.is_some());
@@ -5061,6 +5062,21 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         s > 1_700_000_000 && u < 1_000_000
     });
 
+||||||| 295e7aa
+=======
+    // --- security: syscall boundary must reject kernel addresses ---
+    // copy_out to a kernel-VA (the phys-map offset region) must fail.
+    check(
+        "kern-ptr-rejected",
+        ustd::sc1(shared::SYS_MEMINFO, 0xFFFF_8000_0000_0000) == u64::MAX,
+    );
+    // copy_in from a kernel-VA must fail too (SYS_DEBUG copies a string).
+    check(
+        "kern-ptr-rejected-in",
+        ustd::sc2(shared::SYS_DEBUG, 0xFFFF_8000_0000_0000, 16) == u64::MAX,
+    );
+
+>>>>>>> d53d265f005d84f431076196fe8f1c7c6a0f399e
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64
