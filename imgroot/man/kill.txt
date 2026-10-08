@@ -1,0 +1,9 @@
+kill(1) - signal a process
+NAME
+    kill - send a signal to a process
+SYNOPSIS
+    kill [-SIG] <pid|%job>
+DESCRIPTION
+    Signals: 9/KILL terminate, 15/TERM terminate,
+    19/STOP suspend, 18/CONT resume. %N addresses the
+    Nth job (see jobs). init and winserver are protected.

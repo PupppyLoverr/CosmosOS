@@ -425,6 +425,21 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             .unwrap_or(false)
     });
 
+    // ---- man pages on disk + /proc/version ----
+    check("man-pages", {
+        ustd::read_all("/man/ls.txt")
+            .map(|d| {
+                let s = String::from_utf8_lossy(&d);
+                s.contains("NAME") && s.contains("SYNOPSIS")
+            })
+            .unwrap_or(false)
+    });
+    check("proc-version", {
+        ustd::read_all("/proc/version")
+            .map(|d| String::from_utf8_lossy(&d).contains("CosmosOS"))
+            .unwrap_or(false)
+    });
+
     // ---- signals: STOP freezes a task, CONT resumes it, KILL reaps it ----
     check("sig-stop-cont", {
         let ok = match ustd::spawn("/bin/cosmos-calc", "") {

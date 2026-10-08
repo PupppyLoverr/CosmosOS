@@ -1,0 +1,8 @@
+man(1) - read manual pages
+NAME
+    man - manual pages
+SYNOPSIS
+    man [-k pattern] <page>
+DESCRIPTION
+    Prints /man/<page>.txt. -k searches page names and
+    first-line descriptions.

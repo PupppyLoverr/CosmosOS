@@ -1,0 +1,8 @@
+uniq(1) - filter duplicate lines
+NAME
+    uniq - collapse adjacent duplicate lines
+SYNOPSIS
+    uniq [-cdui] [file]
+DESCRIPTION
+    -c prefix counts, -d only duplicated runs,
+    -u only unique runs, -i case-insensitive.

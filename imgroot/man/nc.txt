@@ -1,0 +1,8 @@
+nc(1) - raw TCP/UDP session
+NAME
+    nc - netcat
+SYNOPSIS
+    nc <host> <port> | nc -l <port> | nc -u ...
+DESCRIPTION
+    Interactive raw socket session. Keystrokes go to the
+    wire, replies print. Esc closes. -l listens, -u UDP.

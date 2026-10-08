@@ -1,0 +1,8 @@
+tar(1) - ustar archive tool
+NAME
+    tar - pack and unpack ustar archives
+SYNOPSIS
+    tar c[z] <dir> > a.tar | tar x[z] <a.tar> | tar t[z]
+DESCRIPTION
+    c create, x extract, t list; z = gzip (real DEFLATE).
+    Recursive directory packing.

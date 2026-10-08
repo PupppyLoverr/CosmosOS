@@ -1,0 +1,8 @@
+cat(1) - concatenate and print files
+NAME
+    cat - concatenate files to stdout
+SYNOPSIS
+    cat <files...>
+DESCRIPTION
+    Prints each file in order. With no file, prints stdin
+    (useful with <<< here-strings and << heredocs).
