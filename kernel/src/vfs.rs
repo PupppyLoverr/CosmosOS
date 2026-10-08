@@ -438,6 +438,7 @@ pub fn release_desc(f: &task::FileDesc) {
     crate::eventfd::close_obj(&f.path);
     crate::epoll::close_obj(&f.path);
     crate::sockpair::close_obj(&f.path);
+    crate::sockfd::close_obj(&f.path);
     crate::pidfd::close_obj(&f.path);
 }
 
@@ -640,6 +641,7 @@ pub fn truncate_path(path: &str, len: u64) -> Result<(), i64> {
         || crate::eventfd::handles(&full)
         || crate::epoll::handles(&full)
         || crate::sockpair::handles(&full)
+        || crate::sockfd::handles(&full)
         || crate::pidfd::handles(&full)
     {
         return Err(-22); // EINVAL on non-regular fds

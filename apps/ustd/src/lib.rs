@@ -1274,3 +1274,146 @@ pub fn writev(fd: i64, iovs: &[(*const u8, usize)]) -> i64 {
     let flat: Vec<u64> = iovs.iter().flat_map(|(p, l)| [*p as u64, *l as u64]).collect();
     sc3(shared::SYS_WRITEV, fd as u64, flat.as_ptr() as u64, iovs.len() as u64) as i64
 }
+
+pub const SOCK_STREAM: u64 = shared::SOCK_STREAM;
+pub const SOCK_DGRAM: u64 = shared::SOCK_DGRAM;
+
+/// socket(type) -> real fd bound to a kernel socket object (/socket/{id}).
+/// The fd works with read/write/poll/epoll/close like any other.
+pub fn socket(stream_type: u64) -> i64 {
+    sc1(shared::SYS_SOCKET, stream_type) as i64
+}
+pub fn bind(fd: i64, lport: u16) -> i64 {
+    sc2(shared::SYS_BIND, fd as u64, lport as u64) as i64
+}
+pub fn connect(fd: i64, ip: [u8; 4], port: u16) -> i64 {
+    sc3(shared::SYS_CONNECT, fd as u64, u32::from_be_bytes(ip) as u64, port as u64) as i64
+}
+pub fn listen(fd: i64, backlog: u64) -> i64 {
+    sc2(shared::SYS_LISTEN, fd as u64, backlog) as i64
+}
+/// accept -> (connfd, peer ip, peer port); peer fields are zeroed when
+/// peer_out isn't wanted... here always returned (kernel writes [ip4|port2]).
+pub fn accept(fd: i64) -> Result<(i64, [u8; 4], u16), i64> {
+    let mut peer = [0u8; 8];
+    let r = sc2(shared::SYS_ACCEPT, fd as u64, peer.as_mut_ptr() as u64) as i64;
+    if r < 0 {
+        return Err(r);
+    }
+    Ok((
+        r,
+        [peer[0], peer[1], peer[2], peer[3]],
+        u16::from_be_bytes([peer[4], peer[5]]),
+    ))
+}
+/// sendto: UDP datagram to an explicit peer; TCP ignores the address.
+pub fn sendto(fd: i64, data: &[u8], ip: [u8; 4], port: u16) -> i64 {
+    sc5(
+        shared::SYS_SENDTO,
+        fd as u64,
+        data.as_ptr() as u64,
+        data.len() as u64,
+        u32::from_be_bytes(ip) as u64,
+        port as u64,
+    ) as i64
+}
+/// recvfrom: read + the sender's (ip,port) for datagram sockets.
+pub fn recvfrom(fd: i64, buf: &mut [u8]) -> Result<(usize, [u8; 4], u16), i64> {
+    let mut src = [0u8; 8];
+    let r = sc4(
+        shared::SYS_RECVFROM,
+        fd as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        src.as_mut_ptr() as u64,
+    ) as i64;
+    if r < 0 {
+        return Err(r);
+    }
+    Ok((
+        r as usize,
+        [src[0], src[1], src[2], src[3]],
+        u16::from_be_bytes([src[4], src[5]]),
+    ))
+}
+
+/// fd-based TCP socket — poll/read/write/close all work on it.
+pub struct TcpFd(pub i64);
+impl TcpFd {
+    pub fn connect(ip: [u8; 4], port: u16) -> Result<Self, i64> {
+        let fd = socket(SOCK_STREAM);
+        if fd < 0 {
+            return Err(fd);
+        }
+        match connect(fd, ip, port) {
+            0 => Ok(Self(fd)),
+            e => {
+                close(fd);
+                Err(e)
+            }
+        }
+    }
+    pub fn listen(lport: u16) -> Result<Self, i64> {
+        let fd = socket(SOCK_STREAM);
+        if fd < 0 {
+            return Err(fd);
+        }
+        if bind(fd, lport) != 0 {
+            close(fd);
+            return Err(-1);
+        }
+        if listen(fd, 4) != 0 {
+            close(fd);
+            return Err(-1);
+        }
+        Ok(Self(fd))
+    }
+    /// Blocking accept -> connected TcpFd + peer.
+    pub fn accept(&self) -> Result<(Self, [u8; 4], u16), i64> {
+        accept(self.0).map(|(fd, ip, p)| (Self(fd), ip, p))
+    }
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, i64> {
+        read(self.0, buf)
+    }
+    pub fn write(&self, data: &[u8]) -> Result<usize, i64> {
+        write(self.0, data)
+    }
+}
+impl Drop for TcpFd {
+    fn drop(&mut self) {
+        close(self.0);
+    }
+}
+
+/// fd-based UDP socket — bind, then sendto/recvfrom or connect+read/write.
+pub struct UdpFd(pub i64);
+impl UdpFd {
+    pub fn bind(lport: u16) -> Result<Self, i64> {
+        let fd = socket(SOCK_DGRAM);
+        if fd < 0 {
+            return Err(fd);
+        }
+        match bind(fd, lport) {
+            0 => Ok(Self(fd)),
+            e => {
+                close(fd);
+                Err(e)
+            }
+        }
+    }
+    pub fn sendto(&self, data: &[u8], ip: [u8; 4], port: u16) -> i64 {
+        sendto(self.0, data, ip, port)
+    }
+    pub fn recvfrom(&self, buf: &mut [u8]) -> Result<(usize, [u8; 4], u16), i64> {
+        recvfrom(self.0, buf)
+    }
+    /// Set the default peer so plain read()/write() work.
+    pub fn connect(&self, ip: [u8; 4], port: u16) -> i64 {
+        connect(self.0, ip, port)
+    }
+}
+impl Drop for UdpFd {
+    fn drop(&mut self) {
+        close(self.0);
+    }
+}

@@ -1340,6 +1340,62 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::remove("/st-ftr");
         ok
     });
+    // ---- batch 36: socket fds ----
+    check("socket-udp", {
+        // bind + sendto + nonblock recvfrom EAGAIN + poll-empty + close
+        let mut ok = false;
+        let fd = ustd::socket(ustd::SOCK_DGRAM);
+        if fd >= 0 && ustd::bind(fd, 43210) == 0 {
+            // nonblock so the empty-queue probes return EAGAIN, not block
+            ustd::fcntl(fd, ustd::F_SETFL, ustd::O_NONBLOCK);
+            // datagram fires onto the wire (needs the peer to be real —
+            // ARP to the slirp gateway resolves)
+            ok = ustd::sendto(fd, b"sockfd-test", [10, 0, 2, 2], 43211) == 11
+                // nothing inbound yet: nonblock read is EAGAIN, poll is 0
+                && ustd::recvfrom(fd, &mut [0u8; 64]).is_err()
+                && ustd::poll(&[fd as u32], &[1], 0) == 0
+                // double-bind is EINVAL
+                && ustd::bind(fd, 43212) != 0;
+        }
+        if fd >= 0 {
+            ustd::close(fd);
+        }
+        // after close the port frees: a fresh socket can bind it
+        let fd2 = ustd::socket(ustd::SOCK_DGRAM);
+        ok = ok && fd2 >= 0 && ustd::bind(fd2, 43210) == 0;
+        if fd2 >= 0 {
+            ustd::close(fd2);
+        }
+        ok
+    });
+    check("socket-tcp", {
+        // bind+listen -> listener fd; accept with nothing pending is
+        // EAGAIN-ish (-11); connect() to the host gets a real answer
+        let mut ok = false;
+        let lfd = ustd::socket(ustd::SOCK_STREAM);
+        if lfd >= 0
+            && ustd::bind(lfd, 43220) == 0
+            && ustd::listen(lfd, 4) == 0
+        {
+            // nonblock: accept on an empty listener is EAGAIN, not a block
+            ustd::fcntl(lfd, ustd::F_SETFL, ustd::O_NONBLOCK);
+            ok = ustd::accept(lfd).is_err()
+                && ustd::poll(&[lfd as u32], &[1], 0) == 0
+                && ustd::fstat(lfd).map(|s| s.size == 0).unwrap_or(false);
+        }
+        if lfd >= 0 {
+            ustd::close(lfd);
+        }
+        // unbound connect picks a real ephemeral port and handshakes
+        let cfd = ustd::socket(ustd::SOCK_STREAM);
+        if cfd >= 0 {
+            // connect to the slirp gateway on a closed port: real SYN out,
+            // real RST/timeout back — any deterministic i64 result counts
+            let _ = ustd::connect(cfd, [10, 0, 2, 2], 9);
+            ustd::close(cfd);
+        }
+        ok
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

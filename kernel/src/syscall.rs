@@ -726,6 +726,140 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_SENDFILE => sys_sendfile(ctx, a1, a2, a3, a4),
         shared::SYS_READV => sys_iov(ctx, a1, a2, a3, true),
         shared::SYS_WRITEV => sys_iov(ctx, a1, a2, a3, false),
+        shared::SYS_SOCKET => {
+            // (SOCK_STREAM|SOCK_DGRAM) -> fd
+            if a1 != shared::SOCK_STREAM && a1 != shared::SOCK_DGRAM {
+                ctx.rax = ERR;
+                return;
+            }
+            let path = crate::sockfd::create(a1 == shared::SOCK_STREAM);
+            task::with_current(|t| {
+                let s = alloc_slot(t);
+                t.fds[s] = Some(task::FileDesc { path, pos: 0, flags: shared::O_RDWR });
+                s as u64
+            })
+        }
+        shared::SYS_BIND => {
+            let id = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => crate::sockfd::parse(&f.path),
+                _ => None,
+            });
+            match id {
+                Some(id) => crate::sockfd::bind(id, a2 as u16) as u64,
+                None => ERR,
+            }
+        }
+        shared::SYS_CONNECT => {
+            let id = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => crate::sockfd::parse(&f.path),
+                _ => None,
+            });
+            match id {
+                Some(id) => crate::sockfd::connect(
+                    id,
+                    (a2 as u32).to_be_bytes(),
+                    a3 as u16,
+                ) as u64,
+                None => ERR,
+            }
+        }
+        shared::SYS_LISTEN => {
+            let id = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => crate::sockfd::parse(&f.path),
+                _ => None,
+            });
+            match id {
+                Some(id) => crate::sockfd::listen(id) as u64,
+                None => ERR,
+            }
+        }
+        shared::SYS_ACCEPT => {
+            // (fd, peer_out[8]|0) -> conn fd; -11 reblocks unless O_NONBLOCK
+            let id = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => crate::sockfd::parse(&f.path),
+                _ => None,
+            });
+            let Some(id) = id else {
+                ctx.rax = ERR;
+                return;
+            };
+            match crate::sockfd::accept(id) {
+                Err(-11) => {
+                    if fd_nonblock(a1 as usize) {
+                        ctx.rax = (-11i64) as u64;
+                    } else {
+                        block_reenter(ctx, task::ticks() + 2, 0);
+                    }
+                    return;
+                }
+                Err(e) => ctx.rax = e as u64,
+                Ok((cpath, rip, rport)) => {
+                    if a2 != 0 {
+                        let mut peer = [0u8; 8];
+                        peer[..4].copy_from_slice(&rip);
+                        peer[4..6].copy_from_slice(&rport.to_be_bytes());
+                        let _ = copy_out(a2, &peer);
+                    }
+                    ctx.rax = task::with_current(|t| {
+                        let s = alloc_slot(t);
+                        t.fds[s] = Some(task::FileDesc {
+                            path: cpath,
+                            pos: 0,
+                            flags: shared::O_RDWR,
+                        });
+                        s as u64
+                    });
+                }
+            }
+            return;
+        }
+        shared::SYS_SENDTO => {
+            // (fd, buf, len, ip u32 BE, port) -> n
+            let Some(data) = copy_in(a2, a3.min(65507)) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let path = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => f.path.clone(),
+                _ => String::new(),
+            });
+            match crate::sockfd::sendto(&path, &data, a4 as u32, a5 as u16) {
+                Ok(n) => n as u64,
+                Err(e) => e as u64,
+            }
+        }
+        shared::SYS_RECVFROM => {
+            // (fd, buf, cap, src_out[8]|0) -> n; -11 reblocks unless nonblock
+            let mut tmp = vec![0u8; a3.min(1 << 16) as usize];
+            let path = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => f.path.clone(),
+                _ => String::new(),
+            });
+            match crate::sockfd::recvfrom(&path, &mut tmp) {
+                Err(-11) => {
+                    if fd_nonblock(a1 as usize) {
+                        ctx.rax = (-11i64) as u64;
+                    } else {
+                        block_reenter(ctx, task::ticks() + 2, 0);
+                    }
+                    return;
+                }
+                Err(e) => ctx.rax = e as u64,
+                Ok((n, ip, port)) => {
+                    if a4 != 0 {
+                        let mut src = [0u8; 8];
+                        src[..4].copy_from_slice(&ip);
+                        src[4..6].copy_from_slice(&port.to_be_bytes());
+                        let _ = copy_out(a4, &src);
+                    }
+                    ctx.rax = match copy_out(a2, &tmp[..n]) {
+                        Some(_) => n as u64,
+                        None => ERR,
+                    };
+                }
+            }
+            return;
+        }
         shared::SYS_ARP => {
             let s = net::arp_stat();
             let n = s.len().min(a2 as usize);
@@ -1077,6 +1211,9 @@ fn fd_read_once(fd: usize, buf: &mut [u8]) -> Result<usize, i64> {
     if crate::timerfd::handles(&path) {
         return crate::timerfd::try_read(&path, buf);
     }
+    if crate::sockfd::handles(&path) {
+        return crate::sockfd::try_read(&path, buf);
+    }
     match vfs::read(fd as i64, buf) {
         Ok(n) => Ok(n as usize),
         Err(e) => Err(e),
@@ -1096,6 +1233,10 @@ fn fd_write_once(fd: usize, data: &[u8]) -> Result<usize, i64> {
     }
     if crate::sockpair::handles(&path) {
         return crate::sockpair::try_write(&path, data);
+    }
+    if crate::sockfd::handles(&path) {
+        let nb = fd_nonblock(fd);
+        return crate::sockfd::try_write(&path, data, nb);
     }
     // pipes are dispatched inside vfs::write (try_write -> -11 full / -32
     // no-readers); real files and dev/proc go the normal route
@@ -1439,6 +1580,9 @@ pub fn fd_ready(path: &str, ev: u32) -> bool {
         ev & 1 != 0 && crate::pidfd::ready(path, true)
     } else if crate::epoll::handles(path) {
         false // epoll fds are wait targets, not readable/writable streams
+    } else if crate::sockfd::handles(path) {
+        (ev & 1 != 0 && crate::sockfd::ready(path, true))
+            || (ev & 2 != 0 && crate::sockfd::ready(path, false))
     } else {
         true
     }

@@ -4971,6 +4971,10 @@ struct Term {
     nc: Option<ustd::TcpSock>,                         // `nc <ip> <port>` raw session
     nc_listen: Option<ustd::TcpListener>,              // `nc -l <port>` waiting for a client
     nc_udp: Option<(ustd::UdpSock, Option<([u8; 4], u16)>)>, // `nc -u`/`-lu` UDP session (peer learned)
+    snc_fd: Option<i64>,                               // `snc <ip> <port>` — socket-fd raw session
+    udpecho_fd: Option<i64>,                           // `udpecho <port>` — UDP socket-fd echo server
+    fd_httpd: Option<(i64, String)>,                   // `fd-httpd <port> [root]` — socket-fd server (lfd, root)
+    fd_httpd_conn: Option<(i64, u64, u32)>,            // accepted conn fd, idle deadline, reqs served
     last_ok: bool,                                     // success of the last statement (for && / ||)
     last_code: i64,                                    // real exit code when the last stmt produced one (wait/exit N); <0 = derive from last_ok
     pipestatus: Vec<i64>,                              // $PIPESTATUS: exit code of each stage of the last pipeline
@@ -13999,6 +14003,92 @@ impl Term {
                     }
                 }
             }
+            "snc" => {
+                // snc <host|a.b.c.d> <port>: nc over a REAL socket fd
+                // (socket/connect/read/write/poll on /socket/{id})
+                match (
+                    args.first().and_then(|s| host_arg(s)),
+                    args.get(1).and_then(|s| s.parse::<u16>().ok()),
+                ) {
+                    (Some(ip), Some(port)) => match ustd::TcpFd::connect(ip, port) {
+                        Ok(s) => {
+                            self.emit(&alloc::format!(
+                                "snc: fd {} connected to {}.{}.{}.{}:{} -- keystrokes send, Esc closes",
+                                s.0, ip[0], ip[1], ip[2], ip[3], port
+                            ));
+                            self.snc_fd = Some(s.0);
+                            core::mem::forget(s); // the fd lives in snc_fd now
+                        }
+                        Err(e) => {
+                            self.fail(&alloc::format!("snc: connect failed ({})", e))
+                        }
+                    },
+                    _ => self.fail("usage: snc <host|a.b.c.d> <port>  (real socket fd, Esc closes)"),
+                }
+            }
+            "udpecho" => {
+                // udpecho <port>: UDP socket-fd echo server — bind, then
+                // recvfrom/sendto datagrams back to their senders. Esc stops.
+                match args.first().and_then(|s| s.parse::<u16>().ok()) {
+                    Some(port) => match ustd::UdpFd::bind(port) {
+                        Ok(u) => {
+                            self.emit(&alloc::format!(
+                                "udpecho: fd {} on :{} -- Esc to stop",
+                                u.0, port
+                            ));
+                            self.udpecho_fd = Some(u.0);
+                            core::mem::forget(u);
+                        }
+                        Err(e) => self.fail(&alloc::format!(
+                            "udpecho: bind :{} failed ({})",
+                            port, e
+                        )),
+                    },
+                    None => self.fail("usage: udpecho <port>  (real UDP socket fd)"),
+                }
+            }
+            "fd-httpd" => {
+                // fd-httpd <port> [root]: the socket-fd HTTP server —
+                // socket/bind/listen/accept + read/write on conn fds
+                match args.first().and_then(|s| s.parse::<u16>().ok()) {
+                    Some(port) => {
+                        let root = args.get(1).copied().unwrap_or("/");
+                        match ustd::stat(root) {
+                            Ok(st) if st.is_dir != 0 => {}
+                            Ok(_) => {
+                                self.fail(&alloc::format!(
+                                    "fd-httpd: {}: not a directory",
+                                    root
+                                ));
+                                return;
+                            }
+                            Err(e) => {
+                                self.fail(&alloc::format!(
+                                    "fd-httpd: {}: err {}",
+                                    root,
+                                    e
+                                ));
+                                return;
+                            }
+                        }
+                        match ustd::TcpFd::listen(port) {
+                            Ok(l) => {
+                                self.fd_httpd = Some((l.0, String::from(root)));
+                                core::mem::forget(l);
+                                self.emit(&alloc::format!(
+                                    "fd-httpd: serving {} on :{} (socket fds) -- Esc to stop",
+                                    root, port
+                                ));
+                            }
+                            Err(e) => self.fail(&alloc::format!(
+                                "fd-httpd: listen :{} failed ({})",
+                                port, e
+                            )),
+                        }
+                    }
+                    None => self.fail("usage: fd-httpd <port> [root]"),
+                }
+            }
             "watch" => {
                 // watch [-n secs] <cmd...>: re-run every N secs until Esc/Enter
                 let (mut ms, mut i) = (1000u64, 0usize);
@@ -19642,6 +19732,61 @@ impl Term {
             self.dirty_all = true;
             return;
         }
+        // snc mode: socket-fd nc — keystrokes are sent via write(fd);
+        // Esc closes the fd for real
+        if let Some(fd) = self.snc_fd {
+            match k.key as u32 {
+                x if x == KeyCode::Escape as u32 => {
+                    ustd::close(fd);
+                    self.snc_fd = None;
+                    self.cur.clear();
+                    self.cx = 0;
+                    self.push_line("snc: closed");
+                }
+                x if x == KeyCode::Enter as u32 => {
+                    let _ = ustd::write(fd, b"\r\n");
+                    self.cur.clear();
+                    self.cx = 0;
+                }
+                x if x == KeyCode::Backspace as u32 => {
+                    let _ = ustd::write(fd, &[0x7f]);
+                    self.cur.pop();
+                    self.cx = self.cx.saturating_sub(1);
+                }
+                x if x == KeyCode::Char as u32 => {
+                    let _ = ustd::write(fd, &[k.chr]);
+                    self.cur.push(k.chr as char);
+                    self.cx += 1;
+                }
+                _ => {}
+            }
+            self.dirty_all = true;
+            return;
+        }
+        // udpecho mode: Esc closes the UDP socket fd
+        if self.udpecho_fd.is_some() && k.key == KeyCode::Escape as u32 {
+            if let Some(fd) = self.udpecho_fd {
+                ustd::close(fd);
+            }
+            self.udpecho_fd = None;
+            self.push_line("udpecho: stopped");
+            self.dirty_all = true;
+            return;
+        }
+        // fd-httpd mode: Esc stops the listener + any open conn fd
+        if self.fd_httpd.is_some() && k.key == KeyCode::Escape as u32 {
+            if let Some((lfd, _)) = self.fd_httpd {
+                ustd::close(lfd);
+            }
+            if let Some((cfd, _, _)) = self.fd_httpd_conn {
+                ustd::close(cfd);
+            }
+            self.fd_httpd = None;
+            self.fd_httpd_conn = None;
+            self.push_line("fd-httpd: stopped");
+            self.dirty_all = true;
+            return;
+        }
         // httpd mode: Esc stops the listener (other keys keep working)
         if self.httpd.is_some() && k.key == KeyCode::Escape as u32 {
             self.httpd = None; // Drop -> SYS_NET_TCP_UNLISTEN
@@ -19895,7 +20040,7 @@ impl Term {
         "uptime", "reboot", "shutdown", "exit", "history", "time",
         "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
         "set", "env", "printenv", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
-        "dmesg", "arp", "httpd", "ntp", "nc", "fserve", "fget", "true", "false",
+        "dmesg", "arp", "httpd", "fd-httpd", "ntp", "nc", "snc", "udpecho", "fserve", "fget", "true", "false",
         "shot", "find", "killall", "basename", "dirname", "strings", "diff", "stat",
         "uniq", "tr", "cut", "tee", "base64", "sha256sum", "tar", "show",
         "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
@@ -21213,6 +21358,10 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         nc: None,
         nc_listen: None,
         nc_udp: None,
+        snc_fd: None,
+        udpecho_fd: None,
+        fd_httpd: None,
+        fd_httpd_conn: None,
         last_ok: true,
         last_code: -1,
         pipestatus: alloc::vec![0],
@@ -21458,6 +21607,111 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 t.httpd_conn = Some((sock, rip, rport, dl, nreq));
             } else {
                 t.push_line("httpd: connection closed");
+            }
+        }
+        // fd-httpd: same HTTP/1.1 service but on real socket fds —
+        // poll(accept-fd) -> accept -> conn fd; poll(conn fd) -> read -> write
+        if t.fd_httpd_conn.is_none() {
+            if let Some((lfd, _)) = &t.fd_httpd {
+                if ustd::poll(&[*lfd as u32], &[1], 0) > 0 {
+                    if let Ok((cfd, _rip, _rport)) = ustd::accept(*lfd) {
+                        t.fd_httpd_conn = Some((cfd, now + 3000, 0));
+                    }
+                }
+            }
+        }
+        if let Some((cfd, mut dl, mut nreq)) = t.fd_httpd_conn.take() {
+            let mut keep_it = true;
+            if ustd::poll(&[cfd as u32], &[1], 0) > 0 {
+                let mut rbuf = [0u8; 2048];
+                match ustd::read(cfd, &mut rbuf) {
+                    Ok(0) => {
+                        keep_it = false; // peer FIN
+                    }
+                    Ok(n) => {
+                        nreq += 1;
+                        let root = t
+                            .fd_httpd
+                            .as_ref()
+                            .map(|(_, r)| r.clone())
+                            .unwrap_or_else(|| String::from("/"));
+                        let (first, resp_head, body, keep, head_only) =
+                            httpd_reply(&rbuf[..n], &root);
+                        let _ = ustd::write(cfd, resp_head.as_bytes());
+                        if !head_only {
+                            let _ = ustd::write(cfd, &body);
+                        }
+                        let status = resp_head
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .trim_start_matches("HTTP/1.1 ")
+                            .to_string();
+                        t.push_line(&alloc::format!(
+                            "fd-httpd: {} -> {}",
+                            first, status
+                        ));
+                        t.dirty_all = true;
+                        if keep && nreq < 8 {
+                            dl = now + 3000;
+                        } else {
+                            keep_it = false;
+                        }
+                    }
+                    Err(_) => {}
+                }
+            } else if now >= dl || nreq >= 8 {
+                keep_it = false;
+            }
+            if keep_it {
+                t.fd_httpd_conn = Some((cfd, dl, nreq));
+            } else {
+                ustd::close(cfd);
+                t.push_line("fd-httpd: connection closed");
+            }
+        }
+        // udpecho: drain datagrams on the socket fd and echo each back
+        // to its sender — a full UDP roundtrip through recvfrom/sendto
+        if let Some(fd) = t.udpecho_fd {
+            if ustd::poll(&[fd as u32], &[1], 0) > 0 {
+                let mut buf = [0u8; 1400];
+                match ustd::recvfrom(fd, &mut buf) {
+                    Ok((n, ip, pt)) => {
+                        let _ = ustd::sendto(fd, &buf[..n], ip, pt);
+                        let txt = String::from_utf8_lossy(&buf[..n]);
+                        let owned = txt.into_owned();
+                        t.push_line(&alloc::format!(
+                            "udpecho: {}B <-> {}.{}.{}.{}:{} : {}",
+                            n, ip[0], ip[1], ip[2], ip[3], pt,
+                            owned.trim_end_matches(|c| c == '\r' || c == '\n')
+                        ));
+                        t.dirty_all = true;
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        // snc: drain the socket fd — poll(read) then read; Ok(0)=remote close
+        if let Some(fd) = t.snc_fd {
+            if ustd::poll(&[fd as u32], &[1], 0) > 0 {
+                let mut buf = [0u8; 1400];
+                match ustd::read(fd, &mut buf) {
+                    Ok(0) => {
+                        ustd::close(fd);
+                        t.snc_fd = None;
+                        t.push_line("snc: remote closed the connection");
+                        t.dirty_all = true;
+                    }
+                    Ok(n) => {
+                        let txt = String::from_utf8_lossy(&buf[..n]);
+                        let owned = txt.into_owned();
+                        for l in owned.split('\n') {
+                            t.push_line(l.trim_end_matches('\r'));
+                        }
+                        t.dirty_all = true;
+                    }
+                    Err(_) => {}
+                }
             }
         }
         // nc -l: accept a pending inbound connection into the nc session
