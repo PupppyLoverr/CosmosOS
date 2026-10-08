@@ -190,6 +190,35 @@ impl Term {
         self.dirty_all = true;
     }
 
+    /// Recursive `tree` rendering (depth-capped).
+    fn tree_recur(&mut self, path: &str, prefix: String, depth: usize) {
+        if depth > 6 {
+            return;
+        }
+        let ents = match ustd::readdir(path) {
+            Ok(e) => e,
+            Err(e) => {
+                self.emit(&alloc::format!("{}[err {}]", prefix, e));
+                return;
+            }
+        };
+        let n = ents.len();
+        for (i, e) in ents.iter().enumerate() {
+            let name = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("?");
+            let last = i + 1 == n;
+            self.emit(&alloc::format!("{}{} {}", prefix, if last { "`--" } else { "|--" }, name));
+            if e.is_dir != 0 {
+                let child = if path == "/" {
+                    alloc::format!("/{}", name)
+                } else {
+                    alloc::format!("{}/{}", path, name)
+                };
+                let next = alloc::format!("{}{}", prefix, if last { "    " } else { "|   " });
+                self.tree_recur(&child, next, depth + 1);
+            }
+        }
+    }
+
     /// Persist history to /history.txt (last 100 commands).
     fn save_hist(&self) {
         let start = self.hist.len().saturating_sub(100);
@@ -308,7 +337,7 @@ impl Term {
                     "          hex <file> wc <file> du <path> history time <cmd>",
                     "          head/tail [-n N] <file> sort <file>",
                     "          a | b   cmd > file   cmd >> file   watch [-n s] cmd",
-                    "          df  (volume usage)  more <file> (pager)  cal [m [y]]",
+                    "          df  (volume usage)  more <file> (pager)  cal [m [y]]  tree  seq [s [st]] e",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -531,6 +560,35 @@ impl Term {
                 ));
             }
             "whoami" => self.emit("cosmos"),
+            "tree" => {
+                let root = match args.first() {
+                    Some(p) if *p != "." => String::from(*p),
+                    _ => ustd::getcwd(),
+                };
+                self.emit(&root);
+                let r = root.clone();
+                self.tree_recur(&r, "".into(), 0);
+            }
+            "sleep" => match args.first().and_then(|s| s.parse::<u64>().ok()) {
+                Some(ms) => ustd::sleep_ms(ms),
+                None => self.emit("usage: sleep <ms>"),
+            },
+            "seq" => {
+                // seq END | seq START END | seq START STEP END
+                let (a, st, b) = match args.len() {
+                    1 => (1i64, 1i64, args[0].parse::<i64>().unwrap_or(0)),
+                    2 => (args[0].parse::<i64>().unwrap_or(0), 1, args[1].parse::<i64>().unwrap_or(0)),
+                    _ => (args[0].parse::<i64>().unwrap_or(0),
+                          args[1].parse::<i64>().unwrap_or(1).max(1),
+                          args[2].parse::<i64>().unwrap_or(0)),
+                };
+                let mut n = a;
+                while n <= b {
+                    self.emit(&alloc::format!("{}", n));
+                    n += st;
+                    if n > b + 10_000 { break; } // guard runaway
+                }
+            }
             "cal" => {
                 // cal [month [year]] — real Gregorian calendar
                 let now = ustd::datetime();
@@ -749,6 +807,12 @@ impl Term {
                             self.emit(&alloc::format!("  {} lines {} words {} bytes", l, w, s.len()));
                         } else if cmd == "sort" {
                             ls.sort();
+                            if args.iter().any(|a| a == &"-u") {
+                                ls.dedup();
+                            }
+                            if args.iter().any(|a| a == &"-r") {
+                                ls.reverse();
+                            }
                             for l in ls {
                                 self.emit(l);
                             }
@@ -870,6 +934,17 @@ impl Term {
             }
             return;
         }
+        // Ctrl+C cancels the current input line (like a real tty)
+        if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 && (k.chr == b'c' || k.chr == b'C') {
+            if !self.cur.is_empty() {
+                let prompt = self.prompt_str();
+                self.emit(&alloc::format!("{}{}^C", prompt, self.cur));
+                self.cur.clear();
+                self.cx = 0;
+                self.dirty_all = true;
+            }
+            return;
+        }
         // Ctrl+L clears the screen
         if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 && (k.chr == b'l' || k.chr == b'L') {
             self.lines.clear();
@@ -953,7 +1028,7 @@ impl Term {
             "resolve", "httpget", "ifconfig", "dhcp", "netstat", "kill", "grep",
             "uptime", "reboot", "shutdown", "exit", "history", "time",
             "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
-            "set", "env", "which", "more", "cal",
+            "set", "env", "which", "more", "cal", "tree", "seq", "sleep",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
