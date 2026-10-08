@@ -77,6 +77,11 @@ pub struct Fat32<D: BlockDevice> {
     clus_bytes: usize,
     next_free: u32,
     time_fn: fn() -> u64,
+    /// Whole File Allocation Table held in RAM — sector reads for every
+    /// FAT entry made large-file reads quadratic (a full chain re-walk per
+    /// clustered read). `fat_read` becomes an index; `fat_write` updates
+    /// both the cache and both on-disk copies. None until first use.
+    fat_ram: Option<Vec<u32>>,
 }
 
 impl<D: BlockDevice> Fat32<D> {
@@ -107,6 +112,7 @@ impl<D: BlockDevice> Fat32<D> {
             dev,
             next_free: 2,
             time_fn: || 0,
+            fat_ram: None,
         })
     }
 
@@ -177,17 +183,40 @@ impl<D: BlockDevice> Fat32<D> {
         Ok(())
     }
 
-    fn fat_read(&mut self, cluster: u32) -> Result<u32> {
+    /// Load FAT1 into `fat_ram` on first use (~`fat_secs`*512B).
+    fn ensure_fat_ram(&mut self) -> Result<()> {
+        if self.fat_ram.is_some() {
+            return Ok(());
+        }
+        let n = self.bpb.fat_secs as usize * (SECTOR / 4);
+        let mut fat = Vec::with_capacity(n);
         let mut sec = [0u8; SECTOR];
-        let fat_off = cluster as u64 * 4;
-        let lba = self.bpb.reserved as u64 + fat_off / SECTOR as u64;
-        self.dev.read_sector(lba, &mut sec)?;
-        let off = (fat_off % SECTOR as u64) as usize;
-        Ok(u32::from_le_bytes([sec[off], sec[off + 1], sec[off + 2], sec[off + 3]]) & 0x0FFF_FFFF)
+        for s in 0..self.bpb.fat_secs {
+            self.dev.read_sector(self.bpb.reserved as u64 + s as u64, &mut sec)?;
+            for w in sec.chunks_exact(4) {
+                fat.push(u32::from_le_bytes([w[0], w[1], w[2], w[3]]) & 0x0FFF_FFFF);
+            }
+        }
+        self.fat_ram = Some(fat);
+        Ok(())
+    }
+
+    fn fat_read(&mut self, cluster: u32) -> Result<u32> {
+        self.ensure_fat_ram()?;
+        Ok(self
+            .fat_ram
+            .as_ref()
+            .and_then(|f| f.get(cluster as usize).copied())
+            .unwrap_or(0x0FFF_FFFF))
     }
 
     fn fat_write(&mut self, cluster: u32, val: u32) -> Result<()> {
         let fat_off = cluster as u64 * 4;
+        if let Some(fat) = self.fat_ram.as_mut() {
+            if let Some(e) = fat.get_mut(cluster as usize) {
+                *e = val & 0x0FFF_FFFF;
+            }
+        }
         for f in 0..self.bpb.num_fats {
             let lba = self.bpb.reserved as u64 + f as u64 * self.bpb.fat_secs as u64 + fat_off / SECTOR as u64;
             let mut sec = [0u8; SECTOR];
