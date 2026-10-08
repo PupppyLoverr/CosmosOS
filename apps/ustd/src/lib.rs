@@ -192,6 +192,16 @@ impl Drop for UdpSock {
         sc1(shared::SYS_NET_UDP_CLOSE, self.lport as u64);
     }
 }
+/// Re-run a real DHCP DISCOVER/OFFER/REQUEST/ACK; returns the leased ip.
+pub fn net_dhcp() -> Option<[u8; 4]> {
+    let r = sc0(shared::SYS_NET_DHCP);
+    if r == shared::SYS_ERR {
+        None
+    } else {
+        Some((r as u32).to_be_bytes())
+    }
+}
+
 /// (mac, ip) of the virtio-net device, if present.
 pub fn net_info() -> Option<([u8; 6], [u8; 4])> {
     let mut b = [0u8; 10];

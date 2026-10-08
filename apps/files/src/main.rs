@@ -278,6 +278,14 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 f.click(p.x, p.y, p.buttons);
             }
             Some((EV_CLOSE, _)) => return 0,
+            // regaining focus = a good moment to pick up fs changes made
+            // elsewhere (e.g. files created in the terminal)
+            Some((EV_FOCUS, pl)) if pl.len() >= 8 => {
+                let e: EvFocus = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
+                if e.focused != 0 {
+                    f.reload();
+                }
+            }
             Some((EV_RESIZE_REQ, pl)) if pl.len() >= 16 => {
                 let r: EvResizeReq = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
                 if f.win.remap(r.shm_id, r.w, r.h) {

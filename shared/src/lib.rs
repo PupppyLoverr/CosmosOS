@@ -53,6 +53,7 @@ pub const SYS_NET_UDP_OPEN: u64 = 55; // (lport) -> 0 | ERR (bind local port)
 pub const SYS_NET_UDP_SEND: u64 = 56; // (lport, dst_ip u32 BE-packed, dport, ptr, len) -> 0 | ERR
 pub const SYS_NET_UDP_RECV: u64 = 57; // (lport, buf, cap, timeout_ms) -> n | ERR; buf=[srcip:4][sport:2][payload]
 pub const SYS_NET_UDP_CLOSE: u64 = 58; // (lport) -> 0
+pub const SYS_NET_DHCP: u64 = 59;      // () -> assigned ip (u32 BE-packed) | ERR
 
 pub const SYS_ERR: u64 = u64::MAX;
 
