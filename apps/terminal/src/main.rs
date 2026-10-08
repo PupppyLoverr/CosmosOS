@@ -4428,6 +4428,736 @@ fn sed_parse(
     Ok(out)
 }
 
+
+/// ed line editor state — buffer, current line, marks, undo snapshot.
+/// `ins` is Some while a/i/c is collecting text lines (ended by `.`).
+struct EdSt {
+    buf: Vec<String>,
+    dot: usize,
+    fname: String,
+    modified: bool,
+    marks: alloc::collections::BTreeMap<char, usize>,
+    last_re: String,
+    last_rep: String,
+    saved: Vec<String>,
+    ins: Option<EdIns>,
+    prompt: bool,
+    silent: bool,
+    errh: bool,
+    last_err: String,
+    warned: bool,
+    quit: bool,
+}
+
+struct EdIns {
+    at: usize,          // insertion index into buf
+    mode: char,         // 'a' append, 'i' insert, 'c' change
+    del: (usize, usize),// 'c': the range to replace
+    acc: Vec<String>,
+}
+
+/// Parse ONE ed address atom at `i`: . $ N + - /re/ ?re? 'x
+/// Returns (resolved 1-based line or None, error flag). `dot`/`len`/`marks`
+////`last_re` come from EdSt.
+fn ed_atom(
+    st: &EdSt, s: &str, i: &mut usize,
+) -> Result<Option<usize>, ()> {
+    let b = s.as_bytes();
+    while *i < b.len() && (b[*i] == b' ' || b[*i] == b'\t') {
+        *i += 1;
+    }
+    if *i >= b.len() {
+        return Ok(None);
+    }
+    let mut base: Option<usize> = None;
+    match b[*i] {
+        b'.' => {
+            *i += 1;
+            base = Some(st.dot.max(1));
+        }
+        b'$' => {
+            *i += 1;
+            base = Some(st.buf.len().max(1));
+        }
+        b'+' | b'-' => {
+            let fwd = b[*i] == b'+';
+            *i += 1;
+            let mut n = 0usize;
+            while *i < b.len() && b[*i].is_ascii_digit() {
+                n = n * 10 + (b[*i] - b'0') as usize;
+                *i += 1;
+            }
+            let n = n.max(1);
+            base = Some(if fwd {
+                (st.dot + n).min(st.buf.len().max(1))
+            } else {
+                st.dot.saturating_sub(n).max(1)
+            });
+        }
+        b'/' | b'?' => {
+            let fwd = b[*i] == b'/';
+            let d = b[*i];
+            *i += 1;
+            let a0 = *i;
+            while *i < b.len() && b[*i] != d {
+                *i += 1;
+            }
+            let mut re = String::from(&s[a0..*i]);
+            if *i < b.len() {
+                *i += 1;
+            }
+            if re.is_empty() {
+                re = st.last_re.clone(); // `//` repeats the last search
+            }
+            if re.is_empty() {
+                return Err(());
+            }
+            let lp = bre_to_ere(&re);
+            let mut hit = None;
+            // wrap-around scan from dot (fwd: dot+1.., bwd: dot-1..)
+            let n = st.buf.len();
+            for k in 1..=n.max(1) {
+                let idx = if fwd {
+                    (st.dot + k - 1) % n.max(1) + 1
+                } else {
+                    ((st.dot + n - k).max(1) - 1) % n.max(1) + 1
+                };
+                if idx >= 1 && idx <= n
+                    && re_search(&lp, &st.buf[idx - 1]).is_some()
+                {
+                    hit = Some(idx);
+                    break;
+                }
+            }
+            match hit {
+                Some(h) => {
+                    base = Some(h);
+                }
+                None => return Err(()),
+            }
+        }
+        b'\'' => {
+            *i += 1;
+            if *i < b.len() {
+                let c = b[*i] as char;
+                *i += 1;
+                match st.marks.get(&c) {
+                    Some(m) => base = Some(*m),
+                    None => return Err(()),
+                }
+            } else {
+                return Err(());
+            }
+        }
+        c if c.is_ascii_digit() => {
+            let mut n = 0usize;
+            while *i < b.len() && b[*i].is_ascii_digit() {
+                n = n * 10 + (b[*i] - b'0') as usize;
+                *i += 1;
+            }
+            if n == 0 || n > st.buf.len() {
+                return Err(());
+            }
+            base = Some(n);
+        }
+        _ => return Ok(None),
+    }
+    // optional +N/-N offset after the atom
+    if let Some(mut v) = base {
+        loop {
+            let mut j = *i;
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+                let fwd = b[j] == b'+';
+                j += 1;
+                let mut n = 0usize;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    n = n * 10 + (b[j] - b'0') as usize;
+                    j += 1;
+                }
+                let n = n.max(1);
+                v = if fwd {
+                    (v + n).min(st.buf.len().max(1))
+                } else {
+                    v.saturating_sub(n).max(1)
+                };
+                *i = j;
+            } else {
+                break;
+            }
+        }
+        base = Some(v);
+    }
+    Ok(base)
+}
+
+/// The address part of an ed command line: `[a[,b]]cmd`.
+/// `%` and a bare `,` mean `1,$`; `;` sets dot to the first address.
+/// Returns (lo, hi, rest_index, cmd_char_or_None_for-bare-line).
+fn ed_addr2(
+    st: &EdSt, s: &str,
+) -> Result<(Option<usize>, Option<usize>, usize), ()> {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    if i < b.len() && b[i] == b'%' {
+        return Ok((Some(1), Some(st.buf.len()), i + 1));
+    }
+    let a1 = ed_atom(st, s, &mut i)?;
+    if i < b.len() && (b[i] == b',' || b[i] == b';') {
+        let semi = b[i] == b';';
+        i += 1;
+        if a1.is_none() {
+            // bare `,`/`;` = 1,$
+            let a2 = ed_atom(st, s, &mut i)?;
+            let hi = a2.unwrap_or(st.buf.len());
+            return Ok((Some(1), Some(hi), i));
+        }
+        let a2 = ed_atom(st, s, &mut i)?;
+        return Ok((a1, Some(a2.unwrap_or(a1.unwrap())), i));
+    }
+    Ok((a1, a1, i))
+}
+
+/// Result of feeding one input line to ed: keep going or exit.
+impl Term {
+    /// Feed one input line to the ed buffer. When `ins` is armed the line
+    /// is buffer text (a lone `.` commits a/i/c); otherwise it's a command.
+    /// Returns false when ed should exit (q/Q/wq/eof).
+    fn ed_feed(&mut self, st: &mut EdSt, l: &str) -> bool {
+        // text-collection state for a/i/c
+        if let Some(mut ins) = st.ins.take() {
+            if l == "." {
+                if ins.mode == 'c' {
+                    let (lo, hi) = ins.del;
+                    if lo <= hi && hi <= st.buf.len() {
+                        st.buf.drain(lo - 1..hi);
+                    }
+                }
+                st.saved = st.buf.clone();
+                let at = ins.at.min(st.buf.len());
+                for (k, t) in ins.acc.iter().enumerate() {
+                    st.buf.insert(at + k, t.clone());
+                }
+                st.dot = at + ins.acc.len();
+                st.modified = !ins.acc.is_empty() || ins.mode == 'c';
+            } else {
+                ins.acc.push(String::from(l));
+                st.ins = Some(ins);
+            }
+            return true;
+        }
+        let (lo, hi, i) = match ed_addr2(st, l) {
+            Ok(t) => t,
+            Err(()) => {
+                st.last_err = String::from("invalid address");
+                self.emit("?");
+                return true;
+            }
+        };
+        let rest = l[i..].trim_start();
+        let n = st.buf.len();
+        // default range per command: most default to dot, w/g to 1,$
+        let dlo = lo.unwrap_or(st.dot.max(1).min(n.max(1)));
+        let dhi = hi.unwrap_or(dlo);
+        let ok_range = |st: &EdSt| dlo >= 1 && dhi >= dlo && dhi <= st.buf.len();
+        let c = rest.chars().next().unwrap_or('\0');
+        match c {
+            '\0' => {
+                // bare address = print it; a bare empty line is `.+1p`
+                if lo.is_none() {
+                    if st.dot < n {
+                        st.dot += 1;
+                        if !st.silent {
+                            self.emit(&st.buf[st.dot - 1].clone());
+                        }
+                    }
+                } else {
+                    if !ok_range(st) {
+                        self.emit("?");
+                        st.last_err = String::from("invalid address");
+                        return true;
+                    }
+                    st.dot = dlo;
+                    if !st.silent {
+                        self.emit(&st.buf[dlo - 1].clone());
+                    }
+                }
+            }
+            '#' => {}
+            'P' => {
+                st.prompt = !st.prompt;
+            }
+            'H' => st.errh = !st.errh,
+            'h' => {
+                if !st.last_err.is_empty() {
+                    self.emit(&st.last_err.clone());
+                }
+            }
+            'a' | 'i' | 'c' => {
+                if !ok_range(st) && c == 'c' {
+                    self.emit("?");
+                    st.last_err = String::from("invalid address");
+                    return true;
+                }
+                let at = match c {
+                    'a' => if st.buf.is_empty() { 0 } else { dlo },
+                    'i' => dlo.saturating_sub(1),
+                    _ => dlo.saturating_sub(1),
+                };
+                st.ins = Some(EdIns {
+                    at,
+                    mode: c,
+                    del: (dlo, dhi),
+                    acc: Vec::new(),
+                });
+            }
+            'd' => {
+                if !ok_range(st) {
+                    self.emit("?");
+                    st.last_err = String::from("invalid address");
+                    return true;
+                }
+                st.saved = st.buf.clone();
+                st.buf.drain(dlo - 1..dhi);
+                st.dot = if st.buf.is_empty() {
+                    0
+                } else {
+                    (dlo - 1).min(st.buf.len())
+                };
+                st.modified = true;
+            }
+            'j' => {
+                if !ok_range(st) || dlo >= dhi {
+                    self.emit("?");
+                    st.last_err = String::from("invalid address");
+                    return true;
+                }
+                st.saved = st.buf.clone();
+                let joined: String = st.buf[dlo - 1..dhi].concat();
+                st.buf.splice(dlo - 1..dhi, [joined]);
+                st.dot = dlo;
+                st.modified = true;
+            }
+            'm' | 't' => {
+                let mut j = 0usize;
+                let ta = match ed_atom(st, rest[1..].trim_start(), &mut j) {
+                    Ok(Some(a)) => a,
+                    _ => {
+                        self.emit("?");
+                        st.last_err = String::from("invalid address");
+                        return true;
+                    }
+                };
+                if !ok_range(st) {
+                    self.emit("?");
+                    return true;
+                }
+                st.saved = st.buf.clone();
+                let chunk: Vec<String> = st.buf[dlo - 1..dhi].to_vec();
+                if c == 'm' {
+                    st.buf.drain(dlo - 1..dhi);
+                    let ta2 = if ta > dhi {
+                        ta - (dhi - dlo + 1)
+                    } else if ta >= dlo {
+                        self.emit("?");
+                        st.buf = st.saved.clone();
+                        return true;
+                    } else {
+                        ta
+                    };
+                    let idx = ta2.min(st.buf.len());
+                    for (k, t) in chunk.iter().enumerate() {
+                        st.buf.insert(idx + k, t.clone());
+                    }
+                    st.dot = idx + chunk.len();
+                } else {
+                    let idx = ta.min(st.buf.len());
+                    for (k, t) in chunk.iter().enumerate() {
+                        st.buf.insert(idx + k, t.clone());
+                    }
+                    st.dot = idx + chunk.len();
+                }
+                st.modified = true;
+            }
+            'p' | 'n' | 'l' => {
+                if st.buf.is_empty() || !ok_range(st) {
+                    self.emit("?");
+                    st.last_err = String::from("invalid address");
+                    return true;
+                }
+                for ln in dlo..=dhi.min(st.buf.len()) {
+                    let line = &st.buf[ln - 1];
+                    match c {
+                        'p' => self.emit(&line.clone()),
+                        'n' => self.emit(&alloc::format!("{}  {}", ln, line)),
+                        _ => {
+                            // l: unambiguous — escapes + trailing $
+                            let mut e = String::new();
+                            for ch in line.chars() {
+                                match ch {
+                                    '\\' => e.push_str("\\\\"),
+                                    c2 if (c2 as u32) < 0x20 => {
+                                        e.push_str(&alloc::format!(
+                                            "\\{:03o}", c2 as u32
+                                        ))
+                                    }
+                                    c2 => e.push(c2),
+                                }
+                            }
+                            e.push('$');
+                            self.emit(&e);
+                        }
+                    }
+                }
+                st.dot = dhi.min(st.buf.len());
+            }
+            '=' => {
+                self.emit(&alloc::format!("{}", hi.unwrap_or(n)));
+            }
+            'k' => {
+                let mb = rest[1..].chars().next().unwrap_or('\0');
+                if mb.is_ascii_lowercase() {
+                    st.marks.insert(mb, dlo);
+                } else {
+                    self.emit("?");
+                }
+            }
+            'u' => {
+                core::mem::swap(&mut st.buf, &mut st.saved);
+                st.dot = st.dot.min(st.buf.len().max(1));
+                st.modified = true;
+            }
+            'q' | 'Q' => {
+                if c == 'q' && st.modified && !st.warned {
+                    st.warned = true;
+                    self.emit("?");
+                    st.last_err = String::from("buffer modified");
+                    return true;
+                }
+                return false;
+            }
+            'e' | 'E' => {
+                if c == 'e' && st.modified && !st.warned {
+                    st.warned = true;
+                    self.emit("?");
+                    st.last_err = String::from("buffer modified");
+                    return true;
+                }
+                let f = rest[1..].trim();
+                let nf = if f.is_empty() {
+                    st.fname.clone()
+                } else {
+                    String::from(f)
+                };
+                match ustd::read_all(&nf) {
+                    Ok(d) => {
+                        st.saved = st.buf.clone();
+                        st.buf = String::from_utf8_lossy(&d)
+                            .lines()
+                            .map(String::from)
+                            .collect();
+                        st.dot = st.buf.len();
+                        st.fname = nf;
+                        st.modified = false;
+                        if !st.silent {
+                            self.emit(&alloc::format!("{}", d.len()));
+                        }
+                    }
+                    Err(_) => {
+                        self.emit("?");
+                        st.last_err = alloc::format!("{}: cannot open", nf);
+                    }
+                }
+            }
+            'r' => {
+                let f = rest[1..].trim();
+                let nf = if f.is_empty() {
+                    st.fname.clone()
+                } else {
+                    String::from(f)
+                };
+                match ustd::read_all(&nf) {
+                    Ok(d) => {
+                        st.saved = st.buf.clone();
+                        let nl: Vec<String> = String::from_utf8_lossy(&d)
+                            .lines()
+                            .map(String::from)
+                            .collect();
+                        let at = dlo.min(st.buf.len());
+                        for (k, t) in nl.iter().enumerate() {
+                            st.buf.insert(at + k, t.clone());
+                        }
+                        st.dot = at + nl.len();
+                        st.modified = true;
+                        if !st.silent {
+                            self.emit(&alloc::format!("{}", d.len()));
+                        }
+                    }
+                    Err(_) => {
+                        self.emit("?");
+                        st.last_err = alloc::format!("{}: cannot open", nf);
+                    }
+                }
+            }
+            'w' | 'W' => {
+                let f = rest[1..].trim();
+                let nf = if f.is_empty() {
+                    st.fname.clone()
+                } else {
+                    String::from(f)
+                };
+                if nf.is_empty() {
+                    self.emit("?");
+                    st.last_err = String::from("no filename");
+                    return true;
+                }
+                let mut data = String::new();
+                for (k, line) in st.buf.iter().enumerate() {
+                    if k > 0 {
+                        data.push('\n');
+                    }
+                    data.push_str(line);
+                }
+                if !st.buf.is_empty() {
+                    data.push('\n');
+                }
+                let bytes = data.len();
+                let res = if c == 'W' {
+                    let mut old =
+                        ustd::read_all(&nf).unwrap_or_default();
+                    old.extend_from_slice(data.as_bytes());
+                    ustd::write_all(&nf, &old)
+                } else {
+                    ustd::write_all(&nf, data.as_bytes())
+                };
+                match res {
+                    Ok(_) => {
+                        st.fname = nf;
+                        st.modified = false;
+                        if !st.silent {
+                            self.emit(&alloc::format!("{}", bytes));
+                        }
+                        if rest[1..].trim_start().starts_with('q') {
+                            return false;
+                        }
+                    }
+                    Err(_) => {
+                        self.emit("?");
+                        st.last_err =
+                            alloc::format!("{}: cannot write", nf);
+                    }
+                }
+            }
+            'f' => {
+                let f = rest[1..].trim();
+                if f.is_empty() {
+                    self.emit(&st.fname.clone());
+                } else {
+                    st.fname = String::from(f);
+                }
+            }
+            's' => {
+                // s/re/sub/[gpnl N]
+                let b = rest.as_bytes();
+                if b.len() < 2 {
+                    self.emit("?");
+                    return true;
+                }
+                let d = b[1];
+                let mut j = 2usize;
+                let a0 = j;
+                while j < b.len() && b[j] != d {
+                    if b[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                let mut re = String::from(&rest[a0..j]);
+                if re.is_empty() {
+                    re = st.last_re.clone();
+                }
+                if j >= b.len() {
+                    self.emit("?");
+                    return true;
+                }
+                j += 1;
+                let a1 = j;
+                while j < b.len() && b[j] != d {
+                    if b[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                let mut rep = String::from(&rest[a1..j]);
+                if rep == "%" {
+                    rep = st.last_rep.clone();
+                }
+                j += 1;
+                let fl = &rest[j.min(b.len())..];
+                let g = fl.contains('g');
+                let nth: usize = fl
+                    .bytes()
+                    .filter(|c| c.is_ascii_digit())
+                    .fold(0usize, |a, c| a * 10 + (c - b'0') as usize);
+                let ere = bre_to_ere(&re);
+                if !ok_range(st) && !st.buf.is_empty() {
+                    // a range outside the buffer errors; empty buf too
+                }
+                st.saved = st.buf.clone();
+                let mut changed = 0usize;
+                for ln in dlo..=dhi.min(st.buf.len()) {
+                    let line = st.buf[ln - 1].clone();
+                    let new = if nth > 0 {
+                        // s///N: substitute only the Nth match
+                        let mut out = String::new();
+                        let mut rest_l = line.as_str();
+                        let mut hits = 0usize;
+                        loop {
+                            match re_search_caps(&ere, rest_l) {
+                                Some((a2, b2, caps))
+                                    if hits + 1 == nth =>
+                                {
+                                    out.push_str(&rest_l[..a2]);
+                                    let mut nb =
+                                        rep.as_bytes().iter().peekable();
+                                    while let Some(&c2) = nb.next() {
+                                        if c2 == b'&' {
+                                            out.push_str(&rest_l[a2..b2]);
+                                        } else if c2 == b'\\' {
+                                            match nb.next() {
+                                                Some(&b'&') => {
+                                                    out.push('&')
+                                                }
+                                                Some(&d2)
+                                                    if d2.is_ascii_digit()
+                                                        && d2 != b'0' =>
+                                                {
+                                                    if let Some(Some((gs, ge))) = caps.get((d2 - b'0') as usize)
+                                                    {
+                                                        out.push_str(&rest_l[*gs..*ge]);
+                                                    }
+                                                }
+                                                Some(&d2) => {
+                                                    out.push('\\');
+                                                    out.push(d2 as char);
+                                                }
+                                                None => out.push('\\'),
+                                            }
+                                        } else {
+                                            out.push(c2 as char);
+                                        }
+                                    }
+                                    out.push_str(&rest_l[b2..]);
+                                    break;
+                                }
+                                Some((a2, b2, _)) => {
+                                    hits += 1;
+                                    out.push_str(&rest_l[..b2.max(a2 + 1)]);
+                                    if b2 == a2 && b2 < rest_l.len() {
+                                        // empty match: keep the char
+                                    }
+                                    rest_l = &rest_l[b2.max(a2 + 1)..];
+                                }
+                                None => {
+                                    out.push_str(rest_l);
+                                    break;
+                                }
+                            }
+                        }
+                        out
+                    } else {
+                        re_sub(&line, &ere, &rep, g)
+                    };
+                    if new != line {
+                        changed += 1;
+                        if fl.contains('p') {
+                            self.emit(&new);
+                        }
+                        if fl.contains('n') {
+                            self.emit(&alloc::format!("{}  {}", ln, new));
+                        }
+                        st.buf[ln - 1] = new;
+                        st.dot = ln;
+                    }
+                }
+                if changed > 0 {
+                    st.last_re = re;
+                    st.last_rep = rep;
+                    st.modified = true;
+                } else {
+                    self.emit("?");
+                    st.last_err = String::from("no match");
+                }
+            }
+            'g' | 'v' => {
+                // g/re/cmds — run the inline cmds on each matching line
+                let b = rest.as_bytes();
+                if b.len() < 2 || b[1] != b'/' {
+                    self.emit("?");
+                    return true;
+                }
+                let mut j = 2usize;
+                let a0 = j;
+                while j < b.len() && b[j] != b'/' {
+                    if b[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                let mut re = String::from(&rest[a0..j]);
+                if re.is_empty() {
+                    re = st.last_re.clone();
+                }
+                let cmds = if j < b.len() { &rest[j + 1..] } else { "p" };
+                let ere = bre_to_ere(&re);
+                let marked: Vec<usize> = (dlo..=dhi.min(st.buf.len()))
+                    .filter(|ln| {
+                        re_search(&ere, &st.buf[ln - 1]).is_some() == (c == 'g')
+                    })
+                    .collect();
+                if marked.is_empty() {
+                    self.emit("?");
+                    return true;
+                }
+                st.last_re = re;
+                for ln in marked {
+                    if ln > st.buf.len() {
+                        break;
+                    }
+                    st.dot = ln;
+                    // inline cmds can't be a/i/c/g/v (need stdin/recurse)
+                    let cl = cmds.trim();
+                    if cl.starts_with('a')
+                        || cl.starts_with('i')
+                        || cl.starts_with('c')
+                        || cl.starts_with('g')
+                        || cl.starts_with('v')
+                    {
+                        self.emit("?");
+                        break;
+                    }
+                    // run the inline cmds with dot pinned to the line
+                    let sub = alloc::format!(".{}", cl);
+                    if !self.ed_feed(st, &sub) {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                self.emit("?");
+                st.last_err = alloc::format!("unknown command '{}'", c);
+            }
+        }
+        true
+    }
+
+}
+
 /// Shared printf-format engine (POSIX printf): %[-+ 0#][w][.p]conv for
 /// s d i u x X o c b q, %% escapes, \\-escapes; the format re-cycles while
 /// args remain. Used by the `printf` builtin and awk `sprintf`.
@@ -6116,6 +6846,7 @@ struct Term {
     rs_saved: String,                                  // edit line saved when rsearch began
     run_depth: u8,                                     // nested run() calls don't record history
     read_modal: Option<(String, usize, u64, bool)>,    // interactive `read VAR` awaiting a typed line: (vars, maxchars, deadline_ms, silent)
+    ed_state: Option<EdSt>,         // live `ed` buffer while __ED modal runs
     rm_queue: Vec<String>,                             // `rm -i`: files awaiting per-file confirm
     ok_queue: alloc::collections::VecDeque<String>,    // `find -ok`: command lines awaiting y/n confirm
     funcs: Vec<(String, String)>,                      // user functions: name -> body source
@@ -8216,6 +8947,16 @@ impl Term {
                         self.read_modal = Some((String::from("__SEL"), 0, 0, false));
                     } else {
                         self.select_in = None;
+                    }
+                }
+            } else if var == "__ED" {
+                // ed command line: feed it; the editor keeps the modal
+                // armed until q/Q/wq (or an EOF marker) returns false
+                if let Some(mut st) = self.ed_state.take() {
+                    if self.ed_feed(&mut st, &v) {
+                        self.ed_state = Some(st);
+                        self.read_modal =
+                            Some((String::from("__ED"), 0, 0, false));
                     }
                 }
             } else if let Some(an) = var.strip_prefix('\x01') {
@@ -15349,6 +16090,74 @@ impl Term {
                 },
                 None => self.fail("usage: chroot <dir>"),
             },
+            "ed" => {
+                // ed [-s] [-p str] [file] — real line editor
+                let mut st = EdSt {
+                    buf: Vec::new(),
+                    dot: 0,
+                    fname: String::new(),
+                    modified: false,
+                    marks: Default::default(),
+                    last_re: String::new(),
+                    last_rep: String::new(),
+                    saved: Vec::new(),
+                    ins: None,
+                    prompt: false,
+                    silent: false,
+                    errh: false,
+                    last_err: String::new(),
+                    warned: false,
+                    quit: false,
+                };
+                let mut ai = 0usize;
+                while ai < args.len() {
+                    match args[ai] {
+                        "-s" => st.silent = true,
+                        "-p" => {
+                            st.prompt = true;
+                            ai += 1; // prompt string arg
+                        }
+                        f => st.fname = String::from(f),
+                    }
+                    ai += 1;
+                }
+                if !st.fname.is_empty() {
+                    match ustd::read_all(&st.fname) {
+                        Ok(d) => {
+                            st.buf = String::from_utf8_lossy(&d)
+                                .lines()
+                                .map(String::from)
+                                .collect();
+                            st.dot = st.buf.len();
+                            if !st.silent {
+                                self.emit(&alloc::format!("{}", d.len()));
+                            }
+                        }
+                        Err(_) => {
+                            self.emit("?");
+                            st.last_err = alloc::format!(
+                                "{}: cannot open", st.fname
+                            );
+                        }
+                    }
+                }
+                match self.pipe_in.clone() {
+                    // non-interactive: stdin lines are commands
+                    Some(txt) => {
+                        for cl in txt.lines() {
+                            if !self.ed_feed(&mut st, cl) {
+                                break;
+                            }
+                        }
+                    }
+                    // interactive: typed lines go through read_modal
+                    None => {
+                        self.ed_state = Some(st);
+                        self.read_modal =
+                            Some((String::from("__ED"), 0, 0, false));
+                    }
+                }
+            }
             "umount" => {
                 // umount [-f|-l] <dir>: -f force-purges busy mounts,
                 // -l lazy-detaches keeping open paths alive
@@ -28147,6 +28956,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         subst_depth: 0,
         run_depth: 0,
         read_modal: None,
+        ed_state: None,
         rm_queue: Vec::new(),
         ok_queue: alloc::collections::VecDeque::new(),
         funcs: Vec::new(),
