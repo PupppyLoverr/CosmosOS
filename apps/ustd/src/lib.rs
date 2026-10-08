@@ -203,6 +203,12 @@ pub fn thread_spawn(f: extern "C" fn(u64) -> i64, arg: u64) -> Result<u32, ()> {
         // free it after reading (leaks nothing on either side)
         let pair = unsafe { *alloc::boxed::Box::from_raw(raw as *mut (extern "C" fn(u64) -> i64, u64)) };
         let code = (pair.0)(pair.1);
+        // free this thread's TCB: fs:0 is the self-pointer of the boxed
+        // [u64;2] thread_spawn leaked — recover it before exiting
+        let tcb = get_fs_base();
+        if tcb != 0 {
+            unsafe { drop(alloc::boxed::Box::from_raw(tcb as *mut [u64; 2])) };
+        }
         exit(code)
     }
     let b = alloc::boxed::Box::new((f, arg));
