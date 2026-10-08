@@ -163,6 +163,202 @@ fn env_subst(s: &str, vars: &alloc::collections::BTreeMap<String, String>) -> St
     out
 }
 
+/// xxHash32 — needed for lz4 frame header checksums.
+fn xxh32(d: &[u8], seed: u32) -> u32 {
+    const P1: u32 = 0x9e37_79b1;
+    const P2: u32 = 0x85eb_ca77;
+    const P3: u32 = 0xc2b2_ae3d;
+    const P4: u32 = 0x27d4_eb2f;
+    const P5: u32 = 0x1656_67b1;
+    let mut i = 0usize;
+    let mut h: u32;
+    if d.len() >= 16 {
+        let mut v1 = seed.wrapping_add(P1).wrapping_add(P2);
+        let mut v2 = seed.wrapping_add(P2);
+        let mut v3 = seed;
+        let mut v4 = seed.wrapping_sub(P1);
+        while i + 16 <= d.len() {
+            let mut lane = |v: &mut u32, off: usize| {
+                *v = v.wrapping_add(
+                    u32::from_le_bytes(d[i + off..i + off + 4].try_into().unwrap())
+                        .wrapping_mul(P2),
+                );
+                *v = v.rotate_left(13).wrapping_mul(P1);
+            };
+            lane(&mut v1, 0);
+            lane(&mut v2, 4);
+            lane(&mut v3, 8);
+            lane(&mut v4, 12);
+            i += 16;
+        }
+        h = v1
+            .rotate_left(1)
+            .wrapping_add(v2.rotate_left(7))
+            .wrapping_add(v3.rotate_left(12))
+            .wrapping_add(v4.rotate_left(18));
+    } else {
+        h = seed.wrapping_add(P5);
+    }
+    h = h.wrapping_add(d.len() as u32);
+    while i + 4 <= d.len() {
+        h = h.wrapping_add(
+            u32::from_le_bytes(d[i..i + 4].try_into().unwrap()).wrapping_mul(P3),
+        );
+        h = h.rotate_left(17).wrapping_mul(P4);
+        i += 4;
+    }
+    while i < d.len() {
+        h = h.wrapping_add((d[i] as u32).wrapping_mul(P5));
+        h = h.rotate_left(11).wrapping_mul(P1);
+        i += 1;
+    }
+    h ^= h >> 15;
+    h = h.wrapping_mul(P2);
+    h ^= h >> 13;
+    h = h.wrapping_mul(P3);
+    h ^= h >> 16;
+    h
+}
+
+/// One lz4 compressed block: tokens of literal-runs + back-reference matches.
+fn lz4_block_decode(src: &[u8], out: &mut Vec<u8>) -> Result<(), &'static str> {
+    let mut i = 0usize;
+    while i < src.len() {
+        let tok = src[i];
+        i += 1;
+        let mut litlen = (tok >> 4) as usize;
+        if litlen == 15 {
+            loop {
+                let b = *src.get(i).ok_or("lz4: truncated")?;
+                i += 1;
+                litlen += b as usize;
+                if b != 255 {
+                    break;
+                }
+            }
+        }
+        if i + litlen > src.len() {
+            return Err("lz4: literal overrun");
+        }
+        out.extend_from_slice(&src[i..i + litlen]);
+        i += litlen;
+        if i == src.len() {
+            return Ok(()); // a block may end on literals
+        }
+        if i + 2 > src.len() {
+            return Err("lz4: truncated offset");
+        }
+        let off = src[i] as usize | (src[i + 1] as usize) << 8;
+        i += 2;
+        if off == 0 || off > out.len() {
+            return Err("lz4: bad offset");
+        }
+        let mut mlen = (tok & 0x0f) as usize;
+        if mlen == 15 {
+            loop {
+                let b = *src.get(i).ok_or("lz4: truncated")?;
+                i += 1;
+                mlen += b as usize;
+                if b != 255 {
+                    break;
+                }
+            }
+        }
+        mlen += 4;
+        let start = out.len() - off;
+        for k in 0..mlen {
+            let b = out[start + k];
+            out.push(b);
+        }
+    }
+    Ok(())
+}
+
+/// LZ4 frame (0x184D2204): FLG/BD, optional content size + dictID, HC
+/// checksum byte (verified via xxh32), LE32-sized blocks (top bit = stored
+/// raw), endmark. Block/content checksums are skipped, not verified.
+fn lz4_decode(d: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if d.len() < 7 || u32::from_le_bytes(d[0..4].try_into().unwrap()) != 0x184d_2204 {
+        return Err("not an lz4 frame");
+    }
+    let flg = d[4];
+    if flg >> 6 != 1 {
+        return Err("lz4: bad version");
+    }
+    let mut p = 6usize;
+    if flg & 0x08 != 0 {
+        p += 8;
+    }
+    if flg & 0x01 != 0 {
+        p += 4;
+    }
+    if p >= d.len() {
+        return Err("lz4: truncated header");
+    }
+    let hc = d[p];
+    if (xxh32(&d[4..p], 0) >> 8) as u8 != hc {
+        return Err("lz4: header checksum");
+    }
+    p += 1;
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        if p + 4 > d.len() {
+            return Err("lz4: missing endmark");
+        }
+        let sz = u32::from_le_bytes(d[p..p + 4].try_into().unwrap());
+        p += 4;
+        if sz == 0 {
+            break;
+        }
+        let raw = sz & 0x8000_0000 != 0;
+        let n = (sz & 0x7fff_ffff) as usize;
+        if p + n > d.len() {
+            return Err("lz4: truncated block");
+        }
+        if raw {
+            out.extend_from_slice(&d[p..p + n]);
+        } else {
+            lz4_block_decode(&d[p..p + n], &mut out)?;
+        }
+        p += n;
+        if flg & 0x10 != 0 {
+            p += 4; // block checksum: skipped, not verified
+        }
+    }
+    Ok(out)
+}
+
+/// Spec-valid lz4 frame encoder: independent literal-only blocks (no
+/// matches) — output decodes under any real lz4 implementation.
+fn lz4_encode(input: &[u8]) -> Vec<u8> {
+    let mut v: Vec<u8> = Vec::new();
+    v.extend_from_slice(&0x184d_2204u32.to_le_bytes());
+    v.push(0x60); // FLG: version 01, block-independent
+    v.push(0x40); // BD: 64KiB max block
+    let hc = (xxh32(&v[4..6], 0) >> 8) as u8;
+    v.push(hc);
+    for chunk in input.chunks(65536) {
+        let mut blk: Vec<u8> = Vec::with_capacity(chunk.len() + 8);
+        let l = chunk.len();
+        if l < 15 {
+            blk.push((l as u8) << 4);
+        } else {
+            blk.push(0xf0);
+            let mut r = l - 15;
+            while r >= 255 {
+                blk.push(255);
+                r -= 255;
+            }
+            blk.push(r as u8);
+        }
+        blk.extend_from_slice(chunk);
+        v.extend_from_slice(&(blk.len() as u32).to_le_bytes());
+        v.extend_from_slice(&blk);
+    }
+    v.extend_from_slice(&0u32.to_le_bytes());
+    v
+}
+
 /// bzip2 block decompressor: BZh stream -> bytes.
 /// Header `BZh<n>` then per block: 48-bit magic, CRC32, origPtr, symbol
 /// map, 2..6 Huffman groups + MTF selectors, RUNA/RUNB run coding, inverse
@@ -8040,6 +8236,8 @@ struct Term {
     cap_bin: Option<Vec<u8>>,                           // binary capture channel (gzip -c etc.)
     last_cap_bin: Vec<u8>,                              // bin captured by the last run_captured
     script_fd: Option<i64>,                             // `script` typescript log fd
+    script_time_fd: Option<i64>,                        // `script -t` timing log fd
+    script_t0: u64,                                     // `script -t` start uptime_ms
     prev_buttons: u8,                                  // pointer buttons last event (edge detect)
     aliases: Vec<(String, String)>,                    // `alias` table (name -> expansion)
     subst_depth: u8,                                   // $(...) recursion guard
@@ -8106,6 +8304,14 @@ impl Term {
         };
         if let Some(fd) = self.script_fd {
             let _ = ustd::write(fd, alloc::format!("{}\n", owned).as_bytes());
+            if let Some(tf) = self.script_time_fd {
+                let rec = alloc::format!(
+                    "{} {}\n",
+                    ustd::uptime_ms().saturating_sub(self.script_t0),
+                    owned.len() + 1
+                );
+                let _ = ustd::write(tf, rec.as_bytes());
+            }
         }
         // wrap at COLS
         let mut rest = owned.as_str();
@@ -8166,6 +8372,20 @@ impl Term {
     fn emit_bin(&mut self, data: &[u8]) {
         if let Some(c) = self.cap_bin.as_mut() {
             c.extend_from_slice(data);
+            // also mirror lossy text into the line capture so binary
+            // output still flows through a `|`-stage's text pipe_in;
+            // a `>` redirect prefers cap_bin so file bytes stay exact.
+            if let Some(t) = self.capture.as_mut() {
+                let s = String::from_utf8_lossy(data).into_owned();
+                for l in s.split('\n') {
+                    t.push(String::from(l));
+                }
+                if let Some(last) = t.last_mut() {
+                    if last.is_empty() && s.ends_with('\n') {
+                        t.pop();
+                    }
+                }
+            }
         } else {
             let s = String::from_utf8_lossy(data).into_owned();
             self.emit(&s);
@@ -16938,6 +17158,148 @@ impl Term {
                     Err(e) => self.fail(&alloc::format!("{}: {}: err {}", cmd, p, e)),
                 }
             }
+            "lz4" | "unlz4" | "lz4cat" => {
+                // lz4 [-d|-c] file[.lz4] — real LZ4 frame codec.
+                // encode: spec-valid literal blocks; decode: full match
+                // back-references + header-checksum verify.
+                let dec = cmd == "unlz4"
+                    || cmd == "lz4cat"
+                    || args.iter().any(|a| *a == "-d");
+                let to_stdout = cmd == "lz4cat" || args.iter().any(|a| *a == "-c");
+                let path = args.iter().find(|a| !a.starts_with('-')).copied();
+                let Some(p) = path else {
+                    self.fail("usage: lz4 [-d] [-c] <file>");
+                    return;
+                };
+                match ustd::read_all(p) {
+                    Ok(d) => {
+                        if dec {
+                            match lz4_decode(&d) {
+                                Ok(out) => {
+                                    if to_stdout {
+                                        self.emit_bin(&out);
+                                    } else {
+                                        let outp = if let Some(st) = p.strip_suffix(".lz4") {
+                                            String::from(st)
+                                        } else {
+                                            alloc::format!("{}.out", p)
+                                        };
+                                        match ustd::write_all(&outp, &out) {
+                                            Ok(()) => self.emit(&alloc::format!(
+                                                "{} -> {}", p, outp
+                                            )),
+                                            Err(e) => self.fail(&alloc::format!(
+                                                "lz4: {}: err {}", outp, e
+                                            )),
+                                        }
+                                    }
+                                }
+                                Err(e) => self.fail(&alloc::format!("{}: {}", cmd, e)),
+                            }
+                        } else {
+                            let enc = lz4_encode(&d);
+                            if to_stdout {
+                                self.emit_bin(&enc);
+                            } else {
+                                let outp = alloc::format!("{}.lz4", p);
+                                match ustd::write_all(&outp, &enc) {
+                                    Ok(()) => self.emit(&alloc::format!(
+                                        "{} -> {} ({} -> {} B)", p, outp, d.len(), enc.len()
+                                    )),
+                                    Err(e) => self.fail(&alloc::format!(
+                                        "lz4: {}: err {}", outp, e
+                                    )),
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => self.fail(&alloc::format!("{}: {}: err {}", cmd, p, e)),
+                }
+            }
+            "run-parts" => {
+                // run-parts [--list] <dir> — run every regular file in the
+                // directory in sorted order (names must be [A-Za-z0-9_-]+).
+                let list_only = args.iter().any(|a| *a == "--list");
+                let dir = args.iter().find(|a| !a.starts_with('-')).copied();
+                let Some(d) = dir else {
+                    self.fail("usage: run-parts [--list] <dir>");
+                    return;
+                };
+                let ents = match ustd::readdir(d) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        self.fail(&alloc::format!("run-parts: {}: err {}", d, e));
+                        return;
+                    }
+                };
+                let mut names: Vec<String> = ents
+                    .iter()
+                    .filter(|e| e.is_dir == 0)
+                    .map(|e| {
+                        String::from(
+                            core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or(""),
+                        )
+                    })
+                    .filter(|n| {
+                        !n.is_empty()
+                            && !n.starts_with('.')
+                            && n.chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    })
+                    .collect();
+                names.sort();
+                for n in &names {
+                    let p = alloc::format!("{}/{}", d.trim_end_matches('/'), n);
+                    if list_only {
+                        self.emit(&p);
+                    } else {
+                        self.emit(&alloc::format!("run-parts: {}", p));
+                        self.run(&alloc::format!("sh {}", p));
+                    }
+                }
+            }
+            "chpasswd" => {
+                // chpasswd [file] — `user:pass` per line updates the
+                // password field of /etc/passwd.
+                let src = if let Some(&p) = args.iter().find(|a| !a.starts_with('-')) {
+                    match ustd::read_all(p) {
+                        Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                        Err(e) => {
+                            self.fail(&alloc::format!("chpasswd: {}: err {}", p, e));
+                            return;
+                        }
+                    }
+                } else {
+                    match &self.pipe_in {
+                        Some(s) => s.clone(),
+                        None => {
+                            self.fail("usage: chpasswd <file>  (or pipe user:pass lines)");
+                            return;
+                        }
+                    }
+                };
+                let mut rows = db_rows("/etc/passwd");
+                let mut ok = 0usize;
+                for line in src.lines() {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let Some((u, pw)) = line.split_once(':') else {
+                        self.emit(&alloc::format!("chpasswd: skipped `{}`", line));
+                        continue;
+                    };
+                    if let Some(r) = rows.iter_mut().find(|r| r.first().map(|s| s == u).unwrap_or(false)) {
+                        if r.len() > 1 {
+                            r[1] = String::from(pw);
+                        }
+                        ok += 1;
+                    } else {
+                        self.emit(&alloc::format!("chpasswd: {}: no such user", u));
+                    }
+                }
+                let _ = db_write("/etc/passwd", &rows);
+                self.emit(&alloc::format!("chpasswd: {} updated", ok));
+            }
             "zmore" | "zless" | "zegrep" | "zfgrep" | "zdiff" | "zcmp" => {
                 // z-wrappers: real gunzip of each file arg into a tmp file,
                 // then dispatch the underlying tool on the plain text.
@@ -19303,12 +19665,28 @@ impl Term {
                     self.fail("shot: failed (no framebuffer?)");
                 }
             }
-            "more" => {
-                let content = match args.first() {
+            "more" | "less" => {
+                // more|less [+N|+/pat] [file] — page through text.
+                // +N starts at line N, +/pat at the first matching line.
+                let mut start: Option<usize> = None;
+                let mut file: Option<&str> = None;
+                let mut seek_pat: Option<String> = None;
+                for a in args.iter() {
+                    if let Some(rest) = a.strip_prefix('+') {
+                        if let Some(pat) = rest.strip_prefix('/') {
+                            seek_pat = Some(String::from(pat));
+                        } else if let Ok(n) = rest.parse::<usize>() {
+                            start = Some(n.saturating_sub(1));
+                        }
+                    } else if !a.starts_with('-') {
+                        file = Some(a);
+                    }
+                }
+                let content = match file {
                     Some(p) => match ustd::read_all(p) {
                         Ok(d) => Some(String::from_utf8_lossy(&d).into_owned()),
                         Err(e) => {
-                            self.fail(&alloc::format!("more: {}: err {}", p, e));
+                            self.fail(&alloc::format!("{}: {}: err {}", cmd, p, e));
                             None
                         }
                     },
@@ -19316,9 +19694,16 @@ impl Term {
                 };
                 if let Some(s) = content {
                     let ls: Vec<String> = s.lines().map(String::from).collect();
-                    self.page(0, ls);
+                    let top = if let Some(pat) = &seek_pat {
+                        ls.iter()
+                            .position(|l| l.contains(pat.as_str()))
+                            .unwrap_or(0)
+                    } else {
+                        start.unwrap_or(0).min(ls.len())
+                    };
+                    self.page(top, ls);
                 } else if args.is_empty() && self.pipe_in.is_none() {
-                    self.fail("usage: more <file>   (Space/PgDn next, b back, q quit)");
+                    self.fail("usage: more|less [+N|+/pat] <file>   (Space/PgDn, b, q)");
                 }
             }
             "httpd" => match args.first().and_then(|s| s.parse::<u16>().ok()) {
@@ -26204,20 +26589,139 @@ impl Term {
                 ));
             }
             "script" => {
-                // script [file] — start/stop a session typescript log
+                // script [-t[f]] [typescript] — start/stop a session log.
+                // -t also writes a timing file: `<elapsed_ms> <len>` per
+                // typescript record (one push_line each), for scriptreplay.
                 if self.script_fd.is_some() {
                     let fd = self.script_fd.take().unwrap();
                     ustd::close(fd);
+                    if let Some(tf) = self.script_time_fd.take() {
+                        ustd::close(tf);
+                    }
                     self.emit("script: stopped");
                 } else {
-                    let p = args.first().copied().unwrap_or("/typescript.log");
-                    match ustd::open(p, ustd::O_WRONLY | ustd::O_CREATE | ustd::O_APPEND) {
+                    let mut tpath: Option<String> = None;
+                    let mut path = "/typescript.log";
+                    let mut i = 0usize;
+                    while i < args.len() {
+                        let a = args[i];
+                        if a == "-t" || a == "--timing" {
+                            if let Some(nx) = args.get(i + 1) {
+                                tpath = Some(String::from(*nx));
+                                i += 1;
+                            } else {
+                                tpath = Some(String::from("/timing.log"));
+                            }
+                        } else if let Some(rest) = a.strip_prefix("-t") {
+                            let r = rest.trim_start_matches('=');
+                            tpath = Some(if r.is_empty() {
+                                String::from("/timing.log")
+                            } else {
+                                String::from(r)
+                            });
+                        } else if !a.starts_with('-') {
+                            path = a;
+                        }
+                        i += 1;
+                    }
+                    match ustd::open(path, ustd::O_WRONLY | ustd::O_CREATE | ustd::O_APPEND) {
                         Ok(fd) => {
                             self.script_fd = Some(fd);
-                            self.emit(&alloc::format!("script: logging to {}", p));
+                            if let Some(tp) = &tpath {
+                                match ustd::open(
+                                    tp,
+                                    ustd::O_WRONLY | ustd::O_CREATE | ustd::O_TRUNC,
+                                ) {
+                                    Ok(tf) => {
+                                        let _ = ustd::write(
+                                            tf,
+                                            b"# elapsed_ms len\n".as_ref(),
+                                        );
+                                        self.script_time_fd = Some(tf);
+                                        self.script_t0 = ustd::uptime_ms();
+                                    }
+                                    Err(e) => self.fail(&alloc::format!(
+                                        "script: {}: err {}", tp, e
+                                    )),
+                                }
+                            }
+                            self.emit(&alloc::format!("script: logging to {}", path));
                         }
-                        Err(e) => self.fail(&alloc::format!("script: {}: err {}", p, e)),
+                        Err(e) => self.fail(&alloc::format!("script: {}: err {}", path, e)),
                     }
+                }
+            }
+            "scriptreplay" => {
+                // scriptreplay <timing> [typescript] — replay with real
+                // delays between records; -d N divides every delay.
+                let div = args
+                    .iter()
+                    .position(|a| *a == "-d")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(1)
+                    .max(1);
+                let pos: Vec<&&str> = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, a)| {
+                        !a.starts_with('-')
+                            && Some(*i)
+                                != args
+                                    .iter()
+                                    .position(|b| *b == "-d")
+                                    .map(|x| x + 1)
+                    })
+                    .map(|(_, a)| a)
+                    .collect();
+                if pos.is_empty() {
+                    self.fail("usage: scriptreplay [-d N] <timing> [typescript]");
+                    return;
+                }
+                let tpath = *pos[0];
+                let spath = pos.get(1).map(|a| **a).unwrap_or("/typescript.log");
+                let timing = match ustd::read_all(tpath) {
+                    Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                    Err(e) => {
+                        self.fail(&alloc::format!("scriptreplay: {}: err {}", tpath, e));
+                        return;
+                    }
+                };
+                let script = match ustd::read_all(spath) {
+                    Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                    Err(e) => {
+                        self.fail(&alloc::format!("scriptreplay: {}: err {}", spath, e));
+                        return;
+                    }
+                };
+                let mut body = script.as_str();
+                let mut prev = 0u64;
+                for line in timing.lines() {
+                    if line.starts_with('#') {
+                        continue;
+                    }
+                    let mut it = line.split_whitespace();
+                    let ms: u64 = match it.next().and_then(|s| s.parse().ok()) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let len: usize = match it.next().and_then(|s| s.parse().ok()) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let delta = ms.saturating_sub(prev) / div;
+                    prev = ms;
+                    if delta > 0 {
+                        ustd::sleep_ms(delta.min(10_000));
+                    }
+                    if body.is_empty() {
+                        break;
+                    }
+                    let take = len.min(body.len());
+                    let chunk = &body[..take];
+                    // typescript lines carry the trailing \n already
+                    self.emit(chunk.trim_end_matches('\n'));
+                    body = &body[take..];
                 }
             }
             "stat" => {
@@ -30883,6 +31387,7 @@ impl Term {
         "iconv", "ascii", "b2sum", "pathchk", "nslookup", "pwck", "grpck",
         "bunzip2", "bzcat", "bzip2", "zmore", "zless", "zegrep", "zfgrep",
         "zdiff", "zcmp", "wall", "mesg",
+        "lz4", "unlz4", "lz4cat", "scriptreplay", "run-parts", "chpasswd", "less",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -32407,6 +32912,8 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         cap_bin: None,
         last_cap_bin: Vec::new(),
         script_fd: None,
+        script_time_fd: None,
+        script_t0: 0,
         yesing: None,
         shufr: None,
         prev_buttons: 0,
