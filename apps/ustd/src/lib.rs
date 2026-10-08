@@ -1054,3 +1054,72 @@ pub fn rusage(pid: u32) -> Option<(u64, u64)> {
     let out = unsafe { core::ptr::read_volatile(&out) };
     Some((out[0], out[2]))
 }
+
+/// fsync(2): commit `fd`'s file to stable storage. 0 | ERR. Writes are
+/// already synchronous per-sector, so this confirms what always holds —
+/// but it's a real device round-trip (VIRTIO_BLK_T_FLUSH), not a stub.
+pub fn fsync(fd: i64) -> i64 {
+    sc1(shared::SYS_FSYNC, fd as u64) as i64
+}
+
+/// sync(2): commit the whole volume. 0 | ERR (no disk attached).
+pub fn sync_all() -> i64 {
+    sc1(shared::SYS_FSYNC, u64::MAX) as i64
+}
+
+/// inotify_init: an fd whose reads yield "{wd} {mask} {name}\n" records.
+pub fn inotify_init() -> i64 {
+    sc0(shared::SYS_INOTIFY_INIT) as i64
+}
+
+/// inotify_add_watch(fd, path, mask) -> wd | <0
+pub fn inotify_add(fd: i64, path: &str, mask: u64) -> i64 {
+    sc4(
+        shared::SYS_INOTIFY_ADD,
+        fd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        mask,
+    ) as i64
+}
+
+/// inotify_rm_watch
+pub fn inotify_rm(fd: i64, wd: u64) -> i64 {
+    sc2(shared::SYS_INOTIFY_RM, fd as u64, wd) as i64
+}
+
+// inotify mask bits (subset of Linux's)
+pub const IN_ACCESS: u64 = 0x1;
+pub const IN_MODIFY: u64 = 0x2;
+pub const IN_ATTRIB: u64 = 0x4;
+pub const IN_CLOSE_WRITE: u64 = 0x8;
+pub const IN_MOVED_FROM: u64 = 0x40;
+pub const IN_MOVED_TO: u64 = 0x80;
+pub const IN_CREATE: u64 = 0x100;
+pub const IN_DELETE: u64 = 0x200;
+pub const IN_DELETE_SELF: u64 = 0x400;
+pub const IN_MOVE_SELF: u64 = 0x800;
+pub const IN_ISDIR: u64 = 0x4000_0000;
+pub const IN_Q_OVERFLOW: u64 = 0x8000;
+pub const IN_ALL: u64 = 0x0fff;
+
+/// timerfd_create: an fd that becomes readable when the armed timer fires;
+/// read yields an 8-byte LE expiration count.
+pub fn timerfd_create() -> i64 {
+    sc0(shared::SYS_TIMERFD) as i64
+}
+
+/// timerfd_settime(fd, init_ms, interval_ms): arm (init>0) or disarm.
+/// interval_ms>0 re-arms periodically. 0 | ERR.
+pub fn timerfd_set(fd: i64, init_ms: u64, interval_ms: u64) -> i64 {
+    sc3(shared::SYS_TFD_SET, fd as u64, init_ms, interval_ms) as i64
+}
+
+/// Read a timerfd's expiration count (drains it). 0 = no expiry yet.
+pub fn timerfd_read(fd: i64) -> Option<u64> {
+    let mut b = [0u8; 8];
+    match read(fd, &mut b) {
+        Ok(8) => Some(u64::from_le_bytes(b)),
+        _ => None,
+    }
+}

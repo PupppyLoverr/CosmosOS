@@ -266,6 +266,7 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
             return Err(-2);
         }
         fs.create_file(&full).map_err(err_to_i64)?;
+        crate::notify::fire(&full, crate::notify::IN_CREATE);
         // POSIX umask: FAT has no mode bits; the one meaningful mapping is
         // owner-write masked out -> the readonly attribute. Other bits are
         // ignored (fat32 has nothing to map them onto).
@@ -277,6 +278,7 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     }
     if exists && flags & O_TRUNC != 0 && !is_dev && !is_proc {
         fs.write_file(&full, &[]).map_err(err_to_i64)?;
+        crate::notify::fire(&full, crate::notify::IN_MODIFY);
     }
     // procfs files stream live data; their size is per-read, not on disk
     let pos = if flags & O_APPEND != 0 && !is_proc {
@@ -411,6 +413,7 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
     }
     data[write_pos as usize..end].copy_from_slice(buf);
     fs.write_file(&path, &data).map_err(err_to_i64)?;
+    crate::notify::fire(&path, crate::notify::IN_MODIFY);
     task::with_current(|t| {
         if let Some(Some(f)) = t.fds.get_mut(fd as usize) {
             f.pos = end as u64;
@@ -420,16 +423,26 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
     Ok(buf.len() as i64)
 }
 
+/// Release the kernel-side object a descriptor holds: pipe reader/writer
+/// role, inotify watch instance, timerfd. Called from close() and from the
+/// task-exit reaper so dead tasks can't pin objects (e.g. a dead writer
+/// would otherwise keep a pipe's `writers` count elevated forever).
+pub fn release_desc(f: &task::FileDesc) {
+    if crate::pipes::handles(&f.path) {
+        let writer = f.flags & (shared::O_WRONLY | shared::O_TRUNC | shared::O_APPEND) != 0;
+        crate::pipes::close_role(&f.path, writer);
+    }
+    crate::notify::close_obj(&f.path);
+    crate::timerfd::close_obj(&f.path);
+}
+
 pub fn close(fd: i64) {
     let gone = task::with_current(|t| match t.fds.get_mut(fd as usize) {
         Some(slot) => slot.take(),
         None => None,
     });
     if let Some(f) = gone {
-        if crate::pipes::handles(&f.path) {
-            let writer = f.flags & (shared::O_WRONLY | shared::O_TRUNC | shared::O_APPEND) != 0;
-            crate::pipes::close_role(&f.path, writer);
-        }
+        release_desc(&f);
     }
 }
 
@@ -489,7 +502,9 @@ pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
-    fs.set_meta(&full, Some(secs), None).map_err(err_to_i64)
+    fs.set_meta(&full, Some(secs), None).map_err(err_to_i64)?;
+    crate::notify::fire(&full, crate::notify::IN_ATTRIB);
+    Ok(())
 }
 
 /// Set the user-settable FAT attribute bits (0x01 ro, 0x02 hidden, 0x04 sys)
@@ -502,7 +517,9 @@ pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
-    fs.set_meta(&full, None, Some(attr)).map_err(err_to_i64)
+    fs.set_meta(&full, None, Some(attr)).map_err(err_to_i64)?;
+    crate::notify::fire(&full, crate::notify::IN_ATTRIB);
+    Ok(())
 }
 
 pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
@@ -559,21 +576,29 @@ pub fn mkdir(path: &str) -> Result<(), i64> {
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
-    fs.mkdir(&full).map_err(err_to_i64)
+    fs.mkdir(&full).map_err(err_to_i64)?;
+    crate::notify::fire(&full, crate::notify::IN_CREATE | crate::notify::IN_ISDIR);
+    Ok(())
 }
 
 pub fn remove(path: &str) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
     if crate::pipes::handles(&full) && !crate::pipes::is_dir(&full) {
-        return crate::pipes::remove(&full);
+        let r = crate::pipes::remove(&full);
+        if r.is_ok() {
+            crate::notify::fire(&full, crate::notify::IN_DELETE);
+        }
+        return r;
     }
     if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
-    fs.remove(&full).map_err(err_to_i64)
+    fs.remove(&full).map_err(err_to_i64)?;
+    crate::notify::fire(&full, crate::notify::IN_DELETE);
+    Ok(())
 }
 
 pub fn rename(from: &str, to: &str) -> Result<(), i64> {
@@ -591,7 +616,10 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
-    fs.rename(&f, &t2).map_err(err_to_i64)
+    fs.rename(&f, &t2).map_err(err_to_i64)?;
+    crate::notify::fire(&f, crate::notify::IN_MOVED_FROM);
+    crate::notify::fire(&t2, crate::notify::IN_MOVED_TO);
+    Ok(())
 }
 
 /// Whole-file write without the fd table — for kernel-side producers
@@ -603,8 +631,11 @@ pub fn write_all_path(path: &str, data: &[u8]) -> Result<(), i64> {
     let fs = g.as_mut().ok_or(-1i64)?;
     if !fs.exists(&full) {
         fs.create_file(&full).map_err(err_to_i64)?;
+        crate::notify::fire(&full, crate::notify::IN_CREATE);
     }
-    fs.write_file(&full, data).map_err(err_to_i64)
+    fs.write_file(&full, data).map_err(err_to_i64)?;
+    crate::notify::fire(&full, crate::notify::IN_MODIFY);
+    Ok(())
 }
 
 /// (total_bytes, free_bytes) for the mounted volume.

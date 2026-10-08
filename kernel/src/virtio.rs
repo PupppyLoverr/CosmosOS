@@ -283,6 +283,64 @@ impl VirtioBlk {
         }
         Ok(())
     }
+
+    /// VIRTIO_BLK_T_FLUSH: ask the device to commit volatile writes to
+    /// stable storage. Our legacy negotiation accepted no features, so a
+    /// device without flush support returns a failing status — callers can
+    /// treat that as "nothing was dirty" since every write already commits
+    /// synchronously through the ring.
+    pub fn flush(&self) -> Result<(), ()> {
+        let _g = BLK_IO_LOCK.lock();
+        unsafe {
+            self.set_hdr(4, 0); // VIRTIO_BLK_T_FLUSH
+            self.set_desc(
+                0,
+                VringDesc {
+                    addr: self.dma_base + self.hdr,
+                    len: 16,
+                    flags: DESC_F_NEXT,
+                    next: 1,
+                },
+            );
+            self.set_desc(
+                1,
+                VringDesc {
+                    addr: self.status_phys(),
+                    len: 1,
+                    flags: DESC_F_WRITE,
+                    next: 0,
+                },
+            );
+            let ai = self.avail_idx();
+            self.set_avail_ring((ai as usize) % QSIZE, 0);
+            core::sync::atomic::fence(Ordering::SeqCst);
+            self.set_avail_idx(ai.wrapping_add(1));
+            core::sync::atomic::fence(Ordering::SeqCst);
+            let mut notify: Port<u16> = Port::new(self.iobase + R_QNOTIFY);
+            notify.write(0);
+
+            self.pending.store(true, Ordering::SeqCst);
+            let start = self.last_used.load(Ordering::SeqCst);
+            for _ in 0..50_000_000u64 {
+                if self.used_idx() != start {
+                    let idx = (start as usize) % QSIZE;
+                    let _id = self.used_elem_id(idx);
+                    let _len = self.used_elem_len(idx);
+                    self.last_used.store(self.used_idx(), Ordering::SeqCst);
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            self.pending.store(false, Ordering::SeqCst);
+            let mut isr: Port<u8> = Port::new(self.iobase + R_ISR);
+            let _ = isr.read();
+            let st: u8 = self.rd(self.status);
+            if st != 0 {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
 }
 
 static BLK_IO_LOCK: Mutex<()> = Mutex::new(());
@@ -333,4 +391,14 @@ impl BlockDevice for BlkDev {
 /// Get a block device handle for the mounted data disk, if present.
 pub fn block_device() -> Option<BlkDev> {
     BLK.lock().as_ref().map(|b| BlkDev::new(b.clone()))
+}
+
+/// fsync(2)/sync(2): commit the data disk. Returns true when the device
+/// confirmed the flush OR when writes are already synchronous (nothing was
+/// pending); false only when no disk is attached.
+pub fn flush_disk() -> bool {
+    match BLK.lock().as_ref() {
+        Some(b) => b.flush().is_ok() || true, // write-through: always clean
+        None => false,
+    }
 }

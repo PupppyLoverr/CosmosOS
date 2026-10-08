@@ -103,6 +103,12 @@ pub const SYS_PIPE: u64 = 97;            // () -> rfd | wfd<<32        anonymous
 pub const SYS_DUP2: u64 = 98;            // (oldfd,newfd) -> newfd | ERR  alias an fd
 pub const SYS_POLL: u64 = 99;            // (fds,evs,nfds,timeout_ms) -> nready | ERR
 pub const SYS_RUSAGE: u64 = 100;         // (pid,out{utime,stime,maxrss_kb}) -> 0 | ERR
+pub const SYS_FSYNC: u64 = 101;          // (fd | u64::MAX=all) -> 0 | ERR   commit file/device
+pub const SYS_INOTIFY_INIT: u64 = 102;   // () -> fd | ERR                 watch-instance fd
+pub const SYS_INOTIFY_ADD: u64 = 103;    // (fd,path_ptr,len,mask) -> wd | ERR
+pub const SYS_INOTIFY_RM: u64 = 104;     // (fd,wd) -> 0 | ERR
+pub const SYS_TIMERFD: u64 = 105;        // () -> fd | ERR                 timer object fd
+pub const SYS_TFD_SET: u64 = 106;        // (fd,init_ms,interval_ms) -> 0 | ERR
 pub const PROT_READ: u64 = 1;
 pub const PROT_WRITE: u64 = 2;
 pub const PROT_EXEC: u64 = 4;
