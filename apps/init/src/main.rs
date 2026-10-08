@@ -33,7 +33,7 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
                 .iter()
                 .any(|p| p.is_user == 1 && contains(&p.name, b"winserver"));
             if !alive {
-                println!("[init] winserver died — respawning");
+                println!("[init] winserver died -- respawning");
                 let _ = spawn("/bin/cosmos-winserver", "");
             }
         }

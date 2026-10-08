@@ -113,9 +113,9 @@ struct S {
     damage: Option<(i32, i32, i32, i32)>, // union of damaged rects (x,y,w,h)
     last_tick: u64,
     last_frame: u64,
-    last_tc: (u64, u32), // (time, win) of last titlebar press — dblclick detect
+    last_tc: (u64, u32), // (time, win) of last titlebar press -- dblclick detect
     wall: Vec<u32>, // wallpaper cache (fh-TBAR_H rows)
-    idle_since: u64, // ms of last input event — screensaver clock
+    idle_since: u64, // ms of last input event -- screensaver clock
     blanked: bool,   // screensaver active: fb is black
     cfg: Cfg,
     cfg_poll: u64, // last /etc/cosmos.conf re-read ms
@@ -225,7 +225,7 @@ fn send_ev(port: u32, kind: u16, payload: &[u8]) {
 }
 
 fn main_loop() -> ! {
-    let fbi = ustd::fb_info().expect("fb claim — winserver must be the first fb user");
+    let fbi = ustd::fb_info().expect("fb claim -- winserver must be the first fb user");
     let fb = Canvas::new(fbi.addr as *mut u32, fbi.width, fbi.height, fbi.stride);
     let ws_port = ustd::ipc_listen(WS_PORT);
     let in_port = ustd::ipc_listen(INPUT_PORT);
@@ -296,9 +296,9 @@ fn main_loop() -> ! {
             progressed = true;
             handle_req(&mut s, &buf[..n]);
         }
-        // per-second taskbar refresh + reap windows whose owner died —
+        // per-second taskbar refresh + reap windows whose owner died --
         // damage the taskbar strip and let the single composite path draw
-        // it (never clear dirty without compositing — dropped composites
+        // it (never clear dirty without compositing -- dropped composites
         // leave "ghost" windows).
         let up = ustd::uptime_ms();
         // live settings: re-read /etc/cosmos.conf every ~2s; a wallpaper
@@ -345,7 +345,7 @@ fn main_loop() -> ! {
             }
         }
         if !progressed {
-            // wait for more input — the message that wakes us still counts
+            // wait for more input -- the message that wakes us still counts
             match ustd::ipc_recv(s.in_port, &mut buf, 16) {
                 Ok(n) if n > 0 => { handle_input(&mut s, &buf[..n]); }
                 _ => {}
@@ -438,6 +438,31 @@ fn on_key(s: &mut S, k: &InputKey) {
             spawn_app(p);
             return;
         }
+        // Alt+Left/Right/Up: snap the focused window to a half or maximized
+        if k.mods & 4 != 0
+            && (k.key == KeyCode::Left as u32
+                || k.key == KeyCode::Right as u32
+                || k.key == KeyCode::Up as u32)
+        {
+            let (fw, fh) = (s.fw, s.fh - TBAR_H);
+            if let Some(wr) = s.wins.iter_mut().find(|w| w.id == s.focus && w.ws == s.workspace) {
+                if wr.resizable() {
+                    wr.saved = (wr.x, wr.y, wr.w, wr.h);
+                    if k.key == KeyCode::Left as u32 {
+                        (wr.x, wr.y, wr.w, wr.h) = (0, 0, fw / 2, fh);
+                    } else if k.key == KeyCode::Right as u32 {
+                        (wr.x, wr.y, wr.w, wr.h) = (fw / 2, 0, fw / 2, fh);
+                    } else {
+                        (wr.x, wr.y, wr.w, wr.h) = (0, 0, fw, fh);
+                    }
+                    wr.maxed = true;
+                    let id = wr.id;
+                    request_resize(s, id);
+                    s.dirty = true;
+                }
+            }
+            return;
+        }
         // Alt+Tab cycles focus among windows on this workspace
         if k.key == KeyCode::Tab as u32 && k.mods & 4 != 0 {
             let ids: Vec<u32> = s
@@ -505,7 +530,7 @@ fn on_mouse(s: &mut S, m: &InputMouse) {
             d.rx = nx - d.ox;
             d.ry = ny - d.oy;
             if d.mode == 1 {
-                // window may have been closed/reaped mid-drag — drop the
+                // window may have been closed/reaped mid-drag -- drop the
                 // drag instead of panicking on the unwrap
                 let Some(w) = s.wins.iter().find(|w| w.id == d.win) else {
                     s.drag = None;
@@ -533,7 +558,7 @@ fn on_mouse(s: &mut S, m: &InputMouse) {
         return;
     }
 
-    // motion: cursor moved — damage only the two 16px cursor cells
+    // motion: cursor moved -- damage only the two 16px cursor cells
     if nx != px || ny != py {
         dmg(s, px, py, 16, 16);
         dmg(s, nx, ny, 16, 16);
@@ -794,7 +819,7 @@ fn close_win(s: &mut S, id: u32) {
     if let Some(i) = s.win_idx(id) {
         let (wx, wy, ww, wh) = (s.wins[i].x, s.wins[i].y, s.wins[i].w, s.wins[i].h);
         let w = s.wins.remove(i);
-        // tell the app to exit gracefully — it may ignore and keep running headless
+        // tell the app to exit gracefully -- it may ignore and keep running headless
         send_ev(w.owner, EV_CLOSE, &id.to_le_bytes());
         if w.shm_id != 0 {
             ustd::shm_drop(w.shm_id);
@@ -802,7 +827,7 @@ fn close_win(s: &mut S, id: u32) {
         if s.focus == id {
             s.focus = top_id(s);
         }
-        // repaint the vacated rect + the newly focused window's deco —
+        // repaint the vacated rect + the newly focused window's deco --
         // without this the closed window's pixels ghost until an
         // unrelated composite (x-close never marked anything dirty)
         dmg(s, wx, wy, ww, wh);

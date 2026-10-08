@@ -92,7 +92,7 @@ fn find_unquoted(s: &str, want: u8) -> Option<usize> {
 }
 
 /// Shell word-splitting: whitespace separates, '...' and "..." group (and are
-/// stripped). Returns (word, was_quoted) per token — quoted words are exempt
+/// stripped). Returns (word, was_quoted) per token -- quoted words are exempt
 /// from glob expansion, like a real shell.
 fn tokenize(s: &str) -> Vec<(String, bool)> {
     let mut out = Vec::new();
@@ -254,7 +254,7 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     if i == 4 { Some(out) } else { None }
 }
 
-/// IPv4 literal or DNS name — tries the literal first, then a real
+/// IPv4 literal or DNS name -- tries the literal first, then a real
 /// DNS query (UDP/53).
 fn host_arg(s: &str) -> Option<[u8; 4]> {
     parse_ipv4(s).or_else(|| ustd::net_dns(s))
@@ -332,7 +332,7 @@ fn diff_lines(a: &[String], b: &[String]) -> Vec<String> {
             };
         }
     }
-    // backtrack: flat op list — 0=eq(skip),1=del,2=add — then group
+    // backtrack: flat op list -- 0=eq(skip),1=del,2=add -- then group
     // consecutive non-eq ops into one hunk
     #[derive(Clone, Copy)]
     enum Op {
@@ -586,6 +586,7 @@ struct Term {
     httpd: Option<(ustd::TcpListener, String)>,        // `httpd <port> [root]` server mode
     nc: Option<ustd::TcpSock>,                         // `nc <ip> <port>` raw session
     nc_listen: Option<ustd::TcpListener>,              // `nc -l <port>` waiting for a client
+    nc_udp: Option<(ustd::UdpSock, Option<([u8; 4], u16)>)>, // `nc -u`/`-lu` UDP session (peer learned)
     last_ok: bool,                                     // success of the last statement (for && / ||)
     sel: Option<((usize, usize), (usize, usize))>,     // scrollback selection (line,col)->(line,col)
     sel_drag: bool,                                    // left button currently held
@@ -600,12 +601,13 @@ struct Term {
     subst_depth: u8,                                   // $(...) recursion guard
     rs: Option<(String, usize)>,                       // Ctrl-R search: (query, oldest scanned hist idx)
     rs_saved: String,                                  // edit line saved when rsearch began
+    run_depth: u8,                                     // nested run() calls don't record history
     host: String,                                      // hostname (persisted in /hostname)
 }
 
 impl Term {
     fn push_line(&mut self, s: &str) {
-        // tabs have no glyph in the 8x8 font — expand to 4 spaces
+        // tabs have no glyph in the 8x8 font -- expand to 4 spaces
         let owned = if s.contains('\t') {
             s.replace('\t', "    ")
         } else {
@@ -710,11 +712,11 @@ impl Term {
                 continue;
             }
             if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'?' {
-                // $? — previous command's exit status (still in last_ok)
+                // $? -- previous command's exit status (still in last_ok)
                 out.push(if self.last_ok { '0' } else { '1' });
                 i += 2;
             } else if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'#' {
-                // $# — script positional-argument count (0 outside scripts)
+                // $# -- script positional-argument count (0 outside scripts)
                 out.push_str(self.vars.get("#").map(|s| s.as_str()).unwrap_or("0"));
                 i += 2;
             } else if b[i] == b'$' && i + 1 < b.len() && (b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_') {
@@ -792,7 +794,7 @@ impl Term {
 
     /// Expand `$(cmd)` substitutions: runs the inner command with output
     /// captured and splices the text in place (interior newlines kept, like a
-    /// real shell's word-splitting after substitution — quoted `$(...)` stays
+    /// real shell's word-splitting after substitution -- quoted `$(...)` stays
     /// one word because the quotes still wrap the spliced text). Ignored inside
     /// single quotes; nested $( ) allowed, recursion capped.
     fn expand_subst(&mut self, s: &str) -> String {
@@ -824,7 +826,7 @@ impl Term {
                     }
                     if d != 0 {
                         out.push('$');
-                        i += 1; // unbalanced — leave literal
+                        i += 1; // unbalanced -- leave literal
                         continue;
                     }
                     let inner = core::str::from_utf8(&b[i + 2..j - 1]).unwrap_or("");
@@ -869,7 +871,7 @@ impl Term {
 
     /// Expand one glob arg (`dir/pat` or bare `pat` against cwd).
     /// Returns the matching paths (dir-prefixed when a dir part was given),
-    /// or the arg itself untouched when nothing matches — shell semantics.
+    /// or the arg itself untouched when nothing matches -- shell semantics.
     fn glob_expand(&self, arg: &str) -> Vec<String> {
         if !arg.contains('*') && !arg.contains('?') {
             return alloc::vec![String::from(arg)];
@@ -1043,7 +1045,28 @@ impl Term {
         self.win.present_all();
     }
 
+    /// Interactive entry point: tracks call depth so only the top-level
+    /// command line reaches history -- nested run() calls (pipe stages, &&
+    /// operands, script lines, watch ticks, !! expansions) don't pollute it.
     fn run(&mut self, input: &str) {
+        let top = self.run_depth == 0;
+        self.run_depth = self.run_depth.saturating_add(1);
+        // record the typed line once, at the top -- recursion via
+        // ; && || pipes redirects subst scripts watch never lands in
+        // history. `!`-lines record their expansion (inside run_body)
+        if top {
+            let t = input.trim();
+            if !t.is_empty() && !t.starts_with('!') {
+                self.hist.push(String::from(t));
+                self.hi = self.hist.len();
+                self.save_hist();
+            }
+        }
+        self.run_body(input, top);
+        self.run_depth = self.run_depth.saturating_sub(1);
+    }
+
+    fn run_body(&mut self, input: &str, top: bool) {
         let input = input.trim();
         if input.is_empty() {
             return;
@@ -1057,12 +1080,18 @@ impl Term {
             } else if let Ok(n) = spec.parse::<usize>() {
                 n.checked_sub(1)
             } else {
-                // !prefix — most recent history entry starting with `spec`
+                // !prefix -- most recent history entry starting with `spec`
                 self.hist.iter().rposition(|l| l.starts_with(spec))
             };
             match idx.and_then(|i| self.hist.get(i).cloned()) {
                 Some(line) => {
                     self.push_line(&alloc::format!("$ {}", line));
+                    if top {
+                        // like bash: `!!`/!n records the expansion, not the `!` line
+                        self.hist.push(line.clone());
+                        self.hi = self.hist.len();
+                        self.save_hist();
+                    }
                     self.run(&line);
                 }
                 None => self.fail(&alloc::format!("!: no such history entry '{}'", spec)),
@@ -1159,9 +1188,6 @@ impl Term {
             }
             return;
         }
-        self.hist.push(String::from(input));
-        self.hi = self.hist.len();
-        self.save_hist();
         // $(cmd) substitution, then $VAR expansion
         let substd = self.expand_subst(input);
         let expanded = self.expand_vars(&substd);
@@ -1203,7 +1229,7 @@ impl Term {
         if !gexp.is_empty() {
             args = gexp.iter().map(|s| s.as_str()).collect();
         }
-        // optimistic success — fail() marks the statement failed; $? /
+        // optimistic success -- fail() marks the statement failed; $? /
         // && / || read this after the command finishes
         self.last_ok = true;
         match cmd {
@@ -1267,6 +1293,7 @@ impl Term {
                 // args get a `path:` header each.
                 let mut show_all = false;
                 let mut by_size = false;
+                let mut by_time = false;
                 let mut rev = false;
                 let mut i = 0usize;
                 while i < args.len() && args[i].starts_with('-') && args[i].len() > 1 {
@@ -1274,6 +1301,7 @@ impl Term {
                         match c {
                             'a' => show_all = true,
                             'S' => by_size = true,
+                            't' => by_time = true,
                             'r' => rev = true,
                             'l' | '1' => {}
                             _ => {
@@ -1312,6 +1340,8 @@ impl Term {
                                 ents.sort_by(|a, b| {
                                     b.is_dir.cmp(&a.is_dir).then(b.size.cmp(&a.size))
                                 });
+                            } else if by_time {
+                                ents.sort_by(|a, b| b.mtime.cmp(&a.mtime));
                             } else {
                                 ents.sort_by(|a, b| {
                                     a.name[..a.name_len as usize]
@@ -1377,6 +1407,38 @@ impl Term {
                     self.fail("usage: set NAME=value | set -u NAME");
                 }
             }
+            "export" => {
+                // export NAME=value | export NAME  (var exists for child lines)
+                match args.first() {
+                    Some(a) if a.contains('=') => {
+                        let eq = a.find('=').unwrap();
+                        let (n, v) = a.split_at(eq);
+                        self.vars.insert(String::from(n), String::from(&v[1..]));
+                    }
+                    Some(a) => {
+                        if self.vars.get(*a).is_none() {
+                            self.vars.insert(String::from(*a), String::new());
+                        }
+                    }
+                    None => {
+                        for (k, v) in self.vars.clone() {
+                            self.emit(&alloc::format!("export {}={}", k, v));
+                        }
+                    }
+                }
+            }
+            "unset" => {
+                if args.is_empty() {
+                    self.fail("usage: unset NAME...");
+                }
+                for a in &args {
+                    self.vars.remove(*a);
+                }
+            }
+            "man" => match args.first() {
+                Some(a) => self.run(&alloc::format!("help {}", a)),
+                None => self.emit("man: what manual page do you want?"),
+            },
             "env" => {
                 for i in 0..self.vars.len() {
                     let (k, v) = self.vars.iter().nth(i).unwrap();
@@ -1485,7 +1547,7 @@ impl Term {
                 }
             }
             "cp" => {
-                // cp [-r] <from> <to> — into-dir and -r recursive copies work
+                // cp [-r] <from> <to> -- into-dir and -r recursive copies work
                 let rec = args.iter().any(|a| a == &"-r" || a == &"-R");
                 let pos: Vec<&str> = args
                     .iter()
@@ -1498,7 +1560,7 @@ impl Term {
                 }
             }
             "echo" => {
-                // echo [-n] [-e] args... — printing only; `>` redirection is
+                // echo [-n] [-e] args... -- printing only; `>` redirection is
                 // handled by the top-level quote-aware redirect splitter
                 let (mut i, mut nonl, mut esc) = (0usize, false, false);
                 while i < args.len() && (args[i] == "-n" || args[i] == "-e") {
@@ -1558,7 +1620,7 @@ impl Term {
                 ));
             }
             "uname" => {
-                // uname [-srmva]: kernel name/release/machine — bare prints -s
+                // uname [-srmva]: kernel name/release/machine -- bare prints -s
                 let all = args.iter().any(|a| a.contains('a'));
                 let mut parts: Vec<&str> = Vec::new();
                 let f = args.first().copied().unwrap_or("");
@@ -1672,13 +1734,13 @@ impl Term {
                     Err(e) => self.emit(&alloc::format!("calc: {}", e)),
                 }
             }
-            // sh / source / . — all run the file's lines in THIS shell
+            // sh / source / . -- all run the file's lines in THIS shell
             // context, so vars/aliases the script sets persist afterwards
             "sh" | "source" | "." => match args.first() {
                 Some(p) => match ustd::read_all(p) {
                     Ok(d) => {
                         // positional params: $0 = script path, $1..$N = args,
-                        // $# = arg count — previous values restored after.
+                        // $# = arg count -- previous values restored after.
                         let keys: Vec<String> = (0..args.len() + 1)
                             .map(|i| {
                                 if i == 0 { String::from("#") } else { alloc::format!("{}", i - 1) }
@@ -1712,7 +1774,7 @@ impl Term {
                 None => self.fail("usage: sh <file> [args...]  ($0..$N, $# in script)"),
             },
             "cal" => {
-                // cal [month [year]] — real Gregorian calendar
+                // cal [month [year]] -- real Gregorian calendar
                 let now = ustd::datetime();
                 let mo = args.first().and_then(|s| s.parse::<u32>().ok()).map(|m| m as u8).unwrap_or(now.month);
                 let yr = args.get(1).and_then(|s| s.parse::<u32>().ok()).map(|y| y as u16).unwrap_or(now.year);
@@ -1724,10 +1786,49 @@ impl Term {
             }
             "date" => {
                 let d = ustd::datetime();
-                self.emit(&alloc::format!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
-                    d.year, d.month, d.day, d.hour, d.minute, d.second
-                ));
+                match args.first() {
+                    // date +FORMAT: %Y %m %d %H %M %S %T %F %%
+                    Some(f) if f.starts_with('+') => {
+                        let f = &f[1..];
+                        let mut out = String::new();
+                        let mut ch = f.chars().peekable();
+                        while let Some(c) = ch.next() {
+                            if c != '%' {
+                                out.push(c);
+                                continue;
+                            }
+                            match ch.next() {
+                                Some('Y') => out.push_str(&alloc::format!("{:04}", d.year)),
+                                Some('y') => out.push_str(&alloc::format!("{:02}", d.year % 100)),
+                                Some('m') => out.push_str(&alloc::format!("{:02}", d.month)),
+                                Some('d') => out.push_str(&alloc::format!("{:02}", d.day)),
+                                Some('H') => out.push_str(&alloc::format!("{:02}", d.hour)),
+                                Some('M') => out.push_str(&alloc::format!("{:02}", d.minute)),
+                                Some('S') => out.push_str(&alloc::format!("{:02}", d.second)),
+                                Some('T') => out.push_str(&alloc::format!(
+                                    "{:02}:{:02}:{:02}", d.hour, d.minute, d.second
+                                )),
+                                Some('F') => out.push_str(&alloc::format!(
+                                    "{:04}-{:02}-{:02}", d.year, d.month, d.day
+                                )),
+                                Some('%') => out.push('%'),
+                                Some(o) => {
+                                    out.push('%');
+                                    out.push(o);
+                                }
+                                None => out.push('%'),
+                            }
+                        }
+                        self.emit(&out);
+                    }
+                    Some(f) => self.fail(&alloc::format!("date: bad arg '{}' (use +FORMAT)", f)),
+                    None => {
+                        self.emit(&alloc::format!(
+                            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                            d.year, d.month, d.day, d.hour, d.minute, d.second
+                        ));
+                    }
+                }
             }
             "ping" => match args.first() {
                 Some(s) => match host_arg(s) {
@@ -1749,7 +1850,7 @@ impl Term {
                 None => self.fail("usage: ping <host|a.b.c.d>  (try 10.0.2.2)"),
             },
             "ntp" => {
-                // real SNTP query (UDP/123) — epoch -> date, vs RTC
+                // real SNTP query (UDP/123) -- epoch -> date, vs RTC
                 let host = args.first().copied().unwrap_or("pool.ntp.org");
                 match ustd::net_dns(host) {
                     Some(ip) => {
@@ -2038,7 +2139,7 @@ impl Term {
                         Some(l) => {
                             self.httpd = Some((l, String::from(root)));
                             self.emit(&alloc::format!(
-                                "httpd: serving {} on :{} — Esc to stop",
+                                "httpd: serving {} on :{} -- Esc to stop",
                                 root,
                                 port
                             ));
@@ -2060,7 +2161,7 @@ impl Term {
                         Ok(data) => match ustd::TcpListener::bind(port) {
                             Some(l) => {
                                 self.emit(&alloc::format!(
-                                    "fserve: {} ({}B) on :{} — waiting up to 30s for a client",
+                                    "fserve: {} ({}B) on :{} -- waiting up to 30s for a client",
                                     path, data.len(), port
                                 ));
                                 match l.accept(30000) {
@@ -2132,12 +2233,57 @@ impl Term {
                 }
             }
             "nc" => {
-                if args.first().map(|s| *s) == Some("-l") {
+                let udp = args
+                    .iter()
+                    .any(|a| a == &"-u" || a == &"-lu" || a == &"-ul");
+                let listen = args
+                    .iter()
+                    .any(|a| a == &"-l" || a == &"-lu" || a == &"-ul");
+                let pos: Vec<&str> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .cloned()
+                    .collect();
+                if udp && listen {
+                    match pos.first().and_then(|s| s.parse::<u16>().ok()) {
+                        Some(port) => match ustd::UdpSock::open(port) {
+                            Some(s) => {
+                                self.emit(&alloc::format!(
+                                    "nc: udp listening on :{} -- keystrokes send to last peer, Esc closes",
+                                    port
+                                ));
+                                self.nc_udp = Some((s, None));
+                            }
+                            None => self.fail(&alloc::format!("nc: udp bind :{} failed", port)),
+                        },
+                        None => self.fail("usage: nc -lu <port>"),
+                    }
+                } else if udp {
+                    match (
+                        pos.first().and_then(|s| host_arg(s)),
+                        pos.get(1).and_then(|s| s.parse::<u16>().ok()),
+                    ) {
+                        (Some(ip), Some(port)) => {
+                            let lport = 41000u16 + (ustd::uptime_ms() % 2000) as u16;
+                            match ustd::UdpSock::open(lport) {
+                                Some(s) => {
+                                    self.emit(&alloc::format!(
+                                        "nc: udp {} -> {}.{}.{}.{}:{} -- keystrokes send, Esc closes",
+                                        lport, ip[0], ip[1], ip[2], ip[3], port
+                                    ));
+                                    self.nc_udp = Some((s, Some((ip, port))));
+                                }
+                                None => self.fail("nc: udp open failed"),
+                            }
+                        }
+                        _ => self.fail("usage: nc -u <host|a.b.c.d> <port>  |  nc -lu <port>"),
+                    }
+                } else if args.first().map(|s| *s) == Some("-l") {
                     match args.get(1).and_then(|s| s.parse::<u16>().ok()) {
                         Some(port) => match ustd::TcpListener::bind(port) {
                             Some(l) => {
                                 self.emit(&alloc::format!(
-                                    "nc: listening on :{} — Esc cancels",
+                                    "nc: listening on :{} -- Esc cancels",
                                     port
                                 ));
                                 self.nc_listen = Some(l);
@@ -2156,7 +2302,7 @@ impl Term {
                             match ustd::TcpSock::connect(lport, ip, port) {
                                 Some(s) => {
                                     self.emit(&alloc::format!(
-                                        "nc: connected to {}.{}.{}.{}:{} — keystrokes send, Esc closes",
+                                        "nc: connected to {}.{}.{}.{}:{} -- keystrokes send, Esc closes",
                                         ip[0], ip[1], ip[2], ip[3], port
                                     ));
                                     self.nc = Some(s);
@@ -2184,7 +2330,7 @@ impl Term {
                     self.fail("usage: watch [-n secs] <cmd...>  (Esc/Enter exits)");
                 } else {
                     self.watch = Some((args[i..].join(" "), ms, 0));
-                    self.emit(&alloc::format!("watching every {}ms — Esc/Enter to stop", ms));
+                    self.emit(&alloc::format!("watching every {}ms -- Esc/Enter to stop", ms));
                 }
             }
             "history" => {
@@ -2275,7 +2421,7 @@ impl Term {
                                 if let Some(p) = popt {
                                     self.tailf = Some((String::from(p), blen as u64));
                                     self.tailf_last = 0;
-                                    self.emit("  (following — Esc/Enter to stop)");
+                                    self.emit("  (following -- Esc/Enter to stop)");
                                 } else {
                                     self.fail("tail: -f needs a file");
                                 }
@@ -2304,7 +2450,7 @@ impl Term {
                             }
                         }
                         if !any && !args.is_empty() {
-                            // nothing readable — fail already reported
+                            // nothing readable -- fail already reported
                         } else if !any {
                             match &self.pipe_in {
                                 Some(s) => {
@@ -2500,7 +2646,7 @@ impl Term {
                         }
                     }
                     "tr" => {
-                        // tr [-d] <set1> [set2] — ranges like a-z expand
+                        // tr [-d] <set1> [set2] -- ranges like a-z expand
                         let del = args.iter().any(|a| a == &"-d");
                         let pos: Vec<&&str> = args.iter().filter(|a| !a.starts_with('-')).collect();
                         let expand = |spec: &str| -> Vec<u8> {
@@ -2609,7 +2755,7 @@ impl Term {
                         }
                     }
                     "tee" => {
-                        // tee [-a] file — pipe stdin to stdout AND the file
+                        // tee [-a] file -- pipe stdin to stdout AND the file
                         let append = args.iter().any(|a| a == &"-a");
                         let src = args.iter().find(|a| !a.starts_with('-'));
                         let inp_owned = self.pipe_in.clone();
@@ -2855,7 +3001,7 @@ impl Term {
                 } else {
                     args.join(" ")
                 });
-                self.emit("yes running — Esc/Enter to stop");
+                self.emit("yes running -- Esc/Enter to stop");
             }
             "sed" => {
                 // sed [-i] [-n] 's/a/b/[g]' | 'N[,M]p' | 'N[,M]d' [file]
@@ -3248,7 +3394,7 @@ impl Term {
                 }
             }
             "dd" => {
-                // dd if=X of=Y [bs=N] [count=M] [skip=N] — real byte-level copy
+                // dd if=X of=Y [bs=N] [count=M] [skip=N] -- real byte-level copy
                 let (mut fi, mut fo) = ("", "");
                 let (mut bs, mut count, mut skip) = (512usize, usize::MAX, 0usize);
                 for a in args {
@@ -3547,8 +3693,8 @@ impl Term {
     }
 
     /// Reverse-history search state update: scans backward for the newest
-    /// entry matching the query (rs.1 is the exclusive scan bound — the
-    /// last match's index — so a repeat Ctrl-R finds the next older hit).
+    /// entry matching the query (rs.1 is the exclusive scan bound -- the
+    /// last match's index -- so a repeat Ctrl-R finds the next older hit).
     fn rs_update(&mut self) {
         let Some((q, bound)) = self.rs.clone() else {
             return;
@@ -3728,6 +3874,48 @@ impl Term {
             self.dirty_all = true;
             return;
         }
+        // nc udp mode: keystrokes send datagrams to the peer; Esc closes
+        if self.nc_udp.is_some() {
+            let peer = self.nc_udp.as_ref().unwrap().1;
+            match k.key as u32 {
+                x if x == KeyCode::Escape as u32 => {
+                    self.nc_udp = None;
+                    self.cur.clear();
+                    self.cx = 0;
+                    self.push_line("nc: udp closed");
+                }
+                _ => {
+                    if let Some((rip, rport)) = peer {
+                        let bytes: &[u8] = match k.key as u32 {
+                            x if x == KeyCode::Enter as u32 => b"\r\n",
+                            x if x == KeyCode::Backspace as u32 => &[0x7f],
+                            x if x == KeyCode::Char as u32 => core::slice::from_ref(&k.chr),
+                            _ => &[],
+                        };
+                        if !bytes.is_empty() {
+                            let _ = self.nc_udp.as_ref().unwrap().0.send_to(rip, rport, bytes);
+                        }
+                    }
+                    match k.key as u32 {
+                        x if x == KeyCode::Enter as u32 => {
+                            self.cur.clear();
+                            self.cx = 0;
+                        }
+                        x if x == KeyCode::Backspace as u32 => {
+                            self.cur.pop();
+                            self.cx = self.cx.saturating_sub(1);
+                        }
+                        x if x == KeyCode::Char as u32 => {
+                            self.cur.push(k.chr as char);
+                            self.cx += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            self.dirty_all = true;
+            return;
+        }
         // nc mode: keystrokes are sent raw over the socket; Esc closes
         if let Some(s) = &self.nc {
             match k.key as u32 {
@@ -3898,6 +4086,7 @@ impl Term {
         "alias", "unalias", "type", "hostname", "id", "printf", "dd", "split",
         "source", "comm", "join", "paste", "expand", "unexpand", "at", "file",
         "test", "[", "rand", "mount", "rmdir",
+        "export", "unset", "man",
     ];
 
     /// Tab-complete: command names before the first space, paths after.
@@ -3909,7 +4098,7 @@ impl Term {
         let word = &head[word_start..];
         let mut cands: Vec<String> = Vec::new();
         if word_start == 0 {
-            // command position — match built-ins + /bin binaries
+            // command position -- match built-ins + /bin binaries
             for c in Self::BUILTINS {
                 if c.starts_with(word) {
                     cands.push(String::from(*c));
@@ -3926,7 +4115,7 @@ impl Term {
                 }
             }
         } else {
-            // path position — split dir/prefix, readdir, keep trailing / on dirs
+            // path position -- split dir/prefix, readdir, keep trailing / on dirs
             let (dir, prefix) = match word.rfind('/') {
                 Some(i) => (&word[..i + 1], &word[i + 1..]),
                 None => ("", word),
@@ -3968,13 +4157,13 @@ impl Term {
             }
             self.cx += add.len();
         } else if cands.len() == 1 {
-            // exact match — add a space after commands
+            // exact match -- add a space after commands
             if word_start == 0 {
                 self.cur.insert(self.cx, ' ');
                 self.cx += 1;
             }
         } else {
-            // ambiguous — list the matches
+            // ambiguous -- list the matches
             for c in &cands {
                 self.emit(&alloc::format!("  {}", c));
             }
@@ -4029,7 +4218,7 @@ impl Term {
                 }
                 ustd::remove(path)
             }
-            Err(_) => ustd::remove(path), // plain file (or bad path — remove reports)
+            Err(_) => ustd::remove(path), // plain file (or bad path -- remove reports)
         }
     }
 
@@ -4346,6 +4535,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         httpd: None,
         nc: None,
         nc_listen: None,
+        nc_udp: None,
         last_ok: true,
         vars: alloc::collections::BTreeMap::new(),
         prev_cwd: String::new(),
@@ -4361,6 +4551,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         prev_buttons: 0,
         aliases: Vec::new(),
         subst_depth: 0,
+        run_depth: 0,
         rs: None,
         rs_saved: String::new(),
         host: ustd::read_all("/hostname")
@@ -4471,7 +4662,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 let req = sock.recv(400).unwrap_or_default();
                 let line = String::from_utf8_lossy(&req);
                 let first = line.lines().next().unwrap_or("");
-                // GET /path — sanitize, map under the docroot, serve a real
+                // GET /path -- sanitize, map under the docroot, serve a real
                 // file or an autoindex listing
                 let path = first
                     .strip_prefix("GET ")
@@ -4579,9 +4770,33 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 t.nc = Some(s);
                 t.nc_listen = None;
                 t.push_line(&alloc::format!(
-                    "nc: client {}.{}.{}.{}:{} connected — keystrokes send, Esc closes",
+                    "nc: client {}.{}.{}.{}:{} connected -- keystrokes send, Esc closes",
                     rip[0], rip[1], rip[2], rip[3], rport
                 ));
+                t.dirty_all = true;
+            }
+        }
+        // nc udp mode: drain inbound datagrams; remember the last peer
+        if t.nc_udp.is_some() {
+            let mut pending: Vec<([u8; 4], u16, Vec<u8>)> = Vec::new();
+            loop {
+                let d = t.nc_udp.as_ref().unwrap().0.recv_from(0);
+                match d {
+                    Some(dg) => pending.push(dg),
+                    None => break,
+                }
+            }
+            let got = !pending.is_empty();
+            for (rip, rport, d) in pending {
+                if let Some((_, peer)) = &mut t.nc_udp {
+                    *peer = Some((rip, rport));
+                }
+                let txt = String::from_utf8_lossy(&d);
+                for l in txt.split('\n') {
+                    t.push_line(l.trim_end_matches('\r'));
+                }
+            }
+            if got {
                 t.dirty_all = true;
             }
         }
@@ -4622,7 +4837,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         if let Some((cmd, ms, last)) = t.watch.clone() {
             if now - last >= ms {
                 let out = t.run_captured(&cmd);
-                let hdr = alloc::format!("$ {}   (every {}ms — Esc/Enter to stop)", cmd, ms);
+                let hdr = alloc::format!("$ {}   (every {}ms -- Esc/Enter to stop)", cmd, ms);
                 t.lines.clear();
                 t.view = 0;
                 t.push_line(&hdr);
