@@ -3372,6 +3372,150 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    // --- *at() syscall family + O_EXCL/O_PATH + SIGPIPE + wait4 ---
+    {
+        let _ = ustd::remove("/atdir/inner.txt");
+        let _ = ustd::remove("/atdir/renamed.txt");
+        let _ = ustd::remove("/atdir/newfile");
+        let _ = ustd::remove("/atdir/lnk");
+        let _ = ustd::remove("/atdir/gone.txt");
+        let _ = ustd::remove("/atdir/subd");
+        let _ = ustd::remove("/atdir");
+        let _ = ustd::mkdir("/atdir");
+        let _ = ustd::write_all("/atdir/inner.txt", b"innerv7");
+        let dfd = ustd::open("/atdir", ustd::O_RDONLY).unwrap_or(-1);
+
+        check("at-open", {
+            let f = ustd::openat(dfd as i64, "inner.txt", ustd::O_RDONLY).unwrap_or(-1);
+            let mut b = [0u8; 16];
+            let n = if f >= 0 { ustd::read(f, &mut b).unwrap_or(0) } else { 0 };
+            if f >= 0 { ustd::close(f); }
+            let fa = ustd::openat(ustd::AT_FDCWD, "/atdir/inner.txt", ustd::O_RDONLY).unwrap_or(-1);
+            if fa >= 0 { ustd::close(fa); }
+            &b[..n] == b"innerv7" && fa >= 0
+        });
+
+        check("at-stat", {
+            ustd::fstatat(dfd as i64, "inner.txt", 0)
+                .map(|s| s.size == 7)
+                .unwrap_or(false)
+        });
+
+        check("at-access", {
+            ustd::access("/atdir/inner.txt", 0)
+                && !ustd::access("/atdir-no-such", 0)
+                && ustd::faccessat(dfd as i64, "inner.txt", 0)
+                && !ustd::access("/proc/version", 2) // W_OK on ro pseudo-fs
+        });
+
+        check("at-mkdir-unlink", {
+            let mk = ustd::mkdirat(dfd as i64, "subd").is_ok();
+            let eisdir = ustd::unlinkat(dfd as i64, "subd", 0) == Err(-21);
+            let rm = ustd::unlinkat(dfd as i64, "subd", ustd::AT_REMOVEDIR).is_ok();
+            let _ = ustd::write_all("/atdir/gone.txt", b"x");
+            let ul = ustd::unlinkat(dfd as i64, "gone.txt", 0).is_ok()
+                && ustd::stat("/atdir/gone.txt").is_err();
+            mk && eisdir && rm && ul
+        });
+
+        check("at-rename", {
+            ustd::renameat(dfd as i64, "inner.txt", dfd as i64, "renamed.txt").is_ok()
+                && ustd::stat("/atdir/renamed.txt").map(|s| s.size == 7).unwrap_or(false)
+        });
+
+        check("at-symlink", {
+            let cr = ustd::symlinkat("/atdir/renamed.txt", dfd as i64, "lnk").is_ok();
+            let tgt = ustd::readlinkat(dfd as i64, "lnk").as_deref() == Some("/atdir/renamed.txt");
+            let lst = ustd::fstatat(dfd as i64, "lnk", ustd::AT_SYMLINK_NOFOLLOW)
+                .map(|s| s.attr & 0x40 != 0)
+                .unwrap_or(false);
+            let fol = ustd::fstatat(dfd as i64, "lnk", 0)
+                .map(|s| s.size == 7)
+                .unwrap_or(false);
+            cr && tgt && lst && fol
+        });
+
+        check("fchdir", {
+            let ok = ustd::fchdir(dfd as i64) == 0 && ustd::getcwd() == "/atdir";
+            let _ = ustd::chdir("/");
+            ok && ustd::getcwd() == "/"
+        });
+
+        check("fchmod", {
+            let f = ustd::open("/atdir/renamed.txt", ustd::O_RDONLY).unwrap_or(-1);
+            let ro = f >= 0
+                && ustd::fchmod(f, 0o444) == 0
+                && ustd::stat("/atdir/renamed.txt").map(|s| s.attr & 0x01 != 0).unwrap_or(false);
+            let rw = f >= 0
+                && ustd::fchmod(f, 0o644) == 0
+                && ustd::stat("/atdir/renamed.txt").map(|s| s.attr & 0x01 == 0).unwrap_or(false);
+            if f >= 0 { ustd::close(f); }
+            ro && rw
+        });
+
+        check("getdents", {
+            ustd::getdents(dfd as i64, 32)
+                .map(|es| es.iter().any(|e| {
+                    let nm = unsafe {
+                        let p = e.name.as_ptr();
+                        let mut l = 0usize;
+                        while l < e.name.len() && *p.add(l) != 0 { l += 1; }
+                        core::str::from_utf8_unchecked(&e.name[..l])
+                    };
+                    nm == "renamed.txt"
+                }))
+                .unwrap_or(false)
+        });
+
+        check("at-oexcl", {
+            let ex = ustd::open("/atdir/renamed.txt", ustd::O_RDWR | ustd::O_CREATE | ustd::O_EXCL);
+            let nf = ustd::open("/atdir/newfile", ustd::O_RDWR | ustd::O_CREATE | ustd::O_EXCL);
+            if let Ok(f) = nf { ustd::close(f); }
+            ex == Err(-17) && nf.map(|f| f >= 0).unwrap_or(false)
+        });
+
+        check("at-opath", {
+            let f = ustd::open("/atdir/renamed.txt", ustd::O_PATH).unwrap_or(-1);
+            let mut b = [0u8; 4];
+            let r = if f >= 0 { ustd::read(f, &mut b) } else { Err(-1) };
+            let w = if f >= 0 { ustd::write(f, b"x") } else { Err(-1) };
+            if f >= 0 { ustd::close(f); }
+            f >= 0 && r == Err(-9) && w == Err(-9)
+        });
+
+        if dfd >= 0 { ustd::close(dfd); }
+    }
+
+    check("sigpipe", {
+        extern "C" fn sp(_: u64) {
+            unsafe { SP_HIT += 1 };
+        }
+        static mut SP_HIT: u32 = 0;
+        unsafe { SP_HIT = 0 };
+        ustd::sigaction(13, sp as usize as u64);
+        match ustd::pipe() {
+            Some((r, w)) => {
+                ustd::close(r);
+                let e = ustd::write(w, b"x");
+                ustd::close(w);
+                ustd::sigaction(13, ustd::SIG_IGN);
+                e == Err(-32) && unsafe { SP_HIT } == 1
+            }
+            None => false,
+        }
+    });
+
+    check("wait4", {
+        match ustd::fork() {
+            0 => ustd::exit(42),
+            p if p > 0 => {
+                let (st, ru) = ustd::wait4(p as i64, 0, 5000);
+                st == 42 && ru.is_some()
+            }
+            _ => false,
+        }
+    });
+
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

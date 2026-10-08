@@ -513,6 +513,145 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
+        shared::SYS_OPENAT => match resolve_at(a1 as i64, a2, a3) {
+            Some(p) => match vfs::open(&p, a4) {
+                Ok(fd) => fd as u64,
+                Err(e) => e as u64,
+            },
+            None => ERR,
+        },
+        shared::SYS_FSTATAT => sys_fstatat(a1 as i64, a2, a3, a4, a5),
+        shared::SYS_FACCESSAT => sys_access_at(a1 as i64, a2, a3, a4),
+        shared::SYS_ACCESS => sys_access_at(shared::AT_FDCWD, a1, a2, a3),
+        shared::SYS_UNLINKAT => match resolve_at(a1 as i64, a2, a3) {
+            Some(p) => {
+                // POSIX split: unlink() on a dir is EISDIR, rmdir() on a
+                // non-dir is ENOTDIR.
+                match vfs::stat_path(&p) {
+                    Ok(st) if st.is_dir != 0 && a4 & shared::AT_REMOVEDIR == 0 => {
+                        (-21i64) as u64
+                    }
+                    Ok(st) if st.is_dir == 0 && a4 & shared::AT_REMOVEDIR != 0 => {
+                        (-20i64) as u64
+                    }
+                    Ok(_) => vfs::remove(&p).map(|_| 0).unwrap_or_else(|e| e as u64),
+                    Err(e) => e as u64,
+                }
+            }
+            None => ERR,
+        },
+        shared::SYS_RENAMEAT => {
+            // 6-arg shape doesn't fit the 5-register ABI: a1 packs the two
+            // dirfds (old low 32, new high 32), then opath,olen,npath,nlen.
+            let (o, n) = (
+                resolve_at(a1 as u32 as i32 as i64, a2, a3),
+                resolve_at((a1 >> 32) as u32 as i32 as i64, a4, a5),
+            );
+            match (o, n) {
+                (Some(o), Some(n)) => vfs::rename(&o, &n).map(|_| 0).unwrap_or_else(|e| e as u64),
+                _ => ERR,
+            }
+        }
+        shared::SYS_MKDIRAT => match resolve_at(a1 as i64, a2, a3) {
+            Some(p) => vfs::mkdir(&p).map(|_| 0).unwrap_or_else(|e| e as u64),
+            None => ERR,
+        },
+        shared::SYS_LINKAT => ERR, // -38 ENOSYS: FAT32 has no hard links
+        shared::SYS_SYMLINKAT => {
+            let (t, n) = (copy_str(a1, a2), resolve_at(a3 as i64, a4, a5));
+            match (t, n) {
+                (Some(t), Some(n)) => sys_symlink_impl(&t, &n),
+                _ => ERR,
+            }
+        }
+        shared::SYS_READLINKAT => match resolve_at(a1 as i64, a2, a3) {
+            Some(p) => match vfs::readlink_path(&p) {
+                Ok(t) => {
+                    let bytes = t.as_bytes();
+                    let n = bytes.len().min(a5 as usize);
+                    match copy_out(a4, &bytes[..n]) {
+                        Some(_) => n as u64,
+                        None => ERR,
+                    }
+                }
+                Err(e) => e as u64,
+            },
+            None => ERR,
+        },
+        shared::SYS_FCHDIR => {
+            let p = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => Some(f.path.clone()),
+                _ => None,
+            });
+            match p {
+                Some(p) => {
+                    let is_dir = crate::proc::is_dir(&p)
+                        || crate::dev::is_dir(&p)
+                        || {
+                            let mut g = vfs::FS.lock();
+                            g.as_mut().and_then(|fs| fs.stat(&p).ok()).map(|s| s.is_dir).unwrap_or(false)
+                        };
+                    if is_dir {
+                        task::with_current(|t| t.cwd = p);
+                        0
+                    } else {
+                        (-20i64) as u64 // ENOTDIR
+                    }
+                }
+                None => ERR,
+            }
+        }
+        shared::SYS_FCHMOD => {
+            let p = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => Some(f.path.clone()),
+                _ => None,
+            });
+            match p {
+                Some(p) => {
+                    // FAT has no mode bits; the one meaningful mapping is
+                    // owner-write masked out -> readonly attribute.
+                    let cur = {
+                        let mut g = vfs::FS.lock();
+                        g.as_mut().and_then(|fs| fs.stat(&p).ok()).map(|s| s.attr)
+                    };
+                    match cur {
+                        Some(attr) => {
+                            let attr = if a2 & 0o200 != 0 { attr & !0x01 } else { attr | 0x01 };
+                            vfs::setattr(&p, attr).map(|_| 0).unwrap_or_else(|e| e as u64)
+                        }
+                        None => (-2i64) as u64,
+                    }
+                }
+                None => ERR,
+            }
+        }
+        shared::SYS_GETDENTS => {
+            let p = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => Some(f.path.clone()),
+                _ => None,
+            });
+            match p {
+                Some(p) => match vfs::listdir(&p) {
+                    Ok(mut ents) => {
+                        ents.truncate(a3 as usize);
+                        let n = ents.len();
+                        let bytes = unsafe {
+                            core::slice::from_raw_parts(
+                                ents.as_ptr() as *const u8,
+                                n * core::mem::size_of::<shared::DirEntry>(),
+                            )
+                        };
+                        match copy_out(a2, bytes) {
+                            Some(_) => n as u64,
+                            None => ERR,
+                        }
+                    }
+                    Err(e) => e as u64,
+                },
+                None => ERR,
+            }
+        }
+        shared::SYS_WAIT4 => sys_wait4(ctx, a1, a2, a3, a4),
         shared::SYS_MQ_UNLINK => {
             let Some(nb) = copy_in(a1, a2.min(64)) else {
                 ctx.rax = ERR;
@@ -2032,11 +2171,14 @@ fn sys_open(pptr: u64, plen: u64, flags: u64) -> u64 {
 /// One non-blocking read attempt against `fd`'s backend — the shared read
 /// path used by sys_read/readv/sendfile. Err(-11) = would block.
 fn fd_read_once(fd: usize, buf: &mut [u8]) -> Result<usize, i64> {
-    let path = task::with_current(|t| match t.fds.get(fd) {
-        Some(Some(f)) => Some(f.path.clone()),
+    let (path, oflags) = task::with_current(|t| match t.fds.get(fd) {
+        Some(Some(f)) => Some((f.path.clone(), f.flags)),
         _ => None,
     })
     .ok_or(-3i64)?;
+    if oflags & shared::O_PATH != 0 {
+        return Err(-9); // EBADF: O_PATH fds are pathname-only
+    }
     if crate::pipes::handles(&path) {
         return match crate::pipes::try_read(&path, buf) {
             crate::pipes::TryRead::WouldBlock => Err(-11),
@@ -2077,11 +2219,14 @@ fn fd_read_once(fd: usize, buf: &mut [u8]) -> Result<usize, i64> {
 /// One non-blocking write attempt against `fd`'s backend. Err(-11) = would
 /// block; Err(-32) = EPIPE.
 fn fd_write_once(fd: usize, data: &[u8]) -> Result<usize, i64> {
-    let path = task::with_current(|t| match t.fds.get(fd) {
-        Some(Some(f)) => Some(f.path.clone()),
+    let (path, oflags) = task::with_current(|t| match t.fds.get(fd) {
+        Some(Some(f)) => Some((f.path.clone(), f.flags)),
         _ => None,
     })
     .ok_or(-3i64)?;
+    if oflags & shared::O_PATH != 0 {
+        return Err(-9); // EBADF: O_PATH fds are pathname-only
+    }
     if crate::eventfd::handles(&path) {
         return crate::eventfd::try_write(&path, data);
     }
@@ -2147,6 +2292,11 @@ fn sys_write(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
             } else {
                 block_reenter(ctx, task::ticks() + 2, 0)
             }
+        }
+        Err(-32) => {
+            // POSIX: a write that fails with EPIPE also raises SIGPIPE.
+            task::signal(cur_id(), 13);
+            (-32i64) as u64
         }
         Err(e) => e as u64,
         Ok(n) => n as u64,
@@ -2217,6 +2367,10 @@ fn sys_iov(ctx: &mut CpuContext, fd: u64, iov_ptr: u64, iovcnt: u64, rd: bool) -
                     Err(-11) if total > 0 => return total as u64,
                     Err(-11) if nonblock => return (-11i64) as u64,
                     Err(-11) => wait_irq(),
+                    Err(-32) => {
+                        task::signal(cur_id(), 13);
+                        return if total > 0 { total as u64 } else { (-32i64) as u64 };
+                    }
                     Err(e) => return e as u64,
                 }
             }
@@ -2321,12 +2475,15 @@ fn restore_pos(inp: usize, saved: Option<u64>, off_ptr: u64) {
 }
 
 fn sys_seek(fd: u64, off: u64, whence: u64) -> u64 {
-    let Some((pos, path)) = task::with_current(|t| match t.fds.get(fd as usize) {
-        Some(Some(f)) => Some((f.pos, f.path.clone())),
+    let Some((pos, path, oflags)) = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) => Some((f.pos, f.path.clone(), f.flags)),
         _ => None,
     }) else {
         return ERR;
     };
+    if oflags & shared::O_PATH != 0 {
+        return (-9i64) as u64;
+    }
     let new = match whence {
         shared::SEEK_SET => off,
         shared::SEEK_CUR => pos + off,
@@ -2790,6 +2947,153 @@ fn sys_stat(pptr: u64, plen: u64, out: u64) -> u64 {
         }
         Err(e) => e as u64,
     }
+}
+
+/// Resolve a possibly dirfd-relative path to an absolute one.
+/// `dirfd` may be AT_FDCWD (-100, use the task's cwd), a real fd whose
+/// desc's path is the base directory, or ignored for absolute paths.
+/// Returns None on a bad fd or bad string.
+fn resolve_at(dirfd: i64, pptr: u64, plen: u64) -> Option<String> {
+    let path = copy_str(pptr, plen)?;
+    if path.is_empty() {
+        // AT_EMPTY_PATH callers pass the dirfd's own path.
+        return task::with_current(|t| {
+            t.fds
+                .get(dirfd as usize)
+                .and_then(|s| s.as_ref())
+                .map(|f| f.path.clone())
+        });
+    }
+    if path.starts_with('/') {
+        return Some(path);
+    }
+    if dirfd == shared::AT_FDCWD {
+        return task::with_current(|t| {
+            Some(alloc::format!("{}/{}", t.cwd.trim_end_matches('/'), path))
+        });
+    }
+    let base = task::with_current(|t| {
+        t.fds
+            .get(dirfd as usize)
+            .and_then(|s| s.as_ref())
+            .map(|f| f.path.clone())
+    })?;
+    Some(alloc::format!("{}/{}", base.trim_end_matches('/'), path))
+}
+
+/// SYS_FSTATAT(dirfd, path, len, flags, out): stat relative to dirfd;
+/// AT_SYMLINK_NOFOLLOW reports the link itself, AT_EMPTY_PATH stats the fd.
+fn sys_fstatat(dirfd: i64, pptr: u64, plen: u64, flags: u64, out: u64) -> u64 {
+    let Some(path) = resolve_at(dirfd, pptr, plen) else { return ERR };
+    if path.is_empty() && flags & shared::AT_EMPTY_PATH == 0 {
+        return ERR;
+    }
+    let st = if flags & shared::AT_SYMLINK_NOFOLLOW != 0 {
+        // readlink_path distinguishes "is a symlink" from stat errors: a
+        // link reports its own Stat (LNK> body), anything else falls back
+        // to the normal stat.
+        match vfs::readlink_path(&path) {
+            Ok(_) => {
+                let mut g = vfs::FS.lock();
+                match g.as_mut().and_then(|fs| fs.stat(&path).ok()) {
+                    Some(s) => shared::Stat {
+                        size: s.size,
+                        is_dir: if s.is_dir { 1 } else { 0 },
+                        mtime: s.mtime,
+                        attr: s.attr as u32,
+                    },
+                    None => return (-2i64) as u64,
+                }
+            }
+            Err(_) => match vfs::stat_path(&path) {
+                Ok(st) => st,
+                Err(e) => return e as u64,
+            },
+        }
+    } else {
+        match vfs::stat_path(&path) {
+            Ok(st) => st,
+            Err(e) => return e as u64,
+        }
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(&st as *const _ as *const u8, core::mem::size_of::<shared::Stat>())
+    };
+    match copy_out(out, bytes) {
+        Some(_) => 0,
+        None => ERR,
+    }
+}
+
+/// SYS_ACCESS/SYS_FACCESSAT: does the path exist and permit `mode`?
+/// FAT32 has no owner/permission model, so the honest checks are: the file
+/// must exist (F_OK), and W_OK fails on the readonly FAT attribute and on
+/// the read-only pseudo filesystems. X_OK follows the same rule (every
+/// readable file is considered executable, like vfat mounts on Linux).
+fn sys_access_at(dirfd: i64, pptr: u64, plen: u64, mode: u64) -> u64 {
+    let Some(path) = resolve_at(dirfd, pptr, plen) else { return ERR };
+    if mode == 0 {
+        // F_OK
+        return match vfs::stat_path(&path) {
+            Ok(_) => 0,
+            Err(e) => e as u64,
+        };
+    }
+    match vfs::stat_path(&path) {
+        Ok(st) => {
+            if mode & 2 != 0 && (st.attr & 0x01 != 0 || !on_real_fs(&path)) {
+                return (-13i64) as u64; // EACCES
+            }
+            0
+        }
+        Err(e) => e as u64,
+    }
+}
+
+fn on_real_fs(path: &str) -> bool {
+    !(crate::proc::handles(path)
+        || crate::dev::handles(path)
+        || crate::pipes::handles(path)
+        || crate::pty::handles(path))
+}
+
+/// Write the `LNK>target` file + symlink attribute — what `ln -s` does
+/// in userspace, callable kernel-side for symlinkat.
+fn sys_symlink_impl(target: &str, link: &str) -> u64 {
+    if vfs::stat_path(link).is_ok() || vfs::readlink_path(link).is_ok() {
+        return (-17i64) as u64; // EEXIST
+    }
+    let body = alloc::format!("LNK>{}", target);
+    if vfs::write_all_path(link, body.as_bytes()).is_err() {
+        return ERR;
+    }
+    let cur = {
+        let mut g = vfs::FS.lock();
+        g.as_mut().and_then(|fs| fs.stat(link).ok()).map(|s| s.attr)
+    };
+    let attr = cur.unwrap_or(0x20) | 0x40;
+    let _ = vfs::setattr(link, attr);
+    0
+}
+
+/// SYS_WAIT4(pid, opts, timeout, rusage_ptr): waitpid + rusage copy-out.
+/// Delegates the wait itself to sys_waitpid (which handles WUNTRACED /
+/// WCONTINUED encodings and the blocking re-entry), then copies the dead
+/// child's {utime_ticks, rtime?} pair when a result lands.
+fn sys_wait4(ctx: &mut CpuContext, pid: u64, opts: u64, timeout: u64, rusage_ptr: u64) -> u64 {
+    let r = sys_waitpid(ctx, pid, timeout, opts);
+    if r != ERR && rusage_ptr != 0 {
+        let cpid = if pid as u32 == u32::MAX {
+            (r >> 32) as u32
+        } else {
+            pid as u32
+        };
+        if let Some((a, b)) = task::rusage(cpid) {
+            let bytes = [a.to_le_bytes(), b.to_le_bytes()].concat();
+            let _ = copy_out(rusage_ptr, &bytes);
+        }
+    }
+    r
 }
 
 fn sys_readdir(pptr: u64, plen: u64, buf: u64, max: u64) -> u64 {

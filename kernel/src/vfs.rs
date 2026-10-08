@@ -251,6 +251,13 @@ pub fn readlink(path: &str) -> Result<String, i64> {
 pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let mut full = normalize(&cwd, path);
+    // O_PATH: descriptor for pathname operations only — never creates,
+    // truncates, or appends; read/write/seek on it return EBADF.
+    let flags = if flags & shared::O_PATH != 0 {
+        (flags | shared::O_PATH) & !(shared::O_CREATE | shared::O_TRUNC | shared::O_APPEND)
+    } else {
+        flags
+    };
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     // links are fully transparent: resolve first, then classify the target
@@ -321,6 +328,9 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     const O_CREAT: u64 = shared::O_CREATE;
     const O_TRUNC: u64 = shared::O_TRUNC;
     const O_APPEND: u64 = shared::O_APPEND;
+    if exists && flags & O_CREAT != 0 && flags & shared::O_EXCL != 0 {
+        return Err(-17); // EEXIST
+    }
     if !exists {
         if flags & O_CREAT == 0 {
             return Err(-2);
