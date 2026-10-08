@@ -88,6 +88,13 @@ pub const SYS_UMASK: u64 = 88;             // (mask|U64MAX=query) -> old   per-t
 pub const SYS_KLOG_CLEAR: u64 = 89;        // () -> 0                      clear the kernel log ring
 pub const SYS_MKFIFO: u64 = 90;            // (path_ptr,len) -> 0 | ERR    create named pipe (mkfifo)
 pub const SYS_READLINK: u64 = 91;          // (path_ptr,len,out,cap) -> len | ERR raw symlink target
+pub const SYS_FLOCK: u64 = 92;             // (path_ptr,len,op) -> 0 | ERR  advisory file lock (LOCK_SH|EX|NB|UN)
+
+// SYS_FLOCK op bits
+pub const LOCK_SH: u64 = 1;
+pub const LOCK_EX: u64 = 2;
+pub const LOCK_NB: u64 = 4;
+pub const LOCK_UN: u64 = 8;
 pub const SYS_ERR: u64 = u64::MAX;
 
 // open flags

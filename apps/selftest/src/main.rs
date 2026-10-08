@@ -542,6 +542,53 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             .map(|d| d == b"rel-ok")
             .unwrap_or(false)
     });
+    // ---- flock: advisory lock registry + /proc/locks + signal 0 probe ----
+    let _ = ustd::write_all("/lock-a.txt", b"locked");
+    check("flock-ex", ustd::flock("/lock-a.txt", 2) == 0);
+    check("flock-proc", {
+        ustd::read_all("/proc/locks")
+            .map(|d| {
+                let s = String::from_utf8_lossy(&d).into_owned();
+                s.contains("EXCLUSIVE") && s.contains("/lock-a.txt")
+            })
+            .unwrap_or(false)
+    });
+    // each flock is a distinct open-file description (POSIX): a second EX
+    // on an already-held path conflicts even for the owner → EWOULDBLOCK
+    check("flock-same-owner-nb", ustd::flock("/lock-a.txt", 2 | 4) == -35);
+    check("flock-nb-free", ustd::flock("/lock-b.txt", 2 | 4) == 0);
+    check("flock-un", ustd::flock("/lock-a.txt", 8) == 0);
+    check("flock-un-gone", {
+        ustd::read_all("/proc/locks")
+            .map(|d| !String::from_utf8_lossy(&d).contains("/lock-a.txt"))
+            .unwrap_or(false)
+    });
+    check("flock-un-unheld", ustd::flock("/lock-a.txt", 8) == 0);
+    let _ = ustd::flock("/lock-b.txt", 8);
+    // signal(pid,0): existence probe — self exists, pid 99999 does not
+    check("kill-probe-self", ustd::kill2(ustd::getpid(), 0) == 0);
+    check("kill-probe-missing", ustd::kill2(99999, 0) != 0);
+    // signals beyond KILL/STOP/CONT now route through kill_pid_code
+    check("kill-term-proc", {
+        match ustd::spawn("/bin/cosmos-calc", "") {
+            Ok(pid) => {
+                let r = ustd::kill2(pid, 15) == 0;
+                ustd::sleep_ms(30);
+                r && ustd::kill2(pid, 0) != 0
+            }
+            Err(_) => false,
+        }
+    });
+    check("kill-hup-proc", {
+        match ustd::spawn("/bin/cosmos-calc", "") {
+            Ok(pid) => {
+                let r = ustd::kill2(pid, 1) == 0;
+                ustd::sleep_ms(30);
+                r && ustd::kill2(pid, 0) != 0
+            }
+            Err(_) => false,
+        }
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

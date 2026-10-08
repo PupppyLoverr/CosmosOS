@@ -392,6 +392,27 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
+        shared::SYS_FLOCK => {
+            // (path_ptr,len,op): advisory file lock — SH/EX (+NB for
+            // nonblocking), UN releases. Contended blocking requests
+            // re-block and retry like the pipe wait path; locks release
+            // automatically when the owner task exits (reaper).
+            match copy_in(a1, a2.min(4096)) {
+                Some(b) => {
+                    let path = String::from_utf8_lossy(&b).into_owned();
+                    if !path.starts_with('/') {
+                        ERR
+                    } else {
+                        match crate::locks::lock(&path, cur_id(), a3) {
+                            Ok(()) => 0,
+                            Err(-11) => block_reenter(ctx, task::ticks() + 2, 0),
+                            Err(e) => e as u64,
+                        }
+                    }
+                }
+                None => ERR,
+            }
+        }
         shared::SYS_MKFIFO => {
             // (ptr,len): mkfifo — create a named pipe at any canonical path
             match copy_in(a1, a2.min(4096)) {

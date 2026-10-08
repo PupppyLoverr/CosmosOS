@@ -18,6 +18,7 @@ const FILES: &[&str] = &[
     "netstat",
     "partitions",
     "stat",
+    "locks",
 ];
 
 /// files under /proc/net
@@ -292,6 +293,22 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/partitions" => {
             let secs = crate::virtio::block_device().map(|d| d.capacity_sectors()).unwrap_or(0);
             alloc::format!("major minor  #blocks  name\n   8     0  {} virtio-blk\n", secs / 2)
+        }
+        "/proc/locks" => {
+            // flock table snapshot: index, mode, owner pid, path
+            let mut s = String::new();
+            for (i, (p, ex, owners)) in crate::locks::snapshot().iter().enumerate() {
+                for pid in owners {
+                    s.push_str(&alloc::format!(
+                        "{}: {} {} {}\n",
+                        i + 1,
+                        if *ex { "EXCLUSIVE" } else { "SHARED" },
+                        pid,
+                        p
+                    ));
+                }
+            }
+            s
         }
         _ => return None,
     };

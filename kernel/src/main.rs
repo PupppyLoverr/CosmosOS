@@ -13,6 +13,7 @@ mod idt;
 mod input;
 mod ipc;
 mod klog;
+mod locks;
 mod mem;
 mod net;
 mod pci;
