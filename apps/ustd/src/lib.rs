@@ -13,6 +13,7 @@ use core::fmt;
 use linked_list_allocator::LockedHeap;
 
 pub mod draw;
+pub mod img;
 // FONT16 moved to `shared` so the kernel can render its panic screen.
 pub mod font16 {
     pub use shared::font16::FONT16;
@@ -368,6 +369,12 @@ pub fn net_info() -> Option<([u8; 6], [u8; 4])> {
     mac.copy_from_slice(&b[..6]);
     ip.copy_from_slice(&b[6..]);
     Some((mac, ip))
+}
+
+/// Sound the PC speaker at `freq` Hz for `ms` (non-blocking; kernel silences
+/// the gate when the duration elapses). `0`/`0` silences immediately.
+pub fn beep(freq: u32, ms: u64) {
+    sc2(shared::SYS_BEEP, freq as u64, ms);
 }
 
 pub fn poweroff() -> ! {

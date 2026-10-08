@@ -150,7 +150,7 @@ impl Files {
         }
         while i < self.ents.len() as i32 && drawn < vis {
             let e = &self.ents[i as usize];
-            let (rx, ry, rw) = self.row_rect(i + if self.cwd != "/" { 1 } else { 0 } - if self.cwd != "/" { 1 } else { 0 });
+            let (rx, _y, rw) = self.row_rect(i + if self.cwd != "/" { 1 } else { 0 } - if self.cwd != "/" { 1 } else { 0 });
             let ry = 40 + drawn * ROW_H;
             if i == self.sel {
                 c.fill(rx, ry, rw, ROW_H, draw::EDGE);
@@ -185,19 +185,22 @@ impl Files {
     }
 
     fn click(&mut self, x: i32, y: i32, buttons: u8) {
-        // an open context menu consumes the next click (item or dismiss)
-        if let Some((mx, my, mi)) = self.menu.take() {
-            const MENU_W: i32 = 110;
-            const MENU_H: i32 = 22 * 3;
-            if x >= mx && x < mx + MENU_W && y >= my && y < my + MENU_H {
-                self.sel = mi as i32;
-                match (y - my) / 22 {
-                    0 => self.open_selected(),
-                    1 => self.start_rename(),
-                    _ => self.delete_sel(),
+        // an open context menu consumes the next left press (item or
+        // dismiss); pointer moves/releases leave it open.
+        if self.menu.is_some() && buttons & 1 != 0 {
+            if let Some((mx, my, mi)) = self.menu.take() {
+                const MENU_W: i32 = 110;
+                const MENU_H: i32 = 22 * 3;
+                if x >= mx && x < mx + MENU_W && y >= my && y < my + MENU_H {
+                    self.sel = mi as i32;
+                    match (y - my) / 22 {
+                        0 => self.open_selected(),
+                        1 => self.start_rename(),
+                        _ => self.delete_sel(),
+                    }
                 }
+                self.dirty = true;
             }
-            self.dirty = true;
             return;
         }
         // right-click on a row: select it + open the context menu
@@ -275,7 +278,8 @@ impl Files {
         let i = self.sel as usize;
         let name = Self::entry_name(&self.ents[i]);
         let path = alloc::format!("{}{}{}", self.cwd, if self.cwd.ends_with('/') { "" } else { "/" }, name);
-        let app = if name.to_ascii_lowercase().ends_with(".ppm") {
+        let lname = name.to_ascii_lowercase();
+        let app = if lname.ends_with(".ppm") || lname.ends_with(".bmp") || lname.ends_with(".qoi") {
             "/bin/cosmos-view"
         } else {
             "/bin/cosmos-editor"

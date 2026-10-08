@@ -524,6 +524,63 @@ fn rng(lo0: usize, hi0: usize) -> String {
     }
 }
 
+/// Parse a note name (`A4`, `C#5`, `Eb3`, `R` = rest) or a raw frequency
+/// into Hz. Equal temperament, A4 = 440, integer math only (no FP on this
+/// target). Returns None on garbage.
+fn note_freq(s: &str) -> Option<u32> {
+    if let Ok(f) = s.parse::<u32>() {
+        return (f > 0).then_some(f);
+    }
+    let b = s.as_bytes();
+    if b.len() < 2 {
+        return None;
+    }
+    let semi = match b[0] {
+        b'C' | b'c' => 0i32,
+        b'D' | b'd' => 2,
+        b'E' | b'e' => 4,
+        b'F' | b'f' => 5,
+        b'G' | b'g' => 7,
+        b'A' | b'a' => 9,
+        b'B' | b'b' => 11,
+        b'R' | b'r' => return Some(0), // rest: freq 0 silences the speaker
+        _ => return None,
+    };
+    let mut i = 1;
+    let semi = match b.get(i) {
+        Some(b'#') | Some(b'+') => {
+            i += 1;
+            semi + 1
+        }
+        Some(b'b') if semi > 0 => {
+            i += 1;
+            semi - 1
+        }
+        _ => semi,
+    };
+    let oct = s[i..].parse::<i32>().ok()?;
+    // midi = 12*(octave+1) + semitone; freq = 440 * 2^((midi-69)/12).
+    // 2^(s/12) ratios in 1e6 fixed point for one octave:
+    const SEMI: [u64; 12] = [
+        1_000_000, 1_059_463, 1_122_462, 1_189_207, 1_259_921, 1_334_840,
+        1_414_214, 1_498_307, 1_587_401, 1_681_793, 1_781_797, 1_887_749,
+    ];
+    let d = 12 * (oct + 1) + semi - 69;
+    let (o, r) = (d.div_euclid(12), d.rem_euclid(12) as usize);
+    let mut num: u64 = 440 * SEMI[r];
+    if o >= 0 {
+        num = num.checked_shl(o as u32)?;
+    } else {
+        num >>= (-o).min(40) as u32;
+    }
+    let f = num / 1_000_000 + ((num % 1_000_000 >= 500_000) as u64);
+    if f < 1 || f > 20_000 {
+        None
+    } else {
+        Some(f as u32)
+    }
+}
+
 /// Real SHA-256 (FIPS 180-4). Verified against the "" and "abc" vectors.
 fn sha256(data: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
@@ -790,6 +847,8 @@ impl Term {
     /// Command output: goes to the capture buffer during a pipe/redirect
     /// stage, else to the scrollback. Embedded newlines split into lines.
     fn emit(&mut self, s: &str) {
+        let mut cleaned = String::new();
+        let s = self.bell(s, &mut cleaned);
         for l in s.split('\n') {
             if let Some(c) = self.capture.as_mut() {
                 c.push(String::from(l));
@@ -799,9 +858,21 @@ impl Term {
         }
     }
 
+    /// BEL (\\x07) rings the PC speaker instead of printing a glyph.
+    fn bell<'a>(&mut self, s: &'a str, cleaned: &'a mut String) -> &'a str {
+        if !s.contains('\x07') {
+            return s;
+        }
+        ustd::beep(880, 80);
+        *cleaned = s.chars().filter(|&c| c != '\x07').collect();
+        cleaned
+    }
+
     /// `echo -n` semantics: append to the current last line (screen or
     /// capture) instead of starting a new one.
     fn emit_no_nl(&mut self, s: &str) {
+        let mut cleaned = String::new();
+        let s = self.bell(s, &mut cleaned);
         if let Some(c) = self.capture.as_mut() {
             match c.last_mut() {
                 Some(last) => last.push_str(s),
@@ -1711,6 +1782,7 @@ impl Term {
                     "          ls -a -S -r  rand [n] [-x]  mount  rmdir  uname -srmva",
                     "          sh <file> args -> $0 $1..$N $#   !<prefix> reruns match",
                     "          more: Space/b page, / search, n next",
+                    "          beep [hz ms]  play <file> (NOTE|HZ,DUR per line, R=rest)",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ];
@@ -4015,6 +4087,61 @@ impl Term {
             },
             "reboot" => ustd::reboot(),
             "shutdown" | "poweroff" => ustd::poweroff(),
+            "beep" => {
+                let f = args
+                    .first()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(880);
+                let ms = args
+                    .get(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(120);
+                ustd::beep(f, ms);
+            }
+            "play" => match args.first() {
+                None => self.fail("usage: play <file>  (lines: NOTE|HZ,DUR_MS)"),
+                Some(path) => match ustd::read_all(path) {
+                    Err(e) => self.fail(&alloc::format!("play: {path}: {e}")),
+                    Ok(data) => {
+                        let text = String::from_utf8_lossy(&data);
+                        let mut n = 0u32;
+                        let mut bad = false;
+                        for (ln, raw) in text.lines().enumerate() {
+                            let l = raw.trim();
+                            if l.is_empty() || l.starts_with('#') {
+                                continue;
+                            }
+                            let mut it = l.split([',', ' ', '\t']).filter(|s| !s.is_empty());
+                            let note = it.next().unwrap_or("");
+                            let dur = it.next().and_then(|s| s.parse::<u64>().ok());
+                            let rest = note.eq_ignore_ascii_case("r")
+                                || note.eq_ignore_ascii_case("rest")
+                                || note.eq_ignore_ascii_case("pause");
+                            match (rest, note_freq(note), dur) {
+                                (true, _, Some(d)) => {
+                                    ustd::sleep_ms(d);
+                                }
+                                (false, Some(f), Some(d)) => {
+                                    ustd::beep(f, d);
+                                    ustd::sleep_ms(d);
+                                    n += 1;
+                                }
+                                _ => {
+                                    self.fail(&alloc::format!(
+                                        "play: bad line {}: {l}",
+                                        ln + 1
+                                    ));
+                                    bad = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !bad {
+                            self.emit(&alloc::format!("play: {n} note(s)"));
+                        }
+                    }
+                },
+            },
             "exit" => {
                 if self.script_depth > 0 {
                     self.flow = 3; // inside sh/source: stop the script
@@ -5138,7 +5265,7 @@ impl Term {
         "eval", "break", "continue", "return",
         "for", "while", "until", "if", "do", "done", "then", "else", "elif", "fi",
         "tac", "fold", "column", "truncate", "mktemp", "clip", "pushd", "popd",
-        "dirs", "zip", "unzip", "zipinfo",
+        "dirs", "zip", "unzip", "zipinfo", "beep", "play",
     ];
 
     /// Tab-complete: command names before the first space, paths after.

@@ -37,6 +37,8 @@ struct Editor {
     undo: Vec<(usize, String, String)>, // (pos, deleted, inserted) inverse ops
     redo: Vec<(usize, String, String)>,
     ins_tail: Option<usize>,            // running typed-insert run start (coalescing)
+    menu: Option<(i32, i32)>,           // right-click context menu origin
+    rdown: bool,                        // right button held (rising-edge detect)
 }
 
 impl Editor {
@@ -203,6 +205,18 @@ impl Editor {
         } else {
             c.text(8, c.h as i32 - 19, &alloc::format!("{}:{}  {} bytes  {}", r + 1, col + 1, self.text.len(), self.status), draw::DIM, None);
         }
+        // right-click context menu
+        if let Some((mx, my)) = self.menu {
+            const MW: i32 = 110;
+            const IH: i32 = 22;
+            const ITEMS: [&str; 4] = ["cut", "copy", "paste", "select all"];
+            let mh = IH * ITEMS.len() as i32;
+            c.fill(mx, my, MW, mh, draw::PANEL);
+            c.border(mx, my, MW, mh, draw::EDGE);
+            for (i, it) in ITEMS.iter().enumerate() {
+                c.text(mx + 10, my + 6 + i as i32 * IH, it, draw::TEXT, None);
+            }
+        }
         self.win.present_all();
     }
 
@@ -247,6 +261,62 @@ impl Editor {
             Err(e) => self.status = alloc::format!("open failed: {} ({})", path, e),
         }
         self.dirty_ui = true;
+    }
+
+    // ---- clipboard ops (shared by Ctrl-keys and the context menu) ----
+    fn select_all(&mut self) {
+        self.sel = if self.text.is_empty() {
+            None
+        } else {
+            Some((0, self.text.len()))
+        };
+    }
+
+    fn copy_sel(&mut self) -> bool {
+        if let Some((s0, s1)) = self.sel {
+            ustd::clip_set(&self.text.as_bytes()[s0..s1]);
+            self.status = alloc::format!("copied {}B", s1 - s0);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn cut_sel(&mut self) -> bool {
+        if let Some((s0, s1)) = self.sel {
+            ustd::clip_set(&self.text.as_bytes()[s0..s1]);
+            self.status = alloc::format!("cut {}B", s1 - s0);
+            let del = String::from(&self.text[s0..s1]);
+            self.text.replace_range(s0..s1, "");
+            self.cx = s0;
+            self.sel = None;
+            self.rec(s0, del, String::new());
+            self.ins_tail = None;
+            self.dirty_text = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn paste_clip(&mut self) {
+        let d = ustd::clip_get();
+        if !d.is_empty() {
+            let s = String::from_utf8_lossy(&d).into_owned();
+            let (pos, del) = if let Some((s0, s1)) = self.sel.take() {
+                let d = String::from(&self.text[s0..s1]);
+                self.text.replace_range(s0..s1, "");
+                self.cx = s0;
+                (s0, d)
+            } else {
+                (self.cx, String::new())
+            };
+            self.text.insert_str(self.cx, &s);
+            self.cx += s.len();
+            self.rec(pos, del, s);
+            self.ins_tail = None;
+            self.dirty_text = true;
+        }
     }
 
     /// Title shows a * while there are unsaved edits.
@@ -577,43 +647,15 @@ impl Editor {
                     self.dirty_ui = true;
                 }
                 b's' => self.save(),
-                b'a' => {
-                    self.sel = if self.text.is_empty() { None } else { Some((0, self.text.len())) };
-                }
+                b'a' => self.select_all(),
                 b'c' | b'x' => {
-                    if let Some((s0, s1)) = self.sel {
-                        ustd::clip_set(&self.text.as_bytes()[s0..s1]);
-                        self.status = alloc::format!("{}d {}B", if k.chr == b'c' || k.chr == b'C' { "copie" } else { "cut" }, s1 - s0);
-                        if k.chr == b'x' || k.chr == b'X' {
-                            let del = String::from(&self.text[s0..s1]);
-                            self.text.replace_range(s0..s1, "");
-                            self.cx = s0;
-                            self.sel = None;
-                            self.rec(s0, del, String::new());
-                            self.ins_tail = None;
-                            self.dirty_text = true;
-                        }
+                    if k.chr == b'x' || k.chr == b'X' {
+                        self.cut_sel();
+                    } else {
+                        self.copy_sel();
                     }
                 }
-                b'v' => {
-                    let d = ustd::clip_get();
-                    if !d.is_empty() {
-                        let s = String::from_utf8_lossy(&d).into_owned();
-                        let (pos, del) = if let Some((s0, s1)) = self.sel.take() {
-                            let d = String::from(&self.text[s0..s1]);
-                            self.text.replace_range(s0..s1, "");
-                            self.cx = s0;
-                            (s0, d)
-                        } else {
-                            (self.cx, String::new())
-                        };
-                        self.text.insert_str(self.cx, &s);
-                        self.cx += s.len();
-                        self.rec(pos, del, s);
-                        self.ins_tail = None;
-                        self.dirty_text = true;
-                    }
-                }
+                b'v' => self.paste_clip(),
                 b'z' if k.mods & 2 != 0 => self.do_redo(), // Ctrl-Shift-Z
                 b'z' => self.do_undo(),
                 b'y' => self.do_redo(),
@@ -754,6 +796,8 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         undo: Vec::new(),
         redo: Vec::new(),
         ins_tail: None,
+        menu: None,
+        rdown: false,
         drag_anchor: None,
         ldown: false,
     };
@@ -765,6 +809,48 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
             }
             Some((EV_POINTER, pl)) if pl.len() >= 16 => {
                 let p: EvPointer = unsafe { core::ptr::read_unaligned(pl.as_ptr() as *const _) };
+                // right-click context menu: a left press inside an open menu
+                // dispatches its item (one outside just closes it); a right
+                // press (re)opens the menu at the cursor.
+                let rpress = p.buttons & 2 != 0 && !e.rdown;
+                e.rdown = p.buttons & 2 != 0;
+                let mut consumed = false;
+                if e.menu.is_some() && p.buttons & 1 != 0 {
+                    if let Some((mx, my)) = e.menu.take() {
+                        const MW: i32 = 110;
+                        const IH: i32 = 22;
+                        if p.x >= mx && p.x < mx + MW && p.y >= my && p.y < my + IH * 4 {
+                            match (p.y - my) / IH {
+                                0 => {
+                                    e.cut_sel();
+                                }
+                                1 => {
+                                    e.copy_sel();
+                                }
+                                2 => e.paste_clip(),
+                                _ => e.select_all(),
+                            }
+                        }
+                        e.dirty_ui = true;
+                    }
+                    consumed = true;
+                }
+                if rpress && p.y >= 30 {
+                    const MW: i32 = 110;
+                    const MH: i32 = 22 * 4;
+                    let mx = p.x.min(e.c.w as i32 - MW - 2).max(0);
+                    let my = p.y.min(e.c.h as i32 - MH - 24).max(30);
+                    e.menu = Some((mx, my));
+                    e.dirty_ui = true;
+                    consumed = true;
+                }
+                if consumed {
+                    if e.dirty_ui {
+                        e.dirty_ui = false;
+                        e.redraw();
+                    }
+                    continue;
+                }
                 // wheel scrolls the text view
                 if p.wheel > 0 {
                     e.scroll = e.scroll.saturating_sub(3);

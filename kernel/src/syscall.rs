@@ -373,6 +373,10 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
+        shared::SYS_BEEP => {
+            crate::timer::beep(a1 as u32, a2);
+            0
+        }
         shared::SYS_PCI_SCAN => {
             let max = (a2 as usize).min(64);
             let mut devs = alloc::vec![pci::PciDev {
