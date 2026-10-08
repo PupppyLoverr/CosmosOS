@@ -378,7 +378,12 @@ pub static BLK_WR_SECTORS: AtomicU64 = AtomicU64::new(0);
 /// Direct-mapped read-through sector cache. FAT/dir sectors get re-read on
 /// every open/stat/cluster-chain walk; without this each one costs a full
 /// synchronous virtqueue round trip (~ms). Write-through keeps it coherent.
-const CACHE_WAYS: usize = 128;
+// Disabled 2026-10-06: with the cache live, selftest showed flaky
+// exec/fork/syscall fails (demand-loaded binaries faulting at their
+// entry page) that never reproduced with it off. Root cause not found —
+// likely a subtle coherence or #PF-path interaction. Re-enable only
+// after that is understood; the constant preserves the tuned size.
+const CACHE_WAYS: usize = 0;
 struct SectorCache {
     tag: [u64; CACHE_WAYS],
     valid: [bool; CACHE_WAYS],
@@ -391,21 +396,36 @@ static SECTOR_CACHE: Mutex<SectorCache> = Mutex::new(SectorCache {
 });
 impl BlockDevice for BlkDev {
     fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> fat32::Result<()> {
+        if CACHE_WAYS == 0 {
+            self.inner.rw_sector(lba, buf, false).map_err(|_| fat32::Error::Io)?;
+            BLK_RD_SECTORS.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         let idx = (lba as usize) % CACHE_WAYS;
-        {
+        // IRQ-off critical section: read_sector is reachable from the #PF
+        // demand pager, and a preempted lock holder must never leave a
+        // faulting task spinning. IRQs off => holder can't be preempted.
+        let hit = x86_64::instructions::interrupts::without_interrupts(|| {
             let c = SECTOR_CACHE.lock();
             if c.valid[idx] && c.tag[idx] == lba {
                 buf[..512].copy_from_slice(&c.data[idx]);
-                return Ok(());
+                true
+            } else {
+                false
             }
+        });
+        if hit {
+            return Ok(());
         }
         // cache miss: real device read — count it, then fill the way
         self.inner.rw_sector(lba, buf, false).map_err(|_| fat32::Error::Io)?;
         BLK_RD_SECTORS.fetch_add(1, Ordering::Relaxed);
-        let mut c = SECTOR_CACHE.lock();
-        c.data[idx].copy_from_slice(&buf[..512]);
-        c.tag[idx] = lba;
-        c.valid[idx] = true;
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut c = SECTOR_CACHE.lock();
+            c.data[idx].copy_from_slice(&buf[..512]);
+            c.tag[idx] = lba;
+            c.valid[idx] = true;
+        });
         Ok(())
     }
     fn write_sector(&mut self, lba: u64, buf: &[u8]) -> fat32::Result<()> {
@@ -413,12 +433,18 @@ impl BlockDevice for BlkDev {
         let mut tmp = [0u8; 512];
         tmp[..512].copy_from_slice(&buf[..512]);
         self.inner.rw_sector(lba, &mut tmp, true).map_err(|_| fat32::Error::Io)?;
-        // write-through: refresh the cached line so reads never see stale data
+        // write-through: refresh the cached line so reads never see stale
+        // data (IRQ-off: same #PF-path spin-safety as read_sector).
+        if CACHE_WAYS == 0 {
+            return Ok(());
+        }
         let idx = (lba as usize) % CACHE_WAYS;
-        let mut c = SECTOR_CACHE.lock();
-        c.data[idx].copy_from_slice(&buf[..512]);
-        c.tag[idx] = lba;
-        c.valid[idx] = true;
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut c = SECTOR_CACHE.lock();
+            c.data[idx].copy_from_slice(&buf[..512]);
+            c.tag[idx] = lba;
+            c.valid[idx] = true;
+        });
         Ok(())
     }
 }

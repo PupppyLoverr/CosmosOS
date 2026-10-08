@@ -18589,8 +18589,72 @@ impl Term {
                 }
             },
             "id" => {
-                // id [user]: real/eff ids from the kernel, names resolved
-                // through /etc/passwd + /etc/group.
+                // id [flags] [user]: real/eff ids from the kernel, names
+                // resolved through /etc/passwd + /etc/group.
+                // Flags: -u/-g/-G print just the eff uid/gid/group list;
+                // -n prints names instead of numbers.
+                let mut flag: Option<char> = None;
+                let mut rest: &[&str] = &[];
+                if let Some(f) = args.first() {
+                    if f.starts_with('-') {
+                        for c in f[1..].chars() {
+                            match c {
+                                'u' | 'g' | 'G' => flag = Some(c),
+                                'n' => flag = Some('n'),
+                                _ => {}
+                            }
+                        }
+                        rest = &args[1..];
+                    } else {
+                        rest = &args[..];
+                    }
+                } else {
+                    rest = &args[..];
+                }
+                let args = rest;
+                // flag forms only apply to the current process
+                if flag.is_some() && args.is_empty() {
+                    let name_mode = flag == Some('n');
+                    let (u, g) = (ustd::geteuid(), ustd::getegid());
+                    match flag {
+                        Some('u') => {
+                            if name_mode {
+                                self.emit(&user_name(u).unwrap_or_else(|| alloc::format!("{}", u)));
+                            } else {
+                                self.emit(&alloc::format!("{}", u));
+                            }
+                        }
+                        Some('g') => {
+                            if name_mode {
+                                self.emit(&group_name(g).unwrap_or_else(|| alloc::format!("{}", g)));
+                            } else {
+                                self.emit(&alloc::format!("{}", g));
+                            }
+                        }
+                        Some('G') => {
+                            let mut gbuf = [0u32; 64];
+                            let ng = ustd::getgroups(&mut gbuf);
+                            let s = gbuf[..ng.min(64)]
+                                .iter()
+                                .map(|i| {
+                                    if name_mode {
+                                        group_name(*i).unwrap_or_else(|| alloc::format!("{}", i))
+                                    } else {
+                                        alloc::format!("{}", i)
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            self.emit(&s);
+                        }
+                        Some('n') => {
+                            // bare -n: print the effective user name (like id -un)
+                            self.emit(&user_name(u).unwrap_or_else(|| alloc::format!("{}", u)));
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
                 if let Some(u) = args.first() {
                     match passwd_ent(u) {
                         Some((uid, gid)) => {
@@ -18651,6 +18715,12 @@ impl Term {
                     }
                     None => println!("getpcaps: pid {}: no such task", pid),
                 }
+            }
+            "logname" => {
+                // real login identity: euid -> /etc/passwd name (root by
+                // default after su; falls back to the numeric uid).
+                let u = ustd::geteuid();
+                self.emit(&user_name(u).unwrap_or_else(|| alloc::format!("{}", u)));
             }
             "groups" => {
                 // groups [user]: supplementary membership list
@@ -20865,7 +20935,7 @@ impl Term {
         "shot", "find", "killall", "basename", "dirname", "strings", "diff", "stat",
         "uniq", "tr", "cut", "tee", "base64", "sha256sum", "tar", "show",
         "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
-        "alias", "unalias", "type", "hostname", "id", "printf", "dd", "split",
+        "alias", "unalias", "type", "hostname", "id", "logname", "printf", "dd", "split",
         "source", "comm", "join", "paste", "expand", "unexpand", "at", "file",
         "test", "[", "rand", "mount", "umount", "chroot", "pivot_root", "unshare", "reboot", "su", "chown", "chgrp", "groups", "rmdir",
         "export", "unset", "man",
