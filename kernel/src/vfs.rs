@@ -258,7 +258,9 @@ fn resolve_links(
     full: &mut String,
 ) -> Result<(), i64> {
     for _ in 0..8 {
-        // tmpfs symlinks: same LNK>-body convention, resolved per mount
+        // tmpfs mounts share the LNK> convention — a link under a
+        // tmpfs-covered dir (e.g. /tmp) resolves here too, and its
+        // target may point back at FAT
         if crate::tmpfs::handles(full) {
             match crate::tmpfs::readlink(full) {
                 Some(tgt) => {

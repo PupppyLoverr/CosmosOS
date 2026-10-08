@@ -7,7 +7,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
@@ -540,6 +540,28 @@ pub fn truncate(path: &str, len: u64) -> Result<(), i64> {
     Ok(())
 }
 
+/// Raw symlink target — mirrors the FAT32 "LNK>" convention: a node
+/// with attr bit 0x40 whose body starts with "LNK>" names its target.
+/// None when the node isn't a link (also what dangling means).
+pub fn readlink(path: &str) -> Option<String> {
+    let ng = NODES.lock();
+    let n = ng.get(path)?;
+    if n.is_dir || n.attr & 0x40 == 0 || n.size > 4096 || n.size < 4 {
+        return None;
+    }
+    let mut b = [0u8; 4096];
+    let got = read_pages(n, 0, &mut b);
+    if !b[..got].starts_with(b"LNK>") {
+        return None;
+    }
+    let t = String::from_utf8_lossy(&b[4..got]).trim().to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
 pub fn exists(path: &str) -> bool {
     NODES.lock().contains_key(path)
 }
@@ -686,26 +708,6 @@ pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
     let Some(n) = ng.get_mut(path) else { return Err(-2) };
     n.mtime = secs;
     Ok(())
-}
-
-/// Symlink body: "LNK>" + target when attr has 0x40 — same convention as FAT.
-pub fn readlink(path: &str) -> Option<String> {
-    let ng = NODES.lock();
-    let n = ng.get(path)?;
-    if n.is_dir || n.attr & 0x40 == 0 || n.size > 4096 || n.size < 4 {
-        return None;
-    }
-    let mut b = [0u8; 4096];
-    let got = read_pages(n, 0, &mut b);
-    if !b[..got].starts_with(b"LNK>") {
-        return None;
-    }
-    let t = String::from(String::from_utf8_lossy(&b[4..got]).trim());
-    if t.is_empty() {
-        None
-    } else {
-        Some(t)
-    }
 }
 
 pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {

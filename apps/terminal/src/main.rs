@@ -165,6 +165,11 @@ fn stmt_split(s: &str) -> Option<(&str, u8, &str)> {
                 bd -= 1;
                 i += 1;
             }
+            b'\\' if !sq => {
+                // backslash escapes the next byte: \; \| \& are literal
+                // inside the word, not statement operators
+                i += 1;
+            }
             b';' if !sq && !dq && pd == 0 && bd == 0 && ad == 0 && cd == 0 => {
                 return Some((&s[..i], b';', &s[i + 1..]))
             }
@@ -227,6 +232,11 @@ fn find_unquoted(s: &str, want: u8) -> Option<usize> {
             }
             b']' if !sq && !dq && bd > 0 && i + 1 < b.len() && b[i + 1] == b']' => {
                 bd -= 1;
+                i += 1;
+            }
+            b'\\' if !sq => {
+                // escaped byte is literal — \| is not a pipe, \< not a
+                // redirect, \; not a statement break (stmt_split too)
                 i += 1;
             }
             x if x == want && !sq && !dq && pd == 0 && bd == 0 && ad == 0 && cd == 0 => {
@@ -416,6 +426,11 @@ fn split_semi(s: &str) -> Vec<String> {
             }
             b']' if !sq && !dq && bd > 0 && i + 1 < b.len() && b[i + 1] == b']' => {
                 bd -= 1;
+                i += 1;
+            }
+            b'\\' if !sq => {
+                // backslash escapes the next byte: \; \| \& stay inside
+                // the statement (terminator tokens reach find as \;)
                 i += 1;
             }
             b';' if !sq && !dq && pd == 0 && bd == 0 && ad == 0 && cd == 0 => {
@@ -1089,6 +1104,50 @@ fn civil_from_days(z: i64) -> (u16, u8, u8) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     ((if m <= 2 { y + 1 } else { y }) as u16, m as u8, d as u8)
+}
+
+/// `touch -t` STAMP: [[CC]YY]MMDDhhmm[.ss] — 8, 10, or 12 digit groups;
+/// 2-digit years follow POSIX (69-99 -> 19YY, 00-68 -> 20YY).
+fn parse_touch_stamp(s: &str) -> Option<u64> {
+    let (main, ss) = match s.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (s, "00"),
+    };
+    if main.is_empty()
+        || !main.bytes().all(|b| b.is_ascii_digit())
+        || !ss.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let dig = |r: &str| r.parse::<u64>().ok();
+    let (year, mmddhhmm): (u64, &str) = match main.len() {
+        8 => (ustd::datetime().year as u64, main),
+        10 => {
+            let yy = dig(&main[..2])?;
+            (if yy >= 69 { 1900 + yy } else { 2000 + yy }, &main[2..])
+        }
+        12 => (dig(&main[..4])?, &main[4..]),
+        _ => return None,
+    };
+    let mo = dig(&mmddhhmm[..2])?;
+    let dd = dig(&mmddhhmm[2..4])?;
+    let hh = dig(&mmddhhmm[4..6])?;
+    let mi = dig(&mmddhhmm[6..8])?;
+    let se = dig(ss)?;
+    if !(1..=12).contains(&mo)
+        || !(1..=31).contains(&dd)
+        || hh > 23
+        || mi > 59
+        || se > 60
+    {
+        return None;
+    }
+    Some(
+        cal_days(year as u16, mo as u8, dd as u8) * 86400
+            + hh * 3600
+            + mi * 60
+            + se,
+    )
 }
 
 fn parse_date_spec(s: &str) -> Option<u64> {
@@ -5373,6 +5432,7 @@ struct Term {
     run_depth: u8,                                     // nested run() calls don't record history
     read_modal: Option<(String, usize, u64, bool)>,    // interactive `read VAR` awaiting a typed line: (vars, maxchars, deadline_ms, silent)
     rm_queue: Vec<String>,                             // `rm -i`: files awaiting per-file confirm
+    ok_queue: alloc::collections::VecDeque<String>,    // `find -ok`: command lines awaiting y/n confirm
     funcs: Vec<(String, String)>,                      // user functions: name -> body source
     func_collect: Option<String>,                      // function name while its multi-line body is collected
     func_depth: u8,                                    // recursion guard for function calls
@@ -7401,6 +7461,8 @@ impl Term {
             };
             if var == "__RMI" {
                 self.rm_i_answer(&v);
+            } else if var == "__FOK" {
+                self.fok_answer(&v);
             } else if let Some(rest) = var.strip_prefix("__MVI:") {
                 // mv -i: 'y' completes the deferred rename
                 if let Some((f, t)) = rest.split_once(':') {
@@ -10392,6 +10454,7 @@ impl Term {
                 // @SECS | SECS | YYYY-MM-DD [HH:MM[:SS]] via SYS_UTIME
                 let mut ref_mtime: Option<u64> = None;
                 let mut date_spec: Option<String> = None;
+                let mut t_spec: Option<String> = None;
                 let mut nocreate = false;
                 let mut files: Vec<&str> = Vec::new();
                 let mut ai = 0usize;
@@ -10433,6 +10496,20 @@ impl Term {
                             nocreate = true;
                             ai += 1;
                         }
+                        "-t" => {
+                            match args.get(ai + 1) {
+                                Some(s) => t_spec = Some(String::from(*s)),
+                                None => {
+                                    self.fail("usage: touch -t STAMP <files>");
+                                    return;
+                                }
+                            }
+                            ai += 2;
+                        }
+                        a if a.starts_with("-t") && a.len() > 2 => {
+                            t_spec = Some(String::from(&a[2..]));
+                            ai += 1;
+                        }
                         "-a" | "-m" => ai += 1,
                         _ => {
                             files.push(args[ai]);
@@ -10441,19 +10518,26 @@ impl Term {
                     }
                 }
                 if files.is_empty() {
-                    self.fail("usage: touch [-r ref] [-d spec] <file>...");
+                    self.fail("usage: touch [-r ref] [-d spec] [-t stamp] <file>...");
                     return;
                 }
-                let set_mtime: Option<u64> = match (ref_mtime, date_spec) {
-                    (Some(m), _) => Some(m),
-                    (None, Some(spec)) => match parse_date_spec(&spec) {
+                let set_mtime: Option<u64> = match (ref_mtime, date_spec, t_spec) {
+                    (Some(m), _, _) => Some(m),
+                    (None, Some(spec), _) => match parse_date_spec(&spec) {
                         Some(s) => Some(s),
                         None => {
                             self.fail(&alloc::format!("touch: invalid date '{}'", spec));
                             return;
                         }
                     },
-                    (None, None) => None,
+                    (None, None, Some(ts)) => match parse_touch_stamp(&ts) {
+                        Some(s) => Some(s),
+                        None => {
+                            self.fail(&alloc::format!("touch: invalid -t stamp '{}'", ts));
+                            return;
+                        }
+                    },
+                    (None, None, None) => None,
                 };
                 for p in files {
                     // real touch must not truncate: rewrite existing bytes
@@ -12101,6 +12185,7 @@ impl Term {
                 // newer or dst absent, -p preserves mtime + FAT attrs
                 let rec = args.iter().any(|a| a == &"-r" || a == &"-R" || a == &"-a");
                 let nolink = args.iter().any(|a| a == &"-P" || a == &"-d" || a == &"-a");
+                let sym_link = args.iter().any(|a| a == &"-s");
                 let inter = args.iter().any(|a| a.starts_with('-') && a.contains('i'));
                 let noclob = args.iter().any(|a| a.starts_with('-') && a.contains('n'));
                 let update = args.iter().any(|a| a.starts_with('-') && a.contains('u'));
@@ -12135,6 +12220,41 @@ impl Term {
                                 }
                             }
                             self.cp_any(f, &dst, rec, verb, pres);
+                            return;
+                        }
+                        // -s: dst becomes a symlink to src instead of a
+                        // copy; a directory dst gets dst/basename(src)
+                        if sym_link {
+                            let mut dst = String::from(*t);
+                            if ustd::stat(&dst).map(|d| d.is_dir != 0).unwrap_or(false)
+                            {
+                                let base = f
+                                    .trim_end_matches('/')
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or(f);
+                                dst = alloc::format!(
+                                    "{}/{}",
+                                    dst.trim_end_matches('/'),
+                                    base
+                                );
+                            }
+                            let body = alloc::format!("LNK>{}", f);
+                            match ustd::write_all(&dst, body.as_bytes()) {
+                                Ok(()) => {
+                                    let _ = ustd::setattr(&dst, 0x60);
+                                    if verb {
+                                        self.emit(&alloc::format!(
+                                            "'{}' -> '{}'",
+                                            dst, f
+                                        ));
+                                    }
+                                }
+                                Err(e) => self.fail(&alloc::format!(
+                                    "cp: {}: err {}",
+                                    dst, e
+                                )),
+                            }
                             return;
                         }
                         // -P/-d: copy a symlink verbatim instead of its target
@@ -15985,7 +16105,13 @@ impl Term {
                 };
                 match content {
                     Some(s) => {
-                        let mut ls: Vec<&str> = s.lines().collect();
+                        // sort -z: NUL-terminated records (xargs -0 pairs)
+                        let nulrec = cmd == "sort" && args.iter().any(|a| *a == "-z");
+                        let mut ls: Vec<&str> = if nulrec {
+                            s.split('\0').filter(|x| !x.is_empty()).collect()
+                        } else {
+                            s.lines().collect()
+                        };
                         if cmd == "sort" {
                             // -f folds case, -b ignores leading blanks
                             let fold = args.iter().any(|a| a == &"-f");
@@ -16141,17 +16267,29 @@ impl Term {
                             match args.iter().position(|a| a == &"-o") {
                                 Some(oi) => {
                                     let f = args.get(oi + 1).copied().unwrap_or("");
-                                    let mut body = ls.join("\n");
+                                    let mut body = if nulrec {
+                                        ls.join("\u{0}")
+                                    } else {
+                                        ls.join("\n")
+                                    };
                                     if !body.is_empty() {
-                                        body.push('\n');
+                                        body.push(if nulrec { '\0' } else { '\n' });
                                     }
                                     if let Err(e) = ustd::write_all(f, body.as_bytes()) {
                                         self.fail(&alloc::format!("sort: {}: err {}", f, e));
                                     }
                                 }
                                 None => {
-                                    for l in ls {
-                                        self.emit(l);
+                                    if nulrec {
+                                        let mut body = ls.join("\u{0}");
+                                        if !body.is_empty() {
+                                            body.push('\0');
+                                        }
+                                        self.emit_no_nl(&body);
+                                    } else {
+                                        for l in ls {
+                                            self.emit(l);
+                                        }
                                     }
                                 }
                             }
@@ -17660,7 +17798,7 @@ impl Term {
                 for p in paths {
                     if rec && ustd::stat(*p).map(|s| s.is_dir != 0).unwrap_or(false) {
                         targets.push(String::from(*p));
-                        for m in self.find_collect(p, "*", None, usize::MAX, None, false) {
+                        for m in self.find_collect(p, "*", None, usize::MAX, None, false, false, &alloc::collections::BTreeSet::new()) {
                             targets.push(m.trim_end_matches('/').to_string());
                         }
                     } else {
@@ -17889,7 +18027,7 @@ impl Term {
                 let bare_pat: Option<&str> = lead.get(1).copied();
                 let has_action = groups.iter().any(|g| {
                     g.iter()
-                        .any(|a| *a == "-exec" || *a == "-delete" || *a == "-print")
+                        .any(|a| *a == "-exec" || *a == "-delete" || *a == "-print" || *a == "-execdir" || *a == "-ok")
                 });
                 let dir_is_dir = ustd::stat(dir)
                     .map(|st| st.is_dir != 0)
@@ -17927,6 +18065,12 @@ impl Term {
                     let mut want_ino: Option<u64> = None;
                     let mut mtime_test: Option<(i8, u64)> = None;
                     let mut ctime_test: Option<(i8, u64)> = None;
+                    let mut want_prune = false;
+                    let mut want_depth = false;
+                    let mut want_xdev = false;
+                    let mut want_quit = false;
+                    let mut lname_pat: Option<(String, bool)> = None;
+                    let mut same_ino: Option<u64> = None;
                     // `!`/`-not` negates the next primary; `neg` is a bitmask
                     // of negated predicates; negating an action kills the arm
                     let mut neg_next = false;
@@ -18052,7 +18196,7 @@ impl Term {
                                     }
                                 }
                             }
-                            "-exec" | "-delete" | "-print"
+                            "-exec" | "-delete" | "-print" | "-execdir" | "-ok"
                                 if neg_next =>
                             {
                                 // `! ACTION` — the arm matches nothing (GNU)
@@ -18204,6 +18348,51 @@ impl Term {
                                     }
                                 }
                             }
+                            "-prune" => {
+                                want_prune = true;
+                                neg_next = false;
+                            }
+                            "-depth" => {
+                                want_depth = true;
+                                neg_next = false;
+                            }
+                            "-xdev" | "-mount" => {
+                                want_xdev = true;
+                                neg_next = false;
+                            }
+                            "-quit" => {
+                                want_quit = true;
+                                neg_next = false;
+                            }
+                            "-lname" | "-ilname" => {
+                                if let Some(v) = g.get(i + 1) {
+                                    lname_pat = Some((
+                                        String::from(*v),
+                                        *a == "-ilname",
+                                    ));
+                                    if neg_next {
+                                        neg |= 1 << 16;
+                                        neg_next = false;
+                                    }
+                                }
+                            }
+                            "-samefile" => {
+                                if let Some(v) = g.get(i + 1) {
+                                    same_ino =
+                                        ustd::statx(v).ok().map(|st| st.ino);
+                                    if same_ino.is_none() {
+                                        self.fail(&alloc::format!(
+                                            "find: {}: err -2",
+                                            v
+                                        ));
+                                        return;
+                                    }
+                                    if neg_next {
+                                        neg |= 1 << 17;
+                                        neg_next = false;
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -18217,9 +18406,27 @@ impl Term {
                             if neg & (1 << 14) != 0 { usize::MAX } else { maxd };
                         let coll_newer =
                             if neg & (1 << 15) != 0 { None } else { newer };
+                        // -xdev/-mount: stay on the start fs — mount
+                        // points from /proc/mounts are listed but not
+                        // descended into
+                        let mut mset: alloc::collections::BTreeSet<String> =
+                            alloc::collections::BTreeSet::new();
+                        if want_xdev {
+                            if let Ok(md) = ustd::read_all("/proc/mounts") {
+                                for l in String::from_utf8_lossy(&md).lines() {
+                                    if let Some(mp) =
+                                        l.split_whitespace().nth(1)
+                                    {
+                                        if mp != dir && mp != "/" {
+                                            mset.insert(String::from(mp));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         let mut ms = self.find_collect(
                             dir, coll_pat, coll_type, coll_maxd, coll_newer,
-                            coll_ci,
+                            coll_ci, want_prune, &mset,
                         );
                         // `! ACTION` matched nothing in this arm (GNU)
                         if group_dead {
@@ -18485,6 +18692,43 @@ impl Term {
                                     != n11
                             });
                         }
+                        // -lname/-ilname: glob-match a symlink's target
+                        if let Some((lp, lci)) = &lname_pat {
+                            let n16 = neg & (1 << 16) != 0;
+                            ms.retain(|m| {
+                                match ustd::readlink(m.trim_end_matches('/')) {
+                                    Some(tgt) => {
+                                        if *lci {
+                                            wild_match(
+                                                &lp.to_lowercase(),
+                                                &tgt.to_lowercase(),
+                                            ) != n16
+                                        } else {
+                                            wild_match(lp, &tgt) != n16
+                                        }
+                                    }
+                                    // not a link: only a negated -lname keeps it
+                                    None => n16,
+                                }
+                            });
+                        }
+                        // -samefile F: same inode as the reference file
+                        if let Some(sino) = same_ino {
+                            let n17 = neg & (1 << 17) != 0;
+                            ms.retain(|m| {
+                                ustd::statx(m.trim_end_matches('/'))
+                                    .map(|st| st.ino == sino)
+                                    .unwrap_or(false)
+                                    != n17
+                            });
+                        }
+                        // -depth: contents before the dir itself (post-order
+                        // via a stable depth-descending sort)
+                        if want_depth {
+                            ms.sort_by(|a, b| {
+                                b.matches('/').count().cmp(&a.matches('/').count())
+                            });
+                        }
                         // -empty: zero-size file or dir with no entries
                         if want_empty {
                             let n3 = neg & (1 << 3) != 0;
@@ -18509,12 +18753,15 @@ impl Term {
                         }
                         // action phase: this arm's action binds to its matches
                         if has_action {
-                            if let Some(xi) =
-                                g.iter().position(|a| *a == "-exec")
-                            {
+                            if let Some(xi) = g.iter().position(|a| {
+                                *a == "-exec" || *a == "-execdir" || *a == "-ok"
+                            }) {
+                                let kind = g[xi];
                                 let end = g[xi + 1..]
                                     .iter()
-                                    .position(|a| *a == ";")
+                                    .position(|a| {
+                                        *a == ";" || *a == "\\;" || *a == "\";\""
+                                    })
                                     .map(|p| xi + 1 + p)
                                     .unwrap_or(g.len());
                                 let tpl: Vec<&str> = g[xi + 1..end].to_vec();
@@ -18525,13 +18772,79 @@ impl Term {
                                 } else {
                                     for m in &ms {
                                         let m = m.trim_end_matches('/');
-                                        let cmdline = tpl
+                                        // -execdir: run in the containing dir
+                                        // with {} bound to the basename
+                                        let (ctx, leaf) = if kind == "-execdir"
+                                        {
+                                            match m.rfind('/') {
+                                                Some(0) => {
+                                                    (String::from("/"), &m[1..])
+                                                }
+                                                Some(p) => (
+                                                    String::from(&m[..p]),
+                                                    &m[p + 1..],
+                                                ),
+                                                None => (ustd::getcwd(), m),
+                                            }
+                                        } else {
+                                            (String::new(), m)
+                                        };
+                                        let body = tpl
                                             .iter()
-                                            .map(|a| a.replace("{}", m))
+                                            .map(|a| a.replace("{}", leaf))
                                             .collect::<Vec<String>>()
                                             .join(" ");
-                                        for l in self.run_captured(&cmdline) {
-                                            self.emit(&l);
+                                        let cmdline = if kind == "-execdir" {
+                                            alloc::format!(
+                                                "(cd {}; {})",
+                                                ctx, body
+                                            )
+                                        } else {
+                                            body
+                                        };
+                                        if kind == "-ok" {
+                                            self.ok_queue.push_back(cmdline);
+                                        } else {
+                                            for l in
+                                                self.run_captured(&cmdline)
+                                            {
+                                                self.emit(&l);
+                                            }
+                                        }
+                                    }
+                                    if kind == "-ok" {
+                                        // piped stdin feeds y/n answers;
+                                        // otherwise modal confirm per cmd
+                                        if let Some(pi) = self.pipe_in.take() {
+                                            let mut lines = pi.split('\n');
+                                            while let Some(cmd) =
+                                                self.ok_queue.pop_front()
+                                            {
+                                                let ans =
+                                                    lines.next().unwrap_or("n");
+                                                self.emit(&alloc::format!(
+                                                    "find: {} -- {}",
+                                                    cmd, ans
+                                                ));
+                                                if ans
+                                                    .trim_start()
+                                                    .starts_with('y')
+                                                {
+                                                    for l in self.run_captured(
+                                                        &cmd,
+                                                    ) {
+                                                        self.emit(&l);
+                                                    }
+                                                }
+                                            }
+                                            let rest: Vec<&str> =
+                                                lines.collect();
+                                            if !rest.is_empty() {
+                                                self.pipe_in =
+                                                    Some(rest.join("\n"));
+                                            }
+                                        } else {
+                                            self.fok_prompt();
                                         }
                                     }
                                 }
@@ -18583,6 +18896,10 @@ impl Term {
                                 self.emit(dir);
                             }
                         }
+                    }
+                    // -quit: stop after this arm is fully processed
+                    if want_quit {
+                        return;
                     }
                 }
             }
@@ -20331,6 +20648,8 @@ impl Term {
                 let silent = args.iter().any(|a| *a == "-s");
                 let listall = args.iter().any(|a| *a == "-l");
                 let mut lim = usize::MAX;
+                // -i SKIP1[:SKIP2]: skip bytes before comparing each file
+                let (mut skip1, mut skip2) = (0usize, 0usize);
                 let mut files: Vec<&str> = Vec::new();
                 let mut i = 0usize;
                 while i < args.len() {
@@ -20339,6 +20658,22 @@ impl Term {
                             lim = args.get(i + 1).and_then(|v| v.parse().ok())
                                 .unwrap_or(usize::MAX);
                             i += 1;
+                        }
+                        "-i" | "--ignore-initial" => {
+                            if let Some(v) = args.get(i + 1) {
+                                let mut sp = v.split(':');
+                                skip1 = sp
+                                    .next()
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0);
+                                // GNU: -i N applies to both files; only
+                                // SKIP1:SKIP2 splits them
+                                skip2 = sp
+                                    .next()
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(skip1);
+                                i += 1;
+                            }
                         }
                         a if !a.starts_with('-') => files.push(a),
                         _ => {}
@@ -20349,6 +20684,11 @@ impl Term {
                     (Some(a), Some(b)) => {
                         match (ustd::read_all(a), ustd::read_all(b)) {
                             (Ok(da), Ok(db)) => {
+                                // -i skips bytes inside each file first
+                                let sa = skip1.min(da.len());
+                                let sb = skip2.min(db.len());
+                                let da = &da[sa..];
+                                let db = &db[sb..];
                                 let n = da.len().min(db.len()).min(lim);
                                 let mut diffs = 0usize;
                                 for i in 0..n {
@@ -20357,7 +20697,7 @@ impl Term {
                                         if listall && !silent {
                                             self.emit(&alloc::format!(
                                                 "{:>6} {:>3o} {:>3o}",
-                                                i + 1, da[i], db[i]
+                                                sa + i + 1, da[i], db[i]
                                             ));
                                         }
                                         if !listall {
@@ -20374,7 +20714,7 @@ impl Term {
                                             .unwrap_or(0);
                                         self.emit(&alloc::format!(
                                             "{} {} differ: byte {}",
-                                            a, b, i + 1
+                                            a, b, sa + i + 1
                                         ));
                                     } else if len_diff {
                                         self.emit(&alloc::format!(
@@ -20907,6 +21247,8 @@ impl Term {
                 // swab,sync] -- real byte-level copy + byte transforms
                 let (mut fi, mut fo) = ("", "");
                 let (mut bs, mut count, mut skip) = (512usize, usize::MAX, 0usize);
+                let mut seek = 0usize;
+                let mut quiet = false;
                 let mut conv = 0u8;
                 for a in args {
                     if let Some(v) = a.strip_prefix("if=") {
@@ -20929,6 +21271,10 @@ impl Term {
                         count = v.parse().unwrap_or(usize::MAX);
                     } else if let Some(v) = a.strip_prefix("skip=") {
                         skip = v.parse().unwrap_or(0);
+                    } else if let Some(v) = a.strip_prefix("seek=") {
+                        seek = v.parse().unwrap_or(0);
+                    } else if let Some(v) = a.strip_prefix("status=") {
+                        quiet = v == "none";
                     }
                 }
                 if fi.is_empty() {
@@ -20957,6 +21303,14 @@ impl Term {
                             let pad = (bs - chunk_v.len() % bs) % bs;
                             chunk_v.extend(core::iter::repeat(0u8).take(pad));
                         }
+                        // seek=N: skip N obs-blocks at the output head —
+                        // zero-fill is how a fresh file expresses the gap
+                        if seek > 0 {
+                            let padb = seek.saturating_mul(bs);
+                            let mut v = alloc::vec![0u8; padb];
+                            v.extend_from_slice(&chunk_v);
+                            chunk_v = v;
+                        }
                         let n = chunk_v.len();
                         let chunk = &chunk_v[..];
                         if fo.is_empty() {
@@ -20965,9 +21319,10 @@ impl Term {
                             }
                         } else {
                             match ustd::write_all(fo, chunk) {
-                                Ok(_) => self.emit(&alloc::format!(
+                                Ok(_) if !quiet => self.emit(&alloc::format!(
                                     "  {} bytes copied {} -> {}", n, fi, fo
                                 )),
+                                Ok(_) => {}
                                 Err(e) => {
                                     self.fail(&alloc::format!("dd: {}: err {}", fo, e))
                                 }
@@ -23852,7 +24207,10 @@ impl Term {
     /// `want_dir` filters by entry type; `maxd` bounds descent depth.
     /// Iterative directory walk: paths matching (pat, want_dir, maxd).
     /// Returns display strings (dirs carry a trailing '/').
-    fn find_collect(&mut self, dir: &str, pat: &str, want_dir: Option<bool>, maxd: usize, newer: Option<u64>, ci: bool) -> Vec<String> {
+    /// `prune` (=find's `-prune` with the -name pattern) emits a matching
+    /// dir but doesn't descend into it; `xdev` holds mount points to stay
+    /// out of entirely (listed, never descended).
+    fn find_collect(&mut self, dir: &str, pat: &str, want_dir: Option<bool>, maxd: usize, newer: Option<u64>, ci: bool, prune: bool, xdev: &alloc::collections::BTreeSet<String>) -> Vec<String> {
         let mut out = Vec::new();
         let mut stack = alloc::vec::Vec::new();
         stack.push((String::from(dir), 0usize));
@@ -23879,7 +24237,11 @@ impl Term {
                         {
                             out.push(alloc::format!("{}{}", p, if is_dir { "/" } else { "" }));
                         }
-                        if is_dir && dep < maxd {
+                        let descend = is_dir
+                            && dep < maxd
+                            && !(prune && name_hit)
+                            && !xdev.contains(p.as_str());
+                        if descend {
                             stack.push((p, dep + 1));
                         }
                     }
@@ -23940,7 +24302,7 @@ impl Term {
     }
 
     fn find_run(&mut self, dir: &str, pat: &str, want_dir: Option<bool>, maxd: usize, newer: Option<u64>) {
-        for p in self.find_collect(dir, pat, want_dir, maxd, newer, false) {
+        for p in self.find_collect(dir, pat, want_dir, maxd, newer, false, false, &alloc::collections::BTreeSet::new()) {
             self.emit(&p);
         }
     }
@@ -24393,6 +24755,27 @@ impl Term {
         })
     }
 
+    /// `find -ok` step: 'y' runs the just-popped command; the next queued
+    /// command then prompts (queue drained = modal ends).
+    fn fok_answer(&mut self, ans: &str) {
+        if let Some(cmd) = self.ok_queue.pop_front() {
+            if ans.trim_start().starts_with('y') {
+                for l in self.run_captured(&cmd) {
+                    self.emit(&l);
+                }
+            }
+        }
+        self.fok_prompt();
+    }
+
+    /// Arm the `find -ok` y/n prompt for the next queued command line.
+    fn fok_prompt(&mut self) {
+        if let Some(next) = self.ok_queue.front() {
+            self.emit_no_nl(&alloc::format!("< {} ... >? ", next));
+            self.read_modal = Some((String::from("__FOK"), 0, 0, false));
+        }
+    }
+
     /// One step of `rm -i`: the typed line answers the pending file, then the
     /// next file prompts (or the modal ends when the queue is drained).
     fn rm_i_answer(&mut self, ans: &str) {
@@ -24574,6 +24957,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         run_depth: 0,
         read_modal: None,
         rm_queue: Vec::new(),
+        ok_queue: alloc::collections::VecDeque::new(),
         funcs: Vec::new(),
         func_locals: Vec::new(),
         func_stack: Vec::new(),
