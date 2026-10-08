@@ -116,6 +116,10 @@ pub fn dispatch(ctx: &mut CpuContext) {
     // halts BEFORE the syscall body runs (rax/rdi/rsi/rdx still hold the
     // args). rip rewinds so CONT re-executes the int80; the re-dispatch
     // then sees sc_phase==2 and falls through to real dispatch.
+    task::with_current(|t| {
+        t.cur_syscall = nr;
+        t.sc_args = [a1, a2, a3, a4, a5];
+    });
     let entry_stop = task::with_current(|t| {
         // phase 2 = mid-syscall (entry-stop already happened, resume
         // re-executed this int80) — anything else armed is a real entry
@@ -298,6 +302,9 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_GETCWD => sys_getcwd(a1, a2),
         shared::SYS_WAITPID => sys_waitpid(ctx, a1, a2, a3),
         shared::SYS_WAITID => sys_waitid(ctx, a1, a2, a3),
+        shared::SYS_EXIT_GROUP => task::exit_group(ctx.rdi as i64),
+        shared::SYS_GETTID => task::with_current(|t| t.id as u64),
+        shared::SYS_TGKILL => task::sys_tgkill(a1 as u32, a2 as u32, a3) as u64,
         shared::SYS_KILL => sys_kill(a1),
         shared::SYS_NET_PING => {
             let ip = [
@@ -1463,6 +1470,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
     // captures rax=ret so the handler's sigreturn resumes correctly
     let mut g = task::SCHED.lock();
     if let Some(s) = g.as_mut() {
+        s.tasks[s.cur].cur_syscall = u64::MAX;
         task::maybe_deliver(s, s.cur, ctx);
         // PTRACE_SYSCALL exit-stop: the syscall's result is already in
         // ctx.rax; mark the tracee Stopped so the repick below switches
@@ -2750,6 +2758,28 @@ fn sys_ptrace(op: u64, pid: u32, addr: u64, data: u64) -> u64 {
                 0
             });
             if ok == 0 { 0 } else { ERR }
+        }
+        shared::PT_GETSIGINFO => {
+            // si_signo/si_errno/si_code of the last stop, 12 bytes
+            let sig = task::with_pid_mut(pid, |t| {
+                if !t.sig.traced || t.sig.tracer != me
+                    || t.state != task::State::Stopped
+                {
+                    return -1;
+                }
+                t.stop_sig as i64
+            });
+            if sig < 0 {
+                return ERR;
+            }
+            let buf = [sig as u32, 0u32, 0u32];
+            let bytes = unsafe {
+                core::slice::from_raw_parts(buf.as_ptr() as *const u8, 12)
+            };
+            match copy_out_pub(data, bytes) {
+                Some(_) => 0,
+                None => ERR,
+            }
         }
         shared::PT_KILL => {
             if task::kill_pid_code(pid, 128 + 9) { 0 } else { ERR }

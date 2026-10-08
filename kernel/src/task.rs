@@ -125,6 +125,8 @@ pub struct Task {
     pub rlim_stack: u64,        // RLIMIT_STACK bytes (advisory for new spawns)
     pub rlim_cpu: u64,          // RLIMIT_CPU: ticks before SIGXCPU
     pub rlim_as: u64,           // RLIMIT_AS: total mapped bytes bound
+    pub cur_syscall: u64,       // nr of the syscall this task is inside (MAX = none)
+    pub sc_args: [u64; 5],      // its arg registers (for /proc/<pid>/syscall)
     pub cont_pending: bool,     // continued (SIGCONT/ptrace) since last wait report
     pub sig: SigState,          // sa_flags, altstack, handler masking, EINTR
 }
@@ -292,6 +294,8 @@ pub fn init() {
         rlim_stack: 256 * 1024,
         rlim_cpu: u64::MAX,
         rlim_as: u64::MAX,
+        cur_syscall: u64::MAX,
+        sc_args: [0; 5],
         cont_pending: false,
         sig: SigState::new(),
     };
@@ -734,6 +738,8 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         rlim_stack: 256 * 1024,
         rlim_cpu: u64::MAX,
         rlim_as: u64::MAX,
+        cur_syscall: u64::MAX,
+        sc_args: [0; 5],
         cont_pending: false,
         sig: SigState::new(),
     };
@@ -825,6 +831,8 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         rlim_stack: 256 * 1024,
         rlim_cpu: u64::MAX,
         rlim_as: u64::MAX,
+        cur_syscall: u64::MAX,
+        sc_args: [0; 5],
         cont_pending: false,
         sig: SigState::new(),
     }));
@@ -992,6 +1000,8 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64) -> Option<u32> {
         rlim_stack: rstk,
         rlim_cpu: rcu,
         rlim_as: ras,
+        cur_syscall: u64::MAX,
+        sc_args: [0; 5],
         cont_pending: false,
         sig: s.tasks[s.cur].sig.for_thread(),
     };
@@ -1551,6 +1561,8 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         rlim_stack: s.tasks[s.cur].rlim_stack,
         rlim_cpu: s.tasks[s.cur].rlim_cpu,
         rlim_as: s.tasks[s.cur].rlim_as,
+        cur_syscall: u64::MAX,
+        sc_args: [0; 5],
         cont_pending: false,
         sig: s.tasks[s.cur].sig.for_fork(),
     };
@@ -1946,6 +1958,82 @@ pub fn exit_current(code: i64) -> ! {
     kill_at(s, idx, code);
     drop(g);
     park_dead_task();
+}
+
+/// SYS_EXIT_GROUP: POSIX exit_group — every thread sharing this mm dies
+/// with `code`, not just the caller. Siblings are reaped first (kill_at
+/// shifts task indices, so re-locate one each pass), then the caller.
+pub fn exit_group(code: i64) -> ! {
+    let mut g = SCHED.lock();
+    let s = g.as_mut().unwrap();
+    let mm = s.tasks[s.cur]
+        .pml4
+        .map(|f| f.start_address().as_u64());
+    if let Some(mm) = mm {
+        loop {
+            let pos = s.tasks.iter().enumerate().position(|(i, t)| {
+                i != s.cur
+                    && t.state != State::Dead
+                    && t.pml4.map(|f| f.start_address().as_u64()) == Some(mm)
+            });
+            match pos {
+                Some(i) => kill_at(s, i, code),
+                None => break,
+            }
+        }
+    }
+    let idx = s.cur;
+    kill_at(s, idx, code);
+    drop(g);
+    park_dead_task();
+}
+
+/// tgkill(tgid, tid, sig): signal a specific thread. tgid 0 skips the
+/// group check; otherwise tid must share tgid's address space.
+pub fn sys_tgkill(tgid: u32, tid: u32, sig: u64) -> i64 {
+    if tgid != 0 {
+        let same = {
+            let g = SCHED.lock();
+            let s = g.as_ref().unwrap();
+            let a = s.tasks.iter().find(|t| t.id == tgid)
+                .and_then(|t| t.pml4).map(|f| f.start_address().as_u64());
+            let b = s.tasks.iter().find(|t| t.id == tid)
+                .and_then(|t| t.pml4).map(|f| f.start_address().as_u64());
+            match (a, b) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            }
+        };
+        if !same {
+            return -3; // ESRCH: not a thread of that group
+        }
+    }
+    signal(tid, sig)
+}
+
+/// /proc/<pid>/syscall: in-flight syscall nr + args, or -1 when the task
+/// is running in user code.
+pub fn pid_syscall(pid: u32) -> Option<String> {
+    let g = SCHED.lock();
+    let s = g.as_ref().unwrap();
+    s.tasks
+        .iter()
+        .find(|t| t.id == pid && t.state != State::Dead)
+        .map(|t| {
+            if t.cur_syscall == u64::MAX {
+                alloc::format!("-1\n")
+            } else {
+                alloc::format!(
+                    "{} {} {} {} {} {}\n",
+                    t.cur_syscall,
+                    t.sc_args[0],
+                    t.sc_args[1],
+                    t.sc_args[2],
+                    t.sc_args[3],
+                    t.sc_args[4]
+                )
+            }
+        })
 }
 
 /// Give up the CPU after the current task died. `int 32` re-runs the

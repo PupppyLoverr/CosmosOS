@@ -176,6 +176,9 @@ pub const SS_DISABLE: u64 = 2;
 
 pub const SYS_PTRACE: u64 = 157;
 pub const SYS_WAITID: u64 = 158; // (idtype, id, flags) -> (pid<<32)|(kind<<24)|status
+pub const SYS_EXIT_GROUP: u64 = 159;   // (code) -> !  kill every thread of the mm
+pub const SYS_GETTID: u64 = 160;       // () -> tid (task id of this thread)
+pub const SYS_TGKILL: u64 = 161;       // (tgid, tid, sig) -> 0 | err
 
 // ptrace request ops
 pub const PT_TRACEME: u64 = 0;
@@ -191,6 +194,7 @@ pub const PT_DETACH: u64 = 17;
 pub const PT_PEEKUSER: u64 = 3;
 pub const PT_POKEUSER: u64 = 6;
 pub const PT_SYSCALL: u64 = 24;
+pub const PT_GETSIGINFO: u64 = 0x4202; // (pid, 0, out) -> writes si_signo/errno/code
 
 /// Register file layout == the kernel's saved CpuContext (PTRACE_GETREGS).
 #[repr(C)]

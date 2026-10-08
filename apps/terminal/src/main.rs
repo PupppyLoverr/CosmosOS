@@ -19320,6 +19320,130 @@ impl Term {
                 },
                 None => self.fail("usage: pmap <pid>"),
             },
+            "dbg" => {
+                // one-shot ptrace debugger:
+                //   dbg <pid>                attach + report stop
+                //   dbg <pid> regs|x ADDR|set ADDR V|step|cont [sig]|
+                //   syscall|si|detach|kill
+                let pid = args.iter().find_map(|a| a.parse::<u32>().ok());
+                let Some(pid) = pid else {
+                    self.fail("usage: dbg <pid> [regs|x A|set A V|step|cont [s]|syscall|si|detach|kill]");
+                    return;
+                };
+                let sub = args.iter().find(|a| a.parse::<u32>().is_err()).map(|s| *s);
+                match sub {
+                    None => {
+                        if ustd::ptrace(ustd::PT_ATTACH, pid, 0, 0) != 0 {
+                            self.fail(&alloc::format!("dbg: attach {} failed", pid));
+                        } else {
+                            match ustd::waitpid_opt(pid, 1, 2000) {
+                                Ok(st) => self.emit(&alloc::format!(
+                                    "dbg: attached pid {}, stopped sig={}",
+                                    pid, (st >> 8) & 0xff)),
+                                Err(_) => self.emit(&alloc::format!(
+                                    "dbg: attached pid {} (no stop yet)", pid)),
+                            }
+                        }
+                    }
+                    Some("regs") => match ustd::ptrace_getregs(pid) {
+                        Some(r) => {
+                            self.emit(&alloc::format!(
+                                "rip={:x} rsp={:x} rflags={:x}", r.rip, r.rsp, r.rflags));
+                            self.emit(&alloc::format!(
+                                "rax={:x} rbx={:x} rcx={:x} rdx={:x}",
+                                r.rax, r.rbx, r.rcx, r.rdx));
+                            self.emit(&alloc::format!(
+                                "rsi={:x} rdi={:x} rbp={:x}",
+                                r.rsi, r.rdi, r.rbp));
+                            self.emit(&alloc::format!(
+                                "r8={:x} r9={:x} r10={:x} r11={:x}",
+                                r.r8, r.r9, r.r10, r.r11));
+                            self.emit(&alloc::format!(
+                                "r12={:x} r13={:x} r14={:x} r15={:x}",
+                                r.r12, r.r13, r.r14, r.r15));
+                            self.emit(&alloc::format!("cs={:x} ss={:x}", r.cs, r.ss));
+                        }
+                        None => self.fail("dbg: not stopped or not yours"),
+                    },
+                    Some("x") => {
+                        let a = args.iter().nth(2)
+                            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+                        match a {
+                            Some(a) if a & 7 == 0 => {
+                                let v = ustd::ptrace(ustd::PT_PEEK, pid, a, 0);
+                                if v < 0 {
+                                    self.fail("dbg: peek failed (stopped? aligned?)");
+                                } else {
+                                    self.emit(&alloc::format!("{:x}: {:016x}", a, v));
+                                }
+                            }
+                            _ => self.fail("usage: dbg <pid> x <hexaddr>"),
+                        }
+                    }
+                    Some("set") => {
+                        let a = args.iter().nth(2)
+                            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+                        let v = args.iter().nth(3)
+                            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+                        match (a, v) {
+                            (Some(a), Some(v)) if a & 7 == 0 => {
+                                if ustd::ptrace(ustd::PT_POKE, pid, a, v) == 0 {
+                                    self.emit(&alloc::format!("{:x} <- {:016x}", a, v));
+                                } else {
+                                    self.fail("dbg: poke failed");
+                                }
+                            }
+                            _ => self.fail("usage: dbg <pid> set <hexaddr> <hexval>"),
+                        }
+                    }
+                    Some("step") => {
+                        if ustd::ptrace(ustd::PT_STEP, pid, 0, 0) != 0 {
+                            self.fail("dbg: step failed");
+                        } else {
+                            let _ = ustd::waitpid_opt(pid, 1, 2000);
+                            match ustd::ptrace_getregs(pid) {
+                                Some(r) => self.emit(&alloc::format!("rip={:x}", r.rip)),
+                                None => self.emit("dbg: stepped"),
+                            }
+                        }
+                    }
+                    Some("cont") => {
+                        let sig = args.iter().nth(2)
+                            .and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                        if ustd::ptrace(ustd::PT_CONT, pid, 0, sig) == 0 {
+                            self.emit("dbg: continued");
+                        } else {
+                            self.fail("dbg: cont failed");
+                        }
+                    }
+                    Some("syscall") => {
+                        if ustd::ptrace(ustd::PT_SYSCALL, pid, 0, 0) == 0 {
+                            self.emit("dbg: syscall-traced resume");
+                        } else {
+                            self.fail("dbg: syscall failed");
+                        }
+                    }
+                    Some("si") => match ustd::ptrace_siginfo(pid) {
+                        Some(s) => self.emit(&alloc::format!("si_signo={}", s)),
+                        None => self.fail("dbg: siginfo failed"),
+                    },
+                    Some("detach") => {
+                        if ustd::ptrace(ustd::PT_DETACH, pid, 0, 0) == 0 {
+                            self.emit("dbg: detached");
+                        } else {
+                            self.fail("dbg: detach failed");
+                        }
+                    }
+                    Some("kill") => {
+                        if ustd::ptrace(ustd::PT_KILL, pid, 0, 0) == 0 {
+                            self.emit("dbg: killed");
+                        } else {
+                            self.fail("dbg: kill failed");
+                        }
+                    }
+                    _ => self.fail("dbg: unknown subcommand"),
+                }
+            }
             "lslocks" => {
                 self.emit("COMMAND           PID  TYPE MODE  PATH");
                 match ustd::read_all("/proc/locks") {

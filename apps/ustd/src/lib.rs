@@ -331,6 +331,7 @@ pub fn ptrace(op: u64, pid: u32, addr: u64, data: u64) -> i64 {
 pub const PT_PEEKUSER: u64 = 3;
 pub const PT_POKEUSER: u64 = 6;
 pub const PT_SYSCALL: u64 = 24;
+pub const PT_GETSIGINFO: u64 = 0x4202;
 
 /// waitid(idtype, id, flags): idtype 0=P_ALL, 1=P_PID; flags bit0
 /// WNOHANG, bit1 WSTOPPED, bit2 WCONTINUED. Returns packed
@@ -345,6 +346,52 @@ pub fn ptrace_getregs(pid: u32) -> Option<PtRegs> {
     let p = &mut r as *mut PtRegs as u64;
     if ptrace(PT_GETREGS, pid, 0, p) == 0 {
         Some(r)
+    } else {
+        None
+    }
+}
+
+/// exit_group(code): POSIX exit_group — kills every thread of the mm.
+pub fn exit_group(code: i64) -> ! {
+    sc1(shared::SYS_EXIT_GROUP, code as u64);
+    unreachable!()
+}
+
+/// gettid(): this thread's id (main thread's tid == getpid).
+pub fn gettid() -> u32 {
+    sc0(shared::SYS_GETTID) as u32
+}
+
+/// tgkill(tgid, tid, sig): signal a specific thread; tgid 0 skips the
+/// same-address-space check.
+pub fn tgkill(tgid: u32, tid: u32, sig: u64) -> i64 {
+    sc3(shared::SYS_TGKILL, tgid as u64, tid as u64, sig) as i64
+}
+
+// POSIX wait-status decoders on the kernel's packed statuses
+// (exit code | stopped 0x7f|(sig<<8) | continued 0xffff)
+pub fn wifexited(st: i64) -> bool {
+    st & 0x7f == 0
+}
+pub fn wexitstatus(st: i64) -> i64 {
+    (st >> 8) & 0xff
+}
+pub fn wifstopped(st: i64) -> bool {
+    st & 0xff == 0x7f
+}
+pub fn wstopsig(st: i64) -> i64 {
+    (st >> 8) & 0xff
+}
+pub fn wifcontinued(st: i64) -> bool {
+    st == 0xffff
+}
+
+/// PTRACE_GETSIGINFO: writes si_signo/errno/code (12 bytes) for the
+/// tracee's last stop. Returns the signal number for convenience.
+pub fn ptrace_siginfo(pid: u32) -> Option<u32> {
+    let mut buf = [0u32; 3];
+    if ptrace(PT_GETSIGINFO, pid, 0, buf.as_mut_ptr() as u64) == 0 {
+        Some(buf[0])
     } else {
         None
     }
