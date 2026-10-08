@@ -180,6 +180,20 @@ pub fn remove(path: &str) -> Result<(), i64> {
     }
 }
 
+/// tee: duplicate up to `len` queued bytes from `from` into `to`
+/// without consuming the source (POSIX tee()). Returns the moved count.
+pub fn tee(from: &str, to: &str, len: usize) -> Result<u64, i64> {
+    let mut g = PIPES.lock();
+    let Some(src) = g.get(from) else { return Err(-22) };
+    let take = src.buf.iter().take(len).copied().collect::<Vec<u8>>();
+    let Some(dst) = g.get_mut(to) else { return Err(-22) };
+    let space = PIPE_CAP.saturating_sub(dst.buf.len());
+    let n = take.len().min(space);
+    dst.buf.extend(&take[..n]);
+    dst.mtime = crate::vfs::now_unix();
+    Ok(n as u64)
+}
+
 /// (size=queued bytes, mtime)
 pub fn stat(path: &str) -> Option<(u64, u64)> {
     PIPES.lock().get(path).map(|p| (p.buf.len() as u64, p.mtime))

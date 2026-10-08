@@ -221,6 +221,21 @@ pub const AT_REMOVEDIR: u64 = 0x200;
 pub const AT_EMPTY_PATH: u64 = 0x1000;
 pub const O_EXCL: u64 = 128;
 pub const O_PATH: u64 = 256;
+pub const SYS_SECCOMP: u64 = 198;       // (mode, allow_ptr, len32B) -> 0|err  1=strict 2=bitmap
+pub const SYS_SET_ROBUST_LIST: u64 = 199;// (head_va) -> 0  node={next, futex_va}
+pub const SYS_STATFS: u64 = 200;        // (path,len,&mut Statfs{type,bsize,blocks,bfree}) -> 0|err
+pub const SYS_FSTATFS: u64 = 201;       // (fd,&mut Statfs) -> 0|err
+pub const SYS_SYNCFS: u64 = 202;        // (fd) -> 0|err   flush the fd's volume
+pub const SYS_FALLOCATE: u64 = 203;     // (fd,off,len) -> 0|err  zero-extend file
+pub const SYS_COPY_FILE_RANGE: u64 = 204;// (in_fd,out_fd,off_packed?) len via a4 -> n|err
+pub const SYS_TEE: u64 = 205;           // (in_pipe_fd,out_pipe_fd,len) -> n|err (dup, no consume)
+pub const SYS_PSELECT: u64 = 206;       // (nfds,rmask_ptr,wmask_ptr,timeout_ms,mask) -> n|err
+pub const SYS_DUP3: u64 = 207;          // (oldfd,newfd,flags) -> newfd|err
+pub const SYS_SCHED_YIELD: u64 = 208;   // () -> 0
+pub const SYS_CLOCK_NANOSLEEP: u64 = 209;// (clock_id, abs_ms) -> 0|err (TIMER_ABSTIME)
+pub const SYS_GETTIMEOFDAY: u64 = 210;  // (&mut {sec,usec}) -> 0|err
+pub const SECCOMP_MODE_STRICT: u64 = 1;
+pub const SECCOMP_MODE_FILTER: u64 = 2;
 
 // ptrace request ops
 pub const PT_TRACEME: u64 = 0;

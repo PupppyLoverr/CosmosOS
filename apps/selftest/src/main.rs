@@ -3516,6 +3516,168 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
     });
 
+    // --- batch 68: seccomp + robust list + statfs/syncfs/fallocate/cfr/tee/pselect/dup3/yield/cns/tod ---
+    check("seccomp-strict", {
+        match ustd::fork() {
+            0 => {
+                let _ = ustd::seccomp(1, None);
+                // gettimeofday is outside the strict allowlist -> SIGKILL
+                let _ = ustd::gettimeofday();
+                ustd::exit(0)
+            }
+            p if p > 0 => ustd::waitpid(p as u32, 5000).unwrap_or(-1) == 128 + 9,
+            _ => false,
+        }
+    });
+    check("seccomp-filter", {
+        match ustd::fork() {
+            0 => {
+                // bitmap allowing only SYS_EXIT(0)
+                let mut b = [0u8; 32];
+                b[0] = 1;
+                let _ = ustd::seccomp(2, Some(&b));
+                let bad = ustd::gettimeofday(); // -> ENOSYS
+                let _ = bad;
+                ustd::exit(42) // SYS_EXIT is allowed
+            }
+            p if p > 0 => ustd::waitpid(p as u32, 5000).unwrap_or(-1) == 42,
+            _ => false,
+        }
+    });
+    check("robust-list", {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static RW: AtomicU64 = AtomicU64::new(0);
+        // node ABI: {next_va, futex_va} u64 pair, list ends at next=0
+        static NODE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+        extern "C" fn rl(_: u64) -> i64 {
+            NODE[0].store(0, Ordering::SeqCst);
+            NODE[1].store(&RW as *const _ as u64, Ordering::SeqCst);
+            ustd::set_robust_list(&NODE as *const _ as u64);
+            RW.store(1, Ordering::SeqCst);
+            ustd::sleep_ms(150); // stay alive while main futex-waits
+            0
+        }
+        match ustd::thread_spawn(rl, 0) {
+            Ok(tid) => {
+                // wait for RW==1 then futex-block on it; when the thread
+                // dies the kernel ORs OWNER_DIED and wakes the waiter.
+                let mut i = 0;
+                while RW.load(Ordering::SeqCst) != 1 && i < 2000 {
+                    ustd::sleep_ms(1);
+                    i += 1;
+                }
+                let r = ustd::futex(&RW, 0, 1, 4000);
+                let _ = ustd::waitpid(tid, 3000);
+                r == 0 && RW.load(Ordering::SeqCst) & (1 << 30) != 0
+            }
+            Err(_) => false,
+        }
+    });
+    {
+        let f = ustd::open("/etc/rc.conf", ustd::O_RDONLY).unwrap_or(-1);
+        let st = ustd::statfs("/");
+        let fs = ustd::fstatfs(f);
+        let sy = ustd::syncfs(f);
+        if f >= 0 { ustd::close(f); }
+        check("statfs", st.map(|(t, bs, bl, bf)| t == 0x4d44 && bs > 0 && bl > bf).unwrap_or(false)
+            && fs.map(|(t, _, _, _)| t == 0x4d44).unwrap_or(false));
+        check("syncfs", f >= 0 && sy == 0);
+    }
+    check("fallocate", {
+        let _ = ustd::remove("/st-falloc");
+        let _ = ustd::write_all("/st-falloc", b"ab");
+        let f = ustd::open("/st-falloc", ustd::O_RDWR).unwrap_or(-1);
+        let ok = f >= 0
+            && ustd::fallocate(f, 0, 4096) == 0
+            && ustd::stat("/st-falloc").map(|s| s.size == 4096).unwrap_or(false)
+            && ustd::read_all("/st-falloc").map(|d| &d[..2] == b"ab" && d[3] == 0).unwrap_or(false);
+        if f >= 0 { ustd::close(f); }
+        let _ = ustd::remove("/st-falloc");
+        ok
+    });
+    check("copy-file-range", {
+        let _ = ustd::remove("/st-cfr-b");
+        let _ = ustd::write_all("/st-cfr-a", b"cfrdata!");
+        let i = ustd::open("/st-cfr-a", ustd::O_RDONLY).unwrap_or(-1);
+        let o = ustd::open("/st-cfr-b", ustd::O_RDWR | ustd::O_CREATE | ustd::O_TRUNC).unwrap_or(-1);
+        let n = if i >= 0 && o >= 0 { ustd::copy_file_range(i, o, 64) } else { -1 };
+        let ok = n == 8 && ustd::read_all("/st-cfr-b").map(|d| &d[..] == b"cfrdata!").unwrap_or(false);
+        if i >= 0 { ustd::close(i); }
+        if o >= 0 { ustd::close(o); }
+        let _ = ustd::remove("/st-cfr-a");
+        let _ = ustd::remove("/st-cfr-b");
+        ok
+    });
+    check("tee", {
+        match (ustd::pipe(), ustd::pipe()) {
+            (Some((r1, w1)), Some((r2, w2))) => {
+                let _ = ustd::write(w1, b"AB");
+                let t = ustd::tee(r1, w2, 2);
+                let mut b = [0u8; 4];
+                let n1 = ustd::read(r1, &mut b).unwrap_or(0); // source NOT consumed
+                let n2 = ustd::read(r2, &mut b).unwrap_or(0);
+                ustd::close(r1); ustd::close(w1); ustd::close(r2); ustd::close(w2);
+                t == 2 && n1 == 2 && n2 == 2 && &b[..2] == b"AB"
+            }
+            _ => false,
+        }
+    });
+    check("pselect", {
+        match ustd::pipe() {
+            Some((r, w)) => {
+                let mut rm: u64 = 1 << r;
+                let mut wm: u64 = 0;
+                let _ = ustd::write(w, b"z");
+                let n = ustd::pselect(64, &mut rm, &mut wm, 1000, u64::MAX);
+                let mut drain = [0u8; 4];
+                let _ = ustd::read(r, &mut drain); // consume "z"
+                let zero = {
+                    let mut rm2: u64 = 1 << r;
+                    let mut wm2: u64 = 0;
+                    ustd::pselect(64, &mut rm2, &mut wm2, 0, u64::MAX)
+                };
+                ustd::close(r); ustd::close(w);
+                n == 1 && rm == (1 << r) && zero == 0
+            }
+            None => false,
+        }
+    });
+    check("pselect-eintr", {
+        extern "C" fn pe(_: u64) {}
+        ustd::sigaction(10, pe as usize as u64);
+        let _ = ustd::kill2(ustd::getpid(), 10); // pending before the call
+        let mut rm: u64 = 0;
+        let mut wm: u64 = 0;
+        ustd::pselect(64, &mut rm, &mut wm, u64::MAX, 0) == -4
+    });
+    check("dup3", {
+        match ustd::pipe() {
+            Some((r, w)) => {
+                let d = ustd::dup3(r, 30, 0);
+                let bad = ustd::dup3(r, 31, 1);
+                ustd::close(r); ustd::close(w);
+                if d >= 0 { ustd::close(d); }
+                d >= 0 && bad < 0
+            }
+            None => false,
+        }
+    });
+    check("sched-yield", {
+        ustd::sched_yield();
+        ustd::sched_yield();
+        true // survived two real yields
+    });
+    check("clock-nanosleep", {
+        let t0 = ustd::uptime_ms();
+        let r = ustd::clock_nanosleep(t0 + 60);
+        let past = ustd::clock_nanosleep(t0); // already past -> immediate 0
+        r == 0 && past == 0 && ustd::uptime_ms() - t0 >= 50
+    });
+    check("gettimeofday", {
+        let (s, u) = ustd::gettimeofday();
+        s > 1_700_000_000 && u < 1_000_000
+    });
+
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

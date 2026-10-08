@@ -138,6 +138,9 @@ pub struct Task {
     pub itimers: [[u64; 2]; 3], // setitimer: [REAL, VIRTUAL, PROF] = [cur,int] ticks, cur 0 = disarmed
     pub ptimers: Vec<PTimer>,   // POSIX timer_create timers (not inherited)
     pub poll_saved_mask: u64,   // ppoll: sigmask before the ppoll swap (MAX = none)
+    pub seccomp_mode: u8,       // 0 none, 1 strict (read/write/exit only), 2 allowlist
+    pub seccomp_allow: [u64; 4],// bitmap of allowed syscall nrs (mode 2)
+    pub robust_list: u64,       // userspace head of {next, futex_va} nodes
     pub poll_dl: u64,           // poll/epoll/ppoll absolute timeout deadline (0 = none);
                                 // persists across int80 re-entry so finite timeouts fire
     pub cont_pending: bool,     // continued (SIGCONT/ptrace) since last wait report
@@ -312,6 +315,9 @@ pub fn init() {
         itimers: [[0; 2]; 3],
         ptimers: Vec::new(),
         poll_saved_mask: u64::MAX,
+        seccomp_mode: 0,
+        seccomp_allow: [0; 4],
+        robust_list: 0,
         poll_dl: 0,
         cont_pending: false,
         sig: SigState::new(),
@@ -799,6 +805,9 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         itimers: [[0; 2]; 3],
         ptimers: Vec::new(),
         poll_saved_mask: u64::MAX,
+        seccomp_mode: 0,
+        seccomp_allow: [0; 4],
+        robust_list: 0,
         poll_dl: 0,
         cont_pending: false,
         sig: SigState::new(),
@@ -896,6 +905,9 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         itimers: [[0; 2]; 3],
         ptimers: Vec::new(),
         poll_saved_mask: u64::MAX,
+        seccomp_mode: 0,
+        seccomp_allow: [0; 4],
+        robust_list: 0,
         poll_dl: 0,
         cont_pending: false,
         sig: SigState::new(),
@@ -1069,6 +1081,9 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64) -> Option<u32> {
         itimers: [[0; 2]; 3],
         ptimers: Vec::new(),
         poll_saved_mask: u64::MAX,
+        seccomp_mode: 0,
+        seccomp_allow: [0; 4],
+        robust_list: 0,
         poll_dl: 0,
         cont_pending: false,
         sig: s.tasks[s.cur].sig.for_thread(),
@@ -1634,6 +1649,9 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         itimers: [[0; 2]; 3],
         ptimers: Vec::new(),
         poll_saved_mask: u64::MAX,
+        seccomp_mode: 0,
+        seccomp_allow: [0; 4],
+        robust_list: 0,
         poll_dl: 0,
         cont_pending: false,
         sig: s.tasks[s.cur].sig.for_fork(),
@@ -1901,6 +1919,41 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
     t.wake_at = u64::MAX;
     t.wait_port = 0;
     t.wait_futex = 0;
+    // robust futex list: a dead task's registered words get OWNER_DIED
+    // (bit30) OR'd in and their waiters woken — a mutex held at death
+    // can't hang whoever futex-waits on it next. Node ABI: {next, va}.
+    if t.robust_list != 0 {
+        if let Some(pml4) = t.pml4 {
+            let mut node = t.robust_list;
+            for _ in 0..64 {
+                if node == 0 {
+                    break;
+                }
+                let Some(pa) = crate::elf::translate_user(pml4, node) else {
+                    break;
+                };
+                let kv = crate::mem::phys_to_virt(pa) as *const u64;
+                let (next, fva) = unsafe { (*kv, *kv.add(1)) };
+                if fva != 0 {
+                    if let Some(fpa) = crate::elf::translate_user(pml4, fva) {
+                        let w = crate::mem::phys_to_virt(fpa) as *mut u64;
+                        unsafe { *w |= 1 << 30 };
+                        // wake inline: SCHED is already locked here
+                        for o in s.tasks.iter_mut() {
+                            if o.wait_futex == fpa {
+                                o.wait_futex = 0;
+                                if o.state == State::Blocked {
+                                    o.state = State::Running;
+                                }
+                            }
+                        }
+                    }
+                }
+                node = next;
+            }
+        }
+        t.robust_list = 0;
+    }
     // wake any waiters (only live ones); u32::MAX = wait(-1) any-child
     for o in s.tasks.iter_mut() {
         if o.waiting_on == t.id || (o.waiting_on == u32::MAX && t.parent == o.id) {
