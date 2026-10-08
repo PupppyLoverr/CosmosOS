@@ -14,6 +14,26 @@ use ustd::draw::{self, Canvas};
 use ustd::wm::{self, Window};
 use ustd::println;
 
+/// CPUID 0x80000002-4 brand string — the real hardware platform id
+/// (`uname -i`, shared with `lscpu`'s brand read).
+fn cpu_brand() -> String {
+    let mut brand = [0u8; 48];
+    unsafe {
+        if core::arch::x86_64::__cpuid(0x80000000).eax >= 0x80000004 {
+            for (i, leaf) in (0x80000002u32..=0x80000004).enumerate() {
+                let r = core::arch::x86_64::__cpuid(leaf);
+                for (j, reg) in [r.eax, r.ebx, r.ecx, r.edx].iter().enumerate() {
+                    brand[i * 16 + j * 4..i * 16 + j * 4 + 4]
+                        .copy_from_slice(&reg.to_le_bytes());
+                }
+            }
+        }
+    }
+    let end = brand.iter().position(|b| *b == 0).unwrap_or(48);
+    let s = String::from_utf8_lossy(&brand[..end]).trim().to_string();
+    if s.is_empty() { String::from("x86_64") } else { s }
+}
+
 /// /etc/passwd row for `user` -> (uid, gid). Missing file = root only.
 fn passwd_ent(user: &str) -> Option<(u32, u32)> {
     if user == "root" {
@@ -9286,8 +9306,14 @@ impl Term {
                 let mut dirself = false;
                 let mut human = false;
                 let mut quote = false;
+                let mut dirs_first = false;
                 let mut i = 0usize;
                 while i < args.len() && args[i].starts_with('-') && args[i].len() > 1 {
+                    if args[i] == "--group-directories-first" {
+                        dirs_first = true;
+                        i += 1;
+                        continue;
+                    }
                     for c in args[i][1..].chars() {
                         match c {
                             'a' => show_all = true,
@@ -9396,6 +9422,11 @@ impl Term {
                             }
                             if rev {
                                 ents.reverse();
+                            }
+                            if dirs_first {
+                                // --group-directories-first: GNU stable
+                                // partition — dirs lead, order preserved
+                                ents.sort_by_key(|e| e.is_dir == 0);
                             }
                             if ents.is_empty() {
                                 self.emit("  (empty)");
@@ -12752,7 +12783,20 @@ impl Term {
                         .collect::<Vec<_>>()
                         .join(" ")
                 ));
+                // -p PID[,PID]...: restrict to the given pids (GNU)
+                let pi = args.iter().position(|a| a == &"-p");
+                let want: Vec<u64> = pi
+                    .and_then(|i| args.get(i + 1))
+                    .map(|c| {
+                        c.split(',')
+                            .filter_map(|x| x.trim().parse::<u64>().ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 for p in ustd::proclist(64) {
+                    if pi.is_some() && !want.contains(&(p.pid as u64)) {
+                        continue;
+                    }
                     let name = core::str::from_utf8(&p.name)
                         .unwrap_or("?")
                         .trim_end_matches('\0');
@@ -14159,6 +14203,10 @@ impl Term {
                 if all || f.contains('o') {
                     parts.push(String::from("CosmosOS"));
                 }
+                // -i: hardware platform — real CPUID brand string
+                if all || f.contains('i') {
+                    parts.push(cpu_brand());
+                }
                 if parts.is_empty() {
                     parts.push(String::from("CosmosOS"));
                 }
@@ -15185,9 +15233,46 @@ impl Term {
             }
             "getent" | "host" => {
                 // getent hosts <name> / host <name> -- live DNS lookup
+                // getent passwd [user] / group [grp] -- real /etc db reads:
+                // no key dumps the whole db, a key prints its entry only
+                // (exit status is 0 iff found, like GNU getent)
+                if cmd == "getent" {
+                    match args.first().copied() {
+                        Some("passwd") | Some("group") => {
+                            let db = args[0];
+                            let src = alloc::format!("/etc/{}", db);
+                            let key = args.get(1).copied();
+                            let data = ustd::read_all(&src)
+                                .map(|d| String::from_utf8_lossy(&d).into_owned())
+                                .unwrap_or_default();
+                            let mut found = false;
+                            for l in data.lines() {
+                                if l.is_empty() || l.starts_with('#') {
+                                    continue;
+                                }
+                                let col0 = l.split(':').next().unwrap_or("");
+                                if key.is_none() || key == Some(col0) {
+                                    self.emit(l);
+                                    found = true;
+                                }
+                            }
+                            if !found {
+                                self.last_ok = false;
+                            }
+                            return;
+                        }
+                        Some("hosts") => {}
+                        _ => {
+                            self.fail(
+                                "usage: getent hosts|passwd|group <key>",
+                            );
+                            return;
+                        }
+                    }
+                }
                 let name = if cmd == "getent" {
-                    match (args.first(), args.get(1)) {
-                        (Some(&"hosts"), Some(n)) => *n,
+                    match args.get(1) {
+                        Some(n) => *n,
                         _ => {
                             self.fail("usage: getent hosts <name>");
                             return;
@@ -15675,9 +15760,16 @@ impl Term {
             }
             "df" => {
                 // df [-h] [-T]: -h human sizes, -T adds the fs type column
+                // -k 1K blocks, -m 1M blocks (GNU unit flags)
                 let human = args.iter().any(|a| *a == "-h");
                 let typ = args.iter().any(|a| *a == "-T" || *a == "--print-type");
                 let posix = args.iter().any(|a| *a == "-P" || *a == "--portability");
+                let unit: u64 = if args.iter().any(|a| *a == "-m" || *a == "--si") {
+                    1 << 20
+                } else {
+                    1 << 10
+                };
+                let uname = if unit == 1 << 20 { "1M-blocks" } else { "1K-blocks" };
                 match ustd::df() {
                     Some((total, free)) => {
                         let used = total - free;
@@ -15693,9 +15785,15 @@ impl Term {
                             return;
                         }
                         if typ {
-                            self.emit("Filesystem     Type   Size      Used      Avail   Use%");
+                            self.emit(&alloc::format!(
+                                "Filesystem     Type   {}      Used      Avail   Use%",
+                                uname
+                            ));
                         } else {
-                            self.emit("Filesystem     Size      Used      Avail   Use%");
+                            self.emit(&alloc::format!(
+                                "Filesystem     {}      Used      Avail   Use%",
+                                uname
+                            ));
                         }
                         if human {
                             if typ {
@@ -15714,12 +15812,12 @@ impl Term {
                         } else if typ {
                             self.emit(&alloc::format!(
                                 "{:<13} {:<6} {:<9} {:<9} {:<8} {}%",
-                                "/dev/vda", "vfat", total, used, free, pct
+                                "/dev/vda", "vfat", total / unit, used / unit, free / unit, pct
                             ));
                         } else {
                             self.emit(&alloc::format!(
                                 "{:<13} {:<9} {:<9} {:<8} {}%",
-                                "/dev/vda", total, used, free, pct
+                                "/dev/vda", total / unit, used / unit, free / unit, pct
                             ));
                         }
                     }
@@ -18190,6 +18288,28 @@ impl Term {
                     );
                     return;
                 }
+                // -L/--table: Linux full-table form — every implemented
+                // signal as `num NAME` rows, 4 per line
+                if args.iter().any(|a| *a == "-L" || *a == "--table") {
+                    let t = [
+                        (1, "HUP"), (2, "INT"), (3, "QUIT"), (6, "ABRT"),
+                        (9, "KILL"), (10, "USR1"), (12, "USR2"), (13, "PIPE"),
+                        (14, "ALRM"), (15, "TERM"), (17, "CHLD"), (18, "CONT"),
+                        (19, "STOP"), (20, "TSTP"), (21, "TTIN"), (22, "TTOU"),
+                        (23, "URG"), (26, "VTALRM"), (27, "PROF"), (28, "WINCH"),
+                    ];
+                    for row in t.chunks(4) {
+                        self.emit(&alloc::format!(
+                            " {}",
+                            row.iter()
+                                .map(|(n, s)| alloc::format!("{:>2}) {:<8}", n, s))
+                                .collect::<Vec<_>>()
+                                .join("")
+                                .trim_end()
+                        ));
+                    }
+                    return;
+                }
                 let mut sig: u64 = 15;
                 let mut ti = 0usize;
                 while let Some(a) = args.get(ti) {
@@ -18296,8 +18416,10 @@ impl Term {
                 None => self.fail("usage: killall <name-substr>"),
             },
             "basename" => {
-                // basename [-s SUF] name... — strip dir prefix, then the
-                // suffix (a literal string, not a glob)
+                // basename [-s SUF] [-z] name... — strip dir prefix, then the
+                // suffix (a literal string, not a glob); -z NUL-terminates
+                // each result (GNU --zero for xargs -0 pipelines)
+                let z = args.iter().any(|a| *a == "-z" || *a == "--zero");
                 let si = args.iter().position(|a| *a == "-s");
                 let suf = si.and_then(|i| args.get(i + 1)).copied().unwrap_or("");
                 let skip = si.map(|i| alloc::vec![i, i + 1]).unwrap_or_default();
@@ -18306,37 +18428,56 @@ impl Term {
                 let pos: Vec<&&str> = args
                     .iter()
                     .enumerate()
-                    .filter(|(i, a)| !a.starts_with('-') && !skip.contains(i))
+                    .filter(|(i, a)| {
+                        (!a.starts_with('-') || **a == "-") && !skip.contains(i)
+                    })
                     .map(|(_, a)| a)
                     .collect();
                 if pos.is_empty() {
-                    self.fail("usage: basename [-s SUF] name...");
+                    self.fail("usage: basename [-s SUF] [-z] name...");
                     return;
                 }
+                let mut out = String::new();
                 for p in pos.iter() {
                     let t = p.trim_end_matches('/');
                     let mut b = t.rsplit('/').next().unwrap_or("/");
                     if !suf.is_empty() && b.len() > suf.len() && b.ends_with(suf) {
                         b = &b[..b.len() - suf.len()];
                     }
-                    self.emit(b);
+                    out.push_str(b);
+                    out.push(if z { '\0' } else { '\n' });
+                }
+                if z {
+                    // byte-exact channel: NULs survive `>` / `|` intact
+                    self.emit_bin(out.as_bytes());
+                } else {
+                    self.emit(&out[..out.len().saturating_sub(1)]);
                 }
             }
             "dirname" => {
-                // dirname name... — directory portion of each path
+                // dirname [-z] name... — directory portion of each path;
+                // -z NUL-terminates (GNU --zero)
+                let z = args.iter().any(|a| *a == "-z" || *a == "--zero");
                 let pos: Vec<&&str> =
                     args.iter().filter(|a| !a.starts_with('-')).collect();
                 if pos.is_empty() {
-                    self.fail("usage: dirname <path>...");
+                    self.fail("usage: dirname [-z] <path>...");
                     return;
                 }
+                let mut out = String::new();
                 for p in pos {
                     let t = p.trim_end_matches('/');
-                    match t.rfind('/') {
-                        None => self.emit("."),
-                        Some(0) => self.emit("/"),
-                        Some(i) => self.emit(&t[..i]),
-                    }
+                    out.push_str(match t.rfind('/') {
+                        None => ".",
+                        Some(0) => "/",
+                        Some(i) => &t[..i],
+                    });
+                    out.push(if z { '\0' } else { '\n' });
+                }
+                if z {
+                    self.emit_bin(out.as_bytes());
+                } else {
+                    self.emit(&out[..out.len().saturating_sub(1)]);
                 }
             }
             "strings" => match args.first() {
@@ -19985,6 +20126,11 @@ impl Term {
                 // stat [-c FMT] path... — FMT: %n name %s size %F type
                 // %a attr-octal %y mtime-iso %% literal
                 let terse = args.iter().any(|a| *a == "-t" || *a == "--terse");
+                // -f/--file-system: report the filesystem, not the file —
+                // backed by the real statfs syscall (type/bsize/blocks/bfree)
+                let fsf = args
+                    .iter()
+                    .any(|a| *a == "-f" || *a == "--file-system");
                 let ci = args.iter().position(|a| *a == "-c");
                 let fmt = ci.and_then(|i| args.get(i + 1)).copied();
                 let pos: Vec<&&str> = args
@@ -20000,6 +20146,26 @@ impl Term {
                     return;
                 }
                 for p in pos {
+                    if fsf {
+                        match ustd::statfs(p) {
+                            Some((ty, bs, bl, bf)) => {
+                                let tn = if ty == 0x0102_1994 {
+                                    "tmpfs"
+                                } else {
+                                    "vfat"
+                                };
+                                self.emit(&alloc::format!(
+                                    "  File: \"{}\"\n    ID: 0x0 Namelen: 255     Type: {}\nBlock size: {}     Fundamental block size: {}\nBlocks: Total: {}\tFree: {}",
+                                    p, tn, bs, bs, bl, bf
+                                ));
+                            }
+                            None => self.fail(&alloc::format!(
+                                "stat: {}: statfs failed",
+                                p
+                            )),
+                        }
+                        continue;
+                    }
                     match ustd::stat(p) {
                         Ok(st) => {
                             let (y, mo, d, h, mi, se) = epoch_to_dt(st.mtime);
@@ -24172,6 +24338,7 @@ impl Term {
                     "          reboot shutdown exit",
                     "          colrm <s> [e]  mountpoint <d>  elfinfo <elf>  utmpdump",
                     "          iconv -f E -t E  ascii  mount -a  find -printf  timeout -s/-k",
+                    "          stat -f  df -k/-m  ps -p  uname -i  getent passwd|group",
                     "          setsid <cmd>  dir/vdir  mkdir -m  df -P  stat -t  chown -R",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];
