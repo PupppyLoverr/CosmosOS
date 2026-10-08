@@ -601,6 +601,70 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             _ => false,
         }
     });
+    check("sig-mask", {
+        use core::sync::atomic::Ordering;
+        static HIT2: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn h2(_: u64) {
+            HIT2.store(1, Ordering::SeqCst);
+        }
+        ustd::sigaction(10, h2 as usize as u64);
+        ustd::sigprocmask(ustd::SIG_BLOCK, 1 << 10);
+        let _ = ustd::raise(10);
+        ustd::sleep_ms(50); // a delivery point passes while blocked — no hit
+        let held = HIT2.load(Ordering::SeqCst) == 0;
+        ustd::sigprocmask(ustd::SIG_SETMASK, 0); // unmask → delivers at return
+        held && HIT2.load(Ordering::SeqCst) == 1
+    });
+    check("sigchld-notify", {
+        use core::sync::atomic::Ordering;
+        static CHLD: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn hc(s: u64) {
+            CHLD.store(s, Ordering::SeqCst);
+        }
+        ustd::sigaction(17, hc as usize as u64);
+        match ustd::fork() {
+            0 => ustd::exit(5),
+            p if p > 0 => {
+                let code = ustd::waitpid(p as u32, 4000).unwrap_or(-1);
+                ustd::sleep_ms(50);
+                code == 5 && CHLD.load(Ordering::SeqCst) == 17
+            }
+            _ => false,
+        }
+    });
+    check("sig-alarm", {
+        use core::sync::atomic::Ordering;
+        static ALRM: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn ha(s: u64) {
+            ALRM.store(s, Ordering::SeqCst);
+        }
+        ustd::sigaction(14, ha as usize as u64);
+        ustd::alarm(1);
+        for _ in 0..50 {
+            if ALRM.load(Ordering::SeqCst) == 14 {
+                break;
+            }
+            ustd::sleep_ms(100);
+        }
+        ALRM.load(Ordering::SeqCst) == 14
+    });
+    check("signalfd-read", {
+        // Linux semantics: block the signal via sigprocmask so delivery
+        // can't consume it, then the fd drains the pending record
+        ustd::sigprocmask(ustd::SIG_BLOCK, 1 << 11);
+        let fd = ustd::signalfd(1 << 11);
+        let ok = if fd < 0 {
+            false
+        } else {
+            let _ = ustd::raise(11);
+            let mut rec = [0u8; 128];
+            let n = ustd::read(fd, &mut rec).unwrap_or(0);
+            let _ = ustd::close(fd);
+            n == 128 && u32::from_le_bytes(rec[..4].try_into().unwrap()) == 11
+        };
+        ustd::sigprocmask(ustd::SIG_SETMASK, 0);
+        ok
+    });
     check("kern-ptr-rejected", {
         // syscall boundary must reject a kernel VA (phys-map region)
         ustd::sc1(shared::SYS_MEMINFO, 0xFFFF_8000_0000_0000) == u64::MAX
