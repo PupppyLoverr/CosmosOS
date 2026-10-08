@@ -4101,11 +4101,13 @@ fn awk_num(
 /// sed command: optional address prefix + operation.
 /// One side of a sed address: line number, last-line `$`, or a `/re/` that
 /// tests the (current) pattern space.
+#[derive(Clone)]
 enum SedEnd {
     N(usize),
     Last,
     Re(String),
 }
+#[derive(Clone)]
 enum SedAddr {
     One(SedEnd),
     // addr1,addr2 — POSIX stateful range: opens at addr1, closes on the
@@ -4140,7 +4142,14 @@ enum SedK {
     Branch(String),  // b name — jump unconditionally
     BranchT(String), // t name — jump if an s/// succeeded
     BranchF(String), // T name — jump if no s/// succeeded
+    Zap,        // z: empty the pattern space
+    QuitSilent, // Q: exit immediately without printing the pattern space
 }
+
+/// One address requirement: a command runs when the address hit-ness
+/// differs from the `!` flag. A `{}` group's address becomes a shared
+/// requirement on every command inside it.
+type SedCond = (SedAddr, bool);
 
 /// Parse one sed address: N | $ | /re/ (a `\/` inside the regex stays an
 /// escaped slash). Returns Ok(None) when no address character follows.
@@ -4237,15 +4246,19 @@ fn sed_field(s: &str, i: &mut usize, d: char) -> Option<String> {
     Some(out)
 }
 
-/// Parse a sed script into (address, command) pairs; `;` or newlines
-/// separate commands. `s`/`y` read two delimiter fields + flags;
-/// `a/i/c` consume text to `;`; `r/w` a path; `p/d/q` are bare.
+/// Parse a sed script into (condition-chain, command) pairs; `;` or
+/// newlines separate commands. `s`/`y` read two delimiter fields + flags;
+/// `a/i/c` consume text to `;`; `r/w` a path; `p/d/q` are bare. `{`/`}`
+/// address-groups flatten: every command inside a group inherits the
+/// group's (addr, !) as an extra AND-condition.
 fn sed_parse(
     spec: &str,
-) -> Result<Vec<(Option<SedAddr>, bool, SedK)>, String> {
+) -> Result<Vec<(Vec<SedCond>, SedK)>, String> {
     let b = spec.as_bytes();
     let mut i = 0usize;
     let mut out = Vec::new();
+    // open `addr{` groups: their requirements apply to inner commands
+    let mut stack: Vec<SedCond> = Vec::new();
     while i < b.len() {
         while i < b.len()
             && (b[i] == b';' || b[i] == b'\n' || b[i] == b' ')
@@ -4254,6 +4267,13 @@ fn sed_parse(
         }
         if i >= b.len() {
             break;
+        }
+        if b[i] == b'}' {
+            i += 1;
+            if stack.pop().is_none() {
+                return Err(String::from("sed: unmatched }"));
+            }
+            continue;
         }
         // address prefix: N | $ | /re/, optionally `,` + a second one
         let a1 = sed_end(b, &mut i, spec)?;
@@ -4276,6 +4296,20 @@ fn sed_parse(
         if i >= b.len() {
             break;
         }
+        // `addr{` opens a group: its condition applies to everything
+        // until the matching `}`
+        if b[i] == b'{' {
+            i += 1;
+            if let Some(a) = addr {
+                stack.push((a, neg));
+            }
+            continue;
+        }
+        // the command's conditions: enclosing groups then its own addr
+        let mut conds: Vec<SedCond> = stack.clone();
+        if let Some(a) = addr {
+            conds.push((a, neg));
+        }
         // `:name`, `b name`, `t name`, `T name` — labels and branches
         if b[i] == b':' || b[i] == b'b' || b[i] == b't' || b[i] == b'T' {
             let c0 = b[i];
@@ -4294,7 +4328,7 @@ fn sed_parse(
                 b't' => SedK::BranchT(name),
                 _ => SedK::BranchF(name),
             };
-            out.push((addr, neg, k));
+            out.push((conds, k));
             continue;
         }
         match b[i] {
@@ -4331,7 +4365,7 @@ fn sed_parse(
                     i += 1;
                 }
                 out.push((
-                    addr, neg,
+                    conds,
                     if is_s {
                         SedK::Sub(f1, f2, g, pf, nth)
                     } else {
@@ -4340,7 +4374,7 @@ fn sed_parse(
                 ));
             }
             b'p' | b'd' | b'q' | b'=' | b'h' | b'H' | b'g' | b'G'
-            | b'x' | b'N' | b'n' | b'P' | b'D' | b'l' => {
+            | b'x' | b'N' | b'n' | b'P' | b'D' | b'l' | b'z' | b'Q' => {
                 let k = match b[i] {
                     b'p' => SedK::P,
                     b'd' => SedK::D,
@@ -4355,10 +4389,12 @@ fn sed_parse(
                     b'P' => SedK::PrintF,
                     b'D' => SedK::DelF,
                     b'l' => SedK::List,
+                    b'z' => SedK::Zap,
+                    b'Q' => SedK::QuitSilent,
                     _ => SedK::Q,
                 };
                 i += 1;
-                out.push((addr, neg, k));
+                out.push((conds, k));
             }
             b'a' | b'i' | b'c' | b'r' | b'w' => {
                 let k = b[i];
@@ -4381,10 +4417,13 @@ fn sed_parse(
                     b'r' => SedK::Rf(t),
                     _ => SedK::Wf(t),
                 };
-                out.push((addr, neg, cmd));
+                out.push((conds, cmd));
             }
             _ => return Err(alloc::format!("sed: bad command {}", b[i] as char)),
         }
+    }
+    if !stack.is_empty() {
+        return Err(String::from("sed: unmatched {"));
     }
     Ok(out)
 }
@@ -22855,8 +22894,7 @@ impl Term {
                     }
                     scripts.push(String::from(files.remove(0)));
                 }
-                let mut cmds: Vec<(Option<SedAddr>, bool, SedK)> =
-                    Vec::new();
+                let mut cmds: Vec<(Vec<SedCond>, SedK)> = Vec::new();
                 for sc in &scripts {
                     match sed_parse(sc) {
                         Ok(mut v) => cmds.append(&mut v),
@@ -22902,14 +22940,18 @@ impl Term {
                 let nlines = lines.len();
                 let mut out: Vec<String> = Vec::new();
                 let mut quit = false;
-                // per-command `/re/,/re/` range state + the hold space
-                let mut rstate: Vec<bool> =
-                    alloc::vec![false; cmds.len()];
+                // per-command, per-condition `/re/,/re/` range state
+                // (a condition chain may hold several ranges when `{}`
+                // groups nest) + the hold space
+                let mut rstate: Vec<Vec<bool>> = cmds
+                    .iter()
+                    .map(|(cc, _)| alloc::vec![false; cc.len()])
+                    .collect();
                 let mut hold = String::new();
                 // `:name` markers resolve once to command indices
                 let mut labels: alloc::collections::BTreeMap<String, usize> =
                     Default::default();
-                for (i, (_, _, k)) in cmds.iter().enumerate() {
+                for (i, (_, k)) in cmds.iter().enumerate() {
                     if let SedK::Label(n) = k {
                         labels.insert(n.clone(), i);
                     }
@@ -22934,42 +22976,54 @@ impl Term {
                     'cycle: loop {
                     let mut ci = 0usize;
                     while ci < cmds.len() {
-                        let (addr, neg, k) = &cmds[ci];
+                        let (conds, k) = &cmds[ci];
                         let ridx = ci; // range state is per command slot
                         ci += 1;
-                        let inr = match addr {
-                            None => true,
-                            Some(SedAddr::One(e)) => {
-                                sed_hit(ere, e, ln, last, &cur, true)
-                            }
-                            Some(SedAddr::RR(a, e2)) => {
-                                if rstate[ridx] {
-                                    // POSIX: addr2 is tested from the
-                                    // line after the opening line
-                                    if sed_hit(
-                                        ere, e2, ln, last, &cur, false,
-                                    ) {
-                                        rstate[ridx] = false;
-                                    }
-                                    true
-                                } else if sed_hit(
-                                    ere, a, ln, last, &cur, true,
-                                ) {
-                                    // numeric/$ addr2 <= the opener
-                                    // closes immediately; a regexp
-                                    // addr2 starts checking next line
-                                    rstate[ridx] = !matches!(
-                                        e2,
-                                        SedEnd::N(m) if ln >= *m
-                                    ) && !matches!(e2, SedEnd::Last if last);
-                                    true
-                                } else {
-                                    false
+                        // every (addr, !) in the chain must pass — group
+                        // conditions come first, then the command's own
+                        let mut pass = true;
+                        for (si, (a, neg)) in conds.iter().enumerate() {
+                            let h = match a {
+                                SedAddr::One(e) => {
+                                    sed_hit(ere, e, ln, last, &cur, true)
                                 }
+                                SedAddr::RR(a2, e2) => {
+                                    if rstate[ridx][si] {
+                                        // POSIX: addr2 is tested from
+                                        // the line after the opener
+                                        if sed_hit(
+                                            ere, e2, ln, last, &cur,
+                                            false,
+                                        ) {
+                                            rstate[ridx][si] = false;
+                                        }
+                                        true
+                                    } else if sed_hit(
+                                        ere, a2, ln, last, &cur, true,
+                                    ) {
+                                        // numeric/$ addr2 <= the opener
+                                        // closes immediately; a regexp
+                                        // addr2 starts checking next line
+                                        rstate[ridx][si] = !matches!(
+                                            e2,
+                                            SedEnd::N(m) if ln >= *m
+                                        ) && !matches!(
+                                            e2,
+                                            SedEnd::Last if last
+                                        );
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                            };
+                            // `addr!` selects the lines the address misses
+                            if h == *neg {
+                                pass = false;
+                                break;
                             }
-                        };
-                        // `addr!` selects the lines the address misses
-                        if inr == *neg {
+                        }
+                        if !pass {
                             continue;
                         }
                         match k {
@@ -23206,6 +23260,19 @@ impl Term {
                                 }
                                 quit = true;
                                 break 'outer;
+                            }
+                            SedK::QuitSilent => {
+                                // Q (GNU): exit now, pattern space NOT
+                                // printed — queued `a` text still flushes
+                                for l in post.drain(..) {
+                                    out.push(l);
+                                }
+                                quit = true;
+                                break 'outer;
+                            }
+                            SedK::Zap => {
+                                // z (GNU): pattern space becomes empty
+                                cur.clear();
                             }
                             SedK::Rf(p) => {
                                 if let Ok(d) = ustd::read_all(p) {
