@@ -1683,6 +1683,67 @@ pub fn socketpair_t(ty: u64) -> Option<(i64, i64)> {
 
 /// pidfd_create: an fd that becomes readable when `pid` exits; reading it
 /// yields the 8-byte exit status. -1 if the task is absent/already dead.
+/// ppoll: poll under a temporary signal mask (mask = u64::MAX = no swap).
+pub fn ppoll(fds: &[u32], evs: &[u32], timeout_ms: u64, mask: u64) -> i64 {
+    sc5(
+        shared::SYS_PPOLL,
+        fds.as_ptr() as u64,
+        evs.as_ptr() as u64,
+        fds.len() as u64,
+        timeout_ms,
+        mask,
+    ) as i64
+}
+
+/// splice: move up to `len` bytes in_fd -> out_fd through a pipe end.
+pub fn splice(in_fd: i32, out_fd: i32, len: usize) -> i64 {
+    sc3(shared::SYS_SPLICE, in_fd as u64, out_fd as u64, len as u64) as i64
+}
+
+/// process_vm_readv: copy `buf.len()` bytes from `pid`'s memory at `addr`.
+pub fn process_vm_readv(pid: u32, addr: u64, buf: &mut [u8]) -> i64 {
+    sc5(
+        shared::SYS_PROCESS_VM,
+        pid as u64,
+        addr,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+    ) as i64
+}
+
+/// process_vm_writev: write `buf` into `pid`'s memory at `addr`.
+pub fn process_vm_writev(pid: u32, addr: u64, buf: &[u8]) -> i64 {
+    sc5(
+        shared::SYS_PROCESS_VM,
+        pid as u64,
+        addr,
+        buf.as_ptr() as u64,
+        buf.len() as u64,
+        1,
+    ) as i64
+}
+
+/// sysinfo: (uptime_sec, totalram_kb, freeram_kb, procs)
+pub fn sysinfo() -> Option<(u64, u64, u64, u64)> {
+    let mut out = [0u64; 4];
+    if sc1(shared::SYS_SYSINFO, out.as_mut_ptr() as u64) != 0 {
+        return None;
+    }
+    let out = unsafe { core::ptr::read_volatile(&out) };
+    Some((out[0], out[1], out[2], out[3]))
+}
+
+/// close_range: close every fd in [first, last].
+pub fn close_range(first: u32, last: u32) -> i64 {
+    sc2(shared::SYS_CLOSE_RANGE, first as u64, last as u64) as i64
+}
+
+/// pidfd_send_signal: send `sig` to the task behind `pidfd` (0 = probe).
+pub fn pidfd_send_signal(pidfd: i32, sig: u64) -> i64 {
+    sc2(shared::SYS_PIDFD_SIGNAL, pidfd as u64, sig) as i64
+}
+
 pub fn pidfd(pid: u32) -> i64 {
     sc1(shared::SYS_PIDFD, pid as u64) as i64
 }
