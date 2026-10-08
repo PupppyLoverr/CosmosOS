@@ -15,10 +15,17 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
-use crate::task::MountNs;
+use crate::task::{MountNs, UtsNs};
+
+/// Which namespace object an fd pins — setns adopts the matching field.
+#[derive(Clone)]
+pub enum NsObj {
+    Mount(Arc<Mutex<MountNs>>),
+    Uts(Arc<Mutex<UtsNs>>),
+}
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
-static REG: Mutex<BTreeMap<u64, Arc<Mutex<MountNs>>>> = Mutex::new(BTreeMap::new());
+static REG: Mutex<BTreeMap<u64, NsObj>> = Mutex::new(BTreeMap::new());
 
 /// Is `path` an ns-object fd?
 pub fn handles(path: &str) -> bool {
@@ -30,9 +37,9 @@ fn seq(path: &str) -> Option<u64> {
 }
 
 /// Register `arc` as a new ns object; returns the fd path to store.
-fn register(arc: Arc<Mutex<MountNs>>) -> String {
+fn register(obj: NsObj) -> String {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    REG.lock().insert(id, arc);
+    REG.lock().insert(id, obj);
     alloc::format!("/nsfd/{}", id)
 }
 
@@ -40,9 +47,11 @@ fn register(arc: Arc<Mutex<MountNs>>) -> String {
 /// object fd. `None` when the path isn't an mntns link or the pid is
 /// dead — caller falls through to the generic proc path (or fails).
 pub fn open(path: &str) -> Option<String> {
-    let rest = path
-        .strip_prefix("/proc/")?
-        .strip_suffix("/ns/mntns")?;
+    let rest = path.strip_prefix("/proc/")?;
+    let (rest, kind) = rest
+        .strip_suffix("/ns/mntns")
+        .map(|r| (r, 0u8))
+        .or_else(|| rest.strip_suffix("/ns/uts").map(|r| (r, 1u8)))?;
     let pid = if rest == "self" {
         crate::task::current_id()
     } else if rest.bytes().all(|b| b.is_ascii_digit()) {
@@ -50,12 +59,14 @@ pub fn open(path: &str) -> Option<String> {
     } else {
         return None;
     };
-    let arc = crate::task::ns_arc_of(pid)?;
-    Some(register(arc))
+    match kind {
+        0 => crate::task::ns_arc_of(pid).map(|a| register(NsObj::Mount(a))),
+        _ => crate::task::uts_arc_of(pid).map(|a| register(NsObj::Uts(a))),
+    }
 }
 
 /// The namespace object behind an ns fd — setns's adopt source.
-pub fn arc(path: &str) -> Option<Arc<Mutex<MountNs>>> {
+pub fn obj(path: &str) -> Option<NsObj> {
     REG.lock().get(&seq(path)?).cloned()
 }
 

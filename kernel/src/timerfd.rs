@@ -40,12 +40,27 @@ pub fn create() -> Result<String, i64> {
     Ok(alloc::format!("/timerfd/{}", id))
 }
 
+/// timerfd_gettime: (remaining_ms, interval_ms) — 0 remaining = disarmed
+/// or expired-awaiting-read, matching Linux's it_value.it_sec==0.
+pub fn gettime(path: &str) -> Option<(u64, u64)> {
+    let id = id_of(path)?;
+    let g = TFDS.lock();
+    let t = g.get(&id)?;
+    let rem = if t.left == u64::MAX { 0 } else { t.left * 10 };
+    Some((rem, t.interval_ticks * 10))
+}
+
 /// timerfd_settime: initial ms + periodic interval ms (0 = one-shot)
 pub fn settime(path: &str, init_ms: u64, interval_ms: u64) -> Result<(), i64> {
     let id = id_of(path).ok_or(-3i64)?;
     let mut g = TFDS.lock();
     let t = g.get_mut(&id).ok_or(-3i64)?;
-    t.left = init_ms.div_ceil(10).max(1);
+    // init_ms==0 disarms — matches Linux's it_value==0
+    t.left = if init_ms == 0 {
+        u64::MAX
+    } else {
+        init_ms.div_ceil(10).max(1)
+    };
     t.interval_ticks = interval_ms / 10;
     Ok(())
 }

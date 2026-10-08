@@ -14,15 +14,20 @@ struct Ring {
     /// `len` reaches CAP; before that, `head` stays 0).
     head: usize,
     len: usize,
+    /// Bytes appended since the last SYSLOG_ACTION_READ drain — the
+    /// shared global read cursor (any reader consumes it, like klogctl).
+    unread: usize,
 }
 
 static RING: Mutex<Ring> = Mutex::new(Ring {
     buf: [0; CAP],
     head: 0,
     len: 0,
+    unread: 0,
 });
 
 fn push_locked(r: &mut Ring, b: u8) {
+    r.unread = r.unread.saturating_add(1);
     if r.len == CAP {
         r.buf[r.head] = b;
         r.head = (r.head + 1) % CAP;
@@ -53,6 +58,32 @@ pub fn clear() {
     let mut r = RING.lock();
     r.head = 0;
     r.len = 0;
+    r.unread = 0;
+}
+
+/// syslog(9) — bytes appended but not yet drained by SYSLOG_ACTION_READ.
+pub fn unread_len() -> usize {
+    let r = RING.lock();
+    r.unread.min(r.len)
+}
+
+/// syslog(10) — the ring's total capacity.
+pub fn buffer_size() -> usize {
+    CAP
+}
+
+/// syslog(3) — copy the not-yet-consumed tail into `out`, drain the
+/// shared read cursor. Returns bytes written.
+pub fn read_unread(out: &mut [u8]) -> usize {
+    let mut r = RING.lock();
+    let n = out.len().min(r.unread).min(r.len);
+    let tail_len = r.len;
+    let start = (r.head + tail_len - n) % CAP;
+    for i in 0..n {
+        out[i] = r.buf[(start + i) % CAP];
+    }
+    r.unread = r.unread.saturating_sub(n);
+    n
 }
 
 /// Copy up to `out.len()` tail bytes of the log into `out`; returns the

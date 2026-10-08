@@ -197,6 +197,42 @@ pub fn mount(target: &str, opts: u64) -> Result<(), i64> {
     Ok(())
 }
 
+/// MS_MOVE: relocate a mounted tmpfs onto `new`. The whole node tree
+/// is path-keyed, so the move re-keys every node under the prefix —
+/// open descriptors into the old path resolve through the same nodes
+/// only if the mount's entry moved with them (it does — same super).
+/// EINVAL when `old` isn't mounted here; EBUSY when `new` is taken.
+pub fn move_mount(old: &str, new: &str) -> Result<(), i64> {
+    let ns = crate::task::ns_of();
+    let mut mg = ns.lock();
+    let Some(i) = mg.tmpfs.iter().position(|m| m.0 == old) else {
+        return Err(-22);
+    };
+    if mg.tmpfs.iter().any(|m| m.0 == new) {
+        return Err(-16);
+    }
+    let under = alloc::format!("{}/", old);
+    let under_new = alloc::format!("{}/", new);
+    let mut ng = NODES.lock();
+    let old_nodes = core::mem::take(&mut *ng);
+    let moved: Vec<(String, Node)> = old_nodes
+        .into_iter()
+        .map(|(k, v)| {
+            if k == old {
+                (String::from(new), v)
+            } else if let Some(rest) = k.strip_prefix(&under) {
+                (alloc::format!("{}{}", under_new, rest), v)
+            } else {
+                (k, v)
+            }
+        })
+        .collect();
+    *ng = moved.into_iter().collect();
+    mg.tmpfs[i].0 = String::from(new);
+    mg.tmpfs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    Ok(())
+}
+
 /// Unmount: EBUSY when any live fd or cwd sits under the mount, or a
 /// nested tmpfs mount lives inside it. Drops every node under the prefix.
 /// umount2(target, flags): MNT_FORCE(1) skips the busy checks and

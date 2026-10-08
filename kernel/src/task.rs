@@ -92,6 +92,9 @@ pub struct Task {
     /// trees. Shared via Arc: fork/clone keep the SAME namespace until
     /// unshare(CLONE_NEWNS) deep-copies it into a fresh Arc.
     pub ns: alloc::sync::Arc<spin::Mutex<MountNs>>,
+    /// UTS namespace (hostname scope) — shared like the mount table
+    /// until unshare(CLONE_NEWUTS) copies it.
+    pub uts: alloc::sync::Arc<spin::Mutex<UtsNs>>,
     pub ports: Vec<u32>,
     pub shm: Vec<u32>,
     pub frames: Vec<u64>, // owned physical frames (kernel stack frames)
@@ -274,6 +277,7 @@ pub fn init() {
         cwd: String::from("/"),
         root: String::from("/"),
         ns: global_ns(),
+        uts: global_uts(),
         ports: Vec::new(),
         shm: Vec::new(),
         frames: Vec::new(),
@@ -767,6 +771,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         cwd: String::from("/"),
         root: String::from("/"),
         ns: global_ns(),
+        uts: global_uts(),
         ports: Vec::new(),
         shm: Vec::new(),
         frames: kframes,
@@ -872,6 +877,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         cwd: String::from("/"),
         root: String::from("/"),
         ns: global_ns(),
+        uts: global_uts(),
         ports: Vec::new(),
         shm: Vec::new(),
         frames: kframes,
@@ -1019,6 +1025,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
     let cwd = cur.cwd.clone();
     let root = cur.root.clone();
     let nsr = cur.ns.clone();
+    let utsr = cur.uts.clone();
     let borrowed = cur.borrowed.clone();
     let shm_ids = cur.shm.clone();
     let (nice, rt, vrun, umask, exe, pfs, rnf, rnp, rstk, rcu, ras) = (
@@ -1054,6 +1061,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         cwd,
         root,
         ns: nsr,
+        uts: utsr,
         ports: Vec::new(),
         shm: shm_ids,
         frames: kframes,
@@ -1604,12 +1612,13 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
     for id in &shm_ids {
         shm::acquire(*id);
     }
-    let (name, argv, cwd, root, nsr) = (
+    let (name, argv, cwd, root, nsr, utsr) = (
         cur.name.clone(),
         cur.argv.clone(),
         cur.cwd.clone(),
         cur.root.clone(),
         cur.ns.clone(),
+        cur.uts.clone(),
     );
     let (maps, filemaps) = (cur.maps.clone(), cur.filemaps.clone());
     let (nice, umask, exe) = (cur.nice, cur.umask, cur.exe.clone());
@@ -1638,6 +1647,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         cwd,
         root,
         ns: nsr,
+        uts: utsr,
         ports: Vec::new(),
         shm: shm_ids,
         frames: kframes,
@@ -1998,6 +2008,52 @@ impl Default for MountNs {
     }
 }
 
+/// A UTS namespace: the nodename (hostname) lives here so
+/// unshare(CLONE_NEWUTS) can give a container its own identity.
+#[derive(Clone)]
+pub struct UtsNs {
+    /// Stable inode-style id shown by /proc/<pid>/ns/uts.
+    pub id: u64,
+    pub hostname: String,
+}
+
+static GLOBAL_UTS: spin::Once<alloc::sync::Arc<spin::Mutex<UtsNs>>> = spin::Once::new();
+
+pub fn global_uts() -> alloc::sync::Arc<spin::Mutex<UtsNs>> {
+    GLOBAL_UTS
+        .call_once(|| {
+            alloc::sync::Arc::new(spin::Mutex::new(UtsNs {
+                id: NEXT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                hostname: String::from("cosmos"),
+            }))
+        })
+        .clone()
+}
+
+/// The current task's UTS namespace.
+pub fn uts_of() -> alloc::sync::Arc<spin::Mutex<UtsNs>> {
+    let mut g = SCHED.lock();
+    match g.as_mut() {
+        Some(s) => s.tasks[s.cur].uts.clone(),
+        None => global_uts(),
+    }
+}
+
+/// The UTS namespace owned by `pid` — setns's uts adopt source.
+pub fn uts_arc_of(pid: u32) -> Option<alloc::sync::Arc<spin::Mutex<UtsNs>>> {
+    let mut g = SCHED.lock();
+    let s = g.as_mut()?;
+    s.tasks
+        .iter()
+        .find(|t| t.id == pid && t.state != State::Dead)
+        .map(|t| t.uts.clone())
+}
+
+/// setns for UTS: swap the current task into `arc`.
+pub fn set_uts(arc: alloc::sync::Arc<spin::Mutex<UtsNs>>) {
+    with_current(|t| t.uts = arc);
+}
+
 static GLOBAL_NS: spin::Once<alloc::sync::Arc<spin::Mutex<MountNs>>> = spin::Once::new();
 
 /// The initial mount namespace — every task's ns starts shared with it.
@@ -2024,6 +2080,15 @@ pub fn unshare_ns() {
         // a new namespace object gets a fresh mntns id
         copy.id = NEXT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         t.ns = alloc::sync::Arc::new(spin::Mutex::new(copy));
+    });
+}
+
+/// unshare(CLONE_NEWUTS): the task's nodename becomes private.
+pub fn unshare_uts() {
+    with_current(|t| {
+        let mut copy = t.uts.lock().clone();
+        copy.id = NEXT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        t.uts = alloc::sync::Arc::new(spin::Mutex::new(copy));
     });
 }
 

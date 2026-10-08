@@ -4301,6 +4301,105 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::remove("/pfd");
         ok && got == b"SHARED"
     });
+    check("syslog", {
+        // kernel log ring via SYS_SYSLOG: capacity + read-all must work
+        // without klog having any unread-cursor side effects.
+        let cap = ustd::syslog_n(10);
+        let unread = ustd::syslog_n(9);
+        let mut b = [0u8; 4096];
+        let n = ustd::syslog(3, &mut b);
+        cap == 32 * 1024 && unread >= 0 && n > 0
+    });
+    check("uts-unshare", {
+        // CLONE_NEWUTS: child's sethostname stays private; parent can
+        // still adopt it back through /proc/<pid>/ns/uts + setns.
+        let before = ustd::hostname();
+        let own = ustd::open("/proc/self/ns/uts", ustd::O_RDONLY).unwrap_or(-1);
+        let pid = ustd::fork();
+        if pid == 0 {
+            if ustd::unshare(0x04000000) != 0 {
+                ustd::exit(15);
+            }
+            if !ustd::set_hostname("kidhost") {
+                ustd::exit(16);
+            }
+            ustd::sleep_ms(2500); // stay alive for the parent's setns
+            ustd::exit(0);
+        }
+        ustd::sleep_ms(300);
+        let pf = alloc::format!("/proc/{}/ns/uts", pid);
+        let theirs = ustd::open(&pf, ustd::O_RDONLY).unwrap_or(-1);
+        let mut ok = own >= 0 && theirs >= 0 && ustd::hostname() == before;
+        if theirs >= 0 && ustd::setns(theirs as u64) == 0 {
+            ok = ok && ustd::hostname() == "kidhost";
+            if own >= 0 {
+                ok = ok && ustd::setns(own as u64) == 0 && ustd::hostname() == before;
+            }
+        }
+        if own >= 0 {
+            let _ = ustd::close(own);
+        }
+        if theirs >= 0 {
+            let _ = ustd::close(theirs);
+        }
+        let _ = ustd::waitpid(pid as u32, 10_000);
+        ok
+    });
+    check("tfd-gettime", {
+        // SYS_TFD_GET: remaining time after settime(500,0) lands inside
+        // (0,500]; a second settime(0,0) disarms to exactly 0.
+        let f = ustd::timerfd_create();
+        let mut ok = f >= 0 && ustd::timerfd_set(f, 500, 0) == 0;
+        if ok {
+            ok = match ustd::timerfd_gettime(f as u64) {
+                Some((rem, iv)) => rem > 0 && rem <= 500 && iv == 0,
+                None => false,
+            };
+            let _ = ustd::timerfd_set(f, 0, 0);
+            ok = ok
+                && ustd::timerfd_gettime(f as u64)
+                    .map(|(rem, _)| rem == 0)
+                    .unwrap_or(false);
+        }
+        if f >= 0 {
+            let _ = ustd::close(f);
+        }
+        ok
+    });
+    check("ms-move", {
+        // MS_MOVE on a real tmpfs: the whole node tree re-keys — the
+        // covering mount's files appear at the new path and the old
+        // path is the bare underlying dir again.
+        let _ = ustd::mkdir("/mvo");
+        let _ = ustd::mkdir("/mvn");
+        let mut ok = ustd::mount("none", "/mvo", "tmpfs") == 0
+            && ustd::write_all("/mvo/f", b"M").is_ok()
+            && ustd::mount_flags("/mvo", "/mvn", "", 0x2000) == 0
+            && ustd::stat("/mvo/f").is_err()
+            && ustd::read_all("/mvn/f").map(|d| d == b"M").unwrap_or(false);
+        let _ = ustd::umount("/mvn");
+        let _ = ustd::remove("/mvo");
+        let _ = ustd::remove("/mvn");
+        // ...and on a bind alias: /bx2 -> /bx3 relocates the alias.
+        let _ = ustd::mkdir("/bx2");
+        let _ = ustd::mkdir("/bx3");
+        ok = ok
+            && ustd::mount_flags("/bin", "/bx2", "", 0x1000) == 0
+            && ustd::mount_flags("/bx2", "/bx3", "", 0x2000) == 0
+            && ustd::stat("/bx2/cosmos-terminal").is_err()
+            && ustd::stat("/bx3/cosmos-terminal").is_ok();
+        let _ = ustd::umount2("/bx3", 1); // MNT_FORCE
+        let _ = ustd::remove("/bx2");
+        let _ = ustd::remove("/bx3");
+        ok
+    });
+    check("reboot-magic", {
+        // SYS_REBOOT's magic gate: bad magic is EINVAL before anything
+        // destructive can run (we never send the valid pair here).
+        let bad = ustd::sc3(shared::SYS_REBOOT, 0, 0, 0) as i64;
+        let bad2 = ustd::sc3(shared::SYS_REBOOT, 0xfee1dead, 0, 0x4321fedc) as i64;
+        bad == -22 && bad2 == -22
+    });
     check("gettimeofday", {
         let (s, u) = ustd::gettimeofday();
         s > 1_700_000_000 && u < 1_000_000
