@@ -2203,6 +2203,67 @@ fn wild_match(pat: &str, s: &str) -> bool {
     pi == p.len()
 }
 
+/// Interpret backslash escapes in a string (printf %b / echo -e set):
+/// \n \t \r \a \b \e \f \v \\ \0ooo \xHH
+fn esc_interp(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] != b'\\' || i + 1 >= b.len() {
+            out.push(b[i] as char);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        match b[i] {
+            b'n' => out.push('\n'),
+            b't' => out.push('\t'),
+            b'r' => out.push('\r'),
+            b'a' => out.push('\x07'),
+            b'b' => out.push('\x08'),
+            b'e' | b'E' => out.push('\x1b'),
+            b'f' => out.push('\x0c'),
+            b'v' => out.push('\x0b'),
+            b'\\' => out.push('\\'),
+            b'x' => {
+                let h: String = b[i + 1..]
+                    .iter()
+                    .take(2)
+                    .take_while(|c| (**c as char).is_ascii_hexdigit())
+                    .map(|c| *c as char)
+                    .collect();
+                if let Ok(v) = u8::from_str_radix(&h, 16) {
+                    out.push(v as char);
+                    i += h.len();
+                } else {
+                    out.push('x');
+                }
+            }
+            b'0'..=b'7' => {
+                // \0ooo — up to 3 octal digits including the one matched
+                let mut v = (b[i] - b'0') as u32;
+                let mut took = 1usize;
+                while took < 3 && i + 1 < b.len() && (b'0'..=b'7').contains(&b[i + 1])
+                {
+                    v = v * 8 + (b[i + 1] - b'0') as u32;
+                    i += 1;
+                    took += 1;
+                }
+                if v > 0 {
+                    out.push(char::from_u32(v.min(255)).unwrap_or('?'));
+                }
+            }
+            o => {
+                out.push('\\');
+                out.push(o as char);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// shell-escape like printf %q: bare when already safe, else single-quoted
 /// with `\''` for embedded quotes (and `\\` for backslashes).
 fn shell_escape(s: &str) -> String {
@@ -3811,6 +3872,13 @@ loop {
                     b'q' => {
                         let a = rest.get(ri).copied().unwrap_or("");
                         line.push_str(&shell_escape(a));
+                        ri += 1;
+                    }
+                    b'b' => {
+                        // %b: escapes are interpreted inside the ARGUMENT
+                        // (\n \t \\ \0ooo), unlike %s
+                        let a = rest.get(ri).copied().unwrap_or("");
+                        line.push_str(&esc_interp(a));
                         ri += 1;
                     }
                     b'd' | b'i' | b'u' | b'x' | b'X' | b'o' => {
@@ -8849,6 +8917,7 @@ impl Term {
                 let mut rec = false;
                 let mut classify = false;
                 let mut dirself = false;
+                let mut human = false;
                 let mut i = 0usize;
                 while i < args.len() && args[i].starts_with('-') && args[i].len() > 1 {
                     for c in args[i][1..].chars() {
@@ -8863,6 +8932,7 @@ impl Term {
                             'R' => rec = true,
                             'F' => classify = true,
                             'd' => dirself = true,
+                            'h' => human = true,
                             'l' | '1' => {}
                             _ => {
                                 self.fail(&alloc::format!("ls: bad flag -{}", c));
@@ -8887,7 +8957,15 @@ impl Term {
                     // directories as plain entries instead of their contents
                     if let Ok(st) = ustd::stat(&dir) {
                         if st.is_dir == 0 || dirself {
-                            self.emit(&alloc::format!("  {}  ({} B)", dir, st.size));
+                            if human {
+                                self.emit(&alloc::format!(
+                                    "  {}  ({})",
+                                    dir,
+                                    human_size(st.size)
+                                ));
+                            } else {
+                                self.emit(&alloc::format!("  {}  ({} B)", dir, st.size));
+                            }
                             continue;
                         }
                     }
@@ -8952,6 +9030,12 @@ impl Term {
                                     alloc::format!("  {} -> {}", name, tgt)
                                 } else if e.is_dir != 0 {
                                     alloc::format!("  {}/", name)
+                                } else if human {
+                                    alloc::format!(
+                                        "  {}  ({})",
+                                        name,
+                                        human_size(e.size)
+                                    )
                                 } else {
                                     alloc::format!("  {}  ({} B)", name, e.size)
                                 };
@@ -15072,11 +15156,13 @@ impl Term {
                         valpos.push(i + 1);
                     }
                 }
-                let popt = args
+                let pfiles: Vec<&str> = args
                     .iter()
                     .enumerate()
-                    .find(|(i, a)| !a.starts_with('-') && !valpos.contains(i))
-                    .map(|(_, a)| *a);
+                    .filter(|(i, a)| !a.starts_with('-') && !valpos.contains(i))
+                    .map(|(_, a)| *a)
+                    .collect();
+                let popt = pfiles.first().copied();
                 // raw -n value may carry a sign: tail -n +K = from line K,
                 // head -n -N = all but the last N lines (GNU forms)
                 let nraw: Option<String> = ni
@@ -15143,12 +15229,6 @@ impl Term {
                 };
                 match content {
                     Some(s) => {
-                        // -v: ==> file <== header (head/tail)
-                        if cmd != "sort" && args.iter().any(|a| a == &"-v") {
-                            if let Some(p) = popt {
-                                self.emit(&alloc::format!("==> {} <==", p));
-                            }
-                        }
                         let mut ls: Vec<&str> = s.lines().collect();
                         if cmd == "sort" {
                             // -f folds case, -b ignores leading blanks
@@ -15258,6 +15338,12 @@ impl Term {
                                     }
                                 };
                                 ls.sort_by_key(|l| field(l));
+                            } else if args.iter().any(|a| a == &"-V") {
+                                // -V: version sort — digit runs compare
+                                // numerically (same nat_cmp as ls -v)
+                                ls.sort_by(|a, b| {
+                                    nat_cmp(a.as_bytes(), b.as_bytes())
+                                });
                             } else if args.iter().any(|a| a == &"-h") {
                                 // -h: human sizes — leading number times the
                                 // K/M/G/B suffix multiplier (1024-based)
@@ -15313,48 +15399,97 @@ impl Term {
                                     }
                                 }
                             }
-                        } else if cmd == "head" {
-                            match cbytes {
-                                Some(cn) => {
-                                    let text: String = s.chars().take(cn).collect();
-                                    for l in text.lines() {
-                                        self.emit(l);
-                                    }
-                                }
-                                None => {
-                                    let lim = if n_butlast {
-                                        ls.len().saturating_sub(n)
-                                    } else {
-                                        n
-                                    };
-                                    for l in ls.iter().take(lim) {
-                                        self.emit(l);
-                                    }
-                                }
-                            }
                         } else {
-                            match cbytes {
-                                Some(cn) => {
-                                    let total = s.chars().count();
-                                    let text: String = s
-                                        .chars()
-                                        .skip(total.saturating_sub(cn))
-                                        .collect();
-                                    for l in text.lines() {
-                                        self.emit(l);
+                            // head/tail: every file operand, GNU multi-file
+                            // `==> f <==` headers when >1; -v forces one,
+                            // -q suppresses all
+                            let quiet_h = args.iter().any(|a| *a == "-q");
+                            let show_hdr = (args.iter().any(|a| *a == "-v")
+                                || pfiles.len() > 1)
+                                && !quiet_h;
+                            let mut sel = |term: &mut Self,
+                                           name: &str,
+                                           sc: &str,
+                                           firstf: bool| {
+                                if show_hdr {
+                                    if !firstf {
+                                        term.emit("");
+                                    }
+                                    term.emit(&alloc::format!("==> {} <==", name));
+                                }
+                                let lsv: Vec<&str> = sc.lines().collect();
+                                if cmd == "head" {
+                                    match cbytes {
+                                        Some(cn) => {
+                                            let text: String =
+                                                sc.chars().take(cn).collect();
+                                            for l in text.lines() {
+                                                term.emit(l);
+                                            }
+                                        }
+                                        None => {
+                                            let lim = if n_butlast {
+                                                lsv.len().saturating_sub(n)
+                                            } else {
+                                                n
+                                            };
+                                            for l in lsv.iter().take(lim) {
+                                                term.emit(l);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    match cbytes {
+                                        Some(cn) => {
+                                            let total = sc.chars().count();
+                                            let text: String = sc
+                                                .chars()
+                                                .skip(
+                                                    total.saturating_sub(cn),
+                                                )
+                                                .collect();
+                                            for l in text.lines() {
+                                                term.emit(l);
+                                            }
+                                        }
+                                        None => {
+                                            let start = if n_from {
+                                                // tail -n +K: from line K
+                                                n.saturating_sub(1)
+                                                    .min(lsv.len())
+                                            } else {
+                                                lsv.len().saturating_sub(n)
+                                            };
+                                            for l in lsv.iter().skip(start) {
+                                                term.emit(l);
+                                            }
+                                        }
                                     }
                                 }
-                                None => {
-                                    let start = if n_from {
-                                        // tail -n +K: print from line K
-                                        n.saturating_sub(1).min(ls.len())
-                                    } else {
-                                        ls.len().saturating_sub(n)
-                                    };
-                                    for l in ls.iter().skip(start) {
-                                        self.emit(l);
+                            };
+                            let mut firstf = true;
+                            for (i, f) in pfiles.iter().enumerate() {
+                                if i == 0 {
+                                    sel(self, f, &s, firstf);
+                                } else {
+                                    match ustd::read_all(f) {
+                                        Ok(d) => {
+                                            let sc = String::from_utf8_lossy(
+                                                &d,
+                                            )
+                                            .into_owned();
+                                            sel(self, f, &sc, firstf);
+                                        }
+                                        Err(e) => self.fail(&alloc::format!(
+                                            "{}: {}: err {}",
+                                            cmd, f, e
+                                        )),
                                     }
                                 }
+                                firstf = false;
+                            }
+                            if pfiles.is_empty() {
+                                sel(self, "-", &s, true);
                             }
                             // tail -f: persistent fd followed via poll() —
                             // works on regular files AND fifos. -F adds a
@@ -15895,23 +16030,68 @@ impl Term {
                         }
                     }
                     "cut" => {
-                        // cut -d X -f N[,M..] <file|stdin>
+                        // cut -d X|-dX -f N[,M..]|-fN <file|stdin>
                         let delim = args
                             .iter()
-                            .position(|a| a == &"-d")
-                            .and_then(|i| args.get(i + 1))
-                            .map(|s| s.chars().next().unwrap_or('\t'))
+                            .find_map(|a| {
+                                if *a == "-d" {
+                                    None
+                                } else {
+                                    a.strip_prefix("-d")
+                                        .filter(|s| !s.is_empty())
+                                        .and_then(|s| s.chars().next())
+                                }
+                            })
+                            .or_else(|| {
+                                args.iter()
+                                    .position(|a| a == &"-d")
+                                    .and_then(|i| args.get(i + 1))
+                                    .and_then(|s| s.chars().next())
+                            })
                             .unwrap_or('\t');
-                        let fields: Vec<usize> = args
+                        // -f spec: comma list of N | A-B | -B | A-
+                        // (open-ended ranges store usize::MAX as the hi)
+                        let fspec: Option<&str> = args
                             .iter()
-                            .position(|a| a == &"-f")
-                            .and_then(|i| args.get(i + 1))
+                            .find_map(|a| {
+                                if *a == "-f" {
+                                    None
+                                } else {
+                                    a.strip_prefix("-f")
+                                        .filter(|s| !s.is_empty())
+                                }
+                            })
+                            .or_else(|| {
+                                args.iter()
+                                    .position(|a| a == &"-f")
+                                    .and_then(|i| args.get(i + 1))
+                                    .copied()
+                            });
+                        let fields: Vec<(usize, usize)> = fspec
                             .map(|s| {
                                 s.split(',')
-                                    .filter_map(|x| x.parse::<usize>().ok())
+                                    .filter_map(|x| {
+                                        if let Some(hi) = x.strip_prefix('-') {
+                                            hi.parse::<usize>()
+                                                .ok()
+                                                .map(|h| (1usize, h))
+                                        } else if let Some(d) = x.find('-') {
+                                            let lo: usize =
+                                                x[..d].parse().ok()?;
+                                            let hi = x[d + 1..]
+                                                .parse::<usize>()
+                                                .unwrap_or(usize::MAX);
+                                            Some((lo, hi))
+                                        } else {
+                                            x.parse::<usize>()
+                                                .ok()
+                                                .map(|n| (n, n))
+                                        }
+                                    })
                                     .collect()
                             })
                             .unwrap_or_default();
+                        let complement = args.iter().any(|a| *a == "--complement");
                         let src = args.iter().enumerate().find(|(i, a)| {
                             !a.starts_with('-') && *i > 0 && args[i - 1] != "-d" && args[i - 1] != "-f"
                         }).map(|(_, a)| *a);
@@ -15930,9 +16110,14 @@ impl Term {
                                 let dstr = alloc::format!("{}", delim);
                                 for l in s.lines() {
                                     let parts: Vec<&str> = l.split(delim).collect();
-                                    let got: Vec<&str> = fields
-                                        .iter()
-                                        .filter_map(|f| parts.get(f.saturating_sub(1)).copied())
+                                    let in_sel = |f: usize| {
+                                        fields.iter().any(|(lo, hi)| {
+                                            f >= *lo && f <= *hi
+                                        })
+                                    };
+                                    let got: Vec<&str> = (1..=parts.len())
+                                        .filter(|f| in_sel(*f) != complement)
+                                        .filter_map(|f| parts.get(f - 1).copied())
                                         .collect();
                                     self.emit(&got.join(&dstr));
                                 }
@@ -16814,6 +16999,7 @@ impl Term {
                     let mut del = false;
                     let mut want_print = false;
                     let mut size_test: Option<(i8, u64)> = None;
+                    let mut mmin: Option<(i8, u64)> = None;
                     for (i, a) in g.iter().enumerate() {
                         match *a {
                             "-size" => {
@@ -16870,6 +17056,25 @@ impl Term {
                                     }
                                 }
                             }
+                            "-mmin" => {
+                                // [-+]N: age in whole minutes (+N = older
+                                // than N min, -N = newer than N min)
+                                if let Some(v) = g.get(i + 1) {
+                                    let b = v.as_bytes();
+                                    let (mode, num) = match b.first() {
+                                        Some(b'+') => (1i8, &v[1..]),
+                                        Some(b'-') => (-1i8, &v[1..]),
+                                        _ => (0i8, *v),
+                                    };
+                                    match num.parse::<u64>() {
+                                        Ok(n) => mmin = Some((mode, n)),
+                                        Err(_) => {
+                                            self.fail("find: bad -mmin value");
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -16903,6 +17108,31 @@ impl Term {
                                         0 => st.size == bytes,
                                         m if m < 0 => st.size < bytes,
                                         _ => st.size > bytes,
+                                    })
+                                    .unwrap_or(false)
+                            });
+                        }
+                        // -mmin [-+]N: modification age in whole minutes
+                        if let Some((mode, mins)) = mmin {
+                            let dn = ustd::datetime();
+                            let now = cal_days(dn.year, dn.month, dn.day)
+                                * 86400
+                                + dn.hour as u64 * 3600
+                                + dn.minute as u64 * 60
+                                + dn.second as u64;
+                            let span = mins * 60;
+                            ms.retain(|m| {
+                                let t = m.trim_end_matches('/');
+                                ustd::stat(t)
+                                    .map(|st| {
+                                        let age =
+                                            now.saturating_sub(st.mtime);
+                                        match mode {
+                                            1 => age > span,
+                                            -1 => age < span
+                                                && now >= st.mtime,
+                                            _ => age / 60 == mins,
+                                        }
                                     })
                                     .unwrap_or(false)
                             });
