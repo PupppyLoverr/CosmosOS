@@ -99,6 +99,10 @@ pub const SYS_MUNMAP: u64 = 93;          // (addr,len) -> 0 | ERR   unmap tracke
 pub const SYS_MPROTECT: u64 = 94;        // (addr,len,prot R|W|X=1|2|4) -> 0 | ERR
 pub const SYS_CHRT: u64 = 95;            // (pid,class 0=other|1=rt) -> 0 | ERR  realtime class
 pub const SYS_IPCS: u64 = 96;            // (buf,cap) -> n | ERR    shm registry dump
+pub const SYS_PIPE: u64 = 97;            // () -> rfd | wfd<<32        anonymous pipe pair
+pub const SYS_DUP2: u64 = 98;            // (oldfd,newfd) -> newfd | ERR  alias an fd
+pub const SYS_POLL: u64 = 99;            // (fds,evs,nfds,timeout_ms) -> nready | ERR
+pub const SYS_RUSAGE: u64 = 100;         // (pid,out{utime,stime,maxrss_kb}) -> 0 | ERR
 pub const PROT_READ: u64 = 1;
 pub const PROT_WRITE: u64 = 2;
 pub const PROT_EXEC: u64 = 4;

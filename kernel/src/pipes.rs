@@ -39,6 +39,35 @@ pub fn mkfifo(path: &str) -> Result<(), i64> {
     create(path)
 }
 
+static ANON_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// pipe(2): mint an unnamed pipe under a hidden /pipes/ name. The entry
+/// exists (handles() claims it) but is filtered out of /pipes listings.
+pub fn create_anon() -> Result<String, i64> {
+    let n = ANON_NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let path = alloc::format!("/pipes/.anon{}", n);
+    create(&path)?;
+    Ok(path)
+}
+
+/// poll(2) readiness: read is ready when data is queued OR all writers are
+/// gone (EOF counts as readable); write is ready while space remains OR no
+/// readers remain (a write would EPIPE — still "ready").
+pub fn ready(path: &str, for_read: bool) -> bool {
+    let g = PIPES.lock();
+    match g.get(path) {
+        Some(p) => {
+            if for_read {
+                !p.buf.is_empty() || p.writers == 0
+            } else {
+                p.buf.len() < PIPE_CAP || p.readers == 0
+            }
+        }
+        // missing pipe: reads hit EOF, writes hit EPIPE — both "ready"
+        None => true,
+    }
+}
+
 pub fn exists(path: &str) -> bool {
     path != "/pipes" && PIPES.lock().contains_key(path)
 }
@@ -81,7 +110,10 @@ pub fn close_role(path: &str, writer: bool) {
             } else if !writer && p.readers > 0 {
                 p.readers -= 1;
             }
-            p.writers == 0 && p.readers == 0 && p.buf.is_empty()
+            // only anonymous pipe() objects self-destruct on last close; a
+            // mkfifo'd name is a persistent fs object until unlinked
+            let anon = path.rsplit('/').next().map(|b| b.starts_with('.')).unwrap_or(false);
+            anon && p.writers == 0 && p.readers == 0 && p.buf.is_empty()
         }
         None => false,
     };
@@ -150,6 +182,9 @@ pub fn entries() -> Vec<shared::DirEntry> {
     let mut out = Vec::new();
     for (name, p) in g.iter() {
         let base = name.rsplit('/').next().unwrap_or(name);
+        if base.starts_with('.') {
+            continue; // hidden anonymous pipes
+        }
         let mut de = shared::DirEntry::default();
         let nb = base.as_bytes();
         let l = nb.len().min(95);

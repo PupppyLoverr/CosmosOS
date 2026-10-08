@@ -544,9 +544,9 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
     // no field on the tombstone may ever re-mark it schedulable
     t.wake_at = u64::MAX;
     t.wait_port = 0;
-    // wake any waiters (only live ones)
+    // wake any waiters (only live ones); u32::MAX = wait(-1) any-child
     for o in s.tasks.iter_mut() {
-        if o.waiting_on == t.id {
+        if o.waiting_on == t.id || (o.waiting_on == u32::MAX && t.parent == o.id) {
             o.waiting_on = 0;
             if o.state != State::Dead {
                 o.state = State::Running;
@@ -644,6 +644,26 @@ pub fn child_exit(pid: u32) -> Option<i64> {
         .iter()
         .find(|t| t.id == pid)
         .and_then(|t| if t.state == State::Dead { Some(t.exit_code) } else { None })
+}
+
+/// POSIX wait(-1): first dead child of `pid`, reaped (removed) on return.
+pub fn child_exit_any(pid: u32) -> Option<(u32, i64)> {
+    let mut g = SCHED.lock();
+    let s = g.as_mut().unwrap();
+    let idx = s
+        .tasks
+        .iter()
+        .position(|t| t.parent == pid && t.state == State::Dead)?;
+    let t = s.tasks.remove(idx);
+    Some((t.id, t.exit_code))
+}
+
+/// True when `pid` has at least one child (live or zombie).
+pub fn has_children(pid: u32) -> bool {
+    let g = SCHED.lock();
+    g.as_ref()
+        .map(|s| s.tasks.iter().any(|t| t.parent == pid))
+        .unwrap_or(false)
 }
 
 /// Whether a task id exists at all (dead or alive).
@@ -781,6 +801,31 @@ pub fn fd_list(pid: u32) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// /proc/<pid>/fdinfo: the real open-file table with position + flags.
+pub fn fd_info(pid: u32) -> Option<String> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    let t = s.tasks.iter().find(|t| t.id == pid)?;
+    let mut out = String::new();
+    for (i, f) in t.fds.iter().enumerate() {
+        if let Some(f) = f {
+            out.push_str(&alloc::format!(
+                "fd: {}\tpos: {}\tflags: {:#o}\tpath: {}\n",
+                i, f.pos, f.flags, f.path
+            ));
+        }
+    }
+    Some(out)
+}
+
+/// SYS_RUSAGE: real per-task resource usage — cpu ticks so far and
+/// current mapped bytes as maxrss (we have no historic peak counter).
+pub fn rusage(pid: u32) -> Option<(u64, u64)> {
+    let g = SCHED.lock();
+    let t = g.as_ref()?.tasks.iter().find(|t| t.id == pid)?;
+    Some((t.cpu_ticks, t.mem_bytes / 1024))
 }
 
 

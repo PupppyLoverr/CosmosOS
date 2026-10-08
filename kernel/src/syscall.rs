@@ -448,6 +448,27 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
+        shared::SYS_PIPE => sys_pipe(),
+        shared::SYS_DUP2 => sys_dup2(a1, a2),
+        shared::SYS_POLL => sys_poll(ctx, a1, a2, a3, a4),
+        shared::SYS_RUSAGE => match task::rusage(a1 as u32) {
+            Some((utime, maxrss)) => {
+                let out = [utime, 0u64, maxrss];
+                match copy_out(
+                    a2,
+                    unsafe {
+                        core::slice::from_raw_parts(
+                            out.as_ptr() as *const u8,
+                            core::mem::size_of_val(&out),
+                        )
+                    },
+                ) {
+                    Some(()) => 0,
+                    None => ERR,
+                }
+            }
+            None => ERR,
+        },
         shared::SYS_ARP => {
             let s = net::arp_stat();
             let n = s.len().min(a2 as usize);
@@ -854,6 +875,126 @@ fn sys_seek(fd: u64, off: u64, whence: u64) -> u64 {
     }
 }
 
+fn alloc_slot(t: &mut task::Task) -> usize {
+    for (i, f) in t.fds.iter().enumerate() {
+        if f.is_none() {
+            return i;
+        }
+    }
+    t.fds.push(None);
+    t.fds.len() - 1
+}
+
+/// SYS_PIPE: an anonymous pipe bound to two fresh fds in the caller's
+/// table — read end + write end. Returns rfd | wfd<<32.
+fn sys_pipe() -> u64 {
+    let Ok(path) = crate::pipes::create_anon() else {
+        return ERR;
+    };
+    let packed = task::with_current(|t| {
+        let rfd = alloc_slot(t);
+        t.fds[rfd] = Some(task::FileDesc {
+            path: path.clone(),
+            pos: 0,
+            flags: shared::O_RDONLY,
+        });
+        let wfd = alloc_slot(t);
+        t.fds[wfd] = Some(task::FileDesc {
+            path: path.clone(),
+            pos: 0,
+            flags: shared::O_TRUNC, // pipes count TRUNC|APPEND|WRONLY as writer
+        });
+        rfd as u64 | ((wfd as u64) << 32)
+    });
+    crate::pipes::open_role(&path, false);
+    crate::pipes::open_role(&path, true);
+    packed
+}
+
+/// SYS_DUP2: clone the open description at `oldfd` into slot `newfd`
+/// (closing whatever sat there, like POSIX dup2).
+fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
+    if newfd > 4096 {
+        return ERR;
+    }
+    if oldfd == newfd {
+        let held = task::with_current(|t| {
+            matches!(t.fds.get(oldfd as usize), Some(Some(_)))
+        });
+        return if held { newfd } else { ERR };
+    }
+    let f = match task::with_current(|t| match t.fds.get(oldfd as usize) {
+        Some(Some(f)) => Some(f.clone()),
+        _ => None,
+    }) {
+        Some(f) => f,
+        None => return ERR,
+    };
+    // close the occupying fd first so pipe roles stay honest
+    vfs::close(newfd as i64);
+    task::with_current(|t| {
+        while t.fds.len() <= newfd as usize {
+            t.fds.push(None);
+        }
+        t.fds[newfd as usize] = Some(f);
+    });
+    newfd
+}
+
+/// SYS_POLL: wait until any listed fd is ready or `timeout_ms` elapses.
+/// `fds`/`evs` are parallel user arrays of u32: events bit0=read bit1=write.
+/// Returns the count of ready fds.
+fn sys_poll(ctx: &mut CpuContext, fds: u64, evs: u64, nfds: u64, timeout_ms: u64) -> u64 {
+    let nfds = nfds.min(64);
+    let fdv = match copy_in(fds, nfds * 4) {
+        Some(d) => d,
+        None => return ERR,
+    };
+    let evv = match copy_in(evs, nfds * 4) {
+        Some(d) => d,
+        None => return ERR,
+    };
+    let rd32 = |v: &[u8], i: usize| u32::from_le_bytes(v[i * 4..i * 4 + 4].try_into().unwrap());
+    let paths: Vec<String> = task::with_current(|t| {
+        (0..nfds as usize)
+            .map(|i| match t.fds.get(rd32(&fdv, i) as usize) {
+                Some(Some(f)) => f.path.clone(),
+                _ => String::new(),
+            })
+            .collect()
+    });
+    let mut ready = 0u64;
+    for (i, path) in paths.iter().enumerate() {
+        if path.is_empty() {
+            continue;
+        }
+        let ev = rd32(&evv, i);
+        let ok = if crate::pipes::handles(path) {
+            (ev & 1 != 0 && crate::pipes::ready(path, true))
+                || (ev & 2 != 0 && crate::pipes::ready(path, false))
+        } else {
+            true // fs/proc/dev fds are always readable+writable
+        };
+        if ok {
+            ready += 1;
+        }
+    }
+    if ready > 0 || timeout_ms == 0 {
+        return ready;
+    }
+    // block: re-enter the syscall until something is ready or deadline hits
+    // (u64::MAX = wait forever, same sentinel as waitpid)
+    let dl = if timeout_ms == u64::MAX {
+        u64::MAX
+    } else {
+        task::ticks() + timeout_ms.div_ceil(10) + 1
+    };
+    if task::ticks() >= dl {
+        return 0;
+    }
+    block_reenter(ctx, dl, 0)
+}
+
 fn sys_stat(pptr: u64, plen: u64, out: u64) -> u64 {
     let Some(path) = copy_str(pptr, plen) else { return ERR };
     match vfs::stat_path(&path) {
@@ -1011,14 +1152,27 @@ fn sys_sleep(ctx: &mut CpuContext, ms: u64) -> u64 {
 }
 
 fn sys_waitpid(ctx: &mut CpuContext, pid: u64, timeout_ms: u64) -> u64 {
-    if !task::exists(pid as u32) {
-        return ERR;
+    let me = cur_id();
+    let any = pid as u32 == u32::MAX;
+    if any {
+        // wait(-1): returns pid<<32 | exit_code of the first dead child
+        if let Some((cpid, code)) = task::child_exit_any(me) {
+            task::with_current(|t| t.wait_timeout = 0);
+            return ((cpid as u64) << 32) | (code as u64 & 0xffff_ffff);
+        }
+        if !task::has_children(me) {
+            return ERR;
+        }
+    } else {
+        if !task::exists(pid as u32) {
+            return ERR;
+        }
+        if let Some(code) = task::child_exit(pid as u32) {
+            task::with_current(|t| t.wait_timeout = 0);
+            return code as u64;
+        }
     }
     let now = task::ticks();
-    if let Some(code) = task::child_exit(pid as u32) {
-        task::with_current(|t| t.wait_timeout = 0);
-        return code as u64;
-    }
     let dl = task::with_current(|t| {
         if t.wait_timeout == 0 {
             t.wait_timeout = if timeout_ms == u64::MAX { u64::MAX } else { now + timeout_ms.div_ceil(10) + 1 };
