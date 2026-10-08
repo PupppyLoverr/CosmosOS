@@ -12966,10 +12966,27 @@ impl Term {
             }
             "reboot" => ustd::reboot(),
             "unshare" => {
-                // unshare [-m]: apply to THIS shell's namespace — mounts
-                // and unmounts stop propagating to the rest of the system
-                match ustd::unshare(0x20000) {
-                    0 => self.emit("mount namespace unshared"),
+                // unshare [-m] [-u] [-p]: -m private mount table, -u own
+                // hostname (UTS), -p children land in a fresh PID
+                // namespace — the next fork sees itself as pid 1.
+                let mut flags = 0u64;
+                for a in args {
+                    if a == "-m" {
+                        flags |= shared::CLONE_NEWNS;
+                    } else if a == "-u" {
+                        flags |= shared::CLONE_NEWUTS;
+                    } else if a == "-p" {
+                        flags |= shared::CLONE_NEWPID;
+                    } else {
+                        self.fail("usage: unshare [-m] [-u] [-p]");
+                        return;
+                    }
+                }
+                if flags == 0 {
+                    flags = shared::CLONE_NEWNS;
+                }
+                match ustd::unshare(flags) {
+                    0 => self.emit("namespace unshared"),
                     e => self.fail(&alloc::format!("unshare: err {}", e)),
                 }
             }

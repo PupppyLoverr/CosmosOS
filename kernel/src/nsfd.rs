@@ -15,13 +15,14 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
-use crate::task::{MountNs, UtsNs};
+use crate::task::{MountNs, PidNs, UtsNs};
 
 /// Which namespace object an fd pins — setns adopts the matching field.
 #[derive(Clone)]
 pub enum NsObj {
     Mount(Arc<Mutex<MountNs>>),
     Uts(Arc<Mutex<UtsNs>>),
+    Pid(Arc<Mutex<PidNs>>),
 }
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -51,7 +52,8 @@ pub fn open(path: &str) -> Option<String> {
     let (rest, kind) = rest
         .strip_suffix("/ns/mntns")
         .map(|r| (r, 0u8))
-        .or_else(|| rest.strip_suffix("/ns/uts").map(|r| (r, 1u8)))?;
+        .or_else(|| rest.strip_suffix("/ns/uts").map(|r| (r, 1u8)))
+        .or_else(|| rest.strip_suffix("/ns/pid").map(|r| (r, 2u8)))?;
     let pid = if rest == "self" {
         crate::task::current_id()
     } else if rest.bytes().all(|b| b.is_ascii_digit()) {
@@ -61,7 +63,8 @@ pub fn open(path: &str) -> Option<String> {
     };
     match kind {
         0 => crate::task::ns_arc_of(pid).map(|a| register(NsObj::Mount(a))),
-        _ => crate::task::uts_arc_of(pid).map(|a| register(NsObj::Uts(a))),
+        1 => crate::task::uts_arc_of(pid).map(|a| register(NsObj::Uts(a))),
+        _ => crate::task::pidns_arc_of(pid).map(|a| register(NsObj::Pid(a))),
     }
 }
 
