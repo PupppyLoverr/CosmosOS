@@ -12,7 +12,8 @@ use ustd::*;
 
 static mut PASS: u32 = 0;
 static mut FAIL: u32 = 0;
-static THREAD_HIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+use core::sync::atomic::AtomicU64;
+static THREAD_HIT: AtomicU64 = AtomicU64::new(0);
 
 fn check(name: &str, ok: bool) {
     if ok {
@@ -422,6 +423,55 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             Err(_) => false,
         }
     });
+    check("futex-mutex-counter", {
+        // 4 threads x 500 increments behind a REAL futex mutex — the
+        // counter must be exact, proving wait/wake under contention
+        use core::sync::atomic::Ordering;
+        static LOCK: ustd::Mutex = ustd::Mutex::new();
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn bump(n: u64) -> i64 {
+            for _ in 0..n {
+                LOCK.lock();
+                CTR.store(CTR.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+                LOCK.unlock();
+            }
+            0
+        }
+        let mut tids = [0u32; 4];
+        let mut spawned = 0usize;
+        for i in 0..4 {
+            match ustd::thread_spawn(bump, 500) {
+                Ok(t) => {
+                    tids[i] = t;
+                    spawned += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        for i in 0..spawned {
+            let _ = ustd::waitpid(tids[i], 15000);
+        }
+        spawned == 4 && CTR.load(Ordering::SeqCst) == 2000
+    });
+    check("futex-timeout", {
+        // WAIT on a word nobody wakes must surface a real ETIMEDOUT
+        use core::sync::atomic::Ordering;
+        static W: AtomicU64 = AtomicU64::new(7);
+        let r = ustd::futex(&W, ustd::FUTEX_WAIT, 7, 60);
+        r == -110 && W.load(Ordering::SeqCst) == 7
+    });
+    check("futex-eagain", {
+        // WAIT with a mismatched expected value returns immediately
+        static W2: AtomicU64 = AtomicU64::new(3);
+        ustd::futex(&W2, ustd::FUTEX_WAIT, 99, 1000) == -11
+    });
+    check("kern-ptr-rejected", {
+        // syscall boundary must reject a kernel VA (phys-map region)
+        ustd::sc1(shared::SYS_MEMINFO, 0xFFFF_8000_0000_0000) == u64::MAX
+    });
+    check("kern-ptr-rejected-in", {
+        ustd::sc2(shared::SYS_DEBUG, 0xFFFF_8000_0000_0000, 16) == u64::MAX
+    });
     check("stack-growdown", {
         // deep recursion over big per-frame arrays forces the user stack to
         // demand-grow pages below the single eager top page
@@ -550,9 +600,15 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                     && ustd::read_all(&alloc::format!("/proc/{}/status", pid))
                         .map(|d| String::from_utf8_lossy(&d).contains("T (stopped)"))
                         .unwrap_or(false);
+                // a resumed task may get scheduled and re-block on IPC
+                // before we can read status — "S (sleeping)" proves CONT
+                // took just as much as "R (running)" does
                 let resumed = ustd::kill2(pid, 18) == 0
                     && ustd::read_all(&alloc::format!("/proc/{}/status", pid))
-                        .map(|d| String::from_utf8_lossy(&d).contains("R (running)"))
+                        .map(|d| {
+                            let s = String::from_utf8_lossy(&d);
+                            s.contains("R (running)") || s.contains("S (sleeping)")
+                        })
                         .unwrap_or(false);
                 let _ = ustd::kill2(pid, 9);
                 stopped && resumed
