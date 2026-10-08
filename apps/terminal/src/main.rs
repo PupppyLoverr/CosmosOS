@@ -7559,16 +7559,25 @@ impl Term {
             pick.map(|n| words[n - 1].clone()).unwrap_or_default(),
         );
         self.run_stmts(body, depth + 1, false);
-        match self.flow {
-            1 => {
+        let (kind, lv) = (self.flow & 7, self.flow >> 3);
+        match (kind, lv) {
+            (1, 0) => {
                 self.flow = 0;
                 false
             }
-            2 => {
+            (2, 0) => {
                 self.flow = 0;
                 true
             }
-            f if f != 0 => false,
+            (1, _) => {
+                self.flow = 1 + ((lv - 1) << 3);
+                false
+            }
+            (2, _) => {
+                self.flow = 2 + ((lv - 1) << 3);
+                false
+            }
+            f if self.flow != 0 => false,
             _ => true,
         }
     }
@@ -8052,13 +8061,22 @@ impl Term {
                                 }
                             }
                             self.run_stmts(&body, depth + 1, trace);
-                            match self.flow {
-                                1 => {
+                            let (kind, lv) = (self.flow & 7, self.flow >> 3);
+                            match (kind, lv) {
+                                (1, 0) => {
                                     self.flow = 0;
                                     break;
                                 }
-                                2 => self.flow = 0,
-                                f if f != 0 => return,
+                                (2, 0) => self.flow = 0,
+                                (1, _) => {
+                                    self.flow = 1 + ((lv - 1) << 3);
+                                    return;
+                                }
+                                (2, _) => {
+                                    self.flow = 2 + ((lv - 1) << 3);
+                                    return;
+                                }
+                                _ if self.flow != 0 => return,
                                 _ => {}
                             }
                             if !incr.is_empty() {
@@ -8198,13 +8216,22 @@ impl Term {
                         for w in words {
                             self.vars.insert(var.clone(), w);
                             self.run_stmts(&body, depth + 1, trace);
-                            match self.flow {
-                                1 => {
+                            let (kind, lv) = (self.flow & 7, self.flow >> 3);
+                            match (kind, lv) {
+                                (1, 0) => {
                                     self.flow = 0;
                                     break;
                                 }
-                                2 => self.flow = 0,
-                                f if f != 0 => return,
+                                (2, 0) => self.flow = 0,
+                                (1, _) => {
+                                    self.flow = 1 + ((lv - 1) << 3);
+                                    return;
+                                }
+                                (2, _) => {
+                                    self.flow = 2 + ((lv - 1) << 3);
+                                    return;
+                                }
+                                _ if self.flow != 0 => return,
                                 _ => {}
                             }
                         }
@@ -8223,13 +8250,22 @@ impl Term {
                                 break;
                             }
                             self.run_stmts(&body, depth + 1, trace);
-                            match self.flow {
-                                1 => {
+                            let (kind, lv) = (self.flow & 7, self.flow >> 3);
+                            match (kind, lv) {
+                                (1, 0) => {
                                     self.flow = 0;
                                     break;
                                 }
-                                2 => self.flow = 0,
-                                f if f != 0 => return,
+                                (2, 0) => self.flow = 0,
+                                (1, _) => {
+                                    self.flow = 1 + ((lv - 1) << 3);
+                                    return;
+                                }
+                                (2, _) => {
+                                    self.flow = 2 + ((lv - 1) << 3);
+                                    return;
+                                }
+                                _ if self.flow != 0 => return,
                                 _ => {}
                             }
                         }
@@ -9016,7 +9052,7 @@ impl Term {
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
             "egrep", "fgrep", "sdiff", "diff3", "merge", "compress",
-            "uncompress", "sum", "sha224sum", "namei", "ts", "pr",
+            "uncompress", "sum", "sha224sum", "namei", "ts", "pr", "numfmt",
         ];
         let glob_tok = |t: &str| {
             t.contains('*')
@@ -9514,8 +9550,26 @@ impl Term {
             }
             "true" => {}
             "false" => self.last_ok = false,
-            "break" => self.flow = 1,      // unwinds to the enclosing run_stmts loop
-            "continue" => self.flow = 2,
+            "break" => {
+                // break [N]: unwind N enclosing loops — levels ride in
+                // flow's upper bits (flow = kind | levels<<3); loop
+                // consumers decrement one level per unwind
+                let n = args.first()
+                    .and_then(|a| a.parse::<u32>().ok())
+                    .unwrap_or(1)
+                    .max(1)
+                    .min(32);
+                self.flow = 1 | (((n - 1) << 3) as u8);
+            }
+            "continue" => {
+                // continue [N]: same encoding, outer loop's next iteration
+                let n = args.first()
+                    .and_then(|a| a.parse::<u32>().ok())
+                    .unwrap_or(1)
+                    .max(1)
+                    .min(32);
+                self.flow = 2 | (((n - 1) << 3) as u8);
+            }
             "return" => {
                 if self.script_depth > 0 || self.func_depth > 0 {
                     self.flow = 3; // unwind to the script runner / func dispatch
@@ -10517,16 +10571,49 @@ impl Term {
                     ));
                 }
             }
-            "which" => match args.first() {
-                Some(c) => {
-                    let p = alloc::format!("/bin/{}", c);
-                    match ustd::stat(&p) {
-                        Ok(_) => self.emit(&p),
-                        Err(_) => self.fail(&alloc::format!("which: {} not found", c)),
+            "which" => {
+                // which [-a] <cmd...>: every match when -a — builtins are
+                // reported too (GNU which prints all PATH hits)
+                let all = args.iter().any(|a| *a == "-a");
+                let mut any = false;
+                for a in args.iter().filter(|a| !a.starts_with('-')) {
+                    let mut hit = false;
+                    if all && Self::BUILTINS.contains(a) {
+                        self.emit(&alloc::format!("{}: shell built-in command", a));
+                        hit = true;
+                    }
+                    if all && self.aliases.iter().any(|(n, _)| n == *a) {
+                        let av = self
+                            .aliases
+                            .iter()
+                            .find(|(n, _)| n == *a)
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_default();
+                        self.emit(&alloc::format!("{}: aliased to {}", a, av));
+                        hit = true;
+                    }
+                    for cand in [
+                        alloc::format!("/bin/{}", a),
+                        alloc::format!("/bin/cosmos-{}", a),
+                    ] {
+                        if ustd::stat(&cand).is_ok() {
+                            self.emit(&cand);
+                            hit = true;
+                            if !all {
+                                break;
+                            }
+                        }
+                    }
+                    if hit {
+                        any = true;
+                    } else {
+                        self.fail(&alloc::format!("which: {} not found", a));
                     }
                 }
-                None => self.fail("usage: which <cmd>"),
-            },
+                if !any && args.iter().all(|a| a.starts_with('-')) {
+                    self.fail("usage: which [-a] <cmd...>");
+                }
+            }
             "cat" => {
                 // cat [-nbETsAve] <files...>: -n numbers all lines, -b numbers
                 // non-blank, -E shows $ at EOL, -T shows tabs as ^I,
@@ -13668,38 +13755,81 @@ impl Term {
                 }
             }
             "truncate" => {
-                // truncate -s N file -- real length change (pad with zeros or cut)
-                let mut size = None;
-                let mut file = None;
+                // truncate -s N file -- real length change (pad with zeros
+                // or cut); -s accepts +N/-N relative deltas and -r REF
+                // copies another file's size (GNU semantics)
+                let mut spec: Option<String> = None;
+                let mut reffile: Option<String> = None;
+                let mut files: Vec<&str> = Vec::new();
                 let mut it = args.iter().peekable();
                 while let Some(a) = it.next() {
-                    if *a == "-s" {
-                        size = it.next().and_then(|x| x.parse::<usize>().ok());
+                    if *a == "-s" || *a == "--size" {
+                        spec = it.next().map(|x| String::from(*x));
                     } else if let Some(v) = a.strip_prefix("-s") {
-                        size = v.parse().ok();
+                        if !v.is_empty() {
+                            spec = Some(String::from(v));
+                        }
+                    } else if *a == "-r" || *a == "--reference" {
+                        reffile = it.next().map(|x| String::from(*x));
+                    } else if let Some(v) = a.strip_prefix("--reference=") {
+                        reffile = Some(String::from(v));
                     } else {
-                        file = Some(*a);
+                        files.push(*a);
                     }
                 }
-                match (size, file) {
-                    (Some(n), Some(p)) => {
-                        // real ftruncate: resize through an open descriptor
-                        match ustd::open(p, ustd::O_WRONLY | ustd::O_CREATE) {
-                            Ok(fd) => {
-                                let e = ustd::ftruncate(fd, n as u64);
-                                ustd::close(fd);
-                                if e != 0 {
-                                    self.fail(&alloc::format!(
-                                        "truncate: err {}",
-                                        e
-                                    ));
-                                }
-                            }
-                            Err(e) => self
-                                .fail(&alloc::format!("truncate: {}: err {}", p, e)),
+                if let Some(r) = &reffile {
+                    match ustd::stat(r) {
+                        Ok(st) => spec = Some(alloc::format!("{}", st.size)),
+                        Err(e) => {
+                            self.fail(&alloc::format!(
+                                "truncate: {}: err {}",
+                                r, e
+                            ));
+                            return;
                         }
                     }
-                    _ => self.fail("usage: truncate -s N <file>"),
+                }
+                match (spec, files.first()) {
+                    (Some(spec), Some(_)) => {
+                        for p in &files {
+                            // resolve +N/-N against the file's real length
+                            let base = if spec.starts_with('+') || spec.starts_with('-') {
+                                ustd::stat(p)
+                                    .map(|s| s.size as i64)
+                                    .unwrap_or(0)
+                            } else {
+                                0
+                            };
+                            let Some(delta) = spec
+                                .trim_start_matches(['+', '-'])
+                                .parse::<i64>()
+                                .ok()
+                                .map(|v| if spec.starts_with('-') { -v } else { v })
+                            else {
+                                self.fail(&alloc::format!(
+                                    "truncate: bad size '{}'",
+                                    spec
+                                ));
+                                return;
+                            };
+                            let n = (base + delta).max(0) as u64;
+                            match ustd::open(p, ustd::O_WRONLY | ustd::O_CREATE) {
+                                Ok(fd) => {
+                                    let e = ustd::ftruncate(fd, n);
+                                    ustd::close(fd);
+                                    if e != 0 {
+                                        self.fail(&alloc::format!(
+                                            "truncate: err {}",
+                                            e
+                                        ));
+                                    }
+                                }
+                                Err(e) => self
+                                    .fail(&alloc::format!("truncate: {}: err {}", p, e)),
+                            }
+                        }
+                    }
+                    _ => self.fail("usage: truncate -s N|-r REF <file>"),
                 }
             }
             "mktemp" => {
@@ -14720,6 +14850,106 @@ impl Term {
                 if a.first() == Some(&"-x") {
                     trace = true;
                     a = &a[1..];
+                }
+                // sh -n: parse only — keyword balance + heredoc closure,
+                // never executes (bash -n semantics)
+                if a.first() == Some(&"-n") {
+                    a = &a[1..];
+                    match a.first() {
+                        Some(p) => match ustd::read_all(p) {
+                            Ok(d) => {
+                                let s = String::from_utf8_lossy(&d).into_owned();
+                                let (stmts, _, unclosed) = norm_stmts(&s);
+                                if let Some(d) = unclosed {
+                                    self.fail(&alloc::format!(
+                                        "{}: unterminated heredoc <<{}",
+                                        p, d
+                                    ));
+                                } else {
+                                    // balance: if/fi, loops/done, case/esac.
+                                    // A keyword only counts after a statement
+                                    // boundary (`;`/`;;`/`then`/`do`/`else`/
+                                    // `elif`/`in`) — `echo done` doesn't trip it
+                                    let mut stack: Vec<&str> = Vec::new();
+                                    let mut bad = false;
+                                    for st in &stmts {
+                                        let mut boundary = true;
+                                        for w_raw in st.split_whitespace() {
+                                            let w =
+                                                w_raw.trim_end_matches(';');
+                                            let structural = boundary;
+                                            boundary = w_raw.ends_with(';')
+                                                || w_raw == ";;"
+                                                || matches!(
+                                                    w,
+                                                    "then" | "do" | "else"
+                                                        | "elif" | "in"
+                                                );
+                                            if !structural {
+                                                continue;
+                                            }
+                                            match w {
+                                                "if" | "case" => stack.push(w),
+                                                "for" | "while" | "until" => {
+                                                    stack.push("do")
+                                                }
+                                                "do" => {
+                                                    // `for …; do`: the pending
+                                                    // marker IS the do — only
+                                                    // push a bare `do` block
+                                                    if stack.last()
+                                                        != Some(&"do")
+                                                    {
+                                                        stack.push("do");
+                                                    }
+                                                }
+                                                "fi" | "esac" | "done" => {
+                                                    let want = match w {
+                                                        "fi" => "if",
+                                                        "esac" => "case",
+                                                        _ => "do",
+                                                    };
+                                                    match stack.pop() {
+                                                        Some(top) if top == want => {}
+                                                        _ => {
+                                                            self.fail(&alloc::format!(
+                                                                "{}: unexpected '{}'",
+                                                                p, w
+                                                            ));
+                                                            bad = true;
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                            if bad {
+                                                break;
+                                            }
+                                        }
+                                        if bad {
+                                            break;
+                                        }
+                                    }
+                                    if !bad {
+                                        if let Some(top) = stack.pop() {
+                                            self.fail(&alloc::format!(
+                                                "{}: '{}' never closed",
+                                                p, top
+                                            ));
+                                        } else {
+                                            self.emit(&alloc::format!(
+                                                "{}: syntax OK",
+                                                p
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => self.fail(&alloc::format!("sh: {}: err {}", p, e)),
+                        },
+                        None => self.fail("usage: sh -n <file>"),
+                    }
+                    return;
                 }
                 match a.first() {
                 Some(p) => match ustd::read_all(p) {
@@ -15770,6 +16000,41 @@ impl Term {
                     1 << 10
                 };
                 let uname = if unit == 1 << 20 { "1M-blocks" } else { "1K-blocks" };
+                // -i: inode view — real tmpfs node count via statfs_inodes;
+                // FAT has no inode table so it honestly prints 0/0/-
+                let ino = args.iter().any(|a| *a == "-i" || *a == "--inodes");
+                if ino {
+                    self.emit(
+                        "Filesystem     Inodes  IUsed   IFree IUse% Mounted on",
+                    );
+                    let p = args
+                        .iter()
+                        .find(|a| !a.starts_with('-'))
+                        .copied()
+                        .unwrap_or("/");
+                    match ustd::statfs_inodes(p) {
+                        Some((files, ffree)) => {
+                            let pct = if files + ffree > 0 {
+                                files * 100 / (files + ffree)
+                            } else {
+                                0
+                            };
+                            let tn = match ustd::statfs(p) {
+                                Some((t, _, _, _)) if t == 0x0102_1994 => "tmpfs",
+                                _ => "vfat",
+                            };
+                            self.emit(&alloc::format!(
+                                "{:<13} {:>6} {:>7} {:>7} {:>4}% {}",
+                                tn, files + ffree, files, ffree, pct, p
+                            ));
+                        }
+                        None => self.fail(&alloc::format!(
+                            "df: {}: statfs failed",
+                            p
+                        )),
+                    }
+                    return;
+                }
                 match ustd::df() {
                     Some((total, free)) => {
                         let used = total - free;
@@ -19757,7 +20022,8 @@ impl Term {
                 }
             }
             "od" => {
-                // od [-An] [-t x1|c] <file> — canonical octal-dump-style view
+                // od [-An] [-t x1|c] [file|-] — canonical octal-dump-style
+                // view; `-`/no file reads piped stdin like GNU
                 let mut offbase = 8usize; // octal offsets by default
                 let mut chars = false;
                 let mut path = "";
@@ -19768,15 +20034,26 @@ impl Term {
                         "-An" => offbase = 0,
                         "-c" | "-t c" | "-tc" => chars = true,
                         "-tx1c" => chars = true,
+                        "-" => path = "-",
                         _ if !a.starts_with('-') => path = a,
                         _ => {}
                     }
                 }
-                if path.is_empty() {
+                let data = if path == "-" || (path.is_empty() && self.pipe_in.is_some()) {
+                    self.pipe_in.clone().unwrap_or_default().into_bytes()
+                } else if path.is_empty() {
                     self.fail("usage: od [-An|-Ax] [-tx1c] <file>");
                     return;
-                }
-                match ustd::read_all(path) {
+                } else {
+                    match ustd::read_all(path) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            self.fail(&alloc::format!("od: {}: err {}", path, e));
+                            return;
+                        }
+                    }
+                };
+                match Ok::<Vec<u8>, String>(data) {
                     Ok(d) => {
                         for (i, ch) in d.chunks(16).enumerate() {
                             let mut l = if offbase == 16 {
@@ -19913,6 +20190,87 @@ impl Term {
                         }
                     }
                     _ => self.fail("usage: units <n> <from> <to>   (e.g. units 5 km mi)"),
+                }
+            }
+            "numfmt" => {
+                // numfmt [--to=iec|si] [--from=iec|si] [NUM...] — real
+                // suffix conversion (K/M/G/T): iec = 1024-based, si = 1000;
+                // bare args or piped stdin, one number per line (GNU coreutil)
+                let mut to_iec = 0u8; // 0 none, 1 iec(1024), 2 si(1000)
+                let mut from_iec = 0u8;
+                let mut nums: Vec<String> = Vec::new();
+                for a in args.iter() {
+                    match *a {
+                        "--to=iec" | "--to=iec-i" => to_iec = 1,
+                        "--to=si" => to_iec = 2,
+                        "--from=iec" | "--from=iec-i" => from_iec = 1,
+                        "--from=si" | "--from=auto" => from_iec = 2,
+                        "--from=none" => from_iec = 0,
+                        "--to=none" => to_iec = 0,
+                        "-h" | "--header" => {} // header passthrough
+                        _ if !a.starts_with('-') => nums.push(String::from(*a)),
+                        _ => {}
+                    }
+                }
+                if nums.is_empty() {
+                    if let Some(pi) = &self.pipe_in {
+                        nums.extend(pi.lines().map(|l| String::from(l.trim())));
+                    }
+                }
+                if nums.is_empty() {
+                    self.fail("usage: numfmt [--to=iec|si] [--from=iec|si] <num>...");
+                    return;
+                }
+                let suffix = "KMGTPE";
+                for n in &nums {
+                    let t = n.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    // optional suffix on input (parsed against from-base)
+                    let (num, suf) = {
+                        let end = t
+                            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                            .unwrap_or(t.len());
+                        (t[..end].to_string(), t[end..].trim_start().to_string())
+                    };
+                    let fb: f64 = if from_iec == 1 { 1024.0 } else { 1000.0 };
+                    let mult = suffix
+                        .find(suf.chars().next().unwrap_or(' '))
+                        .map(|i| {
+                            let mut m = 1.0f64;
+                            for _ in 0..=i {
+                                m *= fb;
+                            }
+                            m
+                        })
+                        .unwrap_or(1.0);
+                    let Some(mut v) = num.parse::<f64>().ok().map(|v| v * mult)
+                    else {
+                        self.fail(&alloc::format!("numfmt: bad number '{}'", t));
+                        return;
+                    };
+                    if to_iec == 0 {
+                        // bare number out — drop the fraction when integral
+                        if v == (v as i64) as f64 {
+                            self.emit(&alloc::format!("{}", v as i64));
+                        } else {
+                            self.emit(&alloc::format!("{:.2}", v));
+                        }
+                        continue;
+                    }
+                    let tb: f64 = if to_iec == 1 { 1024.0 } else { 1000.0 };
+                    let mut level = -1i32;
+                    while v >= tb && level < 5 {
+                        v /= tb;
+                        level += 1;
+                    }
+                    if level < 0 {
+                        self.emit(&alloc::format!("{}", v as i64));
+                    } else {
+                        let s = suffix.as_bytes()[level as usize] as char;
+                        self.emit(&alloc::format!("{:.1}{}", v, s));
+                    }
                 }
             }
             "pr" => {
@@ -24338,7 +24696,8 @@ impl Term {
                     "          reboot shutdown exit",
                     "          colrm <s> [e]  mountpoint <d>  elfinfo <elf>  utmpdump",
                     "          iconv -f E -t E  ascii  mount -a  find -printf  timeout -s/-k",
-                    "          stat -f  df -k/-m  ps -p  uname -i  getent passwd|group",
+                    "          stat -f  df -k/-m/-i  ps -p  uname -i  getent passwd|group",
+                    "          sh -n  break/continue N  which -a  truncate -r/-s  numfmt",
                     "          setsid <cmd>  dir/vdir  mkdir -m  df -P  stat -t  chown -R",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];

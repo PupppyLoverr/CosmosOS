@@ -4206,12 +4206,15 @@ fn sys_statx(argp: u64) -> u64 {
 fn sys_statfs_out(path: &str, out: u64) -> u64 {
     if crate::tmpfs::handles(path) {
         let (total, free) = crate::tmpfs::df();
+        let (files, ffree) = crate::tmpfs::ifree();
         let cb = 4096u64;
         let b = [
             0x1021_994u64.to_le_bytes(), // TMPFS_MAGIC
             cb.to_le_bytes(),
             (total / cb).to_le_bytes(),
             (free / cb).to_le_bytes(),
+            files.to_le_bytes(),
+            ffree.to_le_bytes(),
         ]
         .concat();
         return match copy_out(out, &b) {
@@ -4233,6 +4236,8 @@ fn sys_statfs_out(path: &str, out: u64) -> u64 {
         cb.to_le_bytes(),
         blocks.to_le_bytes(),
         bfree.to_le_bytes(),
+        0u64.to_le_bytes(), // files: FAT has no inode table (GNU prints 0)
+        0u64.to_le_bytes(), // ffree
     ]
     .concat();
     match copy_out(out, &b) {

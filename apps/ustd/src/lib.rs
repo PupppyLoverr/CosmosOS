@@ -2755,7 +2755,7 @@ pub fn set_robust_list(head: u64) -> i64 {
 
 /// statfs(path) -> {type,bsize,blocks,bfree} real FAT volume info.
 pub fn statfs(path: &str) -> Option<(u64, u64, u64, u64)> {
-    let mut b = [0u64; 4];
+    let mut b = [0u64; 6];
     let r = sc3(
         shared::SYS_STATFS,
         path.as_ptr() as u64,
@@ -2765,9 +2765,21 @@ pub fn statfs(path: &str) -> Option<(u64, u64, u64, u64)> {
     if r < 0 { None } else { Some((b[0], b[1], b[2], b[3])) }
 }
 
+/// statfs inode fields — (files, ffree). FAT has no inode table: (0, 0).
+pub fn statfs_inodes(path: &str) -> Option<(u64, u64)> {
+    let mut b = [0u64; 6];
+    let r = sc3(
+        shared::SYS_STATFS,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        b.as_mut_ptr() as u64,
+    ) as i64;
+    if r < 0 { None } else { Some((b[4], b[5])) }
+}
+
 /// fstatfs(fd) — same, via an open fd.
 pub fn fstatfs(fd: i64) -> Option<(u64, u64, u64, u64)> {
-    let mut b = [0u64; 4];
+    let mut b = [0u64; 6];
     let r = sc2(shared::SYS_FSTATFS, fd as u64, b.as_mut_ptr() as u64) as i64;
     if r < 0 { None } else { Some((b[0], b[1], b[2], b[3])) }
 }
