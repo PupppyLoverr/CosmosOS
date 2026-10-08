@@ -2652,6 +2652,100 @@ fn diff_ops(am: &[String], bm: &[String]) -> Vec<DiffOp> {
 }
 
 /// Classic ed-style diff output (`n a/m/d` + `<> ` lines).
+
+/// diff -e: emit a real ed script that edits fileA into fileB. Hunks are
+/// emitted in DESCENDING line order so earlier edits don't renumber later
+/// ones. `Na` appends after line N (`0a` = top), `N,Md` deletes, `N,Mc`
+/// changes — add/change bodies end with `.`; a literal `.` line is written
+/// then `s/.//` (the GNU quirk: ed scripts can't carry a lone dot).
+fn diff_ed(a: &[String], b: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut lo = 0usize;
+    let (mut ahi, mut bhi) = (a.len(), b.len());
+    while lo < ahi && lo < bhi && a[lo] == b[lo] {
+        lo += 1;
+    }
+    while ahi > lo && bhi > lo && a[ahi - 1] == b[bhi - 1] {
+        ahi -= 1;
+        bhi -= 1;
+    }
+    let (am, bm) = (&a[lo..ahi], &b[lo..bhi]);
+    if am.is_empty() && bm.is_empty() {
+        return out;
+    }
+    let ops = diff_ops(am, bm);
+    // collect hunks as (a0, a1, kind, add-indices) then emit reversed
+    let mut hunks: Vec<(usize, usize, u8, Vec<usize>)> = Vec::new();
+    let mut k = 0usize;
+    let (mut a_cur, mut b_cur) = (0usize, 0usize);
+    while k < ops.len() {
+        if matches!(ops[k], DiffOp::Eq) {
+            a_cur += 1;
+            b_cur += 1;
+            k += 1;
+            continue;
+        }
+        let (a0, mut dels, mut adds) = (a_cur, 0usize, Vec::new());
+        while k < ops.len() {
+            match ops[k] {
+                DiffOp::Del(_) => {
+                    dels += 1;
+                    a_cur += 1;
+                }
+                DiffOp::Add(ai) => {
+                    adds.push(ai);
+                    b_cur += 1;
+                }
+                DiffOp::Eq => break,
+            }
+            k += 1;
+        }
+        let kind = if dels == 0 {
+            b'a'
+        } else if adds.is_empty() {
+            b'd'
+        } else {
+            b'c'
+        };
+        hunks.push((a0 + lo, a_cur + lo, kind, adds));
+    }
+    let emit_body = |out: &mut Vec<String>, adds: &[usize]| {
+        for &i in adds {
+            if bm[i] == "." {
+                out.push(String::from("."));
+                out.push(String::from("s/.//"));
+            } else {
+                out.push(bm[i].clone());
+            }
+        }
+        out.push(String::from("."));
+    };
+    for (a0, a1, kind, adds) in hunks.iter().rev() {
+        match kind {
+            b'a' => {
+                out.push(alloc::format!("{}a", a0));
+                emit_body(&mut out, adds);
+            }
+            b'd' => {
+                if a0 + 1 == *a1 {
+                    out.push(alloc::format!("{}d", a1));
+                } else {
+                    out.push(alloc::format!("{},{}d", a0 + 1, a1));
+                }
+            }
+            _ => {
+                if a0 + 1 == *a1 {
+                    out.push(alloc::format!("{}c", a1));
+                } else {
+                    out.push(alloc::format!("{},{}c", a0 + 1, a1));
+                }
+                emit_body(&mut out, adds);
+            }
+        }
+    }
+    out
+}
+
 fn diff_lines(a: &[String], b: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     // trim shared prefix / suffix
@@ -2794,7 +2888,7 @@ fn parse_hunk(h: &str) -> Option<(usize, usize)> {
 /// `var=expr` / `var+=expr`; exprs support + - * / % on fields/vars/numbers.
 fn awk_eval(
     prog: &str,
-    input: &str,
+    inputs: &[String],
     fs: Option<char>,
     preseed: &[(String, String)],
 ) -> Result<Vec<String>, String> {
@@ -2841,10 +2935,17 @@ fn awk_eval(
     for (n, v) in preseed {
         vars.insert(n.clone(), v.parse().unwrap_or(0));
     }
-    // input records + the shared read cursor: `li` is the index of the
-    // NEXT unread record so `getline` (in BEGIN too) and the main loop
-    // consume the same stream
-    let lines: Vec<String> = input.lines().map(String::from).collect();
+    // every input file's records concatenated into ONE shared stream —
+    // `getline` and the main loop walk the same cursor and a getline that
+    // crosses a file boundary simply rolls into the next file's records.
+    // bounds[fi] = [start, end) of file fi inside `lines`.
+    let mut lines: Vec<String> = Vec::new();
+    let mut bounds: Vec<(usize, usize)> = Vec::new();
+    for inp in inputs {
+        let s = lines.len();
+        lines.extend(inp.lines().map(String::from));
+        bounds.push((s, lines.len()));
+    }
     // per-path read offsets behind `getline < "file"`
     let mut gl: alloc::collections::BTreeMap<String, (Vec<String>, usize)> =
         Default::default();
@@ -2853,22 +2954,30 @@ fn awk_eval(
     let mut out: Vec<String> = Vec::new();
     {
         // BEGIN runs with an empty $0/fields; sub/gsub targets get temps
-        let mut b0 = String::from(input);
+        let mut b0 = inputs.first().cloned().unwrap_or_default();
         let mut bf: Vec<String> = Vec::new();
         match awk_stmts(&begin, &mut b0, &mut nr, &mut bf, &mut vars,
                         &mut gl, &lines, &mut li, &mut out, fs) {
             // `exit` in BEGIN skips the main rule pass entirely
             Err(e) if e == "\x01EXIT" => li = lines.len(),
+            // `nextfile` in BEGIN skips the first input file
+            Err(e) if e == "\x01NEXTFILE" => {
+                li = bounds.first().map(|b| b.1).unwrap_or(lines.len())
+            }
             r => r?,
         }
     }
     // `pat1,pat2` range rules hold per-rule in-range state
     let mut rng: Vec<bool> = alloc::vec![false; rules.len()];
-    'main: while li < lines.len() {
+    'files: for &(fs_s, fs_e) in &bounds {
+        while li < fs_e {
         // mutable per-record $0/fields so sub/gsub can rewrite them
         let mut cur = lines[li].clone();
         li += 1;
         nr += 1;
+        // FNR = records consumed in the CURRENT file (li includes any
+        // records getline already pulled past this file's start)
+        vars.insert(String::from("\x00FNR"), (li - fs_s) as i64);
         let mut fields: Vec<String> = match fs {
             Some(c) => cur.split(c).map(String::from).collect(),
             None => cur.split_whitespace().map(String::from).collect(),
@@ -2902,11 +3011,14 @@ fn awk_eval(
                                 &mut vars, &mut gl, &lines, &mut li,
                                 &mut out, fs) {
                     Err(e) if e == "\x01NEXT" => break, // `next`: next record
+                    // `nextfile`: stop this file's records, next file
+                    Err(e) if e == "\x01NEXTFILE" => continue 'files,
                     // `exit`: stop the rule pass and all input, run END
-                    Err(e) if e == "\x01EXIT" => break 'main,
+                    Err(e) if e == "\x01EXIT" => break 'files,
                     r => r?,
                 }
             }
+        }
         }
     }
     {
@@ -2916,6 +3028,7 @@ fn awk_eval(
                         &mut gl, &lines, &mut li, &mut out, fs) {
             // `exit` inside END is just the end
             Err(e) if e == "\x01EXIT" => {}
+            Err(e) if e == "\x01NEXTFILE" => {}
             r => r?,
         }
     }
@@ -3506,6 +3619,9 @@ fn awk_stmts(
             let rhs = st[p + 1..].trim();
             let v = awk_num(rhs, line, *nr, fields, vars)?;
             vars.insert(String::from(name), v);
+            if name == "FNR" {
+                vars.insert(String::from("\x00FNR"), v);
+            }
         } else if st.starts_with("sub(") || st.starts_with("gsub(") {
             // sub(/re/, "rep" [, target]) / gsub(...): regex substitution on
             // $0 (default) or $N. Rewriting $0 re-splits fields; rewriting a
@@ -3554,6 +3670,9 @@ fn awk_stmts(
         } else if st == "next" {
             // `next`: skip the remaining rules for this record
             return Err(String::from("\x01NEXT"));
+        } else if st == "nextfile" {
+            // `nextfile`: abandon the rest of the current input file
+            return Err(String::from("\x01NEXTFILE"));
         } else if st == "exit" || st.starts_with("exit ") {
             // `exit [expr]`: stop input processing; END still runs
             // (the exit-status operand is dropped — mini-awk reports
@@ -3925,8 +4044,12 @@ fn awk_num(
             *p += 1;
         }
         let t = core::str::from_utf8(&b[s..*p]).unwrap_or("");
-        if t == "NR" || t == "FNR" {
+        if t == "NR" {
             return Ok(nr as i64);
+        }
+        if t == "FNR" {
+            // per-file record count, mirrored into a shadow var each record
+            return Ok(*vars.get("\x00FNR").unwrap_or(&0));
         }
         if t == "NF" {
             return Ok(fields.len() as i64);
@@ -4689,6 +4812,16 @@ impl Term {
                 }
             }
             '#' => {}
+            '!' => {
+                // !cmd — run the shell command, output lands in the buffer
+                // view like GNU ed's stdout
+                let c2 = rest[1..].trim();
+                if c2.is_empty() {
+                    self.emit("!");
+                } else {
+                    self.run(c2);
+                }
+            }
             'P' => {
                 st.prompt = !st.prompt;
             }
@@ -19943,29 +20076,42 @@ impl Term {
                         }
                     }
                 }
-                let (prog, file) = match (fprog, rest) {
-                    (Some(p), r) => (Some(p), r.first().copied()),
-                    (None, [p]) => (Some(String::from(*p)), None),
-                    (None, [p, f, ..]) => (Some(String::from(*p)), Some(*f)),
-                    _ => (None, None),
-                };
+                let (prog, files): (Option<String>, Vec<&str>) =
+                    match (fprog, rest) {
+                        (Some(p), r) => (Some(p), r.to_vec()),
+                        (None, [p, r @ ..]) => {
+                            (Some(String::from(*p)), r.to_vec())
+                        }
+                        _ => (None, Vec::new()),
+                    };
                 let Some(prog) = prog else {
-                    self.fail("usage: awk [-F c] [-v n=v] [-f prog] 'prog' [file]");
+                    self.fail(
+                        "usage: awk [-F c] [-v n=v] [-f prog] 'prog' [file...]",
+                    );
                     return;
                 };
-                let input = match file {
-                    Some(f) => match ustd::read_all(f) {
-                        Ok(d) => String::from_utf8_lossy(&d).into_owned(),
-                        Err(e) => {
-                            self.fail(&alloc::format!("awk: {}: err {}", f, e));
-                            return;
-                        }
-                    },
+                // real multi-file awk: every trailing arg is an input file
+                let mut inputs: Vec<String> = Vec::new();
+                if files.is_empty() {
                     // no file and no pipe: still run the program on empty
                     // input so BEGIN-only awk works like real awk
-                    None => self.pipe_in.clone().unwrap_or_default(),
-                };
-                match awk_eval(&prog, &input, fs, &preseed) {
+                    inputs.push(self.pipe_in.clone().unwrap_or_default());
+                } else {
+                    for f in files {
+                        match ustd::read_all(f) {
+                            Ok(d) => inputs.push(
+                                String::from_utf8_lossy(&d).into_owned(),
+                            ),
+                            Err(e) => {
+                                self.fail(&alloc::format!(
+                                    "awk: {}: err {}", f, e
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                }
+                match awk_eval(&prog, &inputs, fs, &preseed) {
                     Ok(lines) => {
                         for l in lines {
                             self.emit(&l);
@@ -21889,6 +22035,7 @@ impl Term {
                 // only that files differ; -i/-w/-B normalize before comparing;
                 // -r diffs two directory trees ("Only in" + per-file diffs)
                 let unified = args.iter().any(|a| *a == "-u");
+                let edmode = args.iter().any(|a| *a == "-e" || *a == "--ed");
                 let side = args.iter().any(|a| *a == "-y" || *a == "--side-by-side");
                 let brief = args.iter().any(|a| *a == "-q" || *a == "--brief");
                 let rpt_id = args.iter().any(|a| {
@@ -21931,6 +22078,13 @@ impl Term {
                                 diff_unified(&la, &lb, 3)
                             } else if side {
                                 diff_side(&la, &lb, 72)
+                            } else if edmode {
+                                // ed scripts carry the ORIGINAL lines
+                                let ra: Vec<String> =
+                                    sa.lines().map(String::from).collect();
+                                let rb: Vec<String> =
+                                    sb.lines().map(String::from).collect();
+                                diff_ed(&ra, &rb)
                             } else {
                                 diff_lines(&la, &lb)
                             };
