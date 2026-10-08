@@ -119,9 +119,22 @@ impl Wm {
             core::slice::from_raw_parts(&req as *const _ as *const u8, core::mem::size_of::<ReqCreateWin>())
         };
         send_req(self.srv, self.ev, REQ_CREATE_WIN, payload);
-        // bounded wait, generous: under demand-paged ELF loading a cold
-        // winserver can fault in hundreds of pages before it answers
-        let (kind, pl) = poll(self.ev, 15000)?;
+        // Bounded wait, generous: under demand-paged ELF loading a cold
+        // winserver can fault in hundreds of pages before it answers.
+        // Non-RSP messages (an input event can land on ev early) are skipped —
+        // without this, a stray keystroke during the wait made us return None
+        // and the caller died on startup.
+        let deadline = crate::uptime_ms() + 90_000;
+        let (kind, pl) = loop {
+            let left = deadline.saturating_sub(crate::uptime_ms());
+            if left == 0 {
+                return None;
+            }
+            match poll(self.ev, left.min(30_000)) {
+                Some((k, p)) if k == RSP_WIN_CREATED => break (k, p),
+                _ => continue,
+            }
+        };
         if kind != RSP_WIN_CREATED || pl.len() < core::mem::size_of::<RspWinCreated>() {
             return None;
         }
