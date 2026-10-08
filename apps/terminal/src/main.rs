@@ -91,6 +91,304 @@ fn group_name(gid: u32) -> Option<String> {
     })
 }
 
+/// /etc/passwd|/etc/group -> rows of ':'-split fields.
+fn db_rows(path: &str) -> Vec<Vec<String>> {
+    let d = ustd::read_all(path).unwrap_or_default();
+    String::from_utf8_lossy(&d)
+        .into_owned()
+        .lines()
+        .map(|l| l.split(':').map(String::from).collect())
+        .collect()
+}
+
+/// rows -> ':'-joined lines written back to `path`.
+fn db_write(path: &str, rows: &[Vec<String>]) -> Result<(), i64> {
+    let mut s = rows
+        .iter()
+        .map(|r| r.join(":"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !s.is_empty() {
+        s.push('\n');
+    }
+    ustd::write_all(path, s.as_bytes())
+}
+
+/// envsubst-style expansion: `$NAME` / `${NAME}` / `${NAME:-def}` from `vars`
+/// only (no command substitution).
+fn env_subst(s: &str, vars: &alloc::collections::BTreeMap<String, String>) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_') {
+            let mut j = i + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            let name = &s[i + 1..j];
+            out.push_str(vars.get(name).map(String::as_str).unwrap_or(""));
+            i = j;
+        } else if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
+            let mut depth = 1i32;
+            let mut j = i + 2;
+            while j < b.len() && depth > 0 {
+                match b[j] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                let inner = &s[i + 2..j - 1];
+                if let Some((n, d)) = inner.split_once(":-") {
+                    let v = vars.get(n).map(String::as_str).unwrap_or("");
+                    out.push_str(if v.is_empty() { d } else { v });
+                } else if let Some((n, _)) = inner.split_once(':') {
+                    out.push_str(vars.get(n).map(String::as_str).unwrap_or(""));
+                } else {
+                    out.push_str(vars.get(inner).map(String::as_str).unwrap_or(""));
+                }
+                i = j;
+            } else {
+                out.push(b[i] as char);
+                i += 1;
+            }
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// mini-m4: expand `src` left-to-right with builtins and user macros.
+/// `define`/`undefine`/`ifdef`/`eval`/`len`/`substr`/`index`/`translit`/
+/// `include`/`incr`/`decr`, `dnl` comments-to-EOL, and '`'..'`' quoting.
+/// Macro results are pushed back onto the input and rescanned (real m4
+/// semantics); `depth` guards runaway recursion.
+fn m4_expand(
+    t: &mut Term,
+    src: &str,
+    defs: &mut Vec<(String, String)>,
+    depth: usize,
+) -> String {
+    if depth > 24 {
+        return String::from(src);
+    }
+    let mut input = String::from(src);
+    let mut out = String::with_capacity(src.len());
+    let mut steps = 0u32;
+    // pull `name(args...)` or bare `name` at the head of input.
+    // returns (name, args, consumed) — consumed==0 when it is plain text.
+    fn m4_head(inp: &str) -> (String, Vec<String>, usize) {
+        let b = inp.as_bytes();
+        if b.is_empty() {
+            return (String::new(), Vec::new(), 0);
+        }
+        let mut i = 0;
+        if !(b[0].is_ascii_alphabetic() || b[0] == b'_') {
+            return (String::new(), Vec::new(), 0);
+        }
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        let name = String::from(&inp[..i]);
+        if i >= b.len() || b[i] != b'(' {
+            return (name, Vec::new(), i);
+        }
+        // balanced-paren scan honoring '`'..'`' quotes
+        let mut d = 1i32;
+        let mut j = i + 1;
+        let mut q = false;
+        while j < b.len() && d > 0 {
+            match b[j] {
+                b'`' => q = true,
+                b'\'' if q => q = false,
+                b'(' if !q => d += 1,
+                b')' if !q => d -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        if d != 0 {
+            return (name, Vec::new(), i); // unclosed: treat name literally
+        }
+        let inner = &inp[i + 1..j - 1];
+        // split top-level commas (parens/quotes nested inside don't count)
+        let mut args = Vec::new();
+        let mut cd = 0i32;
+        let mut cq = false;
+        let mut cur = String::new();
+        for c in inner.chars() {
+            match c {
+                '`' if !cq => cq = true,
+                '\'' if cq => cq = false,
+                '(' if !cq => {
+                    cd += 1;
+                    cur.push(c);
+                }
+                ')' if !cq => {
+                    cd -= 1;
+                    cur.push(c);
+                }
+                ',' if !cq && cd == 0 => {
+                    args.push(String::from(cur.trim()));
+                    cur.clear();
+                }
+                _ => cur.push(c),
+            }
+        }
+        if !inner.trim().is_empty() || !cur.is_empty() {
+            args.push(String::from(cur.trim()));
+        }
+        // strip one layer of '`'..'`' quoting per arg (m4 rule)
+        for a in args.iter_mut() {
+            if a.starts_with('`') && a.ends_with('\'') && a.len() >= 2 {
+                *a = String::from(&a[1..a.len() - 1]);
+            }
+        }
+        (name, args, j)
+    }
+    fn m4_arg<'a>(a: &'a [String], i: usize) -> &'a str {
+        a.get(i).map(String::as_str).unwrap_or("")
+    }
+    while !input.is_empty() {
+        steps += 1;
+        if steps > 200_000 {
+            break;
+        }
+        let b = input.as_bytes();
+        if b[0] == b'`' {
+            // '`'..'`' quoted literal
+            match input[1..].find('\'') {
+                Some(p) => {
+                    out.push_str(&input[1..1 + p]);
+                    input.drain(..1 + p + 1);
+                }
+                None => {
+                    out.push('`');
+                    input.drain(..1);
+                }
+            }
+            continue;
+        }
+        if input.starts_with("dnl")
+            && (input.len() == 3
+                || !input.as_bytes()[3].is_ascii_alphanumeric()
+                    && input.as_bytes()[3] != b'_')
+        {
+            match input.find('\n') {
+                Some(p) => {
+                    input.drain(..p + 1);
+                }
+                None => input.clear(),
+            }
+            continue;
+        }
+        let (name, fargs, used) = m4_head(&input);
+        if used == 0 {
+            // first char is plain text
+            let c = input.chars().next().unwrap();
+            out.push(c);
+            input.drain(..c.len_utf8());
+            continue;
+        }
+        input.drain(..used);
+        match name.as_str() {
+            "define" => {
+                let n = m4_arg(&fargs, 0);
+                if !n.is_empty() {
+                    let v = String::from(m4_arg(&fargs, 1));
+                    match defs.iter_mut().find(|d| d.0 == n) {
+                        Some(d) => d.1 = v,
+                        None => defs.push((String::from(n), v)),
+                    }
+                }
+            }
+            "undefine" => {
+                let n = m4_arg(&fargs, 0);
+                defs.retain(|d| d.0 != n);
+            }
+            "ifdef" => {
+                let n = m4_arg(&fargs, 0);
+                if defs.iter().any(|d| d.0 == n) {
+                    input.insert_str(0, m4_arg(&fargs, 1));
+                } else if fargs.len() > 2 {
+                    input.insert_str(0, m4_arg(&fargs, 2));
+                }
+            }
+            "eval" => {
+                if let Ok(v) = expr_eval(m4_arg(&fargs, 0)) {
+                    input.insert_str(0, &alloc::format!("{}", v));
+                }
+            }
+            "len" => {
+                let n = m4_arg(&fargs, 0).len();
+                input.insert_str(0, &alloc::format!("{}", n));
+            }
+            "substr" => {
+                let s = m4_arg(&fargs, 0);
+                let i: usize = m4_arg(&fargs, 1).parse().unwrap_or(0);
+                let sub = match fargs.get(2).and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) => s.get(i..i + n).unwrap_or(""),
+                    None => s.get(i..).unwrap_or(""),
+                };
+                input.insert_str(0, sub);
+            }
+            "index" => {
+                let s = m4_arg(&fargs, 0);
+                let n = s.find(m4_arg(&fargs, 1)).map(|p| p as i64).unwrap_or(-1);
+                input.insert_str(0, &alloc::format!("{}", n));
+            }
+            "translit" => {
+                let s = m4_arg(&fargs, 0);
+                let from: Vec<char> = m4_arg(&fargs, 1).chars().collect();
+                let to: Vec<char> = m4_arg(&fargs, 2).chars().collect();
+                let r: String = s
+                    .chars()
+                    .map(|c| match from.iter().position(|&f| f == c) {
+                        Some(p) => *to.get(p).unwrap_or(&c),
+                        None => c,
+                    })
+                    .collect();
+                input.insert_str(0, &r);
+            }
+            "include" => {
+                let f = m4_arg(&fargs, 0);
+                match ustd::read_all(f) {
+                    Ok(d) => input.insert_str(0, &String::from_utf8_lossy(&d)),
+                    Err(e) => t.fail(&alloc::format!("m4: {}: err {}", f, e)),
+                }
+            }
+            "incr" | "decr" => {
+                let n: i64 = m4_arg(&fargs, 0).parse().unwrap_or(0);
+                let v = if name == "incr" { n + 1 } else { n - 1 };
+                input.insert_str(0, &alloc::format!("{}", v));
+            }
+            "m4exit" => input.clear(),
+            _ => {
+                if let Some(d) = defs.iter().find(|d| d.0 == name) {
+                    // expand $0..$9, $#, $@ in the body then rescan
+                    let mut body = d.1.clone();
+                    body = body.replace("$0", &name);
+                    body = body.replace("$#", &alloc::format!("{}", fargs.len()));
+                    for (i, a) in fargs.iter().enumerate() {
+                        body = body.replace(
+                            &alloc::format!("${}", i + 1), a);
+                    }
+                    body = body.replace("$@", &fargs.join(","));
+                    input.insert_str(0, &body);
+                } else {
+                    out.push_str(&name);
+                }
+            }
+        }
+    }
+    out
+}
+
 const COLS: usize = 90;
 const ROWS: usize = 40;
 const CW: i32 = 8;
@@ -23923,6 +24221,625 @@ impl Term {
                                 alloc::format!("\"{}\"", v)
                             };
                     self.emit(&alloc::format!("{}={}", k, v));
+                }
+            }
+            "useradd" | "adduser" => {
+                // useradd [-u uid] [-g grp] [-c gecos] [-d home] [-s sh] [-m] name
+                // appends /etc/passwd + /etc/group rows; -m makes the home dir.
+                let mut uid = -1i64;
+                let mut grp: Option<String> = None;
+                let mut gecos = String::new();
+                let mut home: Option<String> = None;
+                let mut shell = String::from("/bin/sh");
+                let mut mkhome = false;
+                let mut name: Option<&str> = None;
+                let mut i = 1;
+                while i < args.len() {
+                    match args[i] {
+                        "-u" | "-g" | "-c" | "-d" | "-s"
+                            if i + 1 < args.len() =>
+                        {
+                            i += 1;
+                            match args[i - 1] {
+                                "-u" => uid = args[i].parse().unwrap_or(-1),
+                                "-g" => grp = Some(String::from(args[i])),
+                                "-c" => gecos = String::from(args[i]),
+                                "-d" => home = Some(String::from(args[i])),
+                                _ => shell = String::from(args[i]),
+                            }
+                        }
+                        "-m" => mkhome = true,
+                        v if !v.starts_with('-') && name.is_none() => {
+                            name = Some(v)
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let Some(name) = name else {
+                    self.fail("usage: useradd [-u uid] [-g grp] [-c gecos] [-d home] [-s sh] [-m] name");
+                    return;
+                };
+                if name.is_empty() || name.contains(':') {
+                    self.fail("useradd: invalid user name");
+                    return;
+                }
+                let mut rows = db_rows("/etc/passwd");
+                if rows.iter().any(|r| r.first().map(String::as_str) == Some(name)) {
+                    self.fail(&alloc::format!("useradd: '{}' already exists", name));
+                    return;
+                }
+                if uid >= 0
+                    && rows.iter().any(|r| {
+                        r.get(2).and_then(|v| v.parse::<i64>().ok()) == Some(uid)
+                    })
+                {
+                    self.fail(&alloc::format!("useradd: uid {} already in use", uid));
+                    return;
+                }
+                let mut grows = db_rows("/etc/group");
+                let gid: i64 = match &grp {
+                    Some(g) => {
+                        let g2 = g.parse::<u32>().ok().unwrap_or_else(|| gid_of(g));
+                        if g2 == u32::MAX
+                            || !grows.iter().any(|r| {
+                                r.get(2).and_then(|v| v.parse::<u32>().ok()) == Some(g2)
+                            })
+                        {
+                            self.fail(&alloc::format!("useradd: unknown group {}", g));
+                            return;
+                        }
+                        g2 as i64
+                    }
+                    None => {
+                        if let Some(r) = grows.iter().find(|r| {
+                            r.first().map(String::as_str) == Some(name)
+                        }) {
+                            r.get(2).and_then(|v| v.parse().ok()).unwrap_or(0)
+                        } else {
+                            let ng = grows
+                                .iter()
+                                .filter_map(|r| {
+                                    r.get(2).and_then(|v| v.parse::<i64>().ok())
+                                })
+                                .max()
+                                .unwrap_or(0)
+                                .max(999)
+                                + 1;
+                            grows.push(alloc::vec![
+                                String::from(name),
+                                String::from("x"),
+                                ng.to_string(),
+                                String::new(),
+                            ]);
+                            ng
+                        }
+                    }
+                };
+                let uidf = if uid >= 0 {
+                    uid
+                } else {
+                    rows.iter()
+                        .filter_map(|r| r.get(2).and_then(|v| v.parse::<i64>().ok()))
+                        .max()
+                        .unwrap_or(0)
+                        .max(999)
+                        + 1
+                };
+                let homep = home.unwrap_or_else(|| alloc::format!("/home/{}", name));
+                rows.push(alloc::vec![
+                    String::from(name),
+                    String::from("x"),
+                    uidf.to_string(),
+                    gid.to_string(),
+                    gecos,
+                    homep.clone(),
+                    shell,
+                ]);
+                let mut ok = db_write("/etc/passwd", &rows).is_ok()
+                    && db_write("/etc/group", &grows).is_ok();
+                if ok && mkhome {
+                    ok = ustd::mkdir(&homep).is_ok();
+                }
+                if ok {
+                    self.emit(&alloc::format!(
+                        "useradd: '{}' uid={} gid={} home={}",
+                        name, uidf, gid, homep
+                    ));
+                } else {
+                    self.fail("useradd: could not write user db");
+                }
+            }
+            "userdel" => {
+                // userdel [-r] name — drop the passwd row, its same-name
+                // group (when no other row holds that gid), and scrub the
+                // name from other groups' member lists; -r removes home.
+                let rm_home = args.iter().any(|a| *a == "-r");
+                let name = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .copied()
+                    .unwrap_or("");
+                if name.is_empty() {
+                    self.fail("usage: userdel [-r] name");
+                    return;
+                }
+                let rows = db_rows("/etc/passwd");
+                let Some(row) = rows.iter().find(|r| {
+                    r.first().map(String::as_str) == Some(name)
+                }) else {
+                    self.fail(&alloc::format!("userdel: no such user '{}'", name));
+                    return;
+                };
+                let home = row.get(5).cloned().unwrap_or_default();
+                let gid = row.get(3).cloned().unwrap_or_default();
+                let kept: Vec<Vec<String>> = rows
+                    .into_iter()
+                    .filter(|r| r.first().map(String::as_str) != Some(name))
+                    .collect();
+                let gid_still_used = kept
+                    .iter()
+                    .any(|r| r.get(3).map(String::as_str) == Some(gid.as_str()));
+                let gout: Vec<Vec<String>> = db_rows("/etc/group")
+                    .into_iter()
+                    .filter(|r| {
+                        !(r.first().map(String::as_str) == Some(name)
+                            && !gid_still_used)
+                    })
+                    .map(|mut r| {
+                        if r.len() > 3 {
+                            let mem: Vec<&str> = r[3]
+                                .split(',')
+                                .filter(|m| !m.is_empty() && *m != name)
+                                .collect();
+                            r[3] = mem.join(",");
+                        }
+                        r
+                    })
+                    .collect();
+                let mut ok = db_write("/etc/passwd", &kept).is_ok()
+                    && db_write("/etc/group", &gout).is_ok();
+                if ok && rm_home && !home.is_empty() {
+                    let line = alloc::format!("rm -r {}", home);
+                    self.run(&line);
+                    ok = self.last_ok;
+                }
+                if ok {
+                    self.emit(&alloc::format!("userdel: '{}' removed", name));
+                } else {
+                    self.fail("userdel: could not update user db");
+                }
+            }
+            "usermod" => {
+                // usermod [-u uid] [-g grp] [-c gecos] [-d home] [-s sh]
+                //         [-l newname] name — patch the passwd row in place.
+                let mut name: Option<&str> = None;
+                let mut newname: Option<String> = None;
+                let mut uid: Option<String> = None;
+                let mut grp: Option<String> = None;
+                let mut gecos: Option<String> = None;
+                let mut home: Option<String> = None;
+                let mut shell: Option<String> = None;
+                let mut i = 1;
+                while i < args.len() {
+                    match args[i] {
+                        "-u" | "-g" | "-c" | "-d" | "-s" | "-l"
+                            if i + 1 < args.len() =>
+                        {
+                            i += 1;
+                            let v = String::from(args[i]);
+                            match args[i - 1] {
+                                "-u" => uid = Some(v),
+                                "-g" => grp = Some(v),
+                                "-c" => gecos = Some(v),
+                                "-d" => home = Some(v),
+                                "-l" => newname = Some(v),
+                                _ => shell = Some(v),
+                            }
+                        }
+                        v if !v.starts_with('-') && name.is_none() => {
+                            name = Some(v)
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let Some(name) = name else {
+                    self.fail("usage: usermod [-u uid] [-g grp] [-c gecos] [-d home] [-s sh] [-l newname] name");
+                    return;
+                };
+                let mut rows = db_rows("/etc/passwd");
+                let Some(ri) = rows.iter().position(|r| {
+                    r.first().map(String::as_str) == Some(name)
+                }) else {
+                    self.fail(&alloc::format!("usermod: no such user '{}'", name));
+                    return;
+                };
+                while rows[ri].len() < 7 {
+                    rows[ri].push(String::new());
+                }
+                if let Some(n) = newname {
+                    if n.is_empty() || n.contains(':') {
+                        self.fail("usermod: invalid new name");
+                        return;
+                    }
+                    rows[ri][0] = n;
+                }
+                if let Some(u) = uid {
+                    rows[ri][2] = u;
+                }
+                if let Some(g) = grp {
+                    let gid = g.parse::<u32>().ok().unwrap_or_else(|| gid_of(&g));
+                    if gid == u32::MAX {
+                        self.fail(&alloc::format!("usermod: unknown group {}", g));
+                        return;
+                    }
+                    rows[ri][3] = gid.to_string();
+                }
+                if let Some(c) = gecos {
+                    rows[ri][4] = c;
+                }
+                if let Some(d) = home {
+                    rows[ri][5] = d;
+                }
+                if let Some(s) = shell {
+                    rows[ri][6] = s;
+                }
+                match db_write("/etc/passwd", &rows) {
+                    Ok(_) => self.emit(&alloc::format!(
+                        "usermod: '{}' -> {}",
+                        name,
+                        rows[ri].join(":")
+                    )),
+                    Err(e) => self.fail(&alloc::format!("usermod: err {}", e)),
+                }
+            }
+            "groupadd" => {
+                // groupadd [-g gid] name
+                let mut gid = -1i64;
+                let mut name: Option<&str> = None;
+                let mut i = 1;
+                while i < args.len() {
+                    if args[i] == "-g" && i + 1 < args.len() {
+                        i += 1;
+                        gid = args[i].parse().unwrap_or(-1);
+                    } else if !args[i].starts_with('-') && name.is_none() {
+                        name = Some(args[i]);
+                    }
+                    i += 1;
+                }
+                let Some(name) = name else {
+                    self.fail("usage: groupadd [-g gid] name");
+                    return;
+                };
+                let mut rows = db_rows("/etc/group");
+                if rows.iter().any(|r| r.first().map(String::as_str) == Some(name)) {
+                    self.fail(&alloc::format!("groupadd: '{}' already exists", name));
+                    return;
+                }
+                if gid >= 0
+                    && rows.iter().any(|r| {
+                        r.get(2).and_then(|v| v.parse::<i64>().ok()) == Some(gid)
+                    })
+                {
+                    self.fail(&alloc::format!("groupadd: gid {} already in use", gid));
+                    return;
+                }
+                let gidf = if gid >= 0 {
+                    gid
+                } else {
+                    rows.iter()
+                        .filter_map(|r| r.get(2).and_then(|v| v.parse::<i64>().ok()))
+                        .max()
+                        .unwrap_or(0)
+                        .max(999)
+                        + 1
+                };
+                rows.push(alloc::vec![
+                    String::from(name),
+                    String::from("x"),
+                    gidf.to_string(),
+                    String::new(),
+                ]);
+                match db_write("/etc/group", &rows) {
+                    Ok(_) => self.emit(&alloc::format!(
+                        "groupadd: '{}' gid={}", name, gidf)),
+                    Err(e) => self.fail(&alloc::format!("groupadd: err {}", e)),
+                }
+            }
+            "groupdel" => {
+                // groupdel name — refuses while it is any user's primary group.
+                let name = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .copied()
+                    .unwrap_or("");
+                if name.is_empty() {
+                    self.fail("usage: groupdel name");
+                    return;
+                }
+                let rows = db_rows("/etc/group");
+                let Some(row) = rows.iter().find(|r| {
+                    r.first().map(String::as_str) == Some(name)
+                }) else {
+                    self.fail(&alloc::format!("groupdel: no such group '{}'", name));
+                    return;
+                };
+                let gid = row.get(2).cloned().unwrap_or_default();
+                let prims = db_rows("/etc/passwd");
+                if prims.iter().any(|r| {
+                    r.get(3).map(String::as_str) == Some(gid.as_str())
+                }) {
+                    self.fail("groupdel: cannot remove a primary group");
+                    return;
+                }
+                let kept: Vec<Vec<String>> = rows
+                    .into_iter()
+                    .filter(|r| r.first().map(String::as_str) != Some(name))
+                    .collect();
+                match db_write("/etc/group", &kept) {
+                    Ok(_) => self.emit(&alloc::format!("groupdel: '{}' removed", name)),
+                    Err(e) => self.fail(&alloc::format!("groupdel: err {}", e)),
+                }
+            }
+            "groupmod" => {
+                // groupmod [-g gid] [-n new] name — -g remaps passwd rows too.
+                let mut gid: Option<String> = None;
+                let mut newname: Option<String> = None;
+                let mut name: Option<&str> = None;
+                let mut i = 1;
+                while i < args.len() {
+                    match args[i] {
+                        "-g" | "-n" if i + 1 < args.len() => {
+                            i += 1;
+                            if args[i - 1] == "-g" {
+                                gid = Some(String::from(args[i]));
+                            } else {
+                                newname = Some(String::from(args[i]));
+                            }
+                        }
+                        v if !v.starts_with('-') && name.is_none() => {
+                            name = Some(v)
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let Some(name) = name else {
+                    self.fail("usage: groupmod [-g gid] [-n new] name");
+                    return;
+                };
+                let mut rows = db_rows("/etc/group");
+                let Some(ri) = rows.iter().position(|r| {
+                    r.first().map(String::as_str) == Some(name)
+                }) else {
+                    self.fail(&alloc::format!("groupmod: no such group '{}'", name));
+                    return;
+                };
+                while rows[ri].len() < 3 {
+                    rows[ri].push(String::new());
+                }
+                if let Some(n) = newname {
+                    if n.is_empty() || n.contains(':') {
+                        self.fail("groupmod: invalid name");
+                        return;
+                    }
+                    rows[ri][0] = n;
+                }
+                if let Some(g) = gid {
+                    let old = rows[ri][2].clone();
+                    rows[ri][2] = g.clone();
+                    let mut prims = db_rows("/etc/passwd");
+                    let mut touched = false;
+                    for r in prims.iter_mut() {
+                        if r.get(3).map(String::as_str) == Some(old.as_str()) {
+                            r[3] = g.clone();
+                            touched = true;
+                        }
+                    }
+                    if touched {
+                        let _ = db_write("/etc/passwd", &prims);
+                    }
+                }
+                match db_write("/etc/group", &rows) {
+                    Ok(_) => self.emit(&alloc::format!(
+                        "groupmod: '{}' -> {}",
+                        name,
+                        rows[ri].join(":")
+                    )),
+                    Err(e) => self.fail(&alloc::format!("groupmod: err {}", e)),
+                }
+            }
+            "chsh" => {
+                // chsh -s shell [user] — rewrite the passwd shell field.
+                let mut shell: Option<String> = None;
+                let mut user: Option<&str> = None;
+                let mut i = 1;
+                while i < args.len() {
+                    if (args[i] == "-s" || args[i] == "--shell")
+                        && i + 1 < args.len()
+                    {
+                        i += 1;
+                        shell = Some(String::from(args[i]));
+                    } else if !args[i].starts_with('-') && user.is_none() {
+                        user = Some(args[i]);
+                    }
+                    i += 1;
+                }
+                let Some(sh) = shell else {
+                    self.fail("usage: chsh -s shell [user]");
+                    return;
+                };
+                let user = user.map(String::from).unwrap_or_else(|| {
+                    user_name(ustd::getuid()).unwrap_or_else(|| String::from("root"))
+                });
+                let mut rows = db_rows("/etc/passwd");
+                let Some(ri) = rows.iter().position(|r| {
+                    r.first().map(String::as_str) == Some(user.as_str())
+                }) else {
+                    self.fail(&alloc::format!("chsh: no such user '{}'", user));
+                    return;
+                };
+                while rows[ri].len() < 7 {
+                    rows[ri].push(String::new());
+                }
+                rows[ri][6] = sh.clone();
+                match db_write("/etc/passwd", &rows) {
+                    Ok(_) => self.emit(&alloc::format!(
+                        "chsh: {} shell -> {}", user, sh)),
+                    Err(e) => self.fail(&alloc::format!("chsh: err {}", e)),
+                }
+            }
+            "chfn" => {
+                // chfn [-f full-name] [user] — rewrite the gecos field.
+                let mut gecos: Option<String> = None;
+                let mut user: Option<&str> = None;
+                let mut i = 1;
+                while i < args.len() {
+                    if (args[i] == "-f" || args[i] == "--full-name")
+                        && i + 1 < args.len()
+                    {
+                        i += 1;
+                        gecos = Some(String::from(args[i]));
+                    } else if !args[i].starts_with('-') && user.is_none() {
+                        user = Some(args[i]);
+                    }
+                    i += 1;
+                }
+                let g = gecos.unwrap_or_default();
+                let user = user.map(String::from).unwrap_or_else(|| {
+                    user_name(ustd::getuid()).unwrap_or_else(|| String::from("root"))
+                });
+                let mut rows = db_rows("/etc/passwd");
+                let Some(ri) = rows.iter().position(|r| {
+                    r.first().map(String::as_str) == Some(user.as_str())
+                }) else {
+                    self.fail(&alloc::format!("chfn: no such user '{}'", user));
+                    return;
+                };
+                while rows[ri].len() < 5 {
+                    rows[ri].push(String::new());
+                }
+                rows[ri][4] = g;
+                match db_write("/etc/passwd", &rows) {
+                    Ok(_) => self.emit(&alloc::format!("chfn: {} gecos updated", user)),
+                    Err(e) => self.fail(&alloc::format!("chfn: err {}", e)),
+                }
+            }
+            "passwd" => {
+                // passwd [user] [newpw] — sets the /etc/passwd password field.
+                // No pw arg -> 'x' (shadow-managed marker).
+                let nf: Vec<&&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).collect();
+                let user = nf
+                    .first()
+                    .map(|s| String::from(**s))
+                    .unwrap_or_else(|| {
+                        user_name(ustd::getuid())
+                            .unwrap_or_else(|| String::from("root"))
+                    });
+                let pw = nf
+                    .get(1)
+                    .map(|s| String::from(**s))
+                    .unwrap_or_else(|| String::from("x"));
+                let mut rows = db_rows("/etc/passwd");
+                let Some(ri) = rows.iter().position(|r| {
+                    r.first().map(String::as_str) == Some(user.as_str())
+                }) else {
+                    self.fail(&alloc::format!("passwd: no such user '{}'", user));
+                    return;
+                };
+                while rows[ri].len() < 2 {
+                    rows[ri].push(String::new());
+                }
+                rows[ri][1] = pw;
+                match db_write("/etc/passwd", &rows) {
+                    Ok(_) => self.emit(&alloc::format!(
+                        "passwd: password updated for {}", user)),
+                    Err(e) => self.fail(&alloc::format!("passwd: err {}", e)),
+                }
+            }
+            "newgrp" => {
+                // newgrp group — switch primary gid via setgid+setgroups.
+                let g = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .copied()
+                    .unwrap_or("");
+                if g.is_empty() {
+                    self.fail("usage: newgrp group");
+                    return;
+                }
+                let gid = g.parse::<u32>().ok().unwrap_or_else(|| gid_of(g));
+                if gid == u32::MAX {
+                    self.fail(&alloc::format!("newgrp: unknown group {}", g));
+                    return;
+                }
+                if ustd::setgid(gid) == 0 && ustd::setgroups(&[gid]) == 0 {
+                    self.emit(&alloc::format!("newgrp: gid={} ({})", gid, g));
+                } else {
+                    self.fail("newgrp: setgid failed");
+                }
+            }
+            "envsubst" => {
+                // envsubst [file] — expand $NAME/${NAME}/${NAME:-d} on
+                // stdin/file using only shell vars (gettext semantics).
+                let src = match args.iter().find(|a| !a.starts_with('-')) {
+                    Some(f) => match ustd::read_all(f) {
+                        Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                        Err(e) => {
+                            self.fail(&alloc::format!(
+                                "envsubst: {}: err {}", f, e));
+                            return;
+                        }
+                    },
+                    None => self.pipe_in.take().unwrap_or_default(),
+                };
+                let out = env_subst(&src, &self.vars);
+                for l in out.split('\n').collect::<Vec<_>>().iter().rev().skip_while(|l| l.is_empty()).collect::<Vec<_>>().iter().rev() {
+                    self.emit(l);
+                }
+            }
+            "m4" => {
+                // m4 [file] — mini macro processor: define/undefine/ifdef/
+                // eval/len/substr/index/translit/include/incr/decr, dnl,
+                // '`'..'`' quoting, $1..$9 in user macros. Reads file|stdin.
+                let src = match args.iter().find(|a| !a.starts_with('-')) {
+                    Some(f) => match ustd::read_all(f) {
+                        Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                        Err(e) => {
+                            self.fail(&alloc::format!("m4: {}: err {}", f, e));
+                            return;
+                        }
+                    },
+                    None => self.pipe_in.take().unwrap_or_default(),
+                };
+                let mut defs: Vec<(String, String)> = Vec::new();
+                let out = m4_expand(self, &src, &mut defs, 0);
+                self.emit(&out);
+            }
+            "nsenter" => {
+                // nsenter <ns-file> cmd... — setns() on a /proc/pid/ns/*
+                // object, then run cmd in the same terminal task.
+                let nf: Vec<&&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).collect();
+                if nf.len() < 2 {
+                    self.fail("usage: nsenter <ns-file> <cmd>...");
+                    return;
+                }
+                match ustd::open(nf[0], 0) {
+                    Ok(fd) => {
+                        if ustd::setns(fd as u64) != 0 {
+                            self.fail("nsenter: setns failed");
+                            let _ = ustd::close(fd);
+                            return;
+                        }
+                        let _ = ustd::close(fd);
+                        let cmdline = nf[1..].iter().map(|s| **s).collect::<Vec<_>>().join(" ");
+                        self.run(&cmdline);
+                    }
+                    Err(e) => self.fail(&alloc::format!(
+                        "nsenter: {}: err {}", nf[0], e)),
                 }
             }
             "patch" => {
