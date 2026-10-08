@@ -4974,6 +4974,9 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         ).is_ok();
         match ustd::fork() {
             0 => {
+                // let the parent move us into the throttled group first —
+                // writes before membership lands are uncharged/unpaced.
+                ustd::sleep_ms(900);
                 let buf = alloc::vec![0x77u8; 65536];
                 for _ in 0..4 {
                     let _ = ustd::write_all("/iotest.bin", &buf);
