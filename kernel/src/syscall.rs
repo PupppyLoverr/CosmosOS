@@ -536,17 +536,21 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
             _ => ERR,
         }),
-        shared::SYS_TIOCSTI => task::with_current(|t| match t.fds.get(a1 as usize) {
-            Some(Some(f)) if crate::pty::handles(&f.path) => {
-                // Linux gates TIOCSTI on CAP_SYS_ADMIN — root only here.
-                if t.euid != 0 {
-                    ERR
-                } else {
-                    crate::pty::tiocsti(&f.path, a2 as u8) as u64
-                }
+        shared::SYS_CAPGET => sys_capget(a1, a2),
+        shared::SYS_CAPSET => sys_capset(a1, a2),
+        shared::SYS_TIOCSTI => {
+            // Linux gates TIOCSTI on CAP_SYS_ADMIN.
+            if !task::capable(task::CAP_SYS_ADMIN) {
+                ERR
+            } else {
+                task::with_current(|t| match t.fds.get(a1 as usize) {
+                    Some(Some(f)) if crate::pty::handles(&f.path) => {
+                        crate::pty::tiocsti(&f.path, a2 as u8) as u64
+                    }
+                    _ => ERR,
+                })
             }
-            _ => ERR,
-        }),
+        }
         shared::SYS_PTSNAME => {
             let sp = task::with_current(|t| match t.fds.get(a1 as usize) {
                 Some(Some(f)) => crate::pty::slave_path(&f.path),
@@ -938,7 +942,14 @@ pub fn dispatch(ctx: &mut CpuContext) {
             let name = String::from_utf8_lossy(&nb).into_owned();
             crate::mqueue::unlink(&name) as u64
         }
-        shared::SYS_KILL => sys_kill(task::visible_pid(a1 as i64) as u64),
+        shared::SYS_KILL => {
+            let p = task::visible_pid(a1 as i64) as u32;
+            if !task::signal_perm(p) {
+                (-1i64) as u64 // EPERM
+            } else {
+                sys_kill(p as u64)
+            }
+        }
         shared::SYS_NET_PING => {
             let ip = [
                 (a1 >> 24) as u8,
@@ -1127,8 +1138,12 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 .unwrap_or_else(|e| e as u64)
         }
         shared::SYS_RTC_SET => {
-            crate::timer::set_unix(a1);
-            0
+            if !task::capable(task::CAP_SYS_TIME) {
+                ERR
+            } else {
+                crate::timer::set_unix(a1);
+                0
+            }
         }
         shared::SYS_UMASK => task::with_current(|t| {
             let old = t.umask as u64;
@@ -2032,7 +2047,12 @@ pub fn dispatch(ctx: &mut CpuContext) {
         }
         shared::SYS_NICE => task::set_nice(a1 as u32, a2 as i64) as u64,
         shared::SYS_KILL2 => {
-            task::signal(task::visible_pid(a1 as i64) as u32, a2) as u64
+            let p = task::visible_pid(a1 as i64) as u32;
+            if !task::signal_perm(p) {
+                (-1i64) as u64 // EPERM
+            } else {
+                task::signal(p, a2) as u64
+            }
         }
         shared::SYS_HOSTNAME_GET => {
             let h = hostname();
@@ -2042,18 +2062,26 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
-        shared::SYS_HOSTNAME_SET => match copy_in(a1, a2.min(64)) {
-            Some(b) => {
-                let h = String::from(String::from_utf8_lossy(&b).trim());
-                if h.is_empty() {
-                    ERR
-                } else {
-                    set_hostname(h);
-                    0
+        shared::SYS_HOSTNAME_SET => {
+            if !task::capable(task::CAP_SYS_ADMIN) {
+                ERR
+            } else {
+                match copy_in(a1, a2.min(64)) {
+                    Some(b) => {
+                        let h = String::from(
+                            String::from_utf8_lossy(&b).trim(),
+                        );
+                        if h.is_empty() {
+                            ERR
+                        } else {
+                            set_hostname(h);
+                            0
+                        }
+                    }
+                    None => ERR,
                 }
             }
-            None => ERR,
-        },
+        }
         shared::SYS_STRACE => match a1 {
             // (op, pid, out, cap): 0 start, 1 stop, 2 drain packed 7*u64 recs
             0 => task::trace_start(a2 as u32) as u64,
@@ -3227,6 +3255,9 @@ fn sys_pidfd_signal(pidfd: u64, sig: u64) -> u64 {
         // permission-style probe: 0 = target exists
         return if task::with_pid_mut(pid, |_| 0) == 0 { 0 } else { ERR };
     }
+    if !task::signal_perm(pid) {
+        return (-1i64) as u64;
+    }
     if task::signal(pid, sig) == 0 {
         0
     } else {
@@ -3431,6 +3462,9 @@ fn sys_symlink_impl(target: &str, link: &str) -> u64 {
 /// target dir; source is ignored like Linux tmpfs. Flags: MS_RDONLY(1),
 /// MS_REMOUNT(32) — remount flips ro on the existing mount.
 fn sys_mount(argp: u64) -> u64 {
+    if !task::capable(task::CAP_SYS_ADMIN) {
+        return (-1i64) as u64; // EPERM
+    }
     let Some(a) = copy_in(argp, 64) else { return ERR };
     let rd = |i: usize| u64::from_le_bytes(a[i * 8..i * 8 + 8].try_into().unwrap());
     let (Some(tgt), Some(fst)) = (copy_str(rd(2) as u64, rd(3) as u64), copy_str(rd(4) as u64, rd(5) as u64))
@@ -3498,6 +3532,9 @@ fn sys_mount(argp: u64) -> u64 {
 /// SYS_CHROOT(path): jail the task under `path` — must be a directory.
 /// Absolute paths resolve under it via vfs::normalize; `..` can't escape.
 fn sys_chroot(pptr: u64, plen: u64) -> u64 {
+    if !task::capable(task::CAP_SYS_CHROOT) {
+        return (-1i64) as u64; // EPERM
+    }
     let Some(p) = copy_str(pptr, plen) else { return ERR };
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = vfs::normalize(&cwd, p.trim_matches('\0'));
@@ -3515,6 +3552,9 @@ fn sys_chroot(pptr: u64, plen: u64) -> u64 {
 
 /// SYS_UMOUNT(target): EBUSY on open fds/cwd/nested mounts under it.
 fn sys_umount(ptr: u64, len: u64, flags: u64) -> u64 {
+    if !task::capable(task::CAP_SYS_ADMIN) {
+        return (-1i64) as u64; // EPERM
+    }
     let Some(tgt) = copy_str(ptr, len) else { return ERR };
     let cwd = task::with_current(|t| t.cwd.clone());
     let t = vfs::normalize(&cwd, tgt.trim_matches('\0'));
@@ -3530,6 +3570,9 @@ fn sys_umount(ptr: u64, len: u64, flags: u64) -> u64 {
 /// task's root to new_root, keeping the old root reachable at
 /// new_root/put_old via a real bind entry. Pivoting is per-task.
 fn sys_pivot_root(argp: u64) -> u64 {
+    if !task::capable(task::CAP_SYS_ADMIN) {
+        return (-1i64) as u64; // EPERM
+    }
     let Some(a) = copy_in(argp, 32) else { return ERR };
     let rd = |i: usize| u64::from_le_bytes(a[i * 8..i * 8 + 8].try_into().unwrap());
     let (Some(newp), Some(oldp)) = (copy_str(rd(0), rd(1)), copy_str(rd(2), rd(3))) else {
@@ -3705,6 +3748,9 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
 /// SYS_UNSHARE(flags): CLONE_NEWNS gives the task a private mount
 /// namespace — mounts/binds/unmounts stop propagating to the parent.
 fn sys_unshare(flags: u64) -> u64 {
+    if !task::capable(task::CAP_SYS_ADMIN) {
+        return (-1i64) as u64; // EPERM
+    }
     let want = shared::CLONE_NEWNS | shared::CLONE_NEWUTS | shared::CLONE_NEWPID;
     if flags & !want != 0 {
         return (-22i64) as u64; // EINVAL: unsupported share bits
@@ -3725,6 +3771,9 @@ fn sys_unshare(flags: u64) -> u64 {
 /// open-close (noop), 2 read-new (shared unread cursor), 3 read-all,
 /// 4 read-all+clear, 5 clear, 9 unread-bytes, 10 buffer-capacity.
 fn sys_syslog(action: u64, ptr: u64, len: u64) -> u64 {
+    if !task::capable(task::CAP_SYS_ADMIN) {
+        return (-1i64) as u64; // EPERM
+    }
     match action {
         0 | 1 => 0,
         2 => {
@@ -3786,6 +3835,9 @@ fn sys_tfd_gettime(fd: u64, ptr: u64) -> u64 {
 /// SYS_REBOOT(magic1, magic2, cmd): RB_RESTART / RB_HALT / RB_POWER_OFF.
 /// Bad magic is EINVAL before anything destructive can run.
 fn sys_reboot_call(m1: u64, m2: u64, cmd: u64) -> u64 {
+    if !task::capable(task::CAP_SYS_BOOT) {
+        return (-1i64) as u64; // EPERM
+    }
     if m1 != shared::RB_MAGIC1 || m2 != shared::RB_MAGIC2 {
         return (-22i64) as u64;
     }
@@ -3800,8 +3852,9 @@ fn sys_reboot_call(m1: u64, m2: u64, cmd: u64) -> u64 {
 /// only restore its effective id to its real one — EPERM otherwise.
 fn sys_setid(v: u64, group: bool) -> u64 {
     let u = v as u32;
+    let cap = if group { task::CAP_SETGID } else { task::CAP_SETUID };
     task::with_current(|t| {
-        if t.euid == 0 {
+        if task::caps_eff_of(t) & cap != 0 {
             if group {
                 t.gid = u;
                 t.egid = u;
@@ -3858,7 +3911,7 @@ fn sys_setgroups(ptr: u64, count: u64) -> u64 {
         ]));
     }
     task::with_current(|t| {
-        if t.euid != 0 {
+        if task::caps_eff_of(t) & task::CAP_SETGID == 0 {
             (-1i64) as u64 // EPERM
         } else {
             t.groups = gs;
@@ -3878,7 +3931,9 @@ fn sys_setresid(r: u64, e: u64, s: u64, group: bool) -> u64 {
             (t.uid, t.euid, t.suid)
         };
         let keep = u32::MAX;
-        let allowed = |v: u32| t.euid == 0 || v == cr || v == ce || v == cs;
+        let cap = if group { task::CAP_SETGID } else { task::CAP_SETUID };
+        let allowed =
+            |v: u32| task::caps_eff_of(t) & cap != 0 || v == cr || v == ce || v == cs;
         for v in [r, e, s] {
             if v != keep && !allowed(v) {
                 return (-1i64) as u64; // EPERM
@@ -3935,9 +3990,8 @@ fn sys_chown(pptr: u64, plen: u64, uid: u64, gid: u64) -> u64 {
             .map(|_| 0)
             .unwrap_or_else(|e| e as u64);
     }
-    let (eu, _) = task::cred();
-    if eu != 0 {
-        return (-1i64) as u64; // EPERM — non-root, any filesystem
+    if !task::capable(task::CAP_CHOWN) {
+        return (-1i64) as u64; // EPERM — no CAP_CHOWN, any filesystem
     }
     (-1i64) as u64 // EPERM — vfat has no owners
 }
@@ -3971,8 +4025,7 @@ fn sys_chmod(pptr: u64, plen: u64, mode: u64) -> u64 {
             .map(|_| 0)
             .unwrap_or_else(|e| e as u64);
     }
-    let (eu, _) = task::cred();
-    if eu != 0 {
+    if !task::capable(task::CAP_FOWNER) {
         return (-1i64) as u64;
     }
     // FAT: owner-write masked -> readonly attr; other bits unmapped
@@ -3986,6 +4039,9 @@ fn sys_chmod(pptr: u64, plen: u64, mode: u64) -> u64 {
 /// /proc/<pid>/ns/{mntns,uts} whose stored path is /nsfd/{n} pinning a
 /// MountNs or UtsNs object. EINVAL on a non-ns fd.
 fn sys_setns(fd: u64) -> u64 {
+    if !task::capable(task::CAP_SYS_ADMIN) {
+        return (-1i64) as u64; // EPERM
+    }
     let path = task::with_current(|t| match t.fds.get(fd as usize) {
         Some(Some(f)) => f.path.clone(),
         _ => String::new(),
@@ -4553,7 +4609,14 @@ fn sys_ptrace(op: u64, pid: u32, addr: u64, data: u64) -> u64 {
             0
         }
         shared::PT_ATTACH => {
+            // Linux: same-uid tracing is free; anything else needs
+            // CAP_SYS_PTRACE.
+            let (ru, _, eu, _) = task::creds();
+            let privd = task::capable(task::CAP_SYS_PTRACE);
             let ok = task::with_pid_mut(pid, |t| {
+                if !privd && ru != t.uid && eu != t.uid && ru != t.suid && eu != t.suid {
+                    return -1;
+                }
                 if !t.is_user
                     || t.state == task::State::Dead
                     || t.id == 1
@@ -5082,6 +5145,44 @@ fn sys_waitid(ctx: &mut CpuContext, idtype: u64, id: u64, flags: u64) -> u64 {
     });
     ctx.rip -= 2;
     task::yield_ctx(ctx);
+}
+
+/// SYS_CAPGET(pid, out u64[3]): (effective, permitted, bounding) of
+/// `pid` — 0 = caller. The effective set is derived: euid 0 wields
+/// permitted; a non-root task shows its stored cap_eff.
+fn sys_capget(pid: u64, out: u64) -> u64 {
+    let v = if pid == 0 {
+        Some(task::capset3())
+    } else {
+        task::pid_caps(pid as u32)
+    };
+    match v {
+        Some((e, p, b)) => {
+            let mut buf = alloc::vec![0u8; 24];
+            for (i, v) in [e, p, b].iter().enumerate() {
+                buf[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            match copy_out(out, &buf) {
+                Some(()) => 0,
+                None => ERR,
+            }
+        }
+        None => (-3i64) as u64, // ESRCH
+    }
+}
+
+/// SYS_CAPSET(pid, in u64[2]{eff,prm}): self only (pid 0 or own id) —
+/// Linux requires CAP_SETPCAP to touch another task's set and our
+/// tasks never hand it out, so cross-task sets stay EPERM.
+fn sys_capset(pid: u64, inp: u64) -> u64 {
+    let me = task::current_id();
+    if pid != 0 && pid as u32 != me {
+        return (-1i64) as u64; // EPERM
+    }
+    let Some(a) = copy_in(inp, 16) else { return ERR };
+    let eff = u64::from_le_bytes(a[..8].try_into().unwrap());
+    let prm = u64::from_le_bytes(a[8..].try_into().unwrap());
+    task::capset_self(eff, prm) as u64
 }
 
 fn sys_kill(pid: u64) -> u64 {
