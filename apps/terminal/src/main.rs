@@ -187,6 +187,33 @@ fn host_arg(s: &str) -> Option<[u8; 4]> {
     parse_ipv4(s).or_else(|| ustd::net_dns(s))
 }
 
+/// Shell-style wildcard match: `*` (any run) and `?` (single char).
+fn wild_match(pat: &str, s: &str) -> bool {
+    let (p, s) = (pat.as_bytes(), s.as_bytes());
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star_p, mut star_s) = (usize::MAX, 0usize);
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star_p = pi;
+            star_s = si;
+            pi += 1;
+        } else if star_p != usize::MAX {
+            pi = star_p + 1;
+            star_s += 1;
+            si = star_s;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 struct Term {
     win: Window,
     c: Canvas,
@@ -477,6 +504,7 @@ impl Term {
                     "          df  (volume usage)  more  cal  tree  seq  sleep  sh  calc  ntp",
                     "          httpd <port>  arp  dmesg  nc <ip> <port>  true  false",
                     "          fserve <port> <file>  fget <ip> <port> <out>  shot [path]",
+                    "          find <dir> [pat]  killall <name>  basename/dirname  strings",
                     "          ops: a ; b   a && b   a || b",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
@@ -1199,6 +1227,82 @@ impl Term {
                 },
                 None => self.fail("usage: kill <pid>"),
             },
+            "killall" => match args.first() {
+                Some(name) => {
+                    let mut n = 0u32;
+                    for p in ustd::proclist(64) {
+                        let pname = core::str::from_utf8(&p.name)
+                            .unwrap_or("")
+                            .trim_end_matches('\0');
+                        if pname.contains(*name) && ustd::kill(p.pid) {
+                            n += 1;
+                        }
+                    }
+                    if n == 0 {
+                        self.fail(&alloc::format!("killall: no process matching '{}'", name));
+                    } else {
+                        self.emit(&alloc::format!("killed {} process(es)", n));
+                    }
+                }
+                None => self.fail("usage: killall <name-substr>"),
+            },
+            "basename" => match args.first() {
+                Some(p) => {
+                    let t = p.trim_end_matches('/');
+                    self.emit(t.rsplit('/').next().unwrap_or("/"));
+                }
+                None => self.fail("usage: basename <path>"),
+            },
+            "dirname" => match args.first() {
+                Some(p) => {
+                    let t = p.trim_end_matches('/');
+                    match t.rfind('/') {
+                        None => self.emit("."),
+                        Some(0) => self.emit("/"),
+                        Some(i) => self.emit(&t[..i]),
+                    }
+                }
+                None => self.fail("usage: dirname <path>"),
+            },
+            "strings" => match args.first() {
+                Some(p) => match ustd::read_all(p) {
+                    Ok(d) => {
+                        let mut run = String::new();
+                        let mut emit_run = |term: &mut Self, run: &mut String| {
+                            if run.len() >= 4 {
+                                term.emit(run);
+                            }
+                            run.clear();
+                        };
+                        for &b in d.iter() {
+                            if b.is_ascii_graphic() || b == b' ' {
+                                run.push(b as char);
+                            } else {
+                                emit_run(self, &mut run);
+                            }
+                        }
+                        emit_run(self, &mut run);
+                    }
+                    Err(e) => self.fail(&alloc::format!("strings: {}: err {}", p, e)),
+                },
+                None => self.fail("usage: strings <file>"),
+            },
+            "find" => {
+                // find <dir> [pat]: recursive name-match (glob * and ?)
+                let (dir, pat) = (
+                    args.first().copied().unwrap_or("/"),
+                    args.get(1).copied().unwrap_or("*"),
+                );
+                match ustd::stat(dir) {
+                    Ok(st) if st.is_dir != 0 => self.find_run(dir, pat),
+                    Ok(_) => {
+                        if wild_match(pat, dir) {
+                            self.emit(dir);
+                        }
+                    }
+                    Err(e) => self.fail(&alloc::format!("find: {}: err {}", dir, e)),
+                }
+            }
             "dhcp" => match ustd::net_dhcp() {
                 Some(ip) => self.emit(&alloc::format!(
                     "dhcp: lease {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]
@@ -1424,7 +1528,7 @@ impl Term {
             "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
             "set", "env", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
             "dmesg", "arp", "httpd", "ntp", "nc", "fserve", "fget", "true", "false",
-            "shot",
+            "shot", "find", "killall", "basename", "dirname", "strings",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
@@ -1587,6 +1691,38 @@ impl Term {
                     }
                 }
                 Err(_) => self.grep_file(pat, &dir), // a plain file was passed
+            }
+        }
+    }
+
+    /// find: recursive name-match walk printing full paths.
+    fn find_run(&mut self, dir: &str, pat: &str) {
+        let mut stack = alloc::vec::Vec::new();
+        stack.push(String::from(dir));
+        while let Some(d) = stack.pop() {
+            match ustd::readdir(&d) {
+                Ok(ents) => {
+                    for e in ents {
+                        let name = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("?");
+                        let p = alloc::format!(
+                            "{}{}{}",
+                            d,
+                            if d.ends_with('/') { "" } else { "/" },
+                            name
+                        );
+                        if wild_match(pat, name) {
+                            self.emit(&alloc::format!(
+                                "{}{}",
+                                p,
+                                if e.is_dir != 0 { "/" } else { "" }
+                            ));
+                        }
+                        if e.is_dir != 0 {
+                            stack.push(p);
+                        }
+                    }
+                }
+                Err(_) => self.fail(&alloc::format!("find: {}: can't open", d)),
             }
         }
     }
