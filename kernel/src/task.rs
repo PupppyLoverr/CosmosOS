@@ -88,6 +88,10 @@ pub struct Task {
     /// chroot jail root — physical prefix a task can't escape; "/"
     /// means unjailed. vfs::normalize clamps `..` at this prefix.
     pub root: String,
+    /// Mount namespace — tmpfs mounts + bind aliases + lazily-detached
+    /// trees. Shared via Arc: fork/clone keep the SAME namespace until
+    /// unshare(CLONE_NEWNS) deep-copies it into a fresh Arc.
+    pub ns: alloc::sync::Arc<spin::Mutex<MountNs>>,
     pub ports: Vec<u32>,
     pub shm: Vec<u32>,
     pub frames: Vec<u64>, // owned physical frames (kernel stack frames)
@@ -269,6 +273,7 @@ pub fn init() {
         fds: Vec::new(),
         cwd: String::from("/"),
         root: String::from("/"),
+        ns: global_ns(),
         ports: Vec::new(),
         shm: Vec::new(),
         frames: Vec::new(),
@@ -761,6 +766,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         fds: Vec::new(),
         cwd: String::from("/"),
         root: String::from("/"),
+        ns: global_ns(),
         ports: Vec::new(),
         shm: Vec::new(),
         frames: kframes,
@@ -865,6 +871,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         fds: Vec::new(),
         cwd: String::from("/"),
         root: String::from("/"),
+        ns: global_ns(),
         ports: Vec::new(),
         shm: Vec::new(),
         frames: kframes,
@@ -1011,6 +1018,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
     }
     let cwd = cur.cwd.clone();
     let root = cur.root.clone();
+    let nsr = cur.ns.clone();
     let borrowed = cur.borrowed.clone();
     let shm_ids = cur.shm.clone();
     let (nice, rt, vrun, umask, exe, pfs, rnf, rnp, rstk, rcu, ras) = (
@@ -1045,6 +1053,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         fds,
         cwd,
         root,
+        ns: nsr,
         ports: Vec::new(),
         shm: shm_ids,
         frames: kframes,
@@ -1595,11 +1604,12 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
     for id in &shm_ids {
         shm::acquire(*id);
     }
-    let (name, argv, cwd, root) = (
+    let (name, argv, cwd, root, nsr) = (
         cur.name.clone(),
         cur.argv.clone(),
         cur.cwd.clone(),
         cur.root.clone(),
+        cur.ns.clone(),
     );
     let (maps, filemaps) = (cur.maps.clone(), cur.filemaps.clone());
     let (nice, umask, exe) = (cur.nice, cur.umask, cur.exe.clone());
@@ -1627,6 +1637,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         fds,
         cwd,
         root,
+        ns: nsr,
         ports: Vec::new(),
         shm: shm_ids,
         frames: kframes,
@@ -1950,6 +1961,46 @@ pub fn fd_path_prefix_in_use(prefix: &str) -> bool {
                     .unwrap_or(false)
             })
     })
+}
+
+/// A mount namespace: tmpfs mount table, bind alias table, and the
+/// lazy-detached prefixes (umount2 MNT_DETACH survivors) of one shared
+/// view. The initial namespace is the global one; unshare copies it.
+#[derive(Clone, Default)]
+pub struct MountNs {
+    /// (mount path, read-only) — longest-prefix-first.
+    pub tmpfs: Vec<(String, bool)>,
+    /// (target, source) bind aliases — longest-target-prefix first.
+    pub binds: Vec<(String, String)>,
+    /// Prefixes whose tmpfs node trees outlive their mount point.
+    pub detached: Vec<String>,
+}
+
+static GLOBAL_NS: spin::Once<alloc::sync::Arc<spin::Mutex<MountNs>>> = spin::Once::new();
+
+/// The initial mount namespace — every task's ns starts shared with it.
+pub fn global_ns() -> alloc::sync::Arc<spin::Mutex<MountNs>> {
+    GLOBAL_NS
+        .call_once(|| alloc::sync::Arc::new(spin::Mutex::new(MountNs::default())))
+        .clone()
+}
+
+/// The CURRENT task's mount namespace (global fallback pre-scheduler).
+pub fn ns_of() -> alloc::sync::Arc<spin::Mutex<MountNs>> {
+    let mut g = SCHED.lock();
+    match g.as_mut() {
+        Some(s) => s.tasks[s.cur].ns.clone(),
+        None => global_ns(),
+    }
+}
+
+/// CLONE_NEWNS: deep-copy the mount tables into a private namespace —
+/// later mounts/binds/unmounts by this task don't touch the parent's.
+pub fn unshare_ns() {
+    with_current(|t| {
+        let copy = t.ns.lock().clone();
+        t.ns = alloc::sync::Arc::new(spin::Mutex::new(copy));
+    });
 }
 
 /// Any live task whose cwd is under `prefix` — also makes a mount busy.

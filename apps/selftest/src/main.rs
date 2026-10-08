@@ -4151,6 +4151,32 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::close(fd);
         ok
     });
+    check("unshare-ns", {
+        // CLONE_NEWNS: the child's mount is invisible in the parent's
+        // namespace — /nsp stays a bare FAT dir here.
+        let _ = ustd::mkdir("/nsp");
+        let pid = ustd::fork();
+        if pid == 0 {
+            if ustd::unshare(0x20000) != 0 {
+                ustd::exit(15);
+            }
+            let m = ustd::mount("none", "/nsp", "tmpfs") == 0
+                && ustd::write_all("/nsp/f", b"N").is_ok();
+            ustd::exit(if m { 0 } else { 16 });
+        }
+        let ok = ustd::waitpid(pid as u32, 10_000) == Ok(0);
+        let invis = ustd::stat("/nsp/f").is_err()
+            && ustd::read_all("/proc/mounts")
+                .map(|d| !String::from_utf8_lossy(&d).contains("tmpfs /nsp tmpfs"))
+                .unwrap_or(false)
+            // mounting the same path here succeeds — separate namespace
+            && ustd::mount("none", "/nsp", "tmpfs") == 0
+            // and the child's file did NOT leak into this fresh mount
+            && ustd::stat("/nsp/f").is_err();
+        let _ = ustd::umount("/nsp");
+        let _ = ustd::remove("/nsp");
+        ok && invis
+    });
     check("gettimeofday", {
         let (s, u) = ustd::gettimeofday();
         s > 1_700_000_000 && u < 1_000_000

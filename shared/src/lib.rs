@@ -267,6 +267,9 @@ pub const SYS_GETRANDOM: u64 = 222;
 pub const SYS_MINCORE: u64 = 223;
 /// madvise(addr, len, advice)
 pub const SYS_MADVISE: u64 = 224;
+/// unshare(flags) — CLONE_NEWNS deep-copies the mount namespace
+pub const SYS_UNSHARE: u64 = 225;
+pub const CLONE_NEWNS: u64 = 0x0002_0000;
 /// openat2 resolve flags
 pub const RESOLVE_NO_XDEV: u64 = 1;
 pub const RESOLVE_NO_SYMLINKS: u64 = 2;

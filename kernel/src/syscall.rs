@@ -871,6 +871,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_GETRANDOM => sys_getrandom(a1, a2, a3),
         shared::SYS_MINCORE => sys_mincore(a1, a2, a3),
         shared::SYS_MADVISE => sys_madvise(a1, a2, a3),
+        shared::SYS_UNSHARE => sys_unshare(a1),
         shared::SYS_CHROOT => sys_chroot(a1, a2),
         shared::SYS_GETTIMEOFDAY => {
             let sec = vfs::now_unix();
@@ -3626,6 +3627,18 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
         }
         _ => 0, // other advice is advisory — legal no-op
     }
+}
+
+/// SYS_UNSHARE(flags): CLONE_NEWNS gives the task a private mount
+/// namespace — mounts/binds/unmounts stop propagating to the parent.
+fn sys_unshare(flags: u64) -> u64 {
+    if flags & !shared::CLONE_NEWNS != 0 {
+        return (-22i64) as u64; // EINVAL: unsupported share bits
+    }
+    if flags & shared::CLONE_NEWNS != 0 {
+        task::unshare_ns();
+    }
+    0
 }
 
 /// SYS_STATX(&[u64;6]{dirfd,pathptr,pathlen,flags,mask,bufp}): extended
