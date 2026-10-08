@@ -107,11 +107,12 @@ pub struct ProcInfo {
     pub pid: u32,
     pub is_user: u32,
     pub mem_kb: u64,
+    pub cpu_ticks: u64, // 10ms PIT ticks this task has run
     pub name: [u8; 32],
 }
 impl Default for ProcInfo {
     fn default() -> Self {
-        Self { pid: 0, is_user: 0, mem_kb: 0, name: [0; 32] }
+        Self { pid: 0, is_user: 0, mem_kb: 0, cpu_ticks: 0, name: [0; 32] }
     }
 }
 
