@@ -589,6 +589,190 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             Err(_) => false,
         }
     });
+    // ---- batch 29: devfs depth + procfs expansion ----
+    check("proc-loadavg", {
+        ustd::read_all("/proc/loadavg")
+            .map(|d| {
+                let s = String::from_utf8_lossy(&d).into_owned();
+                let mut it = s.split_whitespace();
+                let fmt = it
+                    .next()
+                    .map(|x| x.ends_with(".00"))
+                    .unwrap_or(false);
+                // "0.00 0.00 0.00 R/T lastpid" = 5 fields
+                fmt && it.count() == 4
+            })
+            .unwrap_or(false)
+    });
+    check("proc-diskstats", {
+        ustd::read_all("/proc/diskstats")
+            .map(|d| String::from_utf8_lossy(&d).contains("vda"))
+            .unwrap_or(false)
+    });
+    check("proc-interrupts", {
+        ustd::read_all("/proc/interrupts")
+            .map(|d| {
+                let s = String::from_utf8_lossy(&d).into_owned();
+                s.contains("PIT") && s.contains("keyboard")
+            })
+            .unwrap_or(false)
+    });
+    check("proc-modules-empty", {
+        // honest empty file: the kernel is monolithic, no LKM subsystem
+        ustd::read_all("/proc/modules")
+            .map(|d| d.is_empty())
+            .unwrap_or(false)
+    });
+    check("proc-net-dev", {
+        ustd::read_all("/proc/net/dev")
+            .map(|d| String::from_utf8_lossy(&d).contains("eth0:"))
+            .unwrap_or(false)
+    });
+    check("proc-self-magic", {
+        let pid = ustd::getpid();
+        ustd::read_all("/proc/self/status")
+            .map(|d| {
+                String::from_utf8_lossy(&d)
+                    .contains(&alloc::format!("Pid:\t{}", pid))
+            })
+            .unwrap_or(false)
+    });
+    check("proc-pid-maps", {
+        let pid = ustd::getpid();
+        ustd::read_all(&alloc::format!("/proc/{}/maps", pid))
+            .map(|d| {
+                let s = String::from_utf8_lossy(&d).into_owned();
+                s.contains("[stack]") && s.contains("cosmos-selftest")
+            })
+            .unwrap_or(false)
+    });
+    check("proc-pid-io", {
+        let pid = ustd::getpid();
+        // the first read charges rchar; the second must report it > 0
+        let _ = ustd::read_all(&alloc::format!("/proc/{}/io", pid));
+        ustd::read_all(&alloc::format!("/proc/{}/io", pid))
+            .map(|d| {
+                let s = String::from_utf8_lossy(&d).into_owned();
+                s.lines()
+                    .find(|l| l.starts_with("rchar:"))
+                    .and_then(|l| l[6..].trim().parse::<u64>().ok())
+                    .unwrap_or(0)
+                    > 0
+            })
+            .unwrap_or(false)
+    });
+    check("proc-pid-statm", {
+        let pid = ustd::getpid();
+        ustd::read_all(&alloc::format!("/proc/{}/statm", pid))
+            .map(|d| {
+                String::from_utf8_lossy(&d)
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    > 0
+            })
+            .unwrap_or(false)
+    });
+    check("proc-pid-exe", {
+        let pid = ustd::getpid();
+        ustd::readlink(&alloc::format!("/proc/{}/exe", pid))
+            .map(|t| t.contains("cosmos-selftest"))
+            .unwrap_or(false)
+    });
+    check("proc-mmap-maps", {
+        // anonymous mmap lands as [anon] in /proc/self/maps
+        match ustd::mmap(8192) {
+            Some(_) => ustd::read_all(&alloc::format!("/proc/{}/maps", ustd::getpid()))
+                .map(|d| String::from_utf8_lossy(&d).contains("[anon]"))
+                .unwrap_or(false),
+            None => false,
+        }
+    });
+    check("proc-shm-maps", {
+        match ustd::shm_create(4096) {
+            Some(id) => {
+                let mapped = ustd::shm_map(id).is_some();
+                let ok = mapped
+                    && ustd::read_all(&alloc::format!("/proc/{}/maps", ustd::getpid()))
+                        .map(|d| {
+                            String::from_utf8_lossy(&d)
+                                .contains(&alloc::format!("shm#{}", id))
+                        })
+                        .unwrap_or(false);
+                ustd::shm_drop(id);
+                ok
+            }
+            None => false,
+        }
+    });
+    check("sysrq-sync", ustd::write_all("/proc/sysrq-trigger", b"s").is_ok());
+    check("dev-full-enospc", {
+        ustd::write_all("/dev/full", b"x").err() == Some(-28)
+    });
+    check("dev-fb0", {
+        ustd::open("/dev/fb0", 0)
+            .map(|fd| {
+                let mut px = [0u8; 4];
+                let r = ustd::read(fd, &mut px).map(|n| n == 4).unwrap_or(false);
+                ustd::close(fd);
+                r
+            })
+            .unwrap_or(false)
+    });
+    check("dev-mem", {
+        ustd::open("/dev/mem", 0)
+            .map(|fd| {
+                let mut b = [0u8; 16];
+                let r = ustd::read(fd, &mut b).map(|n| n == 16).unwrap_or(false);
+                ustd::close(fd);
+                r
+            })
+            .unwrap_or(false)
+    });
+    check("dev-nvram", {
+        ustd::open("/dev/nvram", 0)
+            .map(|fd| {
+                let mut b = [0u8; 128];
+                let n = ustd::read(fd, &mut b).unwrap_or(0);
+                ustd::close(fd);
+                n == 128
+            })
+            .unwrap_or(false)
+    });
+    check("dev-smbios", {
+        // raw SMBIOS entry point: "_SM3_" (3.x) or "_SM_" (2.x) anchor
+        ustd::open("/dev/smbios", 0)
+            .map(|fd| {
+                let mut b = [0u8; 32];
+                let n = ustd::read(fd, &mut b).unwrap_or(0);
+                ustd::close(fd);
+                n >= 4 && &b[0..3] == b"_SM"
+            })
+            .unwrap_or(false)
+    });
+    check("dev-kmsg", {
+        ustd::open("/dev/kmsg", 0)
+            .map(|fd| {
+                let mut b = [0u8; 64];
+                let n = ustd::read(fd, &mut b).unwrap_or(0);
+                ustd::close(fd);
+                n > 0
+            })
+            .unwrap_or(false)
+    });
+    check(
+        "dev-console-write",
+        ustd::write_all("/dev/console", b"[selftest] console-write\n").is_ok(),
+    );
+    check("dev-rtc-line", {
+        ustd::read_all("/dev/rtc")
+            .map(|d| {
+                let s = String::from_utf8_lossy(&d).into_owned();
+                s.contains(':') && s.contains('-')
+            })
+            .unwrap_or(false)
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

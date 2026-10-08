@@ -34,6 +34,15 @@ pub struct FileDesc {
     pub flags: u64,
 }
 
+/// One `/proc/<pid>/maps` line: a live tracked mapping in the task's
+/// user address space. `perm`: R=1, W=2, X=4.
+pub struct MapEnt {
+    pub start: u64,
+    pub end: u64,
+    pub perm: u8,
+    pub name: String,
+}
+
 pub struct Task {
     pub id: u32,
     pub name: String,
@@ -66,6 +75,10 @@ pub struct Task {
     pub trace: bool,         // syscall tracing on (strace -p)
     pub trbuf: Vec<u64>,     // packed trace records, 7 u64s each: nr,a1..a5,ret
     pub umask: u32,          // file-creation mask (POSIX); inherited across spawn
+    pub exe: String,         // full path the task was spawned from (/proc/<pid>/exe)
+    pub maps: Vec<MapEnt>,   // tracked user-space mappings
+    pub rbytes: u64,         // bytes read via vfs (/proc/<pid>/io)
+    pub wbytes: u64,         // bytes written via vfs
 }
 
 pub struct Sched {
@@ -112,6 +125,10 @@ pub fn init() {
         trace: false,
         trbuf: Vec::new(),
         umask: 0o022,
+        exe: String::from("kernel"),
+        maps: Vec::new(),
+        rbytes: 0,
+        wbytes: 0,
     };
     *SCHED.lock() = Some(Sched { tasks: vec![Box::new(boot)], cur: 0, next_pid: 1 });
 }
@@ -284,7 +301,8 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
     let mut frames: Vec<u64> = Vec::new();
     frames.push(pml4.start_address().as_u64());
 
-    let entry = match crate::elf::load_into(pml4, &data, &mut frames) {
+    let mut umaps: Vec<MapEnt> = Vec::new();
+    let entry = match crate::elf::load_into(pml4, &data, &mut frames, &mut umaps) {
         Ok(e) => e,
         Err(_) => {
             crate::sprintln!("[spawn] elf load {} failed", path);
@@ -293,6 +311,9 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
             return Err(!0u64);
         }
     };
+    for m in umaps.iter_mut() {
+        m.name = String::from(path);
+    }
 
     // user stack
     let stack_frames = crate::elf::map_user_range(
@@ -303,9 +324,21 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
     )
     .ok_or(!0u64)?;
     let _ = stack_frames;
+    umaps.push(MapEnt {
+        start: USER_STACK_TOP - USER_STACK_PAGES * 0x1000,
+        end: USER_STACK_TOP,
+        perm: 1 | 2,
+        name: String::from("[stack]"),
+    });
 
     // args page
     let argf = crate::elf::map_user_range(pml4, USER_ARG_PAGE, 0x1000, &mut frames).ok_or(!0u64)?;
+    umaps.push(MapEnt {
+        start: USER_ARG_PAGE,
+        end: USER_ARG_PAGE + 0x1000,
+        perm: 1 | 2,
+        name: String::from("[args]"),
+    });
     let abytes = args.as_bytes();
     let n = abytes.len().min(0xF00);
     unsafe {
@@ -364,6 +397,10 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         trace: false,
         trbuf: Vec::new(),
         umask: s.tasks.iter().find(|t| t.id == parent).map(|t| t.umask).unwrap_or(0o022),
+        exe: String::from(path),
+        maps: umaps,
+        rbytes: 0,
+        wbytes: 0,
     };
     s.tasks.push(Box::new(t));
     sprintln!("[task] spawned pid={} '{}' entry={:#x}", pid, name, entry);
@@ -422,6 +459,10 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         trace: false,
         trbuf: Vec::new(),
         umask: 0o022,
+        exe: String::from("kernel-thread"),
+        maps: Vec::new(),
+        rbytes: 0,
+        wbytes: 0,
     }));
     pid
 }
@@ -858,5 +899,90 @@ pub fn signal(pid: u32, sig: u64) -> i64 {
                 _ => -22, // EINVAL
             }
         }),
+    }
+}
+
+/// Record a user-space mapping for `/proc/<pid>/maps` (mmap, shm, fb).
+pub fn record_map(pid: u32, start: u64, end: u64, perm: u8, name: &str) {
+    let mut g = SCHED.lock();
+    if let Some(s) = g.as_mut() {
+        if let Some(t) = s.tasks.iter_mut().find(|t| t.id == pid) {
+            t.maps.push(MapEnt { start, end, perm, name: String::from(name) });
+        }
+    }
+}
+
+/// `/proc/<pid>/maps` — Linux-format lines: `start-end rwxp 00000000 00:00 0 name`.
+pub fn pid_maps(pid: u32) -> Option<String> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    let t = s.tasks.iter().find(|t| t.id == pid)?;
+    let mut out = String::new();
+    for m in &t.maps {
+        out.push_str(&alloc::format!(
+            "{:08x}-{:08x} {}{}{}p 00000000 00:00 0          {}\n",
+            m.start,
+            m.end,
+            if m.perm & 1 != 0 { 'r' } else { '-' },
+            if m.perm & 2 != 0 { 'w' } else { '-' },
+            if m.perm & 4 != 0 { 'x' } else { '-' },
+            m.name
+        ));
+    }
+    Some(out)
+}
+
+/// `/proc/<pid>/io` — real vfs byte counters.
+pub fn pid_io(pid: u32) -> Option<(u64, u64)> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    s.tasks.iter().find(|t| t.id == pid).map(|t| (t.rbytes, t.wbytes))
+}
+
+/// `/proc/<pid>/exe` link target — the path the task was spawned from.
+pub fn pid_exe(pid: u32) -> Option<String> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    s.tasks.iter().find(|t| t.id == pid).map(|t| t.exe.clone())
+}
+
+/// `/proc/<pid>/statm`: size resident shared text lib data dirty, in pages.
+/// Resident == size here: user pages are never paged out.
+pub fn pid_statm(pid: u32) -> Option<String> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    let t = s.tasks.iter().find(|t| t.id == pid)?;
+    let mut size = 0u64;
+    let mut shared = 0u64;
+    for m in &t.maps {
+        size += (m.end - m.start) / 0x1000;
+        if m.name.starts_with("shm") || m.name == "[fb]" {
+            shared += (m.end - m.start) / 0x1000;
+        }
+    }
+    Some(alloc::format!("{} {} {} 0 0 {} 0\n", size, size, shared, size))
+}
+
+/// Account `n` bytes of vfs I/O to the calling task (/proc/<pid>/io).
+pub fn io_charge(read: bool, n: u64) {
+    with_current(|t| {
+        if read {
+            t.rbytes += n;
+        } else {
+            t.wbytes += n;
+        }
+    });
+}
+
+/// Load-average snapshot: runnable tasks (state Running) / total / highest pid.
+/// A point-in-time sample — no decay, but real counts.
+pub fn loadavg() -> (usize, usize, u32) {
+    let g = SCHED.lock();
+    match g.as_ref() {
+        Some(s) => {
+            let run = s.tasks.iter().filter(|t| t.state == State::Running).count();
+            (run, s.tasks.len(), s.next_pid.saturating_sub(1))
+        }
+        None => (0, 0, 0),
     }
 }

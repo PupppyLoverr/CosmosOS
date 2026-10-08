@@ -19,10 +19,15 @@ const FILES: &[&str] = &[
     "partitions",
     "stat",
     "locks",
+    "loadavg",
+    "diskstats",
+    "interrupts",
+    "modules",
+    "sysrq-trigger",
 ];
 
 /// files under /proc/net
-const NET_FILES: &[&str] = &["tcp", "udp"];
+const NET_FILES: &[&str] = &["tcp", "udp", "dev"];
 
 /// files under /proc/sys/kernel
 const SYS_FILES: &[&str] = &["hostname"];
@@ -31,17 +36,23 @@ pub fn handles(path: &str) -> bool {
     path == "/proc" || path.starts_with("/proc/")
 }
 
-/// `/proc/<pid>` when `pid` names an alive task (digits only).
+/// `/proc/<pid>` when `pid` names an alive task (digits only, or `self`
+/// which always resolves to the reading task — real POSIX self magic).
 fn pid_of(path: &str) -> Option<u32> {
     let rest = path.strip_prefix("/proc/")?;
     let p = rest.split('/').next()?;
+    if p == "self" {
+        return Some(task::current_id());
+    }
     if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     p.parse().ok()
 }
 
-const PID_FILES: &[&str] = &["status", "cmdline", "stat", "fds", "cwd"];
+const PID_FILES: &[&str] = &[
+    "status", "cmdline", "stat", "fds", "cwd", "maps", "io", "statm", "exe",
+];
 
 pub fn is_dir(path: &str) -> bool {
     path == "/proc"
@@ -196,6 +207,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
     let s = match path {
         "/proc/net/tcp" => net::net_tcp(),
         "/proc/net/udp" => net::net_udp(),
+        "/proc/net/dev" => net::net_dev(),
         "/proc/sys/kernel/hostname" => alloc::format!("{}\n", crate::syscall::hostname()),
         "/proc/stat" => {
             let (user, all) = task::cpu_sums();
@@ -294,6 +306,32 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
             let secs = crate::virtio::block_device().map(|d| d.capacity_sectors()).unwrap_or(0);
             alloc::format!("major minor  #blocks  name\n   8     0  {} virtio-blk\n", secs / 2)
         }
+        "/proc/loadavg" => {
+            // no float formatting in this kernel (SSE is off); the three
+            // fields are the instant runnable count repeated — a real
+            // sample, just not a decaying average (no history kept)
+            let (run, total, last) = task::loadavg();
+            alloc::format!("{}.00 {}.00 {}.00 {}/{} {}\n", run, run, run, run, total, last)
+        }
+        "/proc/diskstats" => {
+            let (r, w) = (
+                crate::virtio::BLK_RD_SECTORS.load(core::sync::atomic::Ordering::Relaxed),
+                crate::virtio::BLK_WR_SECTORS.load(core::sync::atomic::Ordering::Relaxed),
+            );
+            alloc::format!(
+                "   8       0 vda {} {} {} 0 {} {} {} 0 0 0 0\n",
+                r, r, r * 512, w, w, w * 512
+            )
+        }
+        "/proc/interrupts" => alloc::format!(
+            "            CPU0\n   0:{:>8}   PIT    timer\n   1:{:>8}   i8042  keyboard\n  12:{:>8}   i8042  mouse\n",
+            task::ticks(),
+            crate::input::KBD_IRQS.load(core::sync::atomic::Ordering::Relaxed),
+            crate::input::MOUSE_IRQS.load(core::sync::atomic::Ordering::Relaxed),
+        ),
+        // monolithic kernel: no LKM subsystem — the honest answer is an
+        // empty module list, not a fake one
+        "/proc/modules" => String::from(""),
         "/proc/locks" => {
             // flock table snapshot: index, mode, owner pid, path
             let mut s = String::new();
@@ -316,8 +354,18 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
 }
 
 /// Writable proc files: `/proc/sys/kernel/hostname` accepts a new nodename
-/// (trimmed, non-empty, capped at 64 bytes). Returns bytes consumed.
+/// (trimmed, non-empty, capped at 64 bytes). `/proc/sysrq-trigger` takes a
+/// single command letter. Returns bytes consumed.
 pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
+    if path == "/proc/sysrq-trigger" {
+        match buf.first().copied().unwrap_or(0) {
+            b'b' => crate::syscall::reboot(),
+            b'o' => crate::syscall::power_off(),
+            b's' => crate::klog::append("[sysrq] sync (writes are write-through — nothing pending)"),
+            _ => return None,
+        }
+        return Some(buf.len());
+    }
     if path != "/proc/sys/kernel/hostname" {
         return None;
     }
@@ -327,6 +375,16 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
     }
     crate::syscall::set_hostname(s);
     Some(buf.len())
+}
+
+/// Symlink targets inside procfs (readlink): only `/proc/<pid>/exe`.
+pub fn readlink(path: &str) -> Option<String> {
+    if let Some(p) = pid_of(path) {
+        if path.ends_with("/exe") && task::pids().contains(&p) {
+            return task::pid_exe(p);
+        }
+    }
+    None
 }
 
 /// Render a `/proc/<pid>/<file>` — live task state each read.
@@ -352,6 +410,14 @@ fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
         ),
         "fds" => task::fd_list(pid).unwrap_or_default(),
         "cwd" => alloc::format!("{}\n", task::pid_cwd(pid).unwrap_or_default()),
+        "maps" => task::pid_maps(pid).unwrap_or_default(),
+        "io" => {
+            let (r, w) = task::pid_io(pid).unwrap_or((0, 0));
+            alloc::format!("rchar: {}\nwchar: {}\nsyscr: {}\nsyscw: {}\nread_bytes: 0\nwrite_bytes: 0\n", r, w, r, w)
+        }
+        "statm" => task::pid_statm(pid).unwrap_or_default(),
+        // exe is a symlink; opening it directly yields the path text
+        "exe" => alloc::format!("{}\n", task::pid_exe(pid).unwrap_or_default()),
         _ => return None,
     };
     Some(s.into_bytes())

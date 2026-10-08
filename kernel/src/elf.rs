@@ -1,5 +1,6 @@
 //! ELF64 loading into user page tables + user mapping helpers.
 use crate::mem;
+use alloc::string::String;
 use alloc::vec::Vec;
 use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
@@ -8,6 +9,7 @@ use x86_64::PhysAddr;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
+const PF_R: u32 = 4;
 
 fn user_l4(pml4: PhysFrame) -> &'static mut PageTable {
     unsafe { &mut *(mem::phys_to_virt(pml4.start_address().as_u64()) as *mut PageTable) }
@@ -111,7 +113,14 @@ pub fn map_phys_user(pml4: PhysFrame, vaddr: u64, phys: u64, writable: bool) -> 
 
 /// Load ELF64 segments from `data` into the user table `pml4`.
 /// Returns entry point.
-pub fn load_into(pml4: PhysFrame, data: &[u8], frames: &mut Vec<u64>) -> Result<u64, ()> {
+/// Load an ELF image. Every PT_LOAD is also recorded in `maps` as a
+/// `MapEnt` so `/proc/<pid>/maps` reflects the real segment layout.
+pub fn load_into(
+    pml4: PhysFrame,
+    data: &[u8],
+    frames: &mut Vec<u64>,
+    maps: &mut Vec<crate::task::MapEnt>,
+) -> Result<u64, ()> {
     if data.len() < 64 || &data[0..4] != b"\x7fELF" {
         return Err(());
     }
@@ -170,6 +179,15 @@ pub fn load_into(pml4: PhysFrame, data: &[u8], frames: &mut Vec<u64>) -> Result<
         for page in (page_lo..page_hi).step_by(0x1000) {
             map_user_page_flags(pml4, page, writable, frames).ok_or(())?;
         }
+        let perm = (if pflags & PF_R != 0 { 1u8 } else { 0 })
+            | (if writable { 2u8 } else { 0 })
+            | (if pflags & PF_X != 0 { 4u8 } else { 0 });
+        maps.push(crate::task::MapEnt {
+            start: page_lo,
+            end: page_hi,
+            perm,
+            name: String::new(), // filled with the image path by the caller
+        });
         // copy file bytes via the phys map (works regardless of active CR3)
         if pfilesz > 0 {
             let mut off = 0usize;
