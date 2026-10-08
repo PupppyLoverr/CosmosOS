@@ -53,7 +53,7 @@ fn pid_of(path: &str) -> Option<u32> {
 const PID_FILES: &[&str] = &[
     "status", "cmdline", "stat", "fds", "fdinfo", "cwd", "maps", "io",
     "statm", "exe", "smaps", "wchan", "children", "task", "syscall",
-    "sig",
+    "sig", "mountinfo",
 ];
 
 pub fn is_dir(path: &str) -> bool {
@@ -291,9 +291,13 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
                     if ro { "ro" } else { "rw" }
                 ));
             }
+            for (tgt, src) in crate::bind::mounts() {
+                s.push_str(&alloc::format!("none {} none rw,bind:{} 0 0\n", tgt, src));
+            }
             s
         }
-        "/proc/filesystems" => alloc::format!("fat32\nproc\n"),
+        "/proc/filesystems" => alloc::format!("fat32\nproc\ntmpfs\n"),
+        "/proc/mountinfo" | "/proc/self/mountinfo" => mountinfo(),
         "/proc/cmdline" => alloc::format!("BOOT=uefi\n"),
         "/proc/iostat" => {
             let (ro, rb, wo, wb) = crate::vfs::io_stats();
@@ -432,6 +436,32 @@ pub fn readlink(path: &str) -> Option<String> {
 }
 
 /// Render a `/proc/<pid>/<file>` — live task state each read.
+/// Linux mountinfo body: id parent major:minor root mnt opts - fs src
+/// opts. tmpfs entries plus bind mounts (root shown as the source path).
+fn mountinfo() -> String {
+    let mut s = String::from("1 0 8:0 / / rw,relatime - fat32 virtio-blk rw\n");
+    let mut id = 30u32;
+    for (m, ro) in crate::tmpfs::mounts() {
+        s.push_str(&alloc::format!(
+            "{} 1 0:{} / {} {} - tmpfs tmpfs {}\n",
+            id,
+            id,
+            m,
+            if ro { "ro" } else { "rw" },
+            if ro { "ro" } else { "rw" },
+        ));
+        id += 1;
+    }
+    for (tgt, src) in crate::bind::mounts() {
+        s.push_str(&alloc::format!(
+            "{} 1 0:{} {} {} rw - bind none rw\n",
+            id, id, src, tgt,
+        ));
+        id += 1;
+    }
+    s
+}
+
 fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
     let (name, argv, mem, ticks, is_user, state, nice, vrun, ppid) = task::pid_info(pid)?;
     let (min_flt, maj_flt, rss) = task::pid_faults(pid).unwrap_or((0, 0, 0));
@@ -490,6 +520,7 @@ fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
         // exe is a symlink; opening it directly yields the path text
         "exe" => alloc::format!("{}\n", task::pid_exe(pid).unwrap_or_default()),
         "syscall" => task::pid_syscall(pid).unwrap_or_else(|| alloc::format!("-1\n")),
+        "mountinfo" => mountinfo(),
         "sig" => task::pid_sig(pid).unwrap_or_default(),
         _ => return None,
     };

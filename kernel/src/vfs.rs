@@ -110,7 +110,9 @@ pub fn normalize(cwd: &str, path: &str) -> String {
     }
     let mut s = String::from("/");
     s.push_str(&out.join("/"));
-    s
+    // Bind mounts apply on the canonical path — AFTER `..` resolution,
+    // so `bind/../x` escapes to the real parent exactly like Linux.
+    crate::bind::resolve(&s)
 }
 
 pub fn read_all(path: &str) -> Result<Vec<u8>, i64> {
@@ -176,6 +178,16 @@ pub fn read_range(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64>
 /// spinning here would deadlock the fault handler — rescheduling it
 /// lets it finish and release.
 pub fn read_range_pf(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    // paths here arrive normalized at map time, but fold any bind too
+    // (try_lock + wait_irq: the #PF contract forbids spinning/allocs).
+    let owned;
+    let path = match crate::bind::resolve_pf(path) {
+        Some(p) => {
+            owned = p;
+            owned.as_str()
+        }
+        None => path,
+    };
     if crate::memfd::handles(path) {
         // RAM store — no FS lock needed, safe inside the fault handler
         return crate::memfd::read_at(path, offset, buf);
@@ -688,7 +700,7 @@ pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
     }
     if crate::tmpfs::handles(&full) {
         return match crate::tmpfs::stat(&full) {
-            Some((sz, dir, mt, at)) => Ok(shared::Stat {
+            Some((sz, dir, mt, _ct, at)) => Ok(shared::Stat {
                 size: sz,
                 is_dir: dir as u32,
                 mtime: mt,
@@ -707,6 +719,38 @@ pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
 
 /// Set a file's modify time (unix seconds) — the FAT dir entry is patched
 /// in place. Pseudo-filesystems are read-only: always an error.
+/// stat without following a trailing symlink (lstat): links report the
+/// link's own Stat, everything else falls through to stat_path.
+pub fn stat_path_nofollow(path: &str) -> Result<shared::Stat, i64> {
+    let path = &crate::bind::resolve(path);
+    match readlink_path(path) {
+        Ok(_) => {
+            let mut g = FS.lock();
+            match g.as_mut().and_then(|fs| fs.stat(path).ok()) {
+                Some(s) => Ok(shared::Stat {
+                    size: s.size,
+                    is_dir: if s.is_dir { 1 } else { 0 },
+                    mtime: s.mtime,
+                    attr: s.attr as u32,
+                }),
+                None => Err(-2),
+            }
+        }
+        Err(_) => stat_path(path),
+    }
+}
+
+/// Birth time (unix secs) for statx — tmpfs ctime, FAT mtime, 0 elsewhere.
+pub fn btime(path: &str) -> u64 {
+    if crate::tmpfs::handles(path) {
+        return crate::tmpfs::stat(path).map(|s| s.3).unwrap_or(0);
+    }
+    if let Ok(st) = stat_path(path) {
+        return st.mtime;
+    }
+    0
+}
+
 pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);

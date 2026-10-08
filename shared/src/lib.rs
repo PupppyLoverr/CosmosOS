@@ -244,9 +244,36 @@ pub const SYS_MOUNT: u64 = 216;           // (&[u64;6]{sptr,slen,tptr,tlen,fptr,
 pub const SYS_UMOUNT: u64 = 217;
 /// chroot(dir): jail the task's path resolution under `dir` (root field).
 pub const SYS_CHROOT: u64 = 218;
+/// statx(&[u64;6]{dirfd,path,len,flags,mask,&mut Statx}) -> 0|err
+pub const SYS_STATX: u64 = 219;
 /// mount() flags
 pub const MS_RDONLY: u64 = 1;
-pub const MS_REMOUNT: u64 = 32;          // (target_ptr, len) -> 0|err
+pub const MS_REMOUNT: u64 = 32;
+/// MS_BIND: source is an existing path aliased onto target.
+pub const MS_BIND: u64 = 0x1000;
+/// umount flags
+pub const MNT_FORCE: u64 = 1;
+pub const MNT_DETACH: u64 = 2;
+/// statx flags (reuse AT_* where identical)
+pub const AT_STATX_SYMLINK_NOFOLLOW: u64 = 0x100;
+pub const STATX_ALL: u64 = 0xfff;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Statx {
+    pub mask: u32,
+    pub blksize: u32,
+    pub attr: u64,   // FAT attribute byte
+    pub nlink: u64,
+    pub mode: u32,   // unix-style type+perm bits
+    pub _pad: u32,
+    pub ino: u64,    // stable FNV-1a of the canonical path
+    pub size: u64,
+    pub blocks: u64, // 512B units
+    pub mtime: u64,
+    pub ctime: u64,
+    pub btime: u64,
+}          // (target_ptr, len) -> 0|err
 pub const O_CLOEXEC: u64 = 0x10000;       // per-desc flag: close on successful exec
 pub const F_GETFD: u64 = 1;               // fcntl: get descriptor flags
 pub const F_SETFD: u64 = 2;               // fcntl: set descriptor flags (FD_CLOEXEC)

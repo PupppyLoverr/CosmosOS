@@ -1858,6 +1858,32 @@ pub fn mount_flags(source: &str, target: &str, fstype: &str, flags: u64) -> i64 
     sc1(shared::SYS_MOUNT, args.as_ptr() as u64) as i64
 }
 
+/// umount2(target, flags): MNT_FORCE(1) purge despite busy,
+/// MNT_DETACH(2) lazy detach keeping resolved paths alive.
+pub fn umount2(target: &str, flags: u64) -> i64 {
+    sc3(217, target.as_ptr() as u64, target.len() as u64, flags) as i64
+}
+
+/// statx(path) -> extended stat (btime/ino/mode/blocks).
+pub fn statx(path: &str) -> Result<shared::Statx, i64> {
+    statx_at(AT_FDCWD, path, 0)
+}
+
+/// statx_at(dirfd, path, flags) — flags: AT_SYMLINK_NOFOLLOW etc.
+pub fn statx_at(dirfd: i64, path: &str, flags: u64) -> Result<shared::Statx, i64> {
+    let mut sx: shared::Statx = unsafe { core::mem::zeroed() };
+    let args: [u64; 6] = [
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        flags,
+        shared::STATX_ALL,
+        &mut sx as *mut _ as u64,
+    ];
+    let r = sc1(shared::SYS_STATX, args.as_ptr() as u64) as i64;
+    if r < 0 { Err(r) } else { Ok(sx) }
+}
+
 /// chroot(dir): jail this task's path resolution under `dir`.
 pub fn chroot(dir: &str) -> i64 {
     sc2(218, dir.as_ptr() as u64, dir.len() as u64) as i64
