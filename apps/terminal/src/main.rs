@@ -13704,6 +13704,8 @@ impl Term {
                 // always, -a also interior runs that reach a tab stop.
                 let exp = cmd == "expand";
                 let all = !exp && args.iter().any(|a| *a == "-a");
+                // expand -i/--initial: convert only the initial tabs
+                let init_only = exp && args.iter().any(|a| *a == "-i" || *a == "--initial");
                 let mut stop = 8usize;
                 let mut file: Option<&str> = None;
                 let mut it = args.iter().peekable();
@@ -13736,8 +13738,12 @@ impl Term {
                     if exp {
                         let mut out = String::new();
                         let mut col = 0usize;
+                        let mut init = true;
                         for ch in l.chars() {
-                            if ch == '\t' {
+                            if init_only && init && ch != '\t' && ch != ' ' {
+                                init = false;
+                            }
+                            if ch == '\t' && (!init_only || init) {
                                 let n = stop - col % stop;
                                 for _ in 0..n {
                                     out.push(' ');
@@ -20346,13 +20352,36 @@ impl Term {
                 let mut chars = false;
                 let mut path = "";
                 let mut limit: Option<usize> = None;
+                let mut skip: usize = 0;
+                let mut verb = false; // -v: show all lines (no `*` compression)
                 let mut oi = 0usize;
                 while oi < args.len() {
                     let a = args[oi];
                     match a {
-                        "-A" | "-Ax" | "-tx1" | "-A x" => {}
+                        "-A" | "--address-radix" => {
+                            // -A x|o|d|n as a separate operand
+                            match args.get(oi + 1).map(|s| *s) {
+                                Some("x") => { offbase = 16; oi += 1; }
+                                Some("d") => { offbase = 10; oi += 1; }
+                                Some("n") => { offbase = 0; oi += 1; }
+                                Some("o") => { offbase = 8; oi += 1; }
+                                _ => {}
+                            }
+                        }
                         "-Ax" => offbase = 16,
+                        "-Ad" => offbase = 10,
+                        "-Ao" => offbase = 8,
                         "-An" => offbase = 0,
+                        "-t" => {
+                            // -t c|x1 as a separate operand
+                            if args.get(oi + 1) == Some(&"c") {
+                                chars = true;
+                                oi += 1;
+                            } else if args.get(oi + 1).is_some() {
+                                oi += 1;
+                            }
+                        }
+                        "-tx1" => {}
                         "-c" | "-t c" | "-tc" => chars = true,
                         "-tx1c" => chars = true,
                         "-" => path = "-",
@@ -20368,6 +20397,16 @@ impl Term {
                         _ if a.starts_with("--read-size=") => {
                             limit = a[12..].parse().ok();
                         }
+                        "-j" | "--skip-bytes" => {
+                            if let Some(v) = args.get(oi + 1) {
+                                skip = v.parse().unwrap_or(0);
+                                oi += 1;
+                            }
+                        }
+                        _ if a.starts_with("-j") && a.len() > 2 => {
+                            skip = a[2..].parse().unwrap_or(0);
+                        }
+                        "-v" => verb = true,
                         _ if !a.starts_with('-') => path = a,
                         _ => {}
                     }
@@ -20389,15 +20428,32 @@ impl Term {
                 };
                 match Ok::<Vec<u8>, String>(data) {
                     Ok(d) => {
+                        let d = if skip < d.len() { &d[skip..] } else { &[][..] };
                         let d = match limit {
                             Some(n) => &d[..d.len().min(n)],
                             None => &d[..],
                         };
+                        // GNU od collapses runs of identical 16-byte rows
+                        // into a single `*` line unless -v is given
+                        let mut prev: Option<&[u8]> = None;
+                        let mut star = false;
                         for (i, ch) in d.chunks(16).enumerate() {
+                            if !verb && prev == Some(ch) {
+                                if !star {
+                                    self.emit("*");
+                                    star = true;
+                                }
+                                continue;
+                            }
+                            star = false;
+                            prev = Some(ch);
+                            let off = skip + i * 16;
                             let mut l = if offbase == 16 {
-                                alloc::format!("{:08x}  ", i * 16)
+                                alloc::format!("{:08x}  ", off)
                             } else if offbase == 8 {
-                                alloc::format!("{:07o}  ", i * 16)
+                                alloc::format!("{:07o}  ", off)
+                            } else if offbase == 10 {
+                                alloc::format!("{:07}  ", off)
                             } else {
                                 String::new()
                             };
@@ -20419,7 +20475,14 @@ impl Term {
                             }
                             self.emit(&l);
                         }
-                        self.emit(&alloc::format!("{:07o}", d.len()));
+                        let total = skip + d.len();
+                        if offbase == 16 {
+                            self.emit(&alloc::format!("{:08x}", total));
+                        } else if offbase == 8 {
+                            self.emit(&alloc::format!("{:07o}", total));
+                        } else if offbase == 10 {
+                            self.emit(&alloc::format!("{:07}", total));
+                        }
                     }
                     Err(e) => self.fail(&alloc::format!("od: {}: err {}", path, e)),
                 }
@@ -21891,6 +21954,7 @@ impl Term {
                 let mut nul = false;
                 let mut norun_empty = false;
                 let mut delim: Option<char> = None;
+                let mut argfile: Option<String> = None;
                 let mut ci = 0usize;
                 while ci < args.len() {
                     match args[ci] {
@@ -21927,6 +21991,14 @@ impl Term {
                             norun_empty = true;
                             ci += 1;
                         }
+                        "-a" | "--arg-file" => {
+                            argfile = args.get(ci + 1).map(|s| String::from(*s));
+                            ci += 2;
+                        }
+                        a if a.starts_with("-a") && a.len() > 2 => {
+                            argfile = Some(String::from(&a[2..]));
+                            ci += 1;
+                        }
                         _ => break,
                     }
                 }
@@ -21936,7 +22008,18 @@ impl Term {
                     return;
                 }
                 let base = rest.join(" ");
-                if let Some(s) = self.pipe_in.clone() {
+                let xin = match &argfile {
+                    // -a FILE: items come from the file, not stdin
+                    Some(f) => match ustd::read_all(f) {
+                        Ok(d) => Some(String::from_utf8_lossy(&d).into_owned()),
+                        Err(e) => {
+                            self.fail(&alloc::format!("xargs: {}: err {}", f, e));
+                            return;
+                        }
+                    },
+                    None => self.pipe_in.clone(),
+                };
+                if let Some(s) = xin {
                     let items: Vec<&str> = if let Some(d) = delim {
                         s.split(d).collect()
                     } else if nul {
@@ -21954,7 +22037,8 @@ impl Term {
                     } else if nbatch > 0 {
                         nbatch
                     } else {
-                        1
+                        // GNU default: all items in one invocation
+                        items.len().max(1)
                     };
                     if norun_empty && items.is_empty() {
                         return;
