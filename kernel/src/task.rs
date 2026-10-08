@@ -140,7 +140,7 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
     }
     // wake sleepers (sleep + timed waits)
     for t in s.tasks.iter_mut() {
-        if t.state == State::Blocked && t.wake_at <= ticks() && t.waiting_on == 0 {
+        if t.state == State::Blocked && t.wake_at <= ticks() {
             t.state = State::Running;
         }
     }
@@ -653,6 +653,27 @@ pub fn pids() -> Vec<u32> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// (user-task ticks, all-task ticks) across live tasks — feeds /proc/stat.
+pub fn cpu_sums() -> (u64, u64) {
+    let g = SCHED.lock();
+    g.as_ref()
+        .map(|s| {
+            let mut user = 0u64;
+            let mut all = 0u64;
+            for t in s.tasks.iter() {
+                if t.state == State::Dead {
+                    continue;
+                }
+                if t.is_user {
+                    user += t.cpu_ticks;
+                }
+                all += t.cpu_ticks;
+            }
+            (user, all)
+        })
+        .unwrap_or((0, 0))
 }
 
 /// (name, argv, mem_bytes, cpu_ticks, is_user, state, nice, vrun) for /proc/<pid>/*.

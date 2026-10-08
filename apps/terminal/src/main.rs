@@ -1892,6 +1892,8 @@ struct Term {
     func_collect: Option<String>,                      // function name while its multi-line body is collected
     func_depth: u8,                                    // recursion guard for function calls
     func_bdepth: i32,                                  // brace depth while collecting a func body
+    func_locals: Vec<Vec<(String, Option<String>)>>,   // `local` saves per active call frame
+    exit_trap: Option<String>,                         // `trap <cmd> EXIT` — runs on `exit`
     block_buf: String,                                 // unfinished for/while/if/heredoc input awaiting its closer
     heredocs: Vec<String>,                             // heredoc bodies extracted by norm_stmts (`<<\x01N` markers)
     flow: u8,                                          // 0 none, 1 break, 2 continue, 3 script-exit
@@ -3082,8 +3084,9 @@ impl Term {
             return;
         }
         // statement operators: `a; b` (always), `a && b` (on ok), `a || b` (on fail)
+        // (no last_ok reset here -- the next stmt must inherit the previous
+        // one's status so `false; echo $?` prints 1, matching POSIX)
         if let Some((l, op, r)) = stmt_split(input) {
-            self.last_ok = true;
             self.run(l);
             let ok = self.last_ok;
             if self.errexit && !ok {
@@ -3350,8 +3353,26 @@ impl Term {
                 self.vars.insert(alloc::format!("{}", i + 1), String::from(*a));
             }
             self.func_depth += 1;
+            self.func_locals.push(Vec::new());
             self.run(&body);
             self.func_depth -= 1;
+            if self.flow == 3 {
+                // `return` unwinds to here — it's a function exit, not a
+                // script exit, so it must not propagate past the dispatch
+                self.flow = 0;
+            }
+            if let Some(locs) = self.func_locals.pop() {
+                for (k, v) in locs {
+                    match v {
+                        Some(v) => {
+                            self.vars.insert(k, v);
+                        }
+                        None => {
+                            self.vars.remove(&k);
+                        }
+                    }
+                }
+            }
             for (k, v) in keys.iter().zip(saved) {
                 match v {
                     Some(v) => {
@@ -3495,10 +3516,10 @@ impl Term {
             "break" => self.flow = 1,      // unwinds to the enclosing run_stmts loop
             "continue" => self.flow = 2,
             "return" => {
-                if self.script_depth > 0 {
-                    self.flow = 3; // return from a sourced script
+                if self.script_depth > 0 || self.func_depth > 0 {
+                    self.flow = 3; // unwind to the script runner / func dispatch
                 } else {
-                    self.fail("return: only meaningful in a script");
+                    self.fail("return: only meaningful in a script or function");
                 }
             }
             "eval" => {
@@ -3507,6 +3528,285 @@ impl Term {
                 } else {
                     self.run(&args.join(" "));
                 }
+            }
+            "local" => {
+                // function-local vars: saved per call frame, restored at return
+                if self.func_locals.is_empty() {
+                    self.fail("local: only meaningful in a function");
+                } else {
+                    for a in args.iter().copied() {
+                        let (name, val) = match a.split_once('=') {
+                            Some((n, v)) => (n, v),
+                            None => (a, ""),
+                        };
+                        if name.is_empty()
+                            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                        {
+                            self.fail(&alloc::format!("local: {}: bad name", name));
+                            continue;
+                        }
+                        let old = self.vars.get(name).cloned();
+                        if let Some(f) = self.func_locals.last_mut() {
+                            f.push((String::from(name), old));
+                        }
+                        self.vars.insert(String::from(name), String::from(val));
+                    }
+                }
+            }
+            "shift" => {
+                // renumber positional params: $1..$# drop the first n
+                let n: usize = args
+                    .first()
+                    .and_then(|a| a.parse().ok())
+                    .unwrap_or(1);
+                let cnt: usize = self
+                    .vars
+                    .get("#")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let hi = cnt.max(9) + n;
+                let mut map: Vec<Option<String>> = Vec::with_capacity(hi);
+                for i in 1..=hi {
+                    map.push(self.vars.get(&alloc::format!("{}", i)).cloned());
+                }
+                for i in 1..=hi {
+                    let nv = if i + n <= hi {
+                        map[i + n - 1].clone()
+                    } else {
+                        None
+                    };
+                    let k = alloc::format!("{}", i);
+                    match nv {
+                        Some(v) => {
+                            self.vars.insert(k, v);
+                        }
+                        None => {
+                            self.vars.remove(&k);
+                        }
+                    }
+                }
+                self.vars.insert(
+                    String::from("#"),
+                    alloc::format!("{}", cnt.saturating_sub(n)),
+                );
+            }
+            "getopts" => {
+                // getopts <optstring> <var>: consume the next option from $1..
+                // Real OPTIND/OPTCHAR state vars; `x:` in optstring wants an
+                // arg (rest of token else next argv -> OPTARG). rc=1 when done.
+                if args.len() < 2 {
+                    self.fail("usage: getopts <optstring> <var>");
+                    return;
+                }
+                let spec = args[0];
+                let var = args[1];
+                let ind: usize = self
+                    .vars
+                    .get("OPTIND")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1);
+                let arg = self
+                    .vars
+                    .get(&alloc::format!("{}", ind))
+                    .cloned()
+                    .unwrap_or_default();
+                let done = |me: &mut Self| {
+                    me.vars.remove(var);
+                    me.vars.remove("OPTARG");
+                    me.last_ok = false;
+                };
+                if arg.is_empty()
+                    || arg == "--"
+                    || !arg.starts_with('-')
+                    || arg.len() < 2
+                {
+                    done(self);
+                } else {
+                    let chars: Vec<char> = arg[1..].chars().collect();
+                    let ci: usize = self
+                        .vars
+                        .get("OPTCHAR")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    let c = chars.get(ci).copied().unwrap_or('?');
+                    let at = spec.find(c);
+                    if spec.contains(c) {
+                        self.vars
+                            .insert(String::from(var), alloc::format!("{}", c));
+                    } else {
+                        // unknown option: var='?' (real getopts still returns 0)
+                        self.vars.insert(String::from(var), String::from("?"));
+                        self.emit(&alloc::format!("getopts: illegal option -- {}", c));
+                    }
+                    if at.map(|i| spec.as_bytes().get(i + 1) == Some(&b':')).unwrap_or(false) {
+                        // option takes an argument
+                        if ci + 1 < chars.len() {
+                            let rest: String = chars[ci + 1..].iter().collect();
+                            self.vars.insert(String::from("OPTARG"), rest);
+                        } else {
+                            let na = self
+                                .vars
+                                .get(&alloc::format!("{}", ind + 1))
+                                .cloned()
+                                .unwrap_or_default();
+                            self.vars.insert(String::from("OPTARG"), na);
+                            self.vars
+                                .insert(String::from("OPTIND"), alloc::format!("{}", ind + 1));
+                        }
+                    } else {
+                        self.vars.remove("OPTARG");
+                    }
+                    if ci + 1 >= chars.len() {
+                        self.vars
+                            .insert(String::from("OPTIND"), alloc::format!("{}", ind + 1));
+                        self.vars.insert(String::from("OPTCHAR"), String::from("0"));
+                    } else {
+                        self.vars
+                            .insert(String::from("OPTCHAR"), alloc::format!("{}", ci + 1));
+                    }
+                    self.last_ok = true;
+                }
+            }
+            "trap" => {
+                // trap [cmd] EXIT: run cmd when the terminal exits via `exit`
+                match args.len() {
+                    0 => {
+                        match &self.exit_trap {
+                            Some(t) => self.emit(&alloc::format!("trap -- '{}' EXIT", t)),
+                            None => self.emit("no traps"),
+                        }
+                    }
+                    _ => {
+                        let (sig_i, cmd_end) = match args.iter().position(|a| a.eq_ignore_ascii_case("exit")) {
+                            Some(i) if i > 0 => (i, i),
+                            _ => {
+                                self.fail("usage: trap <cmd> EXIT (only EXIT supported)");
+                                return;
+                            }
+                        };
+                        let c = args[..cmd_end].join(" ");
+                        let _ = sig_i;
+                        self.exit_trap = if c.is_empty() { None } else { Some(c) };
+                    }
+                }
+            }
+            "timeout" => {
+                // timeout N /bin/app [args]: spawn + waitpid; kill on expiry.
+                // Binaries only — builtins run inline and can't be preempted.
+                let Some(secs) = args.first().and_then(|a| a.parse::<u64>().ok()) else {
+                    self.fail("usage: timeout <secs> <command> [args...]");
+                    return;
+                };
+                let Some(c) = args.get(1).map(|a| *a) else {
+                    self.fail("usage: timeout <secs> <command> [args...]");
+                    return;
+                };
+                let path = if c.contains('/') {
+                    String::from(c)
+                } else {
+                    alloc::format!("/bin/cosmos-{}", c)
+                };
+                let path = match ustd::stat(&path) {
+                    Ok(_) => path,
+                    Err(_) => {
+                        let alt = alloc::format!("/bin/{}", c);
+                        match ustd::stat(&alt) {
+                            Ok(_) => alt,
+                            Err(_) => {
+                                self.fail(&alloc::format!("timeout: {}: not a binary", c));
+                                return;
+                            }
+                        }
+                    }
+                };
+                match ustd::spawn(&path, &args[2..].join(" ")) {
+                    Ok(pid) => match ustd::waitpid(pid, secs * 1000) {
+                        Ok(code) => {
+                            self.emit(&alloc::format!("timeout: {} exited ({})", c, code));
+                            self.last_ok = code == 0;
+                        }
+                        Err(_) => {
+                            let _ = ustd::kill(pid);
+                            self.emit(&alloc::format!("timeout: {} killed after {}s", c, secs));
+                            self.last_ok = false;
+                        }
+                    },
+                    Err(_) => self.fail(&alloc::format!("timeout: {}: spawn failed", c)),
+                }
+            }
+            "realpath" => {
+                // resolve . .. // against cwd; result must exist (GNU -e)
+                if args.is_empty() {
+                    self.fail("usage: realpath <path>...");
+                    return;
+                }
+                let cwd = ustd::getcwd();
+                for a in args.iter().copied() {
+                    let joined = if a.starts_with('/') {
+                        String::from(a)
+                    } else {
+                        alloc::format!(
+                            "{}{}{}",
+                            cwd,
+                            if cwd.ends_with('/') { "" } else { "/" },
+                            a
+                        )
+                    };
+                    let mut parts: Vec<&str> = Vec::new();
+                    let mut bad = false;
+                    for seg in joined.split('/') {
+                        match seg {
+                            "" | "." => {}
+                            ".." => {
+                                if parts.pop().is_none() {
+                                    bad = true;
+                                    break;
+                                }
+                            }
+                            s => parts.push(s),
+                        }
+                    }
+                    let norm = alloc::format!("/{}", parts.join("/"));
+                    if bad {
+                        self.fail(&alloc::format!("realpath: {}: escapes root", a));
+                    } else if ustd::stat(&norm).is_ok() || norm == "/" {
+                        self.emit(&norm);
+                    } else {
+                        self.fail(&alloc::format!("realpath: {}: no such file", a));
+                    }
+                }
+            }
+            "pidof" => {
+                // exact-name pid lookup via the kernel process table
+                if args.is_empty() {
+                    self.fail("usage: pidof <name>...");
+                    return;
+                }
+                let buf = ustd::proclist(64);
+                let mut found = false;
+                for a in args.iter().copied() {
+                    let want = a.rsplit('/').next().unwrap_or(a);
+                    let wantc = alloc::format!("cosmos-{}", want);
+                    let mut hits: Vec<String> = Vec::new();
+                    for p in &buf {
+                        let nb = &p.name[..p
+                            .name
+                            .iter()
+                            .position(|b| *b == 0)
+                            .unwrap_or(32)];
+                        let nm = core::str::from_utf8(nb).unwrap_or("");
+                        if nm == want || nm == wantc.as_str() {
+                            hits.push(alloc::format!("{}", p.pid));
+                        }
+                    }
+                    if hits.is_empty() {
+                        self.fail(&alloc::format!("pidof: {}: not running", a));
+                    } else {
+                        self.emit(&hits.join(" "));
+                        found = true;
+                    }
+                }
+                self.last_ok = found;
             }
             "set" => {
                 // set NAME=value | set | set -u NAME | set -x|+x|-e|+e
@@ -3521,6 +3821,29 @@ impl Term {
                         return;
                     }
                     _ => {}
+                }
+                if args.first() == Some(&"--") {
+                    // `set -- a b c`: set positional params $1..$N $#
+                    let rest = &args[1..];
+                    let old_hi: usize = self
+                        .vars
+                        .get("#")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0)
+                        .max(9);
+                    for i in 1..=old_hi.max(rest.len()) {
+                        let k = alloc::format!("{}", i);
+                        if i <= rest.len() {
+                            self.vars.insert(k, String::from(rest[i - 1]));
+                        } else {
+                            self.vars.remove(&k);
+                        }
+                    }
+                    self.vars.insert(
+                        String::from("#"),
+                        alloc::format!("{}", rest.len()),
+                    );
+                    return;
                 }
                 if args.is_empty() {
                     for i in 0..self.vars.len() {
@@ -7508,6 +7831,9 @@ impl Term {
                 if self.script_depth > 0 {
                     self.flow = 3; // inside sh/source: stop the script
                 } else {
+                    if let Some(t) = self.exit_trap.take() {
+                        self.run(&t); // `trap <cmd> EXIT` handler
+                    }
                     self.win.close();
                 }
             }
@@ -8839,6 +9165,7 @@ impl Term {
         "nice", "renice", "pgrep", "pkill", "top", "dc", "vmstat", "free",
         "pcap", "ftp", "lsof", "fuser", "burn", "cron", "browse",
         "function", "declare", "typeset",
+        "local", "shift", "getopts", "trap", "timeout", "realpath", "pidof",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -8886,6 +9213,8 @@ impl Term {
                     "          burn  cron  browse (html->text)  sums -c",
                     "          name() { cmds; }  function name { .. } -> $1..$9 $@ $#",
                     "          declare -f/typeset -f  unset -f name  man [-k pat] <page>",
+                    "          local v  shift [n]  getopts <spec> <var>  trap <cmd> EXIT",
+                    "          timeout <s> <bin>  realpath  pidof  /proc/stat /proc/net/*",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];
@@ -9579,6 +9908,8 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         run_depth: 0,
         read_modal: None,
         funcs: Vec::new(),
+        func_locals: Vec::new(),
+        exit_trap: None,
         func_collect: None,
         func_depth: 0,
         func_bdepth: 0,

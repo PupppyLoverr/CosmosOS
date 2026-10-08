@@ -439,6 +439,19 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             .map(|d| String::from_utf8_lossy(&d).contains("CosmosOS"))
             .unwrap_or(false)
     });
+    check("proc-stat", {
+        ustd::read_all("/proc/stat")
+            .map(|d| {
+                let s = String::from_utf8_lossy(&d);
+                s.contains("cpu") && s.contains("intr")
+            })
+            .unwrap_or(false)
+    });
+    check("proc-net-udp", {
+        ustd::read_all("/proc/net/udp")
+            .map(|d| String::from_utf8_lossy(&d).contains("local_address"))
+            .unwrap_or(false)
+    });
 
     // ---- signals: STOP freezes a task, CONT resumes it, KILL reaps it ----
     check("sig-stop-cont", {

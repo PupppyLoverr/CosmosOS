@@ -17,7 +17,11 @@ const FILES: &[&str] = &[
     "iostat",
     "netstat",
     "partitions",
+    "stat",
 ];
+
+/// files under /proc/net
+const NET_FILES: &[&str] = &["tcp", "udp"];
 
 pub fn handles(path: &str) -> bool {
     path == "/proc" || path.starts_with("/proc/")
@@ -37,6 +41,7 @@ const PID_FILES: &[&str] = &["status", "cmdline", "stat", "fds"];
 
 pub fn is_dir(path: &str) -> bool {
     path == "/proc"
+        || path == "/proc/net"
         || pid_of(path)
             .map(|p| task::pids().contains(&p) && path.matches('/').count() == 2)
             .unwrap_or(false)
@@ -53,6 +58,9 @@ pub fn exists(path: &str) -> bool {
             return task::pids().contains(&p) && PID_FILES.contains(&f);
         }
         return false;
+    }
+    if let Some(f) = path.strip_prefix("/proc/net/") {
+        return NET_FILES.contains(&f);
     }
     FILES.contains(&path.trim_start_matches("/proc/"))
 }
@@ -73,6 +81,16 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         }
         let _ = p;
     }
+    if path == "/proc/net" {
+        for name in NET_FILES {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            out.push(de);
+        }
+        return out;
+    }
     for name in FILES {
         let mut de = shared::DirEntry::default();
         let nb = name.as_bytes();
@@ -85,7 +103,14 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         de.mtime = 0;
         out.push(de);
     }
-    // numeric pid dirs alongside the flat files
+    // numeric pid dirs alongside the flat files, plus /proc/net
+    {
+        let mut de = shared::DirEntry::default();
+        de.name[..3].copy_from_slice(b"net");
+        de.name_len = 3;
+        de.is_dir = 1;
+        out.push(de);
+    }
     for pid in task::pids() {
         let name = alloc::format!("{}", pid);
         let mut de = shared::DirEntry::default();
@@ -138,6 +163,21 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         return None;
     }
     let s = match path {
+        "/proc/net/tcp" => net::net_tcp(),
+        "/proc/net/udp" => net::net_udp(),
+        "/proc/stat" => {
+            let (user, all) = task::cpu_sums();
+            let ticks = timer::ticks();
+            let idle = ticks.saturating_sub(all);
+            alloc::format!(
+                "cpu  {} 0 {} {} 0 0 0\nintr {}\nprocs_running {}\n",
+                user,
+                all.saturating_sub(user),
+                idle,
+                ticks,
+                task::task_count()
+            )
+        }
         "/proc/meminfo" => {
             let (total, used, heap) = mem::meminfo();
             alloc::format!(
