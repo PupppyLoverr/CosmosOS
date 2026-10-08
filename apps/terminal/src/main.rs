@@ -23457,6 +23457,474 @@ impl Term {
                     self.emit(&String::from_utf8_lossy(&l));
                 }
             }
+            "objdump" => {
+                // objdump [-h|-t|-p|-s|-x] <elf> — binutils-style dumps via
+                // the shared Elf reader (same data as readelf, binutils names).
+                let file = args.iter().find(|a| !a.starts_with('-'));
+                let Some(f) = file else {
+                    self.fail("usage: objdump [-h|-t|-p|-s] <elf>");
+                    return;
+                };
+                let Ok(d) = ustd::read_all(f) else {
+                    self.fail(&alloc::format!("objdump: {}: err", f));
+                    return;
+                };
+                let Some(e) = Elf::new(&d) else {
+                    self.fail(&alloc::format!("objdump: {}: not ELF64", f));
+                    return;
+                };
+                let want_h = args.iter().any(|a| a.contains('h') || a.contains('x'));
+                let want_t = args.iter().any(|a| a.contains('t') || a.contains('x'));
+                let want_p = args.iter().any(|a| a.contains('p') || a.contains('x'));
+                let want_s = args.iter().any(|a| *a == "-s");
+                if !want_h && !want_t && !want_p && !want_s {
+                    self.fail("usage: objdump [-h|-t|-p|-s] <elf>");
+                    return;
+                }
+                if want_p {
+                    self.emit("Program Header:");
+                    for i in 0..e.phnum() {
+                        let (t, fl, va, fsz, msz) = e.ph(i);
+                        let tn = match t {
+                            1 => "LOAD", 2 => "DYNAMIC", 3 => "INTERP",
+                            4 => "NOTE", 6 => "PHDR", 7 => "TLS",
+                            0x6474e550 => "GNU_EH_FRAME",
+                            0x6474e551 => "GNU_STACK",
+                            0x6474e552 => "GNU_RELRO",
+                            _ => "????",
+                        };
+                        self.emit(&alloc::format!(
+                            "    {} off {:#x} vaddr {:#x} filesz {:#x} memsz {:#x} flags {}{}{}",
+                            tn, va, va, fsz, msz,
+                            if fl & 4 != 0 { 'r' } else { '-' },
+                            if fl & 2 != 0 { 'w' } else { '-' },
+                            if fl & 1 != 0 { 'x' } else { '-' }));
+                    }
+                }
+                if want_h {
+                    self.emit("Sections:");
+                    self.emit("Idx Name          Size      VMA               File off  Algn");
+                    for i in 0..e.shnum() {
+                        let sh = e.sh(i);
+                        self.emit(&alloc::format!(
+                            "{:>3} {:<13} {:08x}  {:016x}  {:08x}  2**{}",
+                            i, sh.name, sh.size, sh.addr, sh.off,
+                            { let mut a = 0u32; let mut v = sh.size.max(1);
+                              while v > 1 { v >>= 1; a += 1; } a.min(6) }));
+                    }
+                }
+                if want_t {
+                    self.emit("SYMBOL TABLE:");
+                    for i in 0..e.shnum() {
+                        let sh = e.sh(i);
+                        if sh.typ != 2 { continue; }
+                        for s in e.syms(i) {
+                            let kind = if s.shndx == 0 { "UND" }
+                                else if s.shndx == 0xfff1 { "ABS" } else { "   " };
+                            self.emit(&alloc::format!(
+                                "{:016x} {:>3} {}", s.value, kind, s.name));
+                        }
+                    }
+                }
+                if want_s {
+                    // full contents of SHF_ALLOC non-NOBITS sections
+                    for i in 0..e.shnum() {
+                        let sh = e.sh(i);
+                        if sh.flags & 0x2 == 0 || sh.typ == 8 || sh.size == 0 {
+                            continue;
+                        }
+                        self.emit(&alloc::format!(
+                            "Contents of section {}:", sh.name));
+                        let off = sh.off as usize;
+                        let n = (sh.size as usize).min(d.len() - off.min(d.len()));
+                        for row in 0..(n + 15) / 16 {
+                            let mut hexs = String::new();
+                            let mut asc = String::new();
+                            for k in 0..16 {
+                                let j = off + row * 16 + k;
+                                if j < off + n {
+                                    hexs.push_str(&alloc::format!("{:02x}", d[j]));
+                                    if k % 4 == 3 { hexs.push(' '); }
+                                    asc.push(if d[j] >= 32 && d[j] < 127 {
+                                        d[j] as char } else { '.' });
+                                } else {
+                                    hexs.push_str("  ");
+                                    if k % 4 == 3 { hexs.push(' '); }
+                                    asc.push(' ');
+                                }
+                            }
+                            self.emit(&alloc::format!(
+                                " {:04x} {:<36} |{}|", row * 16, hexs, asc));
+                        }
+                    }
+                }
+            }
+            "objcopy" => {
+                // objcopy -O binary <elf> <out> — dump PT_LOAD content as a
+                // flat binary (vaddr-sorted, gap-filled) like the real tool.
+                let files: Vec<&&str> =
+                    args.iter().filter(|a| {
+                        !a.starts_with('-') && **a != "binary"
+                    }).collect();
+                let ob = args.iter().any(|a| *a == "-O" || *a == "binary");
+                if !ob || files.len() < 2 {
+                    self.fail("usage: objcopy -O binary <in> <out>");
+                    return;
+                }
+                let Ok(d) = ustd::read_all(files[0]) else {
+                    self.fail(&alloc::format!("objcopy: {}: err", files[0]));
+                    return;
+                };
+                let Some(e) = Elf::new(&d) else {
+                    self.fail(&alloc::format!("objcopy: {}: not ELF64", files[0]));
+                    return;
+                };
+                let mut loads: Vec<(u64, u64, u64)> = Vec::new();
+                for i in 0..e.phnum() {
+                    let (t, _fl, va, fsz, _msz) = e.ph(i);
+                    if t == 1 && fsz > 0 {
+                        // file offset = phoff record field +8.. let me not —
+                        // recompute from vaddr via section? Simpler: PT_LOAD
+                        // file offset is inside ph at +8 — re-read it.
+                        let phoff = e.phoff() as usize + i * 56;
+                        let foff = u64::from_le_bytes(
+                            d[phoff + 8..phoff + 16].try_into().unwrap());
+                        loads.push((va, foff, fsz));
+                    }
+                }
+                if loads.is_empty() {
+                    self.fail("objcopy: no PT_LOAD");
+                    return;
+                }
+                loads.sort();
+                let base = loads[0].0;
+                let mut out: Vec<u8> = Vec::new();
+                for (va, foff, fsz) in loads {
+                    let pad = (va - base) as usize;
+                    while out.len() < pad { out.push(0); }
+                    let s = foff as usize;
+                    let n = (fsz as usize).min(d.len().saturating_sub(s));
+                    out.extend_from_slice(&d[s..s + n]);
+                }
+                match ustd::write_all(files[1], &out) {
+                    Ok(_) => self.emit(&alloc::format!(
+                        "objcopy: {} -> {} ({} bytes)", files[0], files[1],
+                        out.len())),
+                    Err(e) => self.fail(&alloc::format!(
+                        "objcopy: {}: err {}", files[1], e)),
+                }
+            }
+            "ranlib" => {
+                // ranlib <archive>... — write the SysV `/` symbol-index member:
+                // BE u32 nsyms, then per symbol {BE sym_off, BE member_off}
+                // + NUL names, indexing GLOBAL/WEAK defined syms per member.
+                let files: Vec<&&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).collect();
+                if files.is_empty() {
+                    self.fail("usage: ranlib <a-file>...");
+                    return;
+                }
+                for f in files {
+                    let Ok(d) = ustd::read_all(f) else {
+                        self.fail(&alloc::format!("ranlib: {}: err", f));
+                        continue;
+                    };
+                    let Ok(mems) = ar_parse(&d) else {
+                        self.fail(&alloc::format!("ranlib: {}: bad ar", f));
+                        continue;
+                    };
+                    // member header offset of member i in the packed file:
+                    // headers sit right before each data blob. ar_parse lost
+                    // offsets; recompute by walking the format.
+                    let mut syms: Vec<(String, u32)> = Vec::new();
+                    let mut off = 8usize; // past !<arch>\n
+                    let mut new_mems: Vec<(String, Vec<u8>)> = Vec::new();
+                    for (name, data) in &mems {
+                        if name == "/" || name == "__.SYMDEF"
+                            || name == "//" {
+                            // drop existing index/longname members
+                            off += 60 + ((data.len() + 1) & !1);
+                            continue;
+                        }
+                        if let Some(e) = Elf::new(data) {
+                            for i in 0..e.shnum() {
+                                let sh = e.sh(i);
+                                if sh.typ != 2 { continue; }
+                                for s in e.syms(i) {
+                                    if s.shndx != 0 && s.shndx < 0xff00
+                                        && s.info >> 4 != 0 {
+                                        syms.push((s.name.clone(),
+                                                   off as u32));
+                                    }
+                                }
+                            }
+                        }
+                        new_mems.push((name.clone(), data.clone()));
+                        off += 60 + ((data.len() + 1) & !1);
+                    }
+                    // build the `/` index — its own 60-byte header counts,
+                    // so member offsets shift by 60 + index len (even-padded)
+                    let mut names = Vec::new();
+                    let mut idx = Vec::new();
+                    for (n, mo) in &syms {
+                        idx.extend_from_slice(
+                            &(names.len() as u32).to_be_bytes());
+                        idx.extend_from_slice(&mo.to_be_bytes());
+                        names.extend_from_slice(n.as_bytes());
+                        names.push(0);
+                    }
+                    let mut idxm = Vec::new();
+                    idxm.extend_from_slice(
+                        &(syms.len() as u32).to_be_bytes());
+                    idxm.extend_from_slice(&idx);
+                    idxm.extend_from_slice(&names);
+                    // shift every member offset by the index member's space
+                    let shift = 60 + ((idxm.len() + 1) & !1);
+                    let mut idx2 = Vec::new();
+                    let mut names2 = Vec::new();
+                    for (n, mo) in &syms {
+                        idx2.extend_from_slice(
+                            &(names2.len() as u32).to_be_bytes());
+                        idx2.extend_from_slice(
+                            &(mo + shift as u32).to_be_bytes());
+                        names2.extend_from_slice(n.as_bytes());
+                        names2.push(0);
+                    }
+                    let mut idxm2 = Vec::new();
+                    idxm2.extend_from_slice(
+                        &(syms.len() as u32).to_be_bytes());
+                    idxm2.extend_from_slice(&idx2);
+                    idxm2.extend_from_slice(&names2);
+                    new_mems.insert(0, (String::from("/"), idxm2));
+                    let arc = ar_pack(&new_mems);
+                    match ustd::write_all(f, &arc) {
+                        Ok(_) => self.emit(&alloc::format!(
+                            "ranlib: {} ({} symbols indexed)", f, syms.len())),
+                        Err(e) => self.fail(&alloc::format!(
+                            "ranlib: {}: err {}", f, e)),
+                    }
+                }
+            }
+            "make" => {
+                // make [-f FILE] [target] — mini-make: `t: deps` + TAB recipes,
+                // `V=v`/`$(V)`/`$@`/`$<`/`$^`, mtime-based rebuild, `@` quiet.
+                let mut mkfile = String::from("Makefile");
+                let mut goal: Option<String> = None;
+                let mut ai = 0usize;
+                while ai < args.len() {
+                    match args[ai] {
+                        "-f" => {
+                            ai += 1;
+                            if let Some(f) = args.get(ai) {
+                                mkfile = String::from(*f);
+                            }
+                        }
+                        t if !t.starts_with('-') => {
+                            goal = Some(String::from(t));
+                        }
+                        _ => {}
+                    }
+                    ai += 1;
+                }
+                let text = match ustd::read_all(&mkfile) {
+                    Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                    Err(e) => {
+                        self.fail(&alloc::format!(
+                            "make: {}: err {}", mkfile, e));
+                        return;
+                    }
+                };
+                let mut vars: Vec<(String, String)> = Vec::new();
+                let mut rules: Vec<(String, Vec<String>, Vec<String>)> =
+                    Vec::new();
+                let mut cur: Option<usize> = None;
+                for line in text.lines() {
+                    if line.starts_with('\t') || line.starts_with("    ") {
+                        if let Some(i) = cur {
+                            rules[i].2.push(String::from(line.trim()));
+                        }
+                        continue;
+                    }
+                    let l = line.trim();
+                    if l.is_empty() || l.starts_with('#') { continue; }
+                    if let Some((n, v)) = l.split_once('=') {
+                        if !n.contains(':') {
+                            vars.push((String::from(n.trim()),
+                                       String::from(v.trim())));
+                            cur = None;
+                            continue;
+                        }
+                    }
+                    if let Some((t, deps)) = l.split_once(':') {
+                        rules.push((
+                            String::from(t.trim()),
+                            deps.split_whitespace()
+                                .map(String::from).collect(),
+                            Vec::new()));
+                        cur = Some(rules.len() - 1);
+                    }
+                }
+                let subst = |s: &str, vars: &Vec<(String, String)>,
+                             tgt: &str, deps: &Vec<String>| -> String {
+                    let mut o = String::from(s);
+                    for (n, v) in vars {
+                        o = o.replace(&alloc::format!("$({})", n), v);
+                        o = o.replace(&alloc::format!("${{{}}}", n), v);
+                    }
+                    o = o.replace("$@", tgt);
+                    if let Some(f0) = deps.first() {
+                        o = o.replace("$<", f0);
+                    }
+                    o = o.replace("$^", &deps.join(" "));
+                    o
+                };
+                // iterative build: visit(target) builds deps recursively.
+                fn mk_mtime(p: &str) -> Option<u64> {
+                    ustd::stat(p).ok().map(|s| s.mtime)
+                }
+                fn mk_build(
+                    t: &mut Term, tgt: &str,
+                    rules: &Vec<(String, Vec<String>, Vec<String>)>,
+                    vars: &Vec<(String, String)>,
+                    subst: &dyn Fn(&str, &Vec<(String, String)>, &str,
+                                   &Vec<String>) -> String,
+                    depth: usize,
+                ) -> bool {
+                    if depth > 32 { return false; }
+                    let rule = rules.iter().find(|r| r.0 == tgt);
+                    let Some(r) = rule else {
+                        // dep with no rule: fine if it exists
+                        if mk_mtime(tgt).is_none() {
+                            t.fail(&alloc::format!(
+                                "make: no rule for {}", tgt));
+                            return false;
+                        }
+                        return true;
+                    };
+                    for d in &r.1 {
+                        if !mk_build(t, d, rules, vars, subst, depth + 1) {
+                            return false;
+                        }
+                    }
+                    let tmt = mk_mtime(tgt);
+                    let stale = tmt.is_none() || r.1.iter().any(|d| {
+                        mk_mtime(d).map(|m| Some(m) > tmt).unwrap_or(false)
+                    });
+                    if !stale {
+                        t.emit(&alloc::format!(
+                            "make: {} up to date", tgt));
+                        return true;
+                    }
+                    for cmd in &r.2 {
+                        let line = subst(cmd, vars, tgt, &r.1);
+                        let quiet = line.starts_with('@');
+                        let line = if quiet {
+                            String::from(&line[1..]) } else { line };
+                        if !quiet { t.emit(&line); }
+                        t.run(&line);
+                        if !t.last_ok {
+                            t.fail(&alloc::format!(
+                                "make: recipe failed: {}", line));
+                            return false;
+                        }
+                    }
+                    true
+                }
+                let goal = goal.or_else(|| {
+                    rules.first().map(|r| r.0.clone())
+                });
+                match goal {
+                    Some(g) => {
+                        mk_build(self, &g, &rules, &vars,
+                                 &subst, 0);
+                    }
+                    None => self.fail("make: no targets"),
+                }
+            }
+            "shar" | "unshar" => {
+                let unshar = cmd == "unshar";
+                if unshar {
+                    // run the archive script — it cat > files via heredocs
+                    let f = args.iter().find(|a| !a.starts_with('-'));
+                    let Some(f) = f else {
+                        self.fail("usage: unshar <shar-file>");
+                        return;
+                    };
+                    match ustd::read_all(f) {
+                        Ok(d) => {
+                            let s = String::from_utf8_lossy(&d).into_owned();
+                            let (stmts, bodies, unclosed) = norm_stmts(&s);
+                            if let Some(d) = unclosed {
+                                self.fail(&alloc::format!(
+                                    "unshar: unterminated heredoc <<{}", d));
+                            } else {
+                                let saved_hd = core::mem::replace(
+                                    &mut self.heredocs, bodies);
+                                self.script_depth += 1;
+                                self.run_stmts(&stmts, 0, false);
+                                self.heredocs = saved_hd;
+                                self.script_depth = self.script_depth
+                                    .saturating_sub(1);
+                            }
+                        }
+                        Err(e) => self.fail(&alloc::format!(
+                            "unshar: {}: err {}", f, e)),
+                    }
+                } else {
+                    let files: Vec<&&str> =
+                        args.iter().filter(|a| !a.starts_with('-')).collect();
+                    if files.is_empty() {
+                        self.fail("usage: shar <files>... > a.shar");
+                        return;
+                    }
+                    let mut out = String::from("#!/bin/sh\n# shar archive\n");
+                    for f in &files {
+                        match ustd::read_all(f) {
+                            Ok(d) => {
+                                out.push_str(&alloc::format!(
+                                    "echo 'x - {}'\n", f));
+                                out.push_str(&alloc::format!(
+                                    "cat > {} << 'SHAR_EOF'\n", f));
+                                out.push_str(&String::from_utf8_lossy(&d));
+                                if !d.ends_with(b"\n") { out.push('\n'); }
+                                out.push_str("SHAR_EOF\n");
+                            }
+                            Err(e) => self.fail(&alloc::format!(
+                                "shar: {}: err {}", f, e)),
+                        }
+                    }
+                    // binary-safe? shar is a text format — emit as text
+                    for l in out.lines() { self.emit(l); }
+                }
+            }
+            "locale" => {
+                // locale [-a] — report locale envs (we're POSIX-only, but the
+                // vars are real: exported LC_* come from set/export).
+                if args.iter().any(|a| *a == "-a") {
+                    self.emit("C");
+                    self.emit("POSIX");
+                    self.emit("C.UTF-8");
+                    return;
+                }
+                let keys = [
+                    "LANG", "LC_CTYPE", "LC_NUMERIC", "LC_TIME",
+                    "LC_COLLATE", "LC_MONETARY", "LC_MESSAGES",
+                    "LC_PAPER", "LC_NAME", "LC_ADDRESS", "LC_TELEPHONE",
+                    "LC_MEASUREMENT", "LC_IDENTIFICATION", "LC_ALL",
+                ];
+                for k in keys {
+                    let v = self.vars.get(k)
+                        .map(|s| s.as_str())
+                        .unwrap_or(if k == "LANG" { "C.UTF-8" } else { "" });
+                    let v = if v.is_empty() { "\"C\"".into() }
+                            else if k == "LANG" {
+                                alloc::format!("{}", v)
+                            } else {
+                                alloc::format!("\"{}\"", v)
+                            };
+                    self.emit(&alloc::format!("{}={}", k, v));
+                }
+            }
             "patch" => {
                 // patch [-R] [--dry-run] [file.diff] — apply a unified diff.
                 // Reads the diff file given, or stdin (pipe heredoc) when none.
