@@ -948,6 +948,93 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 Err(e) => e as u64,
             }
         }
+        shared::SYS_SENDMSG => {
+            // (fd, buf, len, passfd|usize::MAX) -> n — SCM_RIGHTS: the
+            // passed fd's object path is queued for the peer to adopt.
+            let Some(data) = copy_in(a2, a3.min(1 << 16)) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let (path, pass) = task::with_current(|t| {
+                let p = match t.fds.get(a1 as usize) {
+                    Some(Some(f)) => f.path.clone(),
+                    _ => String::new(),
+                };
+                let pass = if a4 == u64::MAX {
+                    None
+                } else {
+                    match t.fds.get(a4 as usize) {
+                        Some(Some(f)) => Some(f.path.clone()),
+                        _ => Some(String::new()), // bad fd marker
+                    }
+                };
+                (p, pass)
+            });
+            if pass.as_deref() == Some("") {
+                ctx.rax = (-9i64) as u64; // EBADF: passfd isn't an open fd
+                return;
+            }
+            let r = if crate::sockfd::handles(&path) {
+                crate::sockfd::sendmsg(&path, &data, pass)
+            } else if crate::sockpair::handles(&path) {
+                crate::sockpair::send_msg(&path, &data, pass)
+            } else {
+                Err(-88) // ENOTSOCK
+            };
+            match r {
+                Ok(n) => n as u64,
+                Err(e) => e as u64,
+            }
+        }
+        shared::SYS_RECVMSG => {
+            // (fd, buf, cap, fd_out|0) -> n; fd_out gets the adopted fd
+            // for a passed object path (SCM_RIGHTS), or -1. -11 reblocks.
+            let mut tmp = vec![0u8; a3.min(1 << 16) as usize];
+            let path = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => f.path.clone(),
+                _ => String::new(),
+            });
+            let r = if crate::sockfd::handles(&path) {
+                crate::sockfd::recvmsg(&path, &mut tmp)
+            } else if crate::sockpair::handles(&path) {
+                crate::sockpair::recv_msg(&path, &mut tmp)
+            } else {
+                Err(-88)
+            };
+            match r {
+                Err(-11) => {
+                    if fd_nonblock(a1 as usize) {
+                        ctx.rax = (-11i64) as u64;
+                    } else {
+                        block_reenter(ctx, task::ticks() + 2, 0);
+                    }
+                    return;
+                }
+                Err(e) => e as u64,
+                Ok((n, got)) => {
+                    let newfd: i64 = match got {
+                        Some(p) if a4 != 0 => task::with_current(|t| {
+                            let s = alloc_slot(t);
+                            t.fds[s] = Some(task::FileDesc {
+                                path: p,
+                                pos: 0,
+                                flags: shared::O_RDWR,
+                            });
+                            s as i64
+                        }),
+                        _ => -1,
+                    };
+                    if a4 != 0 {
+                        let _ = copy_out(a4, &newfd.to_le_bytes());
+                    }
+                    match copy_out(a2, &tmp[..n]) {
+                        Some(()) => ctx.rax = n as u64,
+                        None => ctx.rax = ERR,
+                    }
+                    return;
+                }
+            }
+        }
         shared::SYS_ARP => {
             let s = net::arp_stat();
             let n = s.len().min(a2 as usize);

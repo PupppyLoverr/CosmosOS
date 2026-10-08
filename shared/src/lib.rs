@@ -138,6 +138,8 @@ pub const SYS_RECVFROM: u64 = 125;       // (fd, buf, cap, src_out[8]|0) -> n | 
 pub const SYS_SHUTDOWN: u64 = 126;       // (fd, how 0=rd 1=wr 2=both) -> 0 | ERR
 pub const SYS_GETSOCKNAME: u64 = 127;    // (fd, out, cap) -> n | ERR
 pub const SYS_GETPEERNAME: u64 = 128;    // (fd, out, cap) -> n | ERR
+pub const SYS_SENDMSG: u64 = 129;        // (fd, buf, len, passfd|usize::MAX) -> n | ERR
+pub const SYS_RECVMSG: u64 = 130;        // (fd, buf, cap, fd_out|0) -> n | ERR
 pub const PROT_READ: u64 = 1;
 pub const PROT_WRITE: u64 = 2;
 pub const PROT_EXEC: u64 = 4;

@@ -534,6 +534,77 @@ pub fn recvfrom(path: &str, buf: &mut [u8]) -> Result<(usize, [u8; 4], u16), i64
     }
 }
 
+/// sendmsg(fd, buf, pass_path): SCM_RIGHTS — on AF_UNIX the object's path
+/// is queued for the peer to adopt as a fresh fd (EOPNOTSUPP elsewhere,
+/// matching POSIX's unix-only ancillary rule). Without ancillary it's a
+/// plain stream write / UDP send-to-peer.
+pub fn sendmsg(path: &str, data: &[u8], pass: Option<String>) -> Result<usize, i64> {
+    let id = parse(path).ok_or(-3i64)?;
+    let s = fields(id).ok_or(-9i64)?;
+    if s.wr_off {
+        return Err(-32);
+    }
+    match s.kind {
+        Kind::Unix => match &s.chan {
+            Some(c) => crate::sockpair::send_msg(c, data, pass),
+            None => Err(-107), // ENOTCONN
+        },
+        Kind::Tcp | Kind::Udp => {
+            if pass.is_some() {
+                return Err(-95); // EOPNOTSUPP: SCM_RIGHTS is AF_UNIX only
+            }
+            try_write(path, data, false)
+        }
+        Kind::TcpListener | Kind::UnixListener => Err(-107),
+    }
+}
+
+/// recvmsg(fd, buf): like read() plus the next object path the peer
+/// passed via SCM_RIGHTS for the caller to adopt as a new fd.
+pub fn recvmsg(path: &str, buf: &mut [u8]) -> Result<(usize, Option<String>), i64> {
+    let id = parse(path).ok_or(-3i64)?;
+    let s = fields(id).ok_or(-9i64)?;
+    match s.kind {
+        Kind::Unix => match &s.chan {
+            Some(c) => crate::sockpair::recv_msg(c, buf),
+            None => Err(-107),
+        },
+        Kind::UnixListener => Err(-11),
+        _ => try_read(path, buf).map(|n| (n, None)),
+    }
+}
+
+/// `/proc/net/unix` dump — one Linux-style row per AF_UNIX socket:
+/// "Num RefCount Protocol Flags Type St Inode Path" (St: 01 unconnected,
+/// 02 listening, 03 connected; Type 0001 = stream).
+pub fn net_unix() -> String {
+    let mut out = String::from(
+        "Num       RefCount Protocol Flags    Type St         Inode Path\n",
+    );
+    let m = SOCKS.lock();
+    for (id, s) in m.iter() {
+        if s.domain != Dom::Unix {
+            continue;
+        }
+        let (st, p) = match s.kind {
+            Kind::UnixListener => ("02", s.uname.clone().unwrap_or_default()),
+            Kind::Unix => (
+                "03",
+                s.uname
+                    .clone()
+                    .or_else(|| s.peer_name.clone())
+                    .unwrap_or_default(),
+            ),
+            _ => continue,
+        };
+        out.push_str(&format!(
+            "{:>10} {:>8} {:>8} {:>8} {:>4} {} {:>10} {}\n",
+            id, 1, 0, "00010000", "0001", st, id, p
+        ));
+    }
+    out
+}
+
 /// fd_ready hook: UDP read-ready = datagram queued; TCP = data or EOF;
 /// unix = sockpair readiness; listeners = a completed conn waiting.
 pub fn ready(path: &str, for_read: bool) -> bool {

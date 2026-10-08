@@ -12,6 +12,8 @@ const CAP: usize = 1 << 16;
 struct Spair {
     a2b: VecDeque<u8>, // side 0 -> side 1
     b2a: VecDeque<u8>, // side 1 -> side 0
+    ca2b: VecDeque<String>, // side 0 -> side 1 ancillary (passed fd paths)
+    cb2a: VecDeque<String>, // side 1 -> side 0 ancillary
     open_a: bool,
     open_b: bool,
     wr_a: bool, // side 0 shutdown(SHUT_WR): its writes stopped
@@ -42,6 +44,8 @@ pub fn create() -> Option<(String, String)> {
         Spair {
             a2b: VecDeque::new(),
             b2a: VecDeque::new(),
+            ca2b: VecDeque::new(),
+            cb2a: VecDeque::new(),
             open_a: true,
             open_b: true,
             wr_a: false,
@@ -73,7 +77,8 @@ pub fn ready(path: &str, for_read: bool) -> bool {
             return true; // shutdown(RD) -> reads see EOF
         }
         let inbox = if side == 0 { &s.b2a } else { &s.a2b };
-        !inbox.is_empty() || !peer_open || peer_wr
+        let cin = if side == 0 { &s.cb2a } else { &s.ca2b };
+        !inbox.is_empty() || !cin.is_empty() || !peer_open || peer_wr
     } else {
         peer_open && !my_wr
     }
@@ -130,6 +135,60 @@ pub fn try_write(path: &str, buf: &[u8]) -> Result<usize, i64> {
         out.push_back(*b);
     }
     Ok(n)
+}
+
+/// sendmsg(2) with SCM_RIGHTS: write the data, then queue an optional
+/// passed object path for the peer to adopt as a fresh fd. Works on a
+/// zero-length payload so an fd can be sent on its own — the peer still
+/// becomes readable via the ctrl queue.
+pub fn send_msg(path: &str, data: &[u8], pass: Option<String>) -> Result<usize, i64> {
+    let Some((id, side)) = parse(path) else {
+        return Err(-2);
+    };
+    let mut g = SP.lock();
+    let Some(s) = g.get_mut(&id) else {
+        return Err(-2);
+    };
+    let peer_open = if side == 0 { s.open_b } else { s.open_a };
+    let my_wr = if side == 0 { s.wr_a } else { s.wr_b };
+    if !peer_open || my_wr {
+        return Err(-32);
+    }
+    let out = if side == 0 { &mut s.a2b } else { &mut s.b2a };
+    if out.len() >= CAP {
+        return Err(-11);
+    }
+    let n = data.len().min(CAP - out.len());
+    for b in data.iter().take(n) {
+        out.push_back(*b);
+    }
+    if let Some(p) = pass {
+        let cq = if side == 0 { &mut s.ca2b } else { &mut s.cb2a };
+        cq.push_back(p);
+    }
+    Ok(n)
+}
+
+/// recvmsg(2): read data, and pop the next queued passed-object path
+/// (SCM_RIGHTS). An fd-only message (empty data + ctrl) still returns —
+/// Ok((0, Some(path))) — never leaves the receiver blocked on its fd.
+pub fn recv_msg(path: &str, buf: &mut [u8]) -> Result<(usize, Option<String>), i64> {
+    let Some((id, side)) = parse(path) else {
+        return Err(-2);
+    };
+    let ctrl = {
+        let mut g = SP.lock();
+        let Some(s) = g.get_mut(&id) else {
+            return Err(-2);
+        };
+        let cq = if side == 0 { &mut s.cb2a } else { &mut s.ca2b };
+        cq.pop_front()
+    };
+    match try_read(path, buf) {
+        Ok(n) => Ok((n, ctrl)),
+        Err(-11) if ctrl.is_some() => Ok((0, ctrl)),
+        Err(e) => Err(e),
+    }
 }
 
 /// shutdown(2) on a pair side: how=0 stops our reads (peer sees nothing),

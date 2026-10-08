@@ -1391,6 +1391,33 @@ pub fn recvfrom(fd: i64, buf: &mut [u8]) -> Result<(usize, [u8; 4], u16), i64> {
         u16::from_be_bytes([src[4], src[5]]),
     ))
 }
+/// sendmsg: stream write that can carry one fd to the peer (SCM_RIGHTS,
+/// AF_UNIX only). Pass -1 as `pass` for no ancillary data.
+pub fn sendmsg(fd: i64, data: &[u8], pass: i64) -> i64 {
+    sc4(
+        shared::SYS_SENDMSG,
+        fd as u64,
+        data.as_ptr() as u64,
+        data.len() as u64,
+        pass as u64,
+    ) as i64
+}
+/// recvmsg: read + the fd the peer sent us, if any (Some(fd) — adopt it
+/// like any other fd: read/write/close work on it).
+pub fn recvmsg(fd: i64, buf: &mut [u8]) -> Result<(usize, Option<i64>), i64> {
+    let mut out: i64 = -1;
+    let r = sc4(
+        shared::SYS_RECVMSG,
+        fd as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        &mut out as *mut i64 as u64,
+    ) as i64;
+    if r < 0 {
+        return Err(r);
+    }
+    Ok((r as usize, if out >= 0 { Some(out) } else { None }))
+}
 
 /// fd-based TCP socket — poll/read/write/close all work on it.
 pub struct TcpFd(pub i64);

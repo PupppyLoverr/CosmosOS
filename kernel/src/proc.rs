@@ -27,7 +27,7 @@ const FILES: &[&str] = &[
 ];
 
 /// files under /proc/net
-const NET_FILES: &[&str] = &["tcp", "udp", "dev", "operstate", "owners"];
+const NET_FILES: &[&str] = &["tcp", "udp", "unix", "dev", "operstate", "owners"];
 
 /// files under /proc/sys/kernel
 const SYS_FILES: &[&str] = &["hostname"];
@@ -208,6 +208,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
     let s = match path {
         "/proc/net/tcp" => net::net_tcp(),
         "/proc/net/udp" => net::net_udp(),
+        "/proc/net/unix" => crate::sockfd::net_unix(),
         "/proc/net/dev" => net::net_dev(),
         "/proc/net/operstate" => alloc::format!(
             "{}\n",
