@@ -773,6 +773,165 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             })
             .unwrap_or(false)
     });
+
+    // ---- batch 30: real mm syscalls, sched class, dev/proc depth ----
+    check("munmap", {
+        match ustd::mmap(8192) {
+            Some(p) => {
+                let pid = ustd::getpid();
+                let maps_has = |needle: &str| {
+                    ustd::read_all(&alloc::format!("/proc/{}/maps", pid))
+                        .map(|d| String::from_utf8_lossy(&d).contains(needle))
+                        .unwrap_or(false)
+                };
+                let before = maps_has("[anon]");
+                let un = ustd::munmap(p, 8192);
+                // first mmap established [anon]; munmap must cut its pages
+                let maps = ustd::read_all(&alloc::format!("/proc/{}/maps", pid))
+                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                    .unwrap_or_default();
+                let addr = p as u64;
+                let still = maps.lines().any(|l| {
+                    l.split_whitespace()
+                        .next()
+                        .and_then(|rg| {
+                            let mut it = rg.split('-');
+                            match (it.next(), it.next()) {
+                                (Some(a), Some(b)) => Some((
+                                    u64::from_str_radix(a, 16).unwrap_or(0),
+                                    u64::from_str_radix(b, 16).unwrap_or(0),
+                                )),
+                                _ => None,
+                            }
+                        })
+                        .map(|(a, b)| addr >= a && addr < b)
+                        .unwrap_or(false)
+                });
+                before && un && !still
+            }
+            None => false,
+        }
+    });
+    check("mprotect", {
+        match ustd::mmap(4096) {
+            Some(p) => {
+                let pid = ustd::getpid();
+                let ok = ustd::mprotect(p, 4096, 1); // PROT_READ
+                let perm = ustd::read_all(&alloc::format!("/proc/{}/maps", pid))
+                    .map(|d| {
+                        let addr = p as u64;
+                        String::from_utf8_lossy(&d)
+                            .lines()
+                            .find(|l| {
+                                l.split_whitespace()
+                                    .next()
+                                    .and_then(|rg| {
+                                        let mut it = rg.split('-');
+                                        match (it.next(), it.next()) {
+                                            (Some(a), Some(b)) => Some((
+                                                u64::from_str_radix(a, 16).unwrap_or(0),
+                                                u64::from_str_radix(b, 16).unwrap_or(0),
+                                            )),
+                                            _ => None,
+                                        }
+                                    })
+                                    .map(|(a, b)| addr >= a && addr < b)
+                                    .unwrap_or(false)
+                            })
+                            .map(|l| l.contains("r--") || l.contains(" r"))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                let _ = ustd::munmap(p, 4096);
+                ok && perm
+            }
+            None => false,
+        }
+    });
+    check("chrt", {
+        let pid = ustd::getpid();
+        let on = ustd::chrt(pid, 1); // SCHED_RT
+        let rt = ustd::read_all(&alloc::format!("/proc/{}/status", pid))
+            .map(|d| {
+                String::from_utf8_lossy(&d)
+                    .lines()
+                    .find(|l| l.starts_with("Rt:"))
+                    .map(|l| l.contains('1'))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let off = ustd::chrt(pid, 0);
+        on && rt && off
+    });
+    check("ipcs-shm", {
+        match ustd::shm_create(4096) {
+            Some(id) => {
+                let listed = ustd::ipcs().contains(&id.to_string());
+                ustd::shm_drop(id);
+                listed && !ustd::ipcs().contains(&alloc::format!("{} ", id))
+            }
+            None => false,
+        }
+    });
+    check("dev-smbios-tables", {
+        // a real smbios table: first structure is any valid type with a
+        // formatted length inside the blob (QEMU leads with type 1 here)
+        ustd::read_all("/dev/smbios-tables")
+            .map(|d| d.len() > 8 && d[1] as usize >= 4 && (d[1] as usize) < d.len())
+            .unwrap_or(false)
+    });
+    check("dev-port", {
+        // real I/O port space: write a byte to 0x80 (POST delay port —
+        // fire-and-forget), read a live byte back from 0x40 (PIT counter)
+        ustd::open("/dev/port", 2)
+            .and_then(|fd| {
+                let mut b = [0u8; 1];
+                let _ = ustd::seek(fd, 0x80, 0);
+                let w = ustd::write(fd, &[0xABu8]).unwrap_or(0);
+                let _ = ustd::seek(fd, 0x40, 0);
+                let n = ustd::read(fd, &mut b).unwrap_or(0);
+                ustd::close(fd);
+                if w == 1 && n == 1 {
+                    Ok(())
+                } else {
+                    Err(-1i64)
+                }
+            })
+            .is_ok()
+    });
+    check("proc-smaps-wchan-children", {
+        let pid = ustd::getpid();
+        let smaps = ustd::read_all(&alloc::format!("/proc/{}/smaps", pid))
+            .map(|d| String::from_utf8_lossy(&d).contains("Rss:"))
+            .unwrap_or(false);
+        let wchan = ustd::read_all(&alloc::format!("/proc/{}/wchan", pid))
+            .map(|d| !String::from_utf8_lossy(&d).trim().is_empty())
+            .unwrap_or(false);
+        let children = ustd::read_all(&alloc::format!("/proc/1/children"))
+            .map(|d| !String::from_utf8_lossy(&d).trim().is_empty())
+            .unwrap_or(false);
+        smaps && wchan && children
+    });
+    check("net-operstate", {
+        let r = |v: &str| ustd::read_all("/proc/net/operstate")
+            .map(|d| String::from_utf8_lossy(&d).trim() == v)
+            .unwrap_or(false);
+        let w = ustd::write_all("/proc/net/operstate", b"down").is_ok()
+            && r("down")
+            && ustd::write_all("/proc/net/operstate", b"up").is_ok()
+            && r("up");
+        w
+    });
+    check("utmp-log", {
+        // every spawn appends "pid exe epoch" — init/selftest must be there
+        ustd::read_all("/utmp")
+            .map(|d| {
+                let t = String::from_utf8_lossy(&d).into_owned();
+                t.lines().any(|l| l.contains("selftest") || l.contains("init"))
+            })
+            .unwrap_or(false)
+    });
+    check("chrt-bogus-pid", !ustd::chrt(0xFFFF_FFFE, 1));
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

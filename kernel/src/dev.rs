@@ -20,14 +20,16 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use spin::Mutex;
 use x86_64::instructions::port::Port;
 
 const SNAPSHOT: usize = 4096;
 /// /dev/vda caps a single open at 1 MiB (cat-style readers terminate).
 const VDA_SNAPSHOT: usize = 1 << 20;
-const NAMES: [&str; 14] = [
+const NAMES: [&str; 16] = [
     "null", "zero", "full", "random", "urandom", "rtc", "vda",
     "fb0", "kmsg", "console", "mem", "nvram", "smbios", "dsp",
+    "smbios-tables", "port",
 ];
 
 pub fn handles(path: &str) -> bool {
@@ -65,6 +67,8 @@ pub fn read_at(path: &str, pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
         "mem" => return mem_read(pos, buf),
         "nvram" => return nvram_read(pos, buf),
         "smbios" => return smbios_read(pos, buf),
+        "smbios-tables" => return smbios_tables_read(pos, buf),
+        "port" => return port_read(pos, buf),
         "kmsg" => {
             // stream of the ring tail: pos 0 emits the whole tail, then EOF
             if pos != 0 {
@@ -101,6 +105,117 @@ pub fn read_at(path: &str, pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
         "console" | "dsp" => Ok(0), // write-only sinks; reads EOF
         _ => Err(-2),
     }
+}
+
+/// /dev/smbios-tables: the SMBIOS structure table exactly as QEMU exports
+/// it through fw_cfg "etc/smbios/smbios-tables" (what dmidecode parses).
+fn smbios_tables_read(pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    let data = smbios_tables().ok_or(-2i64)?;
+    let rem = (data.len() as u64).saturating_sub(pos) as usize;
+    let n = buf.len().min(rem);
+    if n == 0 {
+        return Ok(0);
+    }
+    buf[..n].copy_from_slice(&data[pos as usize..pos as usize + n]);
+    Ok(n)
+}
+
+static SMBIOS_TABLES: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+/// The whole SMBIOS structure table, fetched once and cached.
+/// Two real sources, tried in order:
+///   1. fw_cfg "etc/smbios/smbios-tables" (newer QEMU exports it whole)
+///   2. the anchor's table address/length — the actual dmidecode mechanism —
+///      read straight out of physical memory.
+fn smbios_tables() -> Option<Vec<u8>> {
+    let mut g = SMBIOS_TABLES.lock();
+    if let Some(d) = g.as_ref() {
+        return Some(d.clone());
+    }
+    if let Some((sel, size)) = fw_cfg_find("etc/smbios/smbios-tables") {
+        if size > 0 && size <= 1 << 20 {
+            let mut v = alloc::vec![0u8; size as usize];
+            let n = fw_cfg_read(sel, size as usize, 0, &mut v);
+            v.truncate(n);
+            if n > 0 {
+                *g = Some(v.clone());
+                return Some(v);
+            }
+        }
+    }
+    let (addr, len) = smbios_table_loc()?;
+    if len == 0 || len > 1 << 20 {
+        return None;
+    }
+    let mut v = alloc::vec![0u8; len];
+    unsafe {
+        let src = crate::mem::phys_to_virt(addr) as *const u8;
+        core::ptr::copy_nonoverlapping(src, v.as_mut_ptr(), len);
+    }
+    *g = Some(v.clone());
+    Some(v)
+}
+
+/// Parse the SMBIOS entry point for (table_addr, table_len) — 2.x anchor
+/// carries them in its "_DMI_" intermediate area; 3.x anchor carries a
+/// max size and 64-bit address.
+fn smbios_table_loc() -> Option<(u64, usize)> {
+    // fetch the anchor exactly like smbios_read does
+    let mut ep = alloc::vec![0u8; 64];
+    let n = if let Some((sel, size)) = fw_cfg_find("etc/smbios/smbios-anchor") {
+        fw_cfg_read(sel, size as usize, 0, &mut ep[..(size as usize).min(64)])
+    } else if let Some((ep_addr, ep_len)) = smbios_scan() {
+        let n = ep_len.min(64);
+        unsafe {
+            let src = crate::mem::phys_to_virt(ep_addr) as *const u8;
+            core::ptr::copy_nonoverlapping(src, ep.as_mut_ptr(), n);
+        }
+        n
+    } else {
+        return None;
+    };
+    let ep = &ep[..n];
+    if ep.starts_with(b"_SM3_") && ep.len() >= 24 {
+        let len = u32::from_le_bytes(ep[12..16].try_into().ok()?) as usize;
+        let addr = u64::from_le_bytes(ep[16..24].try_into().ok()?);
+        return Some((addr, len));
+    }
+    if ep.starts_with(b"_SM_") && ep.len() >= 0x20 {
+        // intermediate "_DMI_" section at byte 16: checksum @21,
+        // table len @22-23 (u16 LE), table addr @24-27 (u32 LE)
+        let len = u16::from_le_bytes(ep[22..24].try_into().ok()?) as usize;
+        let addr = u32::from_le_bytes(ep[24..28].try_into().ok()?) as u64;
+        return Some((addr, len));
+    }
+    None
+}
+
+/// /dev/port: raw x86 I/O port space — offset is the port number,
+/// one byte per `in`/`out` (like Linux /dev/port).
+fn port_read(pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    if pos > 0xFFFF {
+        return Ok(0);
+    }
+    let n = buf.len().min((0x10000 - pos) as usize);
+    for i in 0..n {
+        buf[i] = unsafe {
+            x86_64::instructions::port::Port::<u8>::new((pos + i as u64) as u16).read()
+        };
+    }
+    Ok(n)
+}
+
+fn port_write(pos: u64, buf: &[u8]) -> Result<usize, i64> {
+    if pos > 0xFFFF {
+        return Err(-9);
+    }
+    let n = buf.len().min((0x10000 - pos) as usize);
+    for i in 0..n {
+        unsafe {
+            x86_64::instructions::port::Port::<u8>::new((pos + i as u64) as u16).write(buf[i])
+        };
+    }
+    Ok(n)
 }
 
 /// /dev/fb0: raw framebuffer bytes at file offset `pos` (32bpp pixels,
@@ -348,6 +463,7 @@ pub fn write(path: &str, pos: u64, buf: &[u8]) -> Result<usize, i64> {
         "vda" | "rtc" | "mem" | "nvram" | "smbios" => Err(-30), // EROFS
         "random" | "urandom" => Ok(len), // accepted, ignored (like a seed write)
         "fb0" => fb0_write(pos, buf),
+        "port" => port_write(pos, buf),
         "kmsg" | "console" => {
             // userspace printk: into the klog ring and out the serial port
             let s = String::from_utf8_lossy(buf);

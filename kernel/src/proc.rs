@@ -27,7 +27,7 @@ const FILES: &[&str] = &[
 ];
 
 /// files under /proc/net
-const NET_FILES: &[&str] = &["tcp", "udp", "dev"];
+const NET_FILES: &[&str] = &["tcp", "udp", "dev", "operstate"];
 
 /// files under /proc/sys/kernel
 const SYS_FILES: &[&str] = &["hostname"];
@@ -52,6 +52,7 @@ fn pid_of(path: &str) -> Option<u32> {
 
 const PID_FILES: &[&str] = &[
     "status", "cmdline", "stat", "fds", "cwd", "maps", "io", "statm", "exe",
+    "smaps", "wchan", "children",
 ];
 
 pub fn is_dir(path: &str) -> bool {
@@ -208,6 +209,10 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/net/tcp" => net::net_tcp(),
         "/proc/net/udp" => net::net_udp(),
         "/proc/net/dev" => net::net_dev(),
+        "/proc/net/operstate" => alloc::format!(
+            "{}\n",
+            if net::is_up() { "up" } else { "down" }
+        ),
         "/proc/sys/kernel/hostname" => alloc::format!("{}\n", crate::syscall::hostname()),
         "/proc/stat" => {
             let (user, all) = task::cpu_sums();
@@ -366,6 +371,15 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
         }
         return Some(buf.len());
     }
+    if path == "/proc/net/operstate" {
+        let s = String::from(String::from_utf8_lossy(buf).trim());
+        match s.as_str() {
+            "up" => net::set_up(true),
+            "down" => net::set_up(false),
+            _ => return None,
+        }
+        return Some(buf.len());
+    }
     if path != "/proc/sys/kernel/hostname" {
         return None;
     }
@@ -392,8 +406,9 @@ fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
     let (name, argv, mem, ticks, is_user, state, nice, vrun, ppid) = task::pid_info(pid)?;
     let s = match file {
         "status" => alloc::format!(
-            "Name:\t{}\nPid:\t{}\nPPid:\t{}\nState:\t{}\nUser:\t{}\nVmSize:\t{} kB\nCpuTicks:\t{}\nNice:\t{}\nVrun:\t{}\n",
-            name, pid, ppid, state, is_user, mem / 1024, ticks, nice, vrun
+            "Name:\t{}\nPid:\t{}\nPPid:\t{}\nState:\t{}\nUser:\t{}\nVmSize:\t{} kB\nCpuTicks:\t{}\nNice:\t{}\nRt:\t{}\nVrun:\t{}\n",
+            name, pid, ppid, state, is_user, mem / 1024, ticks, nice,
+            task::pid_rt(pid).unwrap_or(false) as u8, vrun
         ),
         "cmdline" => alloc::format!("{} {}\n", name, argv).trim_end().to_string() + "\n",
         "stat" => alloc::format!(
@@ -416,6 +431,16 @@ fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
             alloc::format!("rchar: {}\nwchar: {}\nsyscr: {}\nsyscw: {}\nread_bytes: 0\nwrite_bytes: 0\n", r, w, r, w)
         }
         "statm" => task::pid_statm(pid).unwrap_or_default(),
+        "smaps" => task::pid_smaps(pid).unwrap_or_default(),
+        "wchan" => task::pid_wchan(pid).unwrap_or_default(),
+        "children" => alloc::format!(
+            "{}\n",
+            task::children_of(pid)
+                .iter()
+                .map(|c| alloc::format!("{}", c))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
         // exe is a symlink; opening it directly yields the path text
         "exe" => alloc::format!("{}\n", task::pid_exe(pid).unwrap_or_default()),
         _ => return None,

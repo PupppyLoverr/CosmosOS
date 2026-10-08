@@ -14,6 +14,18 @@ pub static RX_PKTS: AtomicU64 = AtomicU64::new(0);
 pub static RX_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static TX_PKTS: AtomicU64 = AtomicU64::new(0);
 pub static TX_BYTES: AtomicU64 = AtomicU64::new(0);
+static IFACE_UP: AtomicU64 = AtomicU64::new(1);
+
+/// Administrative interface state (`ifconfig eth0 up/down`). When down the
+/// rx pump drops every frame and transmit requests fail — a real carrier
+/// flag, not cosmetic.
+pub fn set_up(up: bool) {
+    IFACE_UP.store(up as u64, Ordering::Relaxed);
+}
+
+pub fn is_up() -> bool {
+    IFACE_UP.load(Ordering::Relaxed) != 0
+}
 
 /// `/proc/net/dev` body: real rx/tx counters for the virtio-net iface.
 pub fn net_dev() -> String {
@@ -87,7 +99,11 @@ fn now_ms() -> u64 {
 /// Returns (ip_proto, transport_payload) for IPv4 frames addressed to us.
 fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
     let mut out = Vec::new();
+    let up = is_up();
     for f in virtio_net::take_rx() {
+        if !up {
+            continue; // interface down: drop frames like a real NIC
+        }
         crate::pcap::log_frame(&f);
         RX_PKTS.fetch_add(1, Ordering::Relaxed);
         RX_BYTES.fetch_add(f.len() as u64, Ordering::Relaxed);
@@ -99,6 +115,9 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
         let mut v = Vec::new();
         n.drain_rx(&mut v);
         for f in v {
+            if !up {
+                continue;
+            }
             crate::pcap::log_frame(&f);
             RX_PKTS.fetch_add(1, Ordering::Relaxed);
             RX_BYTES.fetch_add(f.len() as u64, Ordering::Relaxed);
@@ -111,6 +130,9 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
 }
 
 fn send_frame(dst: [u8; 6], ethertype: u16, payload: &[u8]) -> Result<(), ()> {
+    if !is_up() {
+        return Err(()); // interface administratively down
+    }
     let Some(n) = NET.lock().clone() else { return Err(()) };
     let mut f = Vec::with_capacity(14 + payload.len());
     f.extend_from_slice(&dst);

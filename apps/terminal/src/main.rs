@@ -5,7 +5,9 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use shared::*;
 use ustd::draw::{self, Canvas};
@@ -3869,7 +3871,7 @@ fn note_freq(s: &str) -> Option<u32> {
 }
 
 /// Real SHA-256 (FIPS 180-4). Verified against the "" and "abc" vectors.
-fn sha256(data: &[u8]) -> [u8; 32] {
+fn sha2_core(data: &[u8], mut h: [u32; 8]) -> [u32; 8] {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -3881,10 +3883,6 @@ fn sha256(data: &[u8]) -> [u8; 32] {
         0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
         0xc67178f2,
-    ];
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
     ];
     let mut msg = data.to_vec();
     let bitlen = (data.len() as u64).wrapping_mul(8);
@@ -3937,11 +3935,240 @@ fn sha256(data: &[u8]) -> [u8; 32] {
         h[6] = h[6].wrapping_add(g);
         h[7] = h[7].wrapping_add(hh);
     }
+    h
+}
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    let h = sha2_core(
+        data,
+        [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ],
+    );
     let mut out = [0u8; 32];
     for i in 0..8 {
         out[4 * i..4 * i + 4].copy_from_slice(&h[i].to_be_bytes());
     }
     out
+}
+
+fn sha224(data: &[u8]) -> [u8; 28] {
+    // SHA-224: same compression with the second-round IV, truncating the
+    // last word
+    let h = sha2_core(
+        data,
+        [
+            0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7,
+            0xbefa4fa4,
+        ],
+    );
+    let mut out = [0u8; 28];
+    for i in 0..7 {
+        out[4 * i..4 * i + 4].copy_from_slice(&h[i].to_be_bytes());
+    }
+    out
+}
+
+// .Z format (ncompress-compatible): 1F 9D magic + flag byte (bit7 = block
+// mode, bits0-4 = maxbits), then the LZW code stream packed LSB-first
+// starting at 9 bits, growing to maxbits. Code 256 = CLEAR (block mode).
+const LZW_MAXBITS: usize = 16;
+
+fn lzw_compress(data: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = vec![0x1f, 0x9d, 0x80 | LZW_MAXBITS as u8];
+    let mut bitbuf: u64 = 0;
+    let mut nbits_in_buf = 0usize;
+    let mut cur_bits = 9usize;
+    let mut next: u32 = 257; // 256 = CLEAR
+    // dict: byte-prefix chains keyed by (prefix_code, suffix_byte)
+    let mut dict: BTreeMap<(u32, u8), u32> = BTreeMap::new();
+    let mut emit = |code: u32, bits: usize, out: &mut Vec<u8>, bitbuf: &mut u64, nbb: &mut usize| {
+        *bitbuf |= (code as u64) << *nbb;
+        *nbb += bits;
+        while *nbb >= 8 {
+            out.push((*bitbuf & 0xff) as u8);
+            *bitbuf >>= 8;
+            *nbb -= 8;
+        }
+    };
+    let mut pref: Option<u32> = None;
+    for &b in data {
+        match pref {
+            None => pref = Some(b as u32),
+            Some(p) => {
+                if let Some(&code) = dict.get(&(p, b)) {
+                    pref = Some(code);
+                } else {
+                    emit(p, cur_bits, &mut out, &mut bitbuf, &mut nbits_in_buf);
+                    if next < (1u32 << LZW_MAXBITS) {
+                        dict.insert((p, b), next);
+                        next += 1;
+                        // ncompress rule: grow once free_ent exceeds
+                        // maxcode = (1 << nbits) - 1
+                        if next >= (1u32 << cur_bits) && cur_bits < LZW_MAXBITS {
+                            cur_bits += 1;
+                        }
+                    }
+                    pref = Some(b as u32);
+                }
+            }
+        }
+    }
+    if let Some(p) = pref {
+        emit(p, cur_bits, &mut out, &mut bitbuf, &mut nbits_in_buf);
+    }
+    while nbits_in_buf > 0 {
+        out.push((bitbuf & 0xff) as u8);
+        bitbuf >>= 8;
+        nbits_in_buf = nbits_in_buf.saturating_sub(8);
+    }
+    out
+}
+
+fn lzw_decompress(d: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if d.len() < 3 || d[0] != 0x1f || d[1] != 0x9d {
+        return Err("not a .Z file");
+    }
+    let maxbits = (d[2] & 0x1f) as usize;
+    let block = d[2] & 0x80 != 0;
+    if !(9..=16).contains(&maxbits) {
+        return Err("bad maxbits");
+    }
+    let mut nbits = 9usize;
+    let mut next: usize = if block { 257 } else { 256 };
+    let mut dict: Vec<Vec<u8>> = (0..256).map(|i| vec![i as u8]).collect();
+    dict.resize(258, Vec::new());
+    let mut out = Vec::new();
+    let mut bitpos = 3 * 8usize;
+    let mut prev: Option<Vec<u8>> = None;
+    let rd = |bp: usize, nb: usize| -> Option<u32> {
+        let mut v = 0u32;
+        for i in 0..nb {
+            let byte = (bp + i) / 8;
+            if byte >= d.len() {
+                return None;
+            }
+            if (d[byte] >> ((bp + i) % 8)) & 1 != 0 {
+                v |= 1 << i;
+            }
+        }
+        Some(v)
+    };
+    loop {
+        let Some(code) = rd(bitpos, nbits) else { break };
+        bitpos += nbits;
+        let code = code as usize;
+        if block && code == 256 {
+            nbits = 9;
+            next = 257;
+            dict.truncate(256);
+            dict.resize(258, Vec::new());
+            prev = None;
+            continue;
+        }
+        let entry = if code < next {
+            dict[code].clone()
+        } else if code == next {
+            match &prev {
+                Some(p) if !p.is_empty() => {
+                    let mut e = p.clone();
+                    e.push(p[0]);
+                    e
+                }
+                _ => return Err("bad code"),
+            }
+        } else {
+            return Err("bad code");
+        };
+        if let Some(p) = &prev {
+            if next < (1usize << maxbits) {
+                if next < dict.len() {
+                    dict[next] = {
+                        let mut ne = p.clone();
+                        ne.push(entry[0]);
+                        ne
+                    };
+                } else {
+                    let mut ne = p.clone();
+                    ne.push(entry[0]);
+                    dict.push(ne);
+                }
+                next += 1;
+                if next >= (1usize << nbits) && nbits < maxbits {
+                    nbits += 1;
+                }
+            }
+        }
+        out.extend_from_slice(&entry);
+        prev = Some(entry);
+    }
+    Ok(out)
+}
+
+// `sum` algorithms: BSD (rotating checksum) and System V.
+fn sum_bsd(d: &[u8]) -> u32 {
+    let mut s: u32 = 0;
+    for &b in d {
+        s = (s >> 1) + ((s & 1) << 15);
+        s = s.wrapping_add(b as u32) & 0xffff;
+    }
+    s
+}
+
+fn sum_sysv(d: &[u8]) -> u32 {
+    let mut s: u32 = 0;
+    for &b in d {
+        s = s.wrapping_add(b as u32) & 0xffff;
+    }
+    let r = (s & 0xffff) + ((s >> 16) & 0xffff);
+    (r & 0xffff) + (r >> 16)
+}
+
+// SMBIOS structure-set iterator: each item is (type, formatted bytes after
+// the 4-byte header, decoded string set). The string set ends at a double NUL.
+fn dmi_next(data: &[u8], pos: usize) -> Option<(u8, Vec<u8>, Vec<String>, usize)> {
+    if pos + 4 > data.len() {
+        return None;
+    }
+    let ty = data[pos];
+    let len = data[pos + 1] as usize;
+    if len < 4 || pos + len > data.len() {
+        return None;
+    }
+    let fm = data[pos + 4..pos + len].to_vec();
+    // strings run from pos+len until two consecutive NULs
+    let mut vs = Vec::new();
+    let mut e = pos + len;
+    loop {
+        if e + 1 >= data.len() {
+            e = data.len();
+            break;
+        }
+        if data[e] == 0 && data[e + 1] == 0 {
+            e += 2;
+            break;
+        }
+        if data[e] == 0 {
+            e += 1;
+            continue;
+        }
+        let end = data[e..]
+            .iter()
+            .position(|b| *b == 0)
+            .map(|p| e + p)
+            .unwrap_or(data.len());
+        vs.push(String::from_utf8_lossy(&data[e..end]).into_owned());
+        e = end + 1;
+    }
+    Some((ty, fm, vs, e))
+}
+
+fn dmi_str(vs: &[String], idx: u8) -> String {
+    if idx == 0 {
+        return String::from("<unspecified>");
+    }
+    vs.get(idx as usize - 1).cloned().unwrap_or_default()
 }
 
 /// Reflected CRC32 (poly 0xEDB88320, init/final invert) -- the ZIP/gzip kind.
@@ -4568,6 +4795,7 @@ struct Term {
     nc_listen: Option<ustd::TcpListener>,              // `nc -l <port>` waiting for a client
     nc_udp: Option<(ustd::UdpSock, Option<([u8; 4], u16)>)>, // `nc -u`/`-lu` UDP session (peer learned)
     last_ok: bool,                                     // success of the last statement (for && / ||)
+    last_code: i64,                                    // real exit code when the last stmt produced one (wait/exit N); <0 = derive from last_ok
     pipestatus: Vec<i64>,                              // $PIPESTATUS: exit code of each stage of the last pipeline
     histexpand: bool,                                  // set -H/+H: bang history expansion (on by default)
     sel: Option<((usize, usize), (usize, usize))>,     // scrollback selection (line,col)->(line,col)
@@ -4605,6 +4833,7 @@ struct Term {
     func_depth: u8,                                    // recursion guard for function calls
     func_bdepth: i32,                                  // brace depth while collecting a func body
     func_locals: Vec<Vec<(String, Option<String>)>>,   // `local` saves per active call frame
+    func_stack: Vec<String>,                            // active call names for $FUNCNAME
     exit_trap: Option<String>,                         // `trap <cmd> EXIT` — runs on `exit`
     block_buf: String,                                 // unfinished for/while/if/heredoc input awaiting its closer
     heredocs: Vec<String>,                             // heredoc bodies extracted by norm_stmts (`<<\x01N` markers)
@@ -4782,7 +5011,7 @@ impl Term {
     /// target, each `@@ -s,c +s,c @@` hunk is located by matching its
     /// context+removed lines (searched ±64 lines around the expected spot,
     /// tracking cumulative offset like real patch).
-    fn run_patch(&mut self, text: &str) {
+    fn run_patch(&mut self, text: &str, rev: bool, dry: bool) {
         let lines: Vec<&str> = text.lines().collect();
         let mut i = 0usize;
         let mut any = false;
@@ -4803,7 +5032,15 @@ impl Term {
                 if p.starts_with("+++ ") {
                     let old_name = name(lines[i]);
                     let new_name = name(p);
-                    target = if ustd::stat(&old_name).is_ok() || new_name.is_empty() {
+                    // -R reverses the direction, so the '+++' name is the
+                    // target and '---' is what we're moving towards
+                    target = if rev {
+                        if ustd::stat(&new_name).is_ok() || old_name.is_empty() {
+                            new_name
+                        } else {
+                            old_name
+                        }
+                    } else if ustd::stat(&old_name).is_ok() || new_name.is_empty() {
                         old_name
                     } else {
                         new_name
@@ -4824,13 +5061,14 @@ impl Term {
                 let hdr = lines[i];
                 i += 1;
                 // @@ -a,b +c,d @@
-                let (a_start, _b_start) = match parse_hunk(hdr) {
+                let (a_start, b_start) = match parse_hunk(hdr) {
                     Some(x) => x,
                     None => {
                         self.fail(&alloc::format!("patch: bad hunk header '{}'", hdr));
                         return;
                     }
                 };
+                let a_start = if rev { b_start } else { a_start };
                 let (mut old, mut new) = (Vec::new(), Vec::new());
                 while i < lines.len() {
                     let l = lines[i];
@@ -4848,7 +5086,11 @@ impl Term {
                     }
                     i += 1;
                 }
-                hunks.push((a_start, old, new));
+                if rev {
+                    hunks.push((a_start, new, old));
+                } else {
+                    hunks.push((a_start, old, new));
+                }
             }
             if target.is_empty() || hunks.is_empty() {
                 continue;
@@ -4901,10 +5143,15 @@ impl Term {
                 }
             }
             if ok {
-                let joined = cur.join("\n") + "\n";
-                match ustd::write_all(&target, joined.as_bytes()) {
-                    Ok(()) => any = true,
-                    Err(e) => self.fail(&alloc::format!("patch: {}: err {}", target, e)),
+                if dry {
+                    self.emit(&alloc::format!("patch: {}: dry-run ok", target));
+                    any = true;
+                } else {
+                    let joined = cur.join("\n") + "\n";
+                    match ustd::write_all(&target, joined.as_bytes()) {
+                        Ok(()) => any = true,
+                        Err(e) => self.fail(&alloc::format!("patch: {}: err {}", target, e)),
+                    }
                 }
             }
         }
@@ -4940,6 +5187,41 @@ impl Term {
                 "{}",
                 (ustd::uptime_ms().saturating_sub(self.start_ms)) / 1000
             )),
+            "UID" | "EUID" => Some(String::from("0")),
+            "PPID" => ustd::read_all("/proc/self/status").ok().and_then(|d| {
+                String::from_utf8_lossy(&d)
+                    .into_owned()
+                    .lines()
+                    .find(|l| l.starts_with("PPid:"))
+                    .and_then(|l| l.split_whitespace().nth(1).map(String::from))
+            }),
+            "BASH_VERSION" => Some(String::from("5.2.0(1)-cosmos")),
+            "SHELLOPTS" => Some(alloc::format!(
+                "{}{}{}{}{}{}",
+                if self.noclobber { "noclobber:" } else { "" },
+                if self.noglob { "noglob:" } else { "" },
+                if self.nounset { "nounset:" } else { "" },
+                if self.pipefail { "pipefail:" } else { "" },
+                if self.setx { "xtrace:" } else { "" },
+                if self.histexpand { "histexpand" } else { "" }
+            )),
+            "COLUMNS" => Some(alloc::format!("{}", COLS)),
+            "LINES" => Some(alloc::format!("{}", ROWS)),
+            "HOSTTYPE" => Some(String::from("x86_64")),
+            "OSTYPE" => Some(String::from("cosmos")),
+            "MACHTYPE" => Some(String::from("x86_64-cosmos")),
+            "TERM" => Some(String::from("cosmos")),
+            "FUNCNAME" => self.func_stack.last().cloned(),
+            "FUNCNAME_COUNT" => Some(alloc::format!("{}", self.func_stack.len())),
+            _ if name.starts_with("FUNCNAME_") => name["FUNCNAME_".len()..]
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| {
+                    self.func_stack
+                        .len()
+                        .checked_sub(1 + i)
+                        .and_then(|j| self.func_stack.get(j).cloned())
+                }),
             _ => match self.vars.get(name) {
                 Some(v) => Some(v.clone()),
                 None => {
@@ -5250,7 +5532,10 @@ impl Term {
                         .collect();
                     Some(parts.join(" "))
                 }
-                "?" => Some(String::from(if t.last_ok { "0" } else { "1" })),
+                "?" => Some(alloc::format!(
+                    "{}",
+                    if t.last_code >= 0 { t.last_code } else { t.last_ok as i64 ^ 1 }
+                )),
                 "!" => Some(alloc::format!("{}", t.last_spawn)),
                 "$" => Some(alloc::format!("{}", ustd::getpid())),
                 _ => t.lookup_var(n),
@@ -5281,6 +5566,36 @@ impl Term {
             present.or_else(|| Some(String::new()))
         };
         match () {
+            _ if op.starts_with("^^") || op.starts_with('^') => {
+                // ${V^^} upper-case the whole value; ${V^} first char only
+                let all = op.starts_with("^^");
+                val.map(|v| {
+                    if all {
+                        v.to_uppercase()
+                    } else {
+                        let mut c = v.chars();
+                        match c.next() {
+                            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                            None => v,
+                        }
+                    }
+                })
+            }
+            _ if op.starts_with(",,") || op.starts_with(',') => {
+                // ${V,,} lower-case the whole value; ${V,} first char only
+                let all = op.starts_with(",,");
+                val.map(|v| {
+                    if all {
+                        v.to_lowercase()
+                    } else {
+                        let mut c = v.chars();
+                        match c.next() {
+                            Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
+                            None => v,
+                        }
+                    }
+                })
+            }
             _ if op.starts_with(":-") || op.starts_with('-') => {
                 // default: ${V:-w} uses w when unset-or-empty; ${V-w} unset only
                 let colon = op.starts_with(':');
@@ -7843,6 +8158,8 @@ impl Term {
             "sha1sum", "cksum", "comm", "zgrep", "zip", "unzip", "chmod", "touch",
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
+            "egrep", "fgrep", "sdiff", "diff3", "merge", "compress",
+            "uncompress", "sum", "sha224sum", "namei",
         ];
         let glob_tok = |t: &str| {
             t.contains('*')
@@ -7996,7 +8313,9 @@ impl Term {
             }
             self.func_depth += 1;
             self.func_locals.push(Vec::new());
+            self.func_stack.push(String::from(cmd));
             self.run(&body);
+            self.func_stack.pop();
             self.func_depth -= 1;
             if self.flow == 3 {
                 // `return` unwinds to here — it's a function exit, not a
@@ -8030,10 +8349,35 @@ impl Term {
         // optimistic success -- fail() marks the statement failed; $? /
         // && / || read this after the command finishes
         self.last_ok = true;
+        self.last_code = -1; // set by wait/timeout/exit N when a real code exists
         if self.disabled.contains(cmd) {
             self.fail(&alloc::format!("{}: disabled builtin", cmd));
             return;
         }
+        // alias-style commands rewrite into the real target BEFORE dispatch —
+        // args are already dequoted here, so we mutate cmd/args directly
+        // rather than re-run()ing a synthesized string (which would leak
+        // characters like | inside the original quotes)
+        let mut owned_args: Option<Vec<String>> = None;
+        let mut cmd = cmd;
+        match cmd {
+            "egrep" | "fgrep" | "sdiff" => {
+                let (target, flag) = match cmd {
+                    "egrep" => ("grep", "-E"),
+                    "fgrep" => ("grep", "-F"),
+                    _ => ("diff", "-y"),
+                };
+                let mut v = vec![String::from(flag)];
+                v.extend(args.iter().map(|s| String::from(*s)));
+                owned_args = Some(v);
+                cmd = target;
+            }
+            _ => {}
+        }
+        let args: Vec<&str> = match &owned_args {
+            Some(v) => v.iter().map(|s| s.as_str()).collect(),
+            None => args,
+        };
         match cmd {
             "help" => {
                 let lines = Self::HELP_LINES;
@@ -8417,11 +8761,13 @@ impl Term {
                         Ok(code) => {
                             self.emit(&alloc::format!("timeout: {} exited ({})", c, code));
                             self.last_ok = code == 0;
+                            self.last_code = code;
                         }
                         Err(_) => {
                             let _ = ustd::kill(pid);
                             self.emit(&alloc::format!("timeout: {} killed after {}s", c, secs));
                             self.last_ok = false;
+                            self.last_code = 124;
                         }
                     },
                     Err(_) => self.fail(&alloc::format!("timeout: {}: spawn failed", c)),
@@ -15233,9 +15579,9 @@ impl Term {
                 }
             }
             "patch" => {
-                // patch [file.diff] — apply a unified diff (from `diff -u`).
+                // patch [-R] [--dry-run] [file.diff] — apply a unified diff.
                 // Reads the diff file given, or stdin (pipe heredoc) when none.
-                let text = match args.first() {
+                let text = match args.iter().find(|a| !a.starts_with('-')) {
                     Some(p) => match ustd::read_all(p) {
                         Ok(d) => String::from_utf8_lossy(&d).into_owned(),
                         Err(e) => {
@@ -15249,7 +15595,9 @@ impl Term {
                     self.fail("usage: patch <file.diff>   (or pipe a unified diff)");
                     return;
                 }
-                self.run_patch(&text);
+                let rev = args.iter().any(|a| *a == "-R" || *a == "--reverse");
+                let dry = args.iter().any(|a| *a == "--dry-run" || *a == "-N" && false);
+                self.run_patch(&text, rev, dry);
             }
             "md5sum" | "sha256sum" | "sha1sum" if args.iter().any(|a| *a == "-c") => {
                 // sum -c <listfile>: lines "hash  name" -> verify each
@@ -15915,16 +16263,35 @@ impl Term {
                 )),
                 None => self.fail("dhcp: no response (net down or no server)"),
             },
-            "ifconfig" => match ustd::net_info() {
-                Some((mac, ip)) => {
-                    self.emit(&alloc::format!(
-                        "net0: ip {}.{}.{}.{} mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                        ip[0], ip[1], ip[2], ip[3],
-                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-                    ));
+            "ifconfig" => {
+                // ifconfig [eth0 [up|down]] — 'up'/'down' flip the real link
+                // state through /proc/net/operstate (drops rx, fails tx)
+                let pos: Vec<&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                if pos.len() >= 2 && (pos[1] == "up" || pos[1] == "down") {
+                    match ustd::write_all("/proc/net/operstate", pos[1].as_bytes()) {
+                        Ok(()) => self.emit(&alloc::format!("eth0: link {}", pos[1])),
+                        Err(e) => {
+                            self.fail(&alloc::format!("ifconfig: operstate err {}", e))
+                        }
+                    }
+                    return;
                 }
-                None => self.emit("no network device"),
-            },
+                match ustd::net_info() {
+                    Some((mac, ip)) => {
+                        let up = ustd::read_all("/proc/net/operstate")
+                            .map(|d| String::from_utf8_lossy(&d).trim().to_string())
+                            .unwrap_or_else(|_| String::from("up"));
+                        self.emit(&alloc::format!(
+                            "eth0: flags=<{}> ip {}.{}.{}.{} mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                            if up == "up" { "UP,RUNNING" } else { "DOWN" },
+                            ip[0], ip[1], ip[2], ip[3],
+                            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                        ));
+                    }
+                    None => self.emit("no network device"),
+                }
+            }
             "jobs" => {
                 // jobs [-l] [-p]: -p prints just the live job pids
                 if args.first() == Some(&"-p") {
@@ -16236,16 +16603,59 @@ impl Term {
                 }
             }
             "sysctl" => {
-                // real kernel/machine parameters
+                // sysctl [-a] [key | key=value] — real kernel/machine params
                 let mi = ustd::meminfo();
                 let khn = ustd::hostname();
-                self.emit(&alloc::format!("kernel.hostname = {}", khn));
-                self.emit("kernel.osrelease = 0.1");
-                self.emit("kernel.arch = x86_64");
-                self.emit(&alloc::format!("vm.page_size = {}", 4096));
-                self.emit(&alloc::format!("vm.mem_total_kb = {}", mi.total_kb));
-                self.emit(&alloc::format!("vm.mem_free_kb = {}", mi.total_kb.saturating_sub(mi.used_kb)));
-                self.emit("hw.ncpu = 1");
+                let kv: Vec<(&str, String)> = vec![
+                    ("kernel.hostname", khn.clone()),
+                    ("kernel.osrelease", String::from("0.1")),
+                    ("kernel.arch", String::from("x86_64")),
+                    ("vm.page_size", String::from("4096")),
+                    ("vm.mem_total_kb", alloc::format!("{}", mi.total_kb)),
+                    ("vm.mem_free_kb", alloc::format!(
+                        "{}", mi.total_kb.saturating_sub(mi.used_kb))),
+                    ("hw.ncpu", String::from("1")),
+                ];
+                let pos: Vec<&str> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .copied()
+                    .collect();
+                match pos.first() {
+                    None => {
+                        for (k, v) in &kv {
+                            self.emit(&alloc::format!("{} = {}", k, v));
+                        }
+                    }
+                    Some(k) if k.contains('=') => {
+                        // sysctl -w kernel.hostname=X -> /proc/sys/kernel/hostname
+                        let mut it = k.splitn(2, '=');
+                        let (key, val) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
+                        match key {
+                            "kernel.hostname" | "hostname" => {
+                                let p = "/proc/sys/kernel/hostname";
+                                match ustd::write_all(p, val.as_bytes()) {
+                                    Ok(()) => {
+                                        self.host = String::from(val);
+                                        self.vars.insert(
+                                            String::from("HOSTNAME"),
+                                            self.host.clone());
+                                        self.emit(&alloc::format!(
+                                            "{} = {}", key, val));
+                                    }
+                                    Err(e) => self.fail(&alloc::format!(
+                                        "sysctl: {} err {}", key, e)),
+                                }
+                            }
+                            _ => self.fail(&alloc::format!(
+                                "sysctl: {}: unknown key", key)),
+                        }
+                    }
+                    Some(k) => match kv.iter().find(|(kk, _)| *kk == *k) {
+                        Some((kk, v)) => self.emit(&alloc::format!("{} = {}", kk, v)),
+                        None => self.fail(&alloc::format!("sysctl: {}: unknown key", k)),
+                    },
+                }
             }
             "dos2unix" | "unix2dos" => {
                 // convert CRLF<->LF on a file in place, or pipe content
@@ -16377,7 +16787,14 @@ impl Term {
                     }
                 },
             },
-            "exit" => {
+            "exit" | "logout" => {
+                // exit N: the code propagates — `wait`/`$?` see the real value
+                if let Some(a) = args.first() {
+                    if let Ok(n) = a.parse::<i64>() {
+                        self.last_code = n & 0xff;
+                        self.last_ok = n == 0;
+                    }
+                }
                 if self.script_depth > 0 {
                     self.flow = 3; // inside sh/source: stop the script
                 } else {
@@ -16931,7 +17348,11 @@ impl Term {
                     let js = core::mem::take(&mut self.jobs);
                     for (pid, c) in js {
                         match ustd::waitpid(pid, 30_000) {
-                            Ok(code) => self.emit(&alloc::format!("[{}] {} exited ({})", pid, c, code)),
+                            Ok(code) => {
+                                self.emit(&alloc::format!("[{}] {} exited ({})", pid, c, code));
+                                self.last_code = code;
+                                self.last_ok = code == 0;
+                            }
                             Err(_) => self.fail(&alloc::format!("wait: {}: gone", pid)),
                         }
                     }
@@ -16956,7 +17377,11 @@ impl Term {
                     };
                     self.jobs.retain(|(p, _)| *p != pid);
                     match ustd::waitpid(pid, 30_000) {
-                        Ok(code) => self.emit(&alloc::format!("pid {} exited (status {})", pid, code)),
+                        Ok(code) => {
+                            self.emit(&alloc::format!("pid {} exited (status {})", pid, code));
+                            self.last_code = code;
+                            self.last_ok = code == 0;
+                        }
                         Err(_) => self.fail(&alloc::format!("wait: {}: timeout or no such task", pid)),
                     }
                 }
@@ -17493,6 +17918,824 @@ impl Term {
                             }
                             out.push_str(l.trim_start_matches(' '));
                             self.emit(&out);
+                        }
+                    }
+                }
+            }
+            // ---- batch 30: observability + hardware inventory ----
+            "dmidecode" => {
+                // dmidecode [-t TYPE] — real SMBIOS structures streamed from
+                // /dev/smbios-tables (fetched via QEMU fw_cfg in the kernel)
+                let want: Option<u8> = args
+                    .iter()
+                    .position(|a| *a == "-t" || *a == "--type")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|s| s.parse().ok());
+                match ustd::read_all("/dev/smbios-tables") {
+                    Ok(data) => {
+                        let mut pos = 0usize;
+                        let mut seen = 0usize;
+                        while let Some((ty, fm, vs, next)) = dmi_next(&data, pos) {
+                            pos = next;
+                            if want.map(|w| w != ty).unwrap_or(false) {
+                                continue;
+                            }
+                            let u16at = |o: usize| -> u16 {
+                                if o + 1 < fm.len() {
+                                    u16::from_le_bytes([fm[o], fm[o + 1]])
+                                } else {
+                                    0
+                                }
+                            };
+                            let s = |o: usize| dmi_str(&vs, fm.get(o).copied().unwrap_or(0));
+                            match ty {
+                                0 => {
+                                    self.emit("BIOS Information");
+                                    self.emit(&alloc::format!("\tVendor: {}", s(0)));
+                                    self.emit(&alloc::format!("\tVersion: {}", s(1)));
+                                    self.emit(&alloc::format!(
+                                        "\tRelease Date: {}/{}/20{:02}",
+                                        fm.get(5).copied().unwrap_or(0),
+                                        fm.get(6).copied().unwrap_or(0),
+                                        fm.get(7).copied().unwrap_or(0)
+                                    ));
+                                }
+                                1 => {
+                                    self.emit("System Information");
+                                    for (lbl, i) in [
+                                        ("Manufacturer", 0usize),
+                                        ("Product Name", 1),
+                                        ("Version", 2),
+                                        ("Serial Number", 3),
+                                        ("SKU Number", 21),
+                                        ("Family", 22),
+                                    ] {
+                                        self.emit(&alloc::format!("\t{}: {}", lbl, s(i)));
+                                    }
+                                    if fm.len() >= 20 {
+                                        let u = &fm[4..20];
+                                        self.emit(&alloc::format!(
+                                            "\tUUID: {:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                                            u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+                                            u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]
+                                        ));
+                                    }
+                                }
+                                2 | 3 => {
+                                    self.emit(if ty == 2 {
+                                        "Base Board Information"
+                                    } else {
+                                        "Chassis Information"
+                                    });
+                                    for (lbl, i) in [
+                                        ("Manufacturer", 0usize),
+                                        ("Product Name", 1),
+                                        ("Version", 2),
+                                        ("Serial Number", 3),
+                                    ] {
+                                        self.emit(&alloc::format!("\t{}: {}", lbl, s(i)));
+                                    }
+                                }
+                                4 => {
+                                    self.emit("Processor Information");
+                                    self.emit(&alloc::format!("\tSocket: {}", s(0)));
+                                    self.emit(&alloc::format!("\tManufacturer: {}", s(3)));
+                                    self.emit(&alloc::format!("\tVersion: {}", s(8)));
+                                    self.emit(&alloc::format!(
+                                        "\tExternal Clock: {} MHz", u16at(10)));
+                                    self.emit(&alloc::format!(
+                                        "\tMax Speed: {} MHz", u16at(12)));
+                                    self.emit(&alloc::format!(
+                                        "\tCurrent Speed: {} MHz", u16at(14)));
+                                }
+                                11 => {
+                                    self.emit("OEM Strings");
+                                    for st in &vs {
+                                        self.emit(&alloc::format!("\t{}", st));
+                                    }
+                                }
+                                127 => {
+                                    if want.is_none() || want == Some(127) {
+                                        self.emit("End Of Table");
+                                    }
+                                }
+                                _ => {
+                                    self.emit(&alloc::format!(
+                                        "DMI type {}, {} bytes", ty, fm.len() + 4));
+                                }
+                            }
+                            seen += 1;
+                            if ty == 127 {
+                                break;
+                            }
+                        }
+                        if seen == 0 && want.is_none() {
+                            self.emit("dmidecode: no DMI structures found");
+                        }
+                    }
+                    Err(e) => {
+                        self.fail(&alloc::format!("dmidecode: /dev/smbios-tables err {}", e))
+                    }
+                }
+            }
+            "ipcs" => {
+                // SYS_IPCS dumps the kernel shm registry: "id owner size refs"
+                self.emit("------ Shared Memory Segments --------");
+                self.emit("key        shmid      owner      bytes      nattch");
+                for l in ustd::ipcs().lines() {
+                    let mut it = l.split_whitespace();
+                    let (id, owner, size, refs) = (
+                        it.next().unwrap_or("0").parse::<u32>().unwrap_or(0),
+                        it.next().unwrap_or("0"),
+                        it.next().unwrap_or("0"),
+                        it.next().unwrap_or("0"),
+                    );
+                    self.emit(&alloc::format!(
+                        "{:#010x} {:<10} {:<10} {:<10} {}", id, id, owner, size, refs));
+                }
+            }
+            "ipcrm" => {
+                let mut i = 0usize;
+                let mut done = false;
+                while i < args.len() {
+                    if args[i] == "-m" || args[i] == "-s" || args[i] == "-q" {
+                        match args.get(i + 1).and_then(|s| s.parse::<u32>().ok()) {
+                            Some(id) => {
+                                ustd::shm_drop(id);
+                                done = true;
+                            }
+                            None => {
+                                self.fail("usage: ipcrm -m <shmid>");
+                                return;
+                            }
+                        }
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if !done {
+                    self.fail("usage: ipcrm -m <shmid>");
+                }
+            }
+            "chrt" => {
+                // chrt -p <pid> query | chrt -r|-o <pid> set real sched class
+                let mut mode: Option<u64> = None;
+                let mut query = false;
+                let mut pid: Option<u32> = None;
+                for a in args.iter() {
+                    match *a {
+                        "-r" | "--rr" => mode = Some(1),
+                        "-o" | "--other" => mode = Some(0),
+                        "-p" => query = true,
+                        a => {
+                            if a.parse::<u32>().is_ok() && pid.is_none() {
+                                pid = a.parse().ok();
+                            }
+                        }
+                    }
+                }
+                let Some(pid) = pid else {
+                    self.fail("usage: chrt -p <pid> | chrt -r|-o <pid>");
+                    return;
+                };
+                if mode.is_none() || query {
+                    match ustd::read_all(&alloc::format!("/proc/{}/status", pid)) {
+                        Ok(d) => {
+                            let rt = String::from_utf8_lossy(&d)
+                                .lines()
+                                .find(|l| l.starts_with("Rt:"))
+                                .and_then(|l| l.split_whitespace().nth(1))
+                                .map(|s| s == "1")
+                                .unwrap_or(false);
+                            self.emit(&alloc::format!(
+                                "pid {}'s current scheduling policy: {}",
+                                pid,
+                                if rt { "SCHED_RR" } else { "SCHED_OTHER" }
+                            ));
+                        }
+                        Err(e) => self.fail(&alloc::format!("chrt: {}: err {}", pid, e)),
+                    }
+                } else if ustd::chrt(pid, mode.unwrap()) {
+                    self.emit(&alloc::format!(
+                        "pid {} policy -> {}",
+                        pid,
+                        if mode == Some(1) { "SCHED_RR" } else { "SCHED_OTHER" }
+                    ));
+                } else {
+                    self.fail(&alloc::format!("chrt: pid {} failed", pid));
+                }
+            }
+            "taskset" => {
+                // single-CPU box: the only legal affinity includes cpu 0.
+                // -c takes a cpu LIST ("0,2"), without it the arg is a mask.
+                let list_mode = args
+                    .iter()
+                    .any(|a| a.starts_with('-') && a.contains('c'));
+                let pos: Vec<&str> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .copied()
+                    .collect();
+                match pos.len() {
+                    1 => match pos[0].parse::<u32>() {
+                        Ok(pid) => self.emit(&alloc::format!(
+                            "pid {}'s current affinity mask: 1", pid)),
+                        Err(_) => self.fail("usage: taskset [-pc] [mask|cpus] <pid>"),
+                    },
+                    2 => {
+                        let m = if list_mode {
+                            pos[0]
+                                .split(',')
+                                .filter_map(|p| p.parse::<u32>().ok())
+                                .fold(0u64, |m, id| m | (1u64 << id.min(63)))
+                        } else {
+                            u64::from_str_radix(
+                                pos[0].trim_start_matches("0x"), 16)
+                                .unwrap_or_else(|_| {
+                                    pos[0].parse().unwrap_or(0)
+                                })
+                        };
+                        if m & 1 != 0 {
+                            self.emit(&alloc::format!(
+                                "pid {}'s new affinity mask: 1", pos[1]))
+                        } else {
+                            self.fail("taskset: mask must include cpu 0")
+                        }
+                    }
+                    _ => self.fail("usage: taskset [-pc] [mask|cpus] <pid>"),
+                }
+            }
+            "yield" => {
+                ustd::yield_now();
+            }
+            "lsusb" => {
+                // real USB-class devices from the PCI config-space scan
+                let mut buf = [shared::PciEnt::default(); 32];
+                let n = ustd::pci_scan(&mut buf);
+                let mut any = false;
+                for e in &buf[..n] {
+                    if e.class == 0x0c {
+                        any = true;
+                        let kind = match e.subclass {
+                            0x03 => "USB (XHCI)",
+                            0x10 => "USB (OHCI)",
+                            0x20 => "USB2 (EHCI)",
+                            _ => "USB Controller",
+                        };
+                        self.emit(&alloc::format!(
+                            "Bus {:03} Device {:03}: ID {:04x}:{:04x} {}",
+                            e.bus, e.dev, e.vendor, e.device, kind
+                        ));
+                    }
+                }
+                if !any {
+                    self.emit("no USB devices on the PCI bus");
+                }
+            }
+            "ethtool" => {
+                // ethtool [dev]: link state + real driver/rx/tx counters
+                let up = ustd::read_all("/proc/net/operstate")
+                    .map(|d| String::from_utf8_lossy(&d).trim().to_string())
+                    .unwrap_or_else(|_| String::from("unknown"));
+                let devt = ustd::read_all("/proc/net/dev")
+                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                    .unwrap_or_default();
+                let (mut rxp, mut rxb, mut txp, mut txb) = (0u64, 0u64, 0u64, 0u64);
+                for l in devt.lines() {
+                    if l.contains("eth0") {
+                        // fields live after "eth0:" — the '0' in the iface
+                        // name must not join the number stream
+                        let rest = l.split(':').nth(1).unwrap_or("");
+                        let f: Vec<u64> = rest
+                            .split(|c: char| !c.is_ascii_digit())
+                            .filter(|s| !s.is_empty())
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
+                        // 16 fields like Linux: rx{bytes,packets,errs,drop,
+                        // fifo,frame,comp,mcast} then the same 8 for tx
+                        if f.len() >= 10 {
+                            rxb = f[0];
+                            rxp = f[1];
+                            txb = f[8];
+                            txp = f[9];
+                        }
+                    }
+                }
+                self.emit("Settings for eth0:");
+                self.emit("\tDriver: virtio-net");
+                self.emit(&alloc::format!(
+                    "\tLink detected: {}",
+                    if up == "up" { "yes" } else { "no" }
+                ));
+                self.emit(&alloc::format!("\tRX: {} packets {} bytes", rxp, rxb));
+                self.emit(&alloc::format!("\tTX: {} packets {} bytes", txp, txb));
+            }
+            "ip" => match args.first().copied() {
+                Some("a") | Some("addr") | Some("address") => {
+                    self.run(&String::from("ifconfig"));
+                }
+                Some("l") | Some("link") => {
+                    if args.get(1) == Some(&"set") {
+                        // ip link set eth0 up|down — same real path as ifconfig
+                        let dev = args.get(2).copied().unwrap_or("eth0");
+                        let state = args.get(3).copied().unwrap_or("");
+                        self.run(&alloc::format!("ifconfig {} {}", dev, state));
+                    } else {
+                        let up = ustd::read_all("/proc/net/operstate")
+                            .map(|d| String::from_utf8_lossy(&d).trim().to_string())
+                            .unwrap_or_else(|_| String::from("down"));
+                        if let Some((mac, ip)) = ustd::net_info() {
+                            self.emit(&alloc::format!(
+                                "1: eth0: <{}> mtu 1500 state {}",
+                                if up == "up" { "UP,LOWER_UP" } else { "DOWN" },
+                                up.to_uppercase()
+                            ));
+                            self.emit(&alloc::format!(
+                                "    link/ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                            ));
+                            self.emit(&alloc::format!(
+                                "    inet {}.{}.{}.{}/24",
+                                ip[0], ip[1], ip[2], ip[3]
+                            ));
+                        }
+                    }
+                }
+                Some("r") | Some("route") => {
+                    self.emit("default via 10.0.2.2 dev eth0");
+                    if let Some((_, ip)) = ustd::net_info() {
+                        self.emit(&alloc::format!(
+                            "10.0.2.0/24 dev eth0 proto kernel scope link src {}.{}.{}.{}",
+                            ip[0], ip[1], ip[2], ip[3]
+                        ));
+                    }
+                }
+                _ => self.fail("usage: ip a|addr | ip l|link [set eth0 up|down] | ip r|route"),
+            },
+            "ss" => {
+                // socket snapshot over the kernel's /proc/net dumps
+                let only_tcp = args.iter().any(|a| *a == "-t");
+                let only_udp = args.iter().any(|a| *a == "-u");
+                let show_tcp = only_tcp || !only_udp;
+                let show_udp = only_udp || !only_tcp;
+                self.emit("Netid  Local Address:Port  Peer Address:Port");
+                if show_tcp {
+                    if let Ok(d) = ustd::read_all("/proc/net/tcp") {
+                        let t = String::from_utf8_lossy(&d);
+                        for l in t.lines().skip(1) {
+                            if l.trim().is_empty() {
+                                continue;
+                            }
+                            self.emit(&alloc::format!("tcp  {}", l.trim()));
+                        }
+                    }
+                }
+                if show_udp {
+                    if let Ok(d) = ustd::read_all("/proc/net/udp") {
+                        let t = String::from_utf8_lossy(&d);
+                        for l in t.lines().skip(1) {
+                            if l.trim().is_empty() {
+                                continue;
+                            }
+                            self.emit(&alloc::format!("udp  {}", l.trim()));
+                        }
+                    }
+                }
+            }
+            "pmap" => match args.iter().find(|a| a.parse::<u32>().is_ok()) {
+                Some(pid) => match ustd::read_all(&alloc::format!("/proc/{}/maps", pid)) {
+                    Ok(d) => {
+                        let t = String::from_utf8_lossy(&d);
+                        self.emit(&alloc::format!("{}:   memory map", pid));
+                        let mut total = 0u64;
+                        for l in t.lines() {
+                            self.emit(l);
+                            if let Some(rg) = l.split_whitespace().next() {
+                                let mut it = rg.split('-');
+                                if let (Some(a), Some(b)) = (it.next(), it.next()) {
+                                    if let (Ok(a), Ok(b)) = (
+                                        u64::from_str_radix(a, 16),
+                                        u64::from_str_radix(b, 16),
+                                    ) {
+                                        total += b - a;
+                                    }
+                                }
+                            }
+                        }
+                        self.emit(&alloc::format!(" total {} kB", total / 1024));
+                    }
+                    Err(e) => self.fail(&alloc::format!("pmap: {}: err {}", pid, e)),
+                },
+                None => self.fail("usage: pmap <pid>"),
+            },
+            "lslocks" => {
+                self.emit("COMMAND           PID  TYPE MODE  PATH");
+                match ustd::read_all("/proc/locks") {
+                    Ok(d) => {
+                        let t = String::from_utf8_lossy(&d);
+                        if t.trim().is_empty() {
+                            self.emit("(no locks held)");
+                        } else {
+                            for l in t.lines() {
+                                self.emit(l);
+                            }
+                        }
+                    }
+                    Err(e) => self.fail(&alloc::format!("lslocks: err {}", e)),
+                }
+            }
+            "findmnt" => match ustd::read_all("/proc/mounts") {
+                Ok(d) => {
+                    self.emit("TARGET  SOURCE       FSTYPE OPTIONS");
+                    for l in String::from_utf8_lossy(&d).lines() {
+                        let mut it = l.split_whitespace();
+                        let (src, tgt, fst) = (
+                            it.next().unwrap_or("?"),
+                            it.next().unwrap_or("?"),
+                            it.next().unwrap_or("?"),
+                        );
+                        self.emit(&alloc::format!("{:<7} {:<12} {:<6} rw", tgt, src, fst));
+                    }
+                }
+                Err(e) => self.fail(&alloc::format!("findmnt: err {}", e)),
+            },
+            "namei" => match args.first() {
+                Some(path) => {
+                    // namei [-l] <path>: component-by-component real lookup
+                    let long = args.iter().any(|a| *a == "-l");
+                    let p = if args.len() > 1 && args[0].starts_with('-') {
+                        args[1]
+                    } else {
+                        args[0]
+                    };
+                    let mut cur = String::from("/");
+                    self.emit(if p.starts_with('/') { "f: /" } else { "f: ." });
+                    let comps: Vec<&str> =
+                        p.trim_matches('/').split('/').filter(|c| !c.is_empty()).collect();
+                    for (i, c) in comps.iter().enumerate() {
+                        cur = if cur == "/" {
+                            alloc::format!("/{}", c)
+                        } else {
+                            alloc::format!("{}/{}", cur, c)
+                        };
+                        match ustd::stat(&cur) {
+                            Ok(st) => {
+                                let kind = if st.is_dir != 0 { "d" } else { "-" };
+                                if long {
+                                    self.emit(&alloc::format!(
+                                        " {} {}  {} {}",
+                                        if i == comps.len() - 1 { "f:" } else { " d:" },
+                                        kind, cur, if st.is_dir != 0 { "(dir)" } else { "" }
+                                    ));
+                                } else {
+                                    self.emit(&alloc::format!(" {} {}", kind, c));
+                                }
+                            }
+                            Err(_) => {
+                                self.emit(&alloc::format!(" {} {} - No such file", "l", c));
+                                if !long {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                None => self.fail("usage: namei [-l] <path>"),
+            },
+            "hostid" => {
+                // host id from the NIC MAC — stable per-VM like a real hostid
+                match ustd::net_info() {
+                    Some((mac, _)) => {
+                        let h = u32::from(mac[0]) << 24
+                            | u32::from(mac[1]) << 16
+                            | u32::from(mac[2]) << 8
+                            | u32::from(mac[5]);
+                        self.emit(&alloc::format!("{:08x}", h));
+                    }
+                    None => self.emit("00000000"),
+                }
+            }
+            "who" | "w" | "users" | "last" => {
+                // real session records from /utmp ("pid exe epoch" per spawn)
+                let data = ustd::read_all("/utmp")
+                    .map(|d| String::from_utf8_lossy(&d).into_owned())
+                    .unwrap_or_default();
+                let live: Vec<u32> =
+                    ustd::proclist(64).iter().map(|p| p.pid).collect();
+                let recs: Vec<(u32, String, u64)> = data
+                    .lines()
+                    .filter_map(|l| {
+                        let mut it = l.split_whitespace();
+                        match (it.next(), it.next(), it.next()) {
+                            (Some(p), Some(x), Some(t)) => Some((
+                                p.parse().unwrap_or(0),
+                                String::from(x),
+                                t.parse().unwrap_or(0),
+                            )),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                match cmd {
+                    "users" => {
+                        let n = recs.iter().filter(|(p, _, _)| live.contains(p)).count();
+                        for _ in 0..n {
+                            self.emit("root");
+                        }
+                    }
+                    "w" => {
+                        let up = ustd::uptime_ms() / 1000;
+                        self.emit(&alloc::format!(
+                            " up {}:{:02},  {} users", up / 60, up % 60,
+                            recs.iter().filter(|(p, _, _)| live.contains(p)).count()
+                        ));
+                        self.emit("USER     TTY          LOGIN@  WHAT");
+                        for (pid, exe, t) in recs.iter().filter(|(p, _, _)| live.contains(p)) {
+                            let (y, mo, d, h, mi, _s) = epoch_to_dt(*t);
+                            self.emit(&alloc::format!(
+                                "root     tty{:<6} {:04}-{:02}-{:02} {:02}:{:02}  {}",
+                                pid, y, mo, d, h, mi, exe
+                            ));
+                        }
+                    }
+                    "last" => {
+                        for (pid, exe, t) in recs.iter().rev() {
+                            let (y, mo, d, h, mi, _s) = epoch_to_dt(*t);
+                            self.emit(&alloc::format!(
+                                "root     tty{:<6} {:04}-{:02}-{:02} {:02}:{:02}  {} {}",
+                                pid, y, mo, d, h, mi,
+                                exe.rsplit('/').next().unwrap_or(exe),
+                                if live.contains(pid) { "(still running)" } else { "(gone)" }
+                            ));
+                        }
+                    }
+                    _ => {
+                        for (pid, exe, t) in recs.iter().filter(|(p, _, _)| live.contains(p)) {
+                            let (y, mo, d, h, mi, _s) = epoch_to_dt(*t);
+                            self.emit(&alloc::format!(
+                                "root     tty{:<6} {:04}-{:02}-{:02} {:02}:{:02}  {}",
+                                pid, y, mo, d, h, mi, exe
+                            ));
+                        }
+                    }
+                }
+            }
+            "sum" => {
+                // sum [-r|-s] <file...>: BSD rotating or System V checksum
+                let sysv = args.iter().any(|a| *a == "-s" || *a == "--sysv");
+                let files: Vec<String> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .map(|a| String::from(*a))
+                    .collect();
+                let mut outs: Vec<String> = Vec::new();
+                let mut err: Option<String> = None;
+                if files.is_empty() {
+                    if let Some(t) = self.pipe_in.clone() {
+                        let d = t.as_bytes();
+                        outs.push(if sysv {
+                            alloc::format!(
+                                "{:05} {:5} -", sum_sysv(d), d.len().div_ceil(512))
+                        } else {
+                            alloc::format!(
+                                "{:05} {:5} -", sum_bsd(d), d.len().div_ceil(1024))
+                        });
+                    } else {
+                        err = Some(String::from("usage: sum [-r|-s] <file...>"));
+                    }
+                } else {
+                    for f in &files {
+                        match ustd::read_all(f) {
+                            Ok(d) => outs.push(if sysv {
+                                alloc::format!("{:05} {:5} {}",
+                                    sum_sysv(&d), d.len().div_ceil(512), f)
+                            } else {
+                                alloc::format!("{:05} {:5} {}",
+                                    sum_bsd(&d), d.len().div_ceil(1024), f)
+                            }),
+                            Err(e) => {
+                                err = Some(alloc::format!("sum: {}: err {}", f, e));
+                                break;
+                            }
+                        }
+                    }
+                }
+                for o in outs {
+                    self.emit(&o);
+                }
+                if let Some(e) = err {
+                    self.fail(&e);
+                }
+            }
+            "sha224sum" => {
+                let mut any = false;
+                for a in args.iter().filter(|a| !a.starts_with('-')) {
+                    match ustd::read_all(a) {
+                        Ok(d) => {
+                            any = true;
+                            self.emit(&alloc::format!("{}  {}", hexs(&sha224(&d)), a));
+                        }
+                        Err(e) => {
+                            self.fail(&alloc::format!("sha224sum: {}: err {}", a, e))
+                        }
+                    }
+                }
+                if !any {
+                    match self.pipe_in.clone() {
+                        Some(t) => {
+                            self.emit(&alloc::format!("{}  -", hexs(&sha224(t.as_bytes()))))
+                        }
+                        None => self.fail("usage: sha224sum <file...>"),
+                    }
+                }
+            }
+            "lsmod" => {
+                // modules live in-kernel — list them from /proc/modules
+                match ustd::read_all("/proc/modules") {
+                    Ok(d) => {
+                        let t = String::from_utf8_lossy(&d);
+                        self.emit("Module                  Size  Used by");
+                        for l in t.lines() {
+                            self.emit(l);
+                        }
+                    }
+                    Err(e) => self.fail(&alloc::format!("lsmod: err {}", e)),
+                }
+            }
+            "compress" | "uncompress" => {
+                // real .Z: LZW, 1F9D magic, LSB-first 9→16 bit codes
+                let de = cmd == "uncompress";
+                let stdout = args.iter().any(|a| *a == "-c");
+                let files: Vec<&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                if files.is_empty() {
+                    match self.pipe_in.clone() {
+                        Some(t) => {
+                            let r = if de {
+                                lzw_decompress(t.as_bytes())
+                            } else {
+                                Ok(lzw_compress(t.as_bytes()))
+                            };
+                            match r {
+                                Ok(d) => self.emit_bin(&d),
+                                Err(e) => self.fail(&alloc::format!("{}: {}", cmd, e)),
+                            }
+                        }
+                        None => self.fail(&alloc::format!(
+                            "usage: {} [-c] <file...>", cmd)),
+                    }
+                } else {
+                    for f in files {
+                        match ustd::read_all(f) {
+                            Ok(d) => {
+                                let r = if de {
+                                    lzw_decompress(&d)
+                                } else {
+                                    Ok(lzw_compress(&d))
+                                };
+                                match r {
+                                    Ok(out) => {
+                                        if stdout {
+                                            self.emit_bin(&out);
+                                        } else {
+                                            let name = if de {
+                                                f.strip_suffix(".Z").unwrap_or(f)
+                                            } else {
+                                                &alloc::format!("{}.Z", f)
+                                            };
+                                            match ustd::write_all(name, &out) {
+                                                Ok(()) => self.emit(&alloc::format!(
+                                                    "{}: {} -> {} ({} -> {} bytes)",
+                                                    cmd, f, name, d.len(), out.len())),
+                                                Err(e) => self.fail(&alloc::format!(
+                                                    "{}: {}: err {}", cmd, name, e)),
+                                            }
+                                        }
+                                    }
+                                    Err(e) => self.fail(&alloc::format!(
+                                        "{}: {}: {}", cmd, f, e)),
+                                }
+                            }
+                            Err(e) => self.fail(&alloc::format!("{}: {}: err {}", cmd, f, e)),
+                        }
+                    }
+                }
+            }
+            "diff3" => {
+                // diff3 A B C: report hunks where the three files diverge
+                let files: Vec<&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                if files.len() < 3 {
+                    self.fail("usage: diff3 <file1> <file2> <file3>");
+                    return;
+                }
+                let mut texts = Vec::new();
+                let mut ok = true;
+                for f in &files[..3] {
+                    match ustd::read_all(f) {
+                        Ok(d) => texts.push(
+                            String::from_utf8_lossy(&d).into_owned()),
+                        Err(e) => {
+                            self.fail(&alloc::format!("diff3: {}: err {}", f, e));
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    let ls: Vec<Vec<&str>> = texts
+                        .iter()
+                        .map(|t| t.lines().collect())
+                        .collect();
+                    let n = ls.iter().map(|v| v.len()).max().unwrap_or(0);
+                    // diff3-style hunks: every run where the three files
+                    // disagree, printed as ==== + per-file "N:Mc" blocks
+                    let mut i = 0usize;
+                    let mut any_hunk = false;
+                    while i < n {
+                        let same =
+                            ls.iter().all(|v| v.get(i) == ls[0].get(i));
+                        if same {
+                            i += 1;
+                            continue;
+                        }
+                        let s0 = i;
+                        while i < n
+                            && !ls.iter().all(|v| v.get(i) == ls[0].get(i))
+                        {
+                            i += 1;
+                        }
+                        any_hunk = true;
+                        self.emit("====");
+                        for (fi, v) in ls.iter().enumerate() {
+                            if s0 < v.len() || fi == 0 {
+                                self.emit(&alloc::format!(
+                                    "{}:{}c", fi + 1, s0 + 1));
+                                for l in &v[s0..i.min(v.len())] {
+                                    self.emit(&alloc::format!("  {}", l));
+                                }
+                            }
+                        }
+                    }
+                    if !any_hunk {
+                        self.emit("(all three files identical)");
+                    }
+                }
+            }
+            "merge" => {
+                // merge [-p] A BASE B: apply BASE->B deltas onto A (3-way)
+                let files: Vec<&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                if files.len() < 3 {
+                    self.fail("usage: merge <file> <base> <other>");
+                    return;
+                }
+                let mut rs = Vec::new();
+                let mut ok = true;
+                for f in &files[..3] {
+                    match ustd::read_all(f) {
+                        Ok(d) => rs
+                            .push(String::from_utf8_lossy(&d).into_owned()),
+                        Err(e) => {
+                            self.fail(&alloc::format!("merge: {}: err {}", f, e));
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    let a: Vec<&str> = rs[0].lines().collect();
+                    let b: Vec<&str> = rs[1].lines().collect();
+                    let c: Vec<&str> = rs[2].lines().collect();
+                    // line-wise: where c differs from b, take c; where both
+                    // changed differently, mark a real conflict
+                    let n = a.len().max(b.len()).max(c.len());
+                    let mut out: Vec<String> = Vec::new();
+                    let mut conflicts = 0usize;
+                    for i in 0..n {
+                        let av = a.get(i).copied().unwrap_or("");
+                        let bv = b.get(i).copied().unwrap_or("");
+                        let cv = c.get(i).copied().unwrap_or("");
+                        if cv != bv && av == bv {
+                            out.push(String::from(cv));
+                        } else if cv != bv && av != bv {
+                            out.push(String::from("<<<<<<< file"));
+                            out.push(String::from(av));
+                            out.push(String::from("======="));
+                            out.push(String::from(cv));
+                            out.push(String::from(">>>>>>> other"));
+                            conflicts += 1;
+                        } else {
+                            out.push(String::from(av));
+                        }
+                    }
+                    let joined = out.join("\n") + "\n";
+                    match ustd::write_all(files[0], joined.as_bytes()) {
+                        Ok(()) => self.emit(&alloc::format!(
+                            "merge: {} conflicts", conflicts)),
+                        Err(e) => {
+                            self.fail(&alloc::format!("merge: write err {}", e))
                         }
                     }
                 }
@@ -18057,6 +19300,11 @@ impl Term {
         "umask", "chmod", "ulimit", "complete", "compgen", "hexdump",
             "ln", "shopt", "hash", "enable", "stty", "readlink",
             "flock",
+        "dmidecode", "ipcs", "ipcrm", "chrt", "taskset", "yield", "lsusb",
+            "ethtool", "ip", "ss", "pmap", "lslocks", "findmnt", "namei",
+            "hostid", "who", "w", "users", "last", "sum", "sha224sum",
+            "lsmod", "merge", "diff3", "compress", "uncompress", "sdiff",
+            "egrep", "fgrep",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -19324,6 +20572,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         nc_listen: None,
         nc_udp: None,
         last_ok: true,
+        last_code: -1,
         pipestatus: alloc::vec![0],
         histexpand: true,
         vars: alloc::collections::BTreeMap::new(),
@@ -19359,6 +20608,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         rm_queue: Vec::new(),
         funcs: Vec::new(),
         func_locals: Vec::new(),
+        func_stack: Vec::new(),
         exit_trap: None,
         func_collect: None,
         func_depth: 0,

@@ -292,6 +292,69 @@ pub fn translate(pml4: PhysFrame, vaddr: u64) -> Option<u64> {
     Some(pt[i1].addr().as_u64() + (vaddr & 0xFFF))
 }
 
+/// Unmap one user page in `pml4`; returns its physical frame address when it
+/// was mapped (the caller decides whether the frame is owned or borrowed).
+pub fn unmap_user_page(pml4: PhysFrame, vaddr: u64) -> Option<u64> {
+    let l4 = user_l4(pml4);
+    let i4 = ((vaddr >> 39) & 0x1FF) as usize;
+    if l4[i4].is_unused() {
+        return None;
+    }
+    let pdpt = unsafe { &mut *(mem::phys_to_virt(l4[i4].addr().as_u64()) as *mut PageTable) };
+    let i3 = ((vaddr >> 30) & 0x1FF) as usize;
+    if pdpt[i3].is_unused() {
+        return None;
+    }
+    let pd = unsafe { &mut *(mem::phys_to_virt(pdpt[i3].addr().as_u64()) as *mut PageTable) };
+    let i2 = ((vaddr >> 21) & 0x1FF) as usize;
+    if pd[i2].is_unused() {
+        return None;
+    }
+    let pt = unsafe { &mut *(mem::phys_to_virt(pd[i2].addr().as_u64()) as *mut PageTable) };
+    let i1 = ((vaddr >> 12) & 0x1FF) as usize;
+    if pt[i1].is_unused() {
+        return None;
+    }
+    let phys = pt[i1].addr().as_u64();
+    pt[i1].set_unused();
+    Some(phys)
+}
+
+/// Rewrite the WRITABLE/NO_EXECUTE bits of a mapped user page (mprotect).
+/// Returns Some(()) when the page was mapped.
+pub fn protect_user_page(pml4: PhysFrame, vaddr: u64, writable: bool, executable: bool) -> Option<()> {
+    use x86_64::structures::paging::PageTableFlags as F;
+    let l4 = user_l4(pml4);
+    let i4 = ((vaddr >> 39) & 0x1FF) as usize;
+    if l4[i4].is_unused() {
+        return None;
+    }
+    let pdpt = unsafe { &mut *(mem::phys_to_virt(l4[i4].addr().as_u64()) as *mut PageTable) };
+    let i3 = ((vaddr >> 30) & 0x1FF) as usize;
+    if pdpt[i3].is_unused() {
+        return None;
+    }
+    let pd = unsafe { &mut *(mem::phys_to_virt(pdpt[i3].addr().as_u64()) as *mut PageTable) };
+    let i2 = ((vaddr >> 21) & 0x1FF) as usize;
+    if pd[i2].is_unused() {
+        return None;
+    }
+    let pt = unsafe { &mut *(mem::phys_to_virt(pd[i2].addr().as_u64()) as *mut PageTable) };
+    let i1 = ((vaddr >> 12) & 0x1FF) as usize;
+    if pt[i1].is_unused() {
+        return None;
+    }
+    let mut fl = F::PRESENT | F::USER_ACCESSIBLE;
+    if writable {
+        fl |= F::WRITABLE;
+    }
+    if !executable {
+        fl |= F::NO_EXECUTE;
+    }
+    pt[i1].set_flags(fl);
+    Some(())
+}
+
 /// Free every user-mapped page + page-table frame under `pml4` (indices < 512
 /// except shared kernel slots). Returns all freed frame addresses.
 pub fn free_user_space(pml4: PhysFrame) -> Vec<u64> {
