@@ -12970,7 +12970,7 @@ impl Term {
                 let nst = [
                     ("mnt", "mntns"), ("uts", "uts"), ("pid", "pid"),
                     ("ipc", "ipc"), ("time", "time"),
-                    ("time", "time_for_children"),
+                    ("time", "time_for_children"), ("user", "user"),
                 ];
                 println!("NS TYPE NPROCS   PID NAME");
                 for (ty, f) in nst {
@@ -13001,8 +13001,10 @@ impl Term {
                         flags |= shared::CLONE_NEWIPC;
                     } else if a == "-T" {
                         flags |= shared::CLONE_NEWTIME;
+                    } else if a == "-U" {
+                        flags |= shared::CLONE_NEWUSER;
                     } else {
-                        self.fail("usage: unshare [-m] [-u] [-p] [-i] [-T]");
+                        self.fail("usage: unshare [-m] [-u] [-p] [-i] [-T] [-U]");
                         return;
                     }
                 }
