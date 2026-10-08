@@ -375,6 +375,17 @@ pub fn net_info() -> Option<([u8; 6], [u8; 4])> {
 
 /// Sound the PC speaker at `freq` Hz for `ms` (non-blocking; kernel silences
 /// the gate when the duration elapses). `0`/`0` silences immediately.
+/// SYS_PCAP control. op: 0 start, 1 stop, 2 stats (pkts<<32|dropped), 3 on?
+/// op 4: fetch the pcap file image into `out` (returns len, or -needed).
+pub fn pcap(op: u64, out: &mut [u8]) -> i64 {
+    sc3(
+        shared::SYS_PCAP,
+        op,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+    ) as i64
+}
+
 /// Own process id.
 pub fn getpid() -> u32 {
     sc0(shared::SYS_GETPID) as u32

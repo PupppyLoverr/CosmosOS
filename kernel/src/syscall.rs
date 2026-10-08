@@ -374,6 +374,20 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
         }
         shared::SYS_GETPID => task::current_id() as u64,
+        shared::SYS_PCAP => {
+            // a1 op, a2 buf ptr, a3 cap
+            if a1 == 4 {
+                match a3 {
+                    0..=262_144 => match copy_out_pcap(a2, a3 as usize) {
+                        Ok(n) => n as u64,
+                        Err(e) => e as u64,
+                    },
+                    _ => ERR,
+                }
+            } else {
+                crate::pcap::sys_pcap(a1, &mut []) as u64
+            }
+        }
         shared::SYS_NICE => task::set_nice(a1 as u32, a2 as i64) as u64,
         shared::SYS_BEEP => {
             crate::timer::beep(a1 as u32, a2);
@@ -863,5 +877,18 @@ fn reboot() -> ! {
     }
     loop {
         x86_64::instructions::hlt();
+    }
+}
+
+/// SYS_PCAP op 4: bounds-check + copy the capture image to userspace.
+fn copy_out_pcap(ptr: u64, cap: usize) -> Result<i64, i64> {
+    let mut tmp = alloc::vec![0u8; cap];
+    let n = crate::pcap::sys_pcap(4, &mut tmp);
+    if n < 0 {
+        return Err(n);
+    }
+    match copy_out(ptr, &tmp[..n as usize]) {
+        Some(()) => Ok(n),
+        None => Err(-2),
     }
 }
