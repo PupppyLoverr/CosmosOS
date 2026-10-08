@@ -1135,6 +1135,36 @@ fn parse_date_spec(s: &str) -> Option<u64> {
     Some(cal_days(y, mo, d) * 86400 + h * 3600 + mi * 60 + se)
 }
 
+/// `date -d` EXPR -> a DateTime: relative words (now/today/tomorrow/
+/// yesterday) or any `parse_date_spec` form (@SECS, bare SECS, ISO date[time]).
+fn parse_date_expr(s: &str) -> Option<DateTime> {
+    let s = s.trim();
+    let secs = match s {
+        "now" | "today" | "tomorrow" | "yesterday" => {
+            let now = ustd::datetime();
+            let n: i64 = match s {
+                "tomorrow" => 1,
+                "yesterday" => -1,
+                _ => 0,
+            };
+            (cal_days(now.year, now.month, now.day) as i64 + n) as u64 * 86400
+                + now.hour as u64 * 3600
+                + now.minute as u64 * 60
+                + now.second as u64
+        }
+        _ => parse_date_spec(s)?,
+    };
+    let (y, mo, d, h, mi, se) = epoch_to_dt(secs);
+    Some(DateTime {
+        year: y,
+        month: mo,
+        day: d,
+        hour: h,
+        minute: mi,
+        second: se,
+    })
+}
+
 /// Render one month as text lines (Sunday-first), or mark today.
 fn cal_render(m: u8, y: u16) -> Vec<String> {
     let mut out = Vec::new();
@@ -13488,13 +13518,30 @@ impl Term {
                 }
             }
             "date" => {
-                let d = ustd::datetime();
                 const WDAY: [&str; 7] =
                     ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
                 const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+                // -d/--date EXPR: evaluate EXPR instead of now
+                let di = args
+                    .iter()
+                    .position(|a| *a == "-d" || *a == "--date");
+                let (d, first) = match di {
+                    Some(i) => {
+                        match parse_date_expr(
+                            args.get(i + 1).copied().unwrap_or(""),
+                        ) {
+                            Some(dt) => (dt, args.get(i + 2)),
+                            None => {
+                                self.fail("date: invalid date expression");
+                                return;
+                            }
+                        }
+                    }
+                    None => (ustd::datetime(), args.first()),
+                };
                 let dow = ((cal_days(d.year, d.month, d.day) + 4) % 7) as usize;
-                match args.first() {
+                match first {
                     // -R/--rfc-2822: Tue, 06 Oct 2026 02:09:00 +0000
                     Some(&"-R") | Some(&"--rfc-2822") => {
                         self.emit(&alloc::format!(
@@ -15035,7 +15082,37 @@ impl Term {
                                 }
                                 return;
                             }
-                            if keyf > 0 || sep.is_some() {
+                            if args.iter().any(|a| a == &"-R") {
+                                // -R: random order — Fisher-Yates over the
+                                // real RNG
+                                for i in (1..ls.len()).rev() {
+                                    let j = (ustd::rand_u64().unwrap_or(0)
+                                        % (i as u64 + 1))
+                                        as usize;
+                                    ls.swap(i, j);
+                                }
+                            } else if args.iter().any(|a| a == &"-M") {
+                                // -M: month sort — leading month name,
+                                // Jan<..<Dec; non-month lines first
+                                let mon = |l: &&str| -> usize {
+                                    const M: [&str; 12] = [
+                                        "jan", "feb", "mar", "apr", "may", "jun",
+                                        "jul", "aug", "sep", "oct", "nov", "dec",
+                                    ];
+                                    let w: String = l
+                                        .trim_start()
+                                        .split_whitespace()
+                                        .next()
+                                        .unwrap_or("")
+                                        .to_lowercase();
+                                    let w3 = &w[..w.len().min(3)];
+                                    M.iter()
+                                        .position(|m| *m == w3)
+                                        .map(|i| i + 1)
+                                        .unwrap_or(0)
+                                };
+                                ls.sort_by_key(mon);
+                            } else if keyf > 0 || sep.is_some() {
                                 let field = |l: &&str| -> String {
                                     let parts: Vec<&str> = match sep {
                                         Some(c) => l.split(c).collect(),
