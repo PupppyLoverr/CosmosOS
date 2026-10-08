@@ -15746,11 +15746,37 @@ impl Term {
                 }
             }
             "pgrep" | "pkill" => {
-                // pgrep [-x] <pat> / pkill [-x] <pat>: match process names
-                let exact = args.iter().any(|a| *a == "-x");
-                let pat = args.iter().find(|a| !a.starts_with('-')).copied().unwrap_or("");
+                // pgrep [-x] [-l] [-c] [-n] [-o] [-f] <pat>
+                // pkill [-x] [-f] [-sig] <pat>  (default TERM=15)
+                let mut exact = false;
+                let mut list = false;
+                let mut count = false;
+                let mut newest = false;
+                let mut oldest = false;
+                let mut full = false;
+                let mut sig = 15u64;
+                let mut pat = "";
+                for a in args.iter() {
+                    match *a {
+                        "-x" => exact = true,
+                        "-l" => list = true,
+                        "-c" => count = true,
+                        "-n" => newest = true,
+                        "-o" => oldest = true,
+                        "-f" => full = true,
+                        s if cmd == "pkill"
+                            && s.starts_with('-')
+                            && s.len() > 1
+                            && s[1..].chars().all(|c| c.is_ascii_digit()) =>
+                        {
+                            sig = s[1..].parse().unwrap_or(15);
+                        }
+                        s if !s.starts_with('-') && pat.is_empty() => pat = s,
+                        _ => {}
+                    }
+                }
                 let me = ustd::getpid();
-                let mut hits = 0usize;
+                let mut hits: Vec<(u32, String)> = Vec::new();
                 for p in ustd::proclist(64) {
                     if p.pid == me || p.is_user == 0 {
                         continue;
@@ -15758,23 +15784,61 @@ impl Term {
                     let name = core::str::from_utf8(&p.name)
                         .unwrap_or("?")
                         .trim_end_matches('\0');
-                    let m = if exact { name == pat } else { name.contains(pat) };
+                    let hay = if full {
+                        ustd::read_all(&alloc::format!(
+                            "/proc/{}/cmdline",
+                            p.pid
+                        ))
+                        .map(|b| {
+                            String::from_utf8_lossy(&b)
+                                .replace('\0', " ")
+                                .trim_end()
+                                .to_string()
+                        })
+                        .unwrap_or_else(|_| String::from(name))
+                    } else {
+                        String::from(name)
+                    };
+                    let m = if exact { name == pat } else { hay.contains(pat) };
                     if m {
-                        hits += 1;
-                        if cmd == "pgrep" {
-                            self.emit(&alloc::format!("{}", p.pid));
-                        } else {
-                            let ok = ustd::kill(p.pid);
-                            self.emit(&alloc::format!(
-                                "pkill: {} {} {}",
-                                p.pid,
-                                name,
-                                if ok { "killed" } else { "failed" }
-                            ));
-                        }
+                        hits.push((p.pid, String::from(name)));
                     }
                 }
-                if hits == 0 {
+                if newest {
+                    hits.sort_by_key(|h| h.0);
+                    let t = hits.last().cloned();
+                    hits.clear();
+                    if let Some(h) = t {
+                        hits.push(h);
+                    }
+                } else if oldest {
+                    hits.sort_by_key(|h| h.0);
+                    hits.truncate(1);
+                }
+                if cmd == "pgrep" {
+                    if count {
+                        self.emit(&alloc::format!("{}", hits.len()));
+                    } else {
+                        for (pid, name) in &hits {
+                            if list {
+                                self.emit(&alloc::format!("{} {}", pid, name));
+                            } else {
+                                self.emit(&alloc::format!("{}", pid));
+                            }
+                        }
+                    }
+                } else {
+                    for (pid, name) in &hits {
+                        let ok = ustd::kill2(*pid, sig) == 0;
+                        self.emit(&alloc::format!(
+                            "pkill: {} {} {}",
+                            pid,
+                            name,
+                            if ok { "killed" } else { "failed" }
+                        ));
+                    }
+                }
+                if hits.is_empty() {
                     self.fail(&alloc::format!("{}: no process matched '{}'", cmd, pat));
                 }
             }
@@ -25081,6 +25145,390 @@ impl Term {
                                 alloc::format!("\"{}\"", v)
                             };
                     self.emit(&alloc::format!("{}={}", k, v));
+                }
+            }
+            "newusers" => {
+                // newusers [file] — batch account creation from
+                // `name:pw:uid:gid:gecos:home:shell` lines (file or pipe).
+                let src = if let Some(&p) =
+                    args.iter().find(|a| !a.starts_with('-'))
+                {
+                    match ustd::read_all(p) {
+                        Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                        Err(e) => {
+                            self.fail(&alloc::format!(
+                                "newusers: {}: err {}",
+                                p,
+                                e
+                            ));
+                            return;
+                        }
+                    }
+                } else {
+                    match &self.pipe_in {
+                        Some(s) => s.clone(),
+                        None => {
+                            self.fail(
+                                "usage: newusers <file>  (or pipe user:pw:uid:gid:gecos:home:sh)",
+                            );
+                            return;
+                        }
+                    }
+                };
+                let mut rows = db_rows("/etc/passwd");
+                let mut grows = db_rows("/etc/group");
+                let mut added = 0usize;
+                for line in src.lines() {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let f: Vec<&str> = line.split(':').collect();
+                    if f.len() < 4 || f[0].is_empty() || f[0].contains(':') {
+                        self.emit(&alloc::format!(
+                            "newusers: skipped `{}`",
+                            line
+                        ));
+                        continue;
+                    }
+                    let name = f[0];
+                    if rows.iter().any(|r| {
+                        r.first().map(String::as_str) == Some(name)
+                    }) {
+                        self.emit(&alloc::format!(
+                            "newusers: {} already exists",
+                            name
+                        ));
+                        continue;
+                    }
+                    let uid: i64 = if f[2].is_empty() {
+                        rows.iter()
+                            .filter_map(|r| {
+                                r.get(2).and_then(|v| v.parse::<i64>().ok())
+                            })
+                            .max()
+                            .unwrap_or(0)
+                            + 1
+                    } else {
+                        match f[2].parse() {
+                            Ok(u) => u,
+                            Err(_) => {
+                                self.emit(&alloc::format!(
+                                    "newusers: {}: bad uid",
+                                    name
+                                ));
+                                continue;
+                            }
+                        }
+                    };
+                    // gid: empty -> use/create a group named like the user
+                    let gid: i64 = if f[3].is_empty() {
+                        if let Some(r) = grows.iter().find(|r| {
+                            r.first().map(String::as_str) == Some(name)
+                        }) {
+                            r.get(2)
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(1000)
+                        } else {
+                            let g = grows
+                                .iter()
+                                .filter_map(|r| {
+                                    r.get(2)
+                                        .and_then(|v| v.parse::<i64>().ok())
+                                })
+                                .max()
+                                .unwrap_or(0)
+                                + 1;
+                            grows.push(alloc::vec![
+                                String::from(name),
+                                String::from("x"),
+                                alloc::format!("{}", g),
+                            ]);
+                            g
+                        }
+                    } else {
+                        match f[3].parse() {
+                            Ok(g) => g,
+                            Err(_) => {
+                                self.emit(&alloc::format!(
+                                    "newusers: {}: bad gid",
+                                    name
+                                ));
+                                continue;
+                            }
+                        }
+                    };
+                    let gecos = f.get(4).copied().unwrap_or("");
+                    let home = if f.get(5).copied().unwrap_or("").is_empty() {
+                        alloc::format!("/home/{}", name)
+                    } else {
+                        String::from(f[5])
+                    };
+                    let shell = if f.get(6).copied().unwrap_or("").is_empty() {
+                        String::from("/bin/sh")
+                    } else {
+                        String::from(f[6])
+                    };
+                    rows.push(alloc::vec![
+                        String::from(name),
+                        String::from(f[1]),
+                        alloc::format!("{}", uid),
+                        alloc::format!("{}", gid),
+                        String::from(gecos),
+                        home,
+                        shell,
+                    ]);
+                    added += 1;
+                }
+                if db_write("/etc/passwd", &rows).is_ok()
+                    && db_write("/etc/group", &grows).is_ok()
+                {
+                    self.emit(&alloc::format!("newusers: {} added", added));
+                } else {
+                    self.fail("newusers: write failed");
+                }
+            }
+            "domainname" | "nisdomainname" | "dnsdomainname"
+            | "ypdomainname" =>
+            {
+                // domainname [name] — get/set the NIS domain
+                // (persisted in /etc/domainname).
+                if let Some(v) = args.iter().find(|a| !a.starts_with('-')) {
+                    match ustd::write_all("/etc/domainname", v.as_bytes()) {
+                        Ok(()) => {}
+                        Err(e) => self.fail(&alloc::format!(
+                            "domainname: set failed err {}",
+                            e
+                        )),
+                    }
+                } else {
+                    match ustd::read_all("/etc/domainname") {
+                        Ok(d) => {
+                            let s = String::from_utf8_lossy(&d)
+                                .trim()
+                                .to_string();
+                            if s.is_empty() {
+                                self.emit("(none)");
+                            } else {
+                                self.emit(&s);
+                            }
+                        }
+                        Err(_) => self.emit("(none)"),
+                    }
+                }
+            }
+            "timedatectl" => {
+                // timedatectl [status] | set-time H:M:S | set-date Y-M-D
+                // Real RTC state via ustd::datetime()/rtc_set.
+                let mut sub = "";
+                let mut val = "";
+                for a in args.iter() {
+                    if sub.is_empty() && a.starts_with("set-") {
+                        sub = a;
+                    } else if sub.is_empty() && *a == "status" {
+                        sub = a;
+                    } else if !a.starts_with('-') && val.is_empty() {
+                        val = a;
+                    }
+                }
+                match sub {
+                    "set-time" => {
+                        // HH:MM:SS — keep the current date part
+                        let d = ustd::datetime();
+                        let p: Vec<&str> = val.split(':').collect();
+                        if p.len() != 3 {
+                            self.fail("usage: timedatectl set-time HH:MM:SS");
+                            return;
+                        }
+                        let (h, m, s) = (
+                            p[0].parse::<u64>().unwrap_or(u64::MAX),
+                            p[1].parse::<u64>().unwrap_or(u64::MAX),
+                            p[2].parse::<u64>().unwrap_or(u64::MAX),
+                        );
+                        if h > 23 || m > 59 || s > 59 {
+                            self.fail("timedatectl: bad time");
+                            return;
+                        }
+                        let secs = cal_days(d.year, d.month, d.day) * 86400
+                            + h * 3600 + m * 60 + s;
+                        ustd::set_time(secs);
+                        self.emit(&alloc::format!(
+                            "timedatectl: RTC set {:02}:{:02}:{:02}",
+                            h, m, s
+                        ));
+                    }
+                    "set-date" => {
+                        // YYYY-MM-DD — keep the current time part
+                        let d = ustd::datetime();
+                        let p: Vec<&str> = val.split('-').collect();
+                        if p.len() != 3 {
+                            self.fail("usage: timedatectl set-date YYYY-MM-DD");
+                            return;
+                        }
+                        let (y, mo, dd) = (
+                            p[0].parse::<u16>().unwrap_or(0),
+                            p[1].parse::<u8>().unwrap_or(0),
+                            p[2].parse::<u8>().unwrap_or(0),
+                        );
+                        if !(1..=12).contains(&mo) || dd == 0 || dd > 31 || y == 0 {
+                            self.fail("timedatectl: bad date");
+                            return;
+                        }
+                        let secs = cal_days(y, mo, dd) * 86400
+                            + d.hour as u64 * 3600
+                            + d.minute as u64 * 60
+                            + d.second as u64;
+                        ustd::set_time(secs);
+                        self.emit(&alloc::format!(
+                            "timedatectl: RTC set {:04}-{:02}-{:02}",
+                            y, mo, dd
+                        ));
+                    }
+                    _ => {
+                        let d = ustd::datetime();
+                        let dow = ((cal_days(d.year, d.month, d.day) + 4) % 7)
+                            as usize;
+                        const WD: [&str; 7] = [
+                            "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
+                        ];
+                        self.emit(&alloc::format!(
+                            "       Local time: {} {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                            WD[dow], d.year, d.month, d.day,
+                            d.hour, d.minute, d.second
+                        ));
+                        self.emit(&alloc::format!(
+                            "   Universal time: {} {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                            WD[dow], d.year, d.month, d.day,
+                            d.hour, d.minute, d.second
+                        ));
+                        self.emit("           Time zone: UTC (UTC, +0000)");
+                        self.emit("System clock synchronized: no");
+                        self.emit("        RTC in local TZ: no");
+                    }
+                }
+            }
+            "vipw" | "vigr" => {
+                // vipw/vigr — edit /etc/passwd or /etc/group in the real
+                // editor app (spawned; terminal stays usable).
+                let f = if cmd == "vipw" { "/etc/passwd" } else { "/etc/group" };
+                match ustd::spawn("/bin/cosmos-editor", f) {
+                    Ok(_) => self.emit(&alloc::format!("{}: editing {}", cmd, f)),
+                    Err(_) => self.fail(&alloc::format!(
+                        "{}: editor spawn failed",
+                        cmd
+                    )),
+                }
+            }
+            "colcrt" => {
+                // colcrt [-] [-2] — filter col output for terminals with no
+                // underlining: `_\x08X` overstrike -> `X` underlined to `-` on
+                // a new line; half-line feeds \x0b ignored; -2 = print all
+                // half-lines.
+                let all = args.iter().any(|a| *a == "-2");
+                let data = self
+                    .pipe_in
+                    .clone()
+                    .map(|s| s.into_bytes())
+                    .or_else(|| {
+                        args.iter()
+                            .find(|a| !a.starts_with('-'))
+                            .and_then(|f| ustd::read_all(f).ok())
+                    })
+                    .unwrap_or_default();
+                // Apply backspace overstrike first (keep last char per col),
+                // then `_\b`-underscore runs become `-` underline rows.
+                let mut lines: Vec<Vec<u8>> = vec![Vec::new()];
+                for &b in &data {
+                    match b {
+                        b'\n' => lines.push(Vec::new()),
+                        b'\x0b' => {
+                            // reverse half-line feed; -2 keeps it as a
+                            // fresh row, default drops the position
+                            if all && lines.len() > 1 {
+                                lines.pop();
+                            }
+                        }
+                        b'\x08' => {
+                            if let Some(l) = lines.last_mut() {
+                                l.pop();
+                            }
+                        }
+                        b'\r' => {}
+                        _ => {
+                            if let Some(l) = lines.last_mut() {
+                                l.push(b);
+                            }
+                        }
+                    }
+                }
+                // underscore-overstrike rows (`_` surviving col pass) are
+                // rendered as `-` under the previous line
+                for l in &lines {
+                    let only_us = l.iter().all(|&c| c == b'_' || c == b' ')
+                        && l.iter().any(|&c| c == b'_');
+                    if only_us {
+                        // merge into a `-` underline row under prev content
+                        self.emit(&l
+                            .iter()
+                            .map(|&c| if c == b'_' { '-' } else { ' ' as u8 as char })
+                            .map(|c| c.to_string())
+                            .collect::<String>());
+                    } else {
+                        self.emit(&String::from_utf8_lossy(l));
+                    }
+                }
+            }
+            "ptx" => {
+                // ptx [-w width] [file] — GNU permuted index (KWIC): each
+                // rotated keyword line shows context with the keyword marked.
+                let mut width = 72usize;
+                let mut file: Option<&str> = None;
+                let mut i = 0;
+                while i < args.len() {
+                    match args[i] {
+                        "-w" if i + 1 < args.len() => {
+                            i += 1;
+                            width = args[i].parse().unwrap_or(72);
+                        }
+                        s if !s.starts_with('-') && file.is_none() => {
+                            file = Some(s)
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let src = if let Some(f) = file {
+                    match ustd::read_all(f) {
+                        Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                        Err(e) => {
+                            self.fail(&alloc::format!("ptx: {}: err {}", f, e));
+                            return;
+                        }
+                    }
+                } else {
+                    self.pipe_in.clone().unwrap_or_default()
+                };
+                // every word produces a rotated line: <right> <word> <left>
+                let mut rows: Vec<(String, usize)> = Vec::new();
+                for line in src.lines() {
+                    let mut pos = 0usize;
+                    for w in line.split(|c: char| !c.is_alphanumeric()) {
+                        if !w.is_empty() {
+                            rows.push((String::from(line), pos));
+                            pos += w.len() + 1;
+                        } else {
+                            pos += 1;
+                        }
+                    }
+                }
+                rows.sort_by(|a, b| {
+                    let ka = a.0[a.1..].to_lowercase();
+                    let kb = b.0[b.1..].to_lowercase();
+                    ka.cmp(&kb)
+                });
+                for (line, pos) in rows {
+                    let (l, r) = line.split_at(pos.min(line.len()));
+                    let s = alloc::format!("{}  |>|  {}", l.trim(), r.trim());
+                    self.emit(&s.chars().take(width).collect::<String>());
                 }
             }
             "useradd" | "adduser" => {
