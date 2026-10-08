@@ -156,6 +156,13 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, i64> {
             crate::proc::read_file(path).ok_or(-2)
         };
     }
+    if crate::cgroup::handles(path) {
+        return if crate::cgroup::is_dir(path) {
+            Err(-4) // EISDIR
+        } else {
+            crate::cgroup::read_file(path).ok_or(-2)
+        };
+    }
     if crate::tmpfs::handles(path) {
         return crate::tmpfs::read_all(path);
     }
@@ -174,7 +181,7 @@ pub fn read_range(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64>
     if crate::tmpfs::handles(path) {
         return crate::tmpfs::read_range(path, offset, buf);
     }
-    if crate::pipes::handles(path) || crate::dev::handles(path) || crate::proc::handles(path) {
+    if crate::pipes::handles(path) || crate::dev::handles(path) || crate::proc::handles(path) || crate::cgroup::handles(path) {
         return Err(-22);
     }
     let mut g = FS.lock();
@@ -310,6 +317,7 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     let is_proc = crate::proc::handles(&full);
     let is_dev = crate::dev::handles(&full);
     let is_pipe = crate::pipes::handles(&full);
+    let is_cg = crate::cgroup::handles(&full);
     // MS_NODEV on the covering mount (typically a bind alias) bars
     // device-file access through it — EACCES like Linux.
     if is_dev {
@@ -422,6 +430,17 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
             return Err(-4);
         }
         ex
+    } else if is_cg {
+        // cgroupfs is read-computed/write-routed: O_CREATE only works
+        // through mkdir; a missing control file fails
+        if crate::cgroup::is_dir(&full) {
+            return Err(-4);
+        }
+        let ex = crate::cgroup::exists(&full);
+        if !ex && flags & shared::O_CREATE != 0 {
+            return Err(-4);
+        }
+        ex
     } else {
         fs.exists(&full)
     };
@@ -432,8 +451,8 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
         return Err(-17); // EEXIST
     }
     if !exists {
-        if flags & O_CREAT == 0 {
-            return Err(-2);
+        if flags & O_CREAT == 0 || is_cg {
+            return Err(-2); // no O_CREATE under cgroupfs — use mkdir
         }
         fs.create_file(&full).map_err(err_to_i64)?;
         crate::notify::fire(&full, crate::notify::IN_CREATE);
@@ -446,12 +465,12 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
             let _ = fs.set_meta(&full, None, Some(cur | 0x01));
         }
     }
-    if exists && flags & O_TRUNC != 0 && !is_dev && !is_proc {
+    if exists && flags & O_TRUNC != 0 && !is_dev && !is_proc && !is_cg {
         fs.write_file(&full, &[]).map_err(err_to_i64)?;
         crate::notify::fire(&full, crate::notify::IN_MODIFY);
     }
     // procfs files stream live data; their size is per-read, not on disk
-    let pos = if flags & O_APPEND != 0 && !is_proc {
+    let pos = if flags & O_APPEND != 0 && !is_proc && !is_cg {
         fs.stat(&full).map_err(err_to_i64)?.size
     } else {
         0
@@ -500,6 +519,19 @@ pub fn read(fd: i64, buf: &mut [u8]) -> Result<i64, i64> {
             }
         });
         task::io_charge(true, n);
+        return Ok(n as i64);
+    }
+    if crate::cgroup::handles(&path) {
+        let data = crate::cgroup::read_file(&path).ok_or(-3i64)?;
+        let avail = if pos as usize >= data.len() { 0 } else { data.len() - pos as usize };
+        let n = avail.min(buf.len());
+        buf[..n].copy_from_slice(&data[pos as usize..pos as usize + n]);
+        task::with_current(|t| {
+            if let Some(Some(f)) = t.fds.get_mut(fd as usize) {
+                f.pos += n as u64;
+            }
+        });
+        task::io_charge(true, n as u64);
         return Ok(n as i64);
     }
     if crate::proc::handles(&path) {
@@ -587,6 +619,20 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
         });
         task::io_charge(false, n as u64);
         return Ok(n as i64);
+    }
+    if crate::cgroup::handles(&path) {
+        match crate::cgroup::write_file(&path, buf) {
+            Some(n) => {
+                task::with_current(|t| {
+                    if let Some(Some(f)) = t.fds.get_mut(fd as usize) {
+                        f.pos += n as u64;
+                    }
+                });
+                task::io_charge(false, n as u64);
+                return Ok(n as i64);
+            }
+            None => return Err(-1),
+        }
     }
     if crate::proc::handles(&path) {
         // procfs is read-only except whitelisted sysctl files
@@ -755,6 +801,14 @@ pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
             .map(|d| shared::Stat { size: d.len() as u64, is_dir: 0, mtime: 0, attr: 0 })
             .ok_or(-2);
     }
+    if crate::cgroup::handles(&full) {
+        if crate::cgroup::is_dir(&full) {
+            return Ok(shared::Stat { size: 0, is_dir: 1, mtime: 0, attr: 0 });
+        }
+        return crate::cgroup::read_file(&full)
+            .map(|d| shared::Stat { size: d.len() as u64, is_dir: 0, mtime: 0, attr: 0 })
+            .ok_or(-2);
+    }
     if crate::tmpfs::handles(&full) {
         return match crate::tmpfs::stat(&full) {
             Some((sz, dir, mt, _ct, at)) => Ok(shared::Stat {
@@ -876,7 +930,7 @@ pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
     if crate::tmpfs::handles(&full) {
         return crate::tmpfs::utime(&full, secs);
     }
-    if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
+    if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) || crate::cgroup::handles(&full) {
         return Err(-4);
     }
     // vfat ownership: files are root:root, so a non-root caller gets
@@ -899,7 +953,7 @@ pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
     if crate::tmpfs::handles(&full) {
         return crate::tmpfs::setattr(&full, attr);
     }
-    if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
+    if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) || crate::cgroup::handles(&full) {
         return Err(-4);
     }
     // vfat ownership: files are root:root, so a non-root caller gets
@@ -938,6 +992,13 @@ pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
             Err(-4) // ENOTDIR
         };
     }
+    if crate::cgroup::handles(&full) {
+        return if crate::cgroup::is_dir(&full) {
+            Ok(crate::cgroup::entries(&full))
+        } else {
+            Err(-4) // ENOTDIR
+        };
+    }
     if crate::tmpfs::handles(&full) {
         return crate::tmpfs::listdir(&full);
     }
@@ -968,6 +1029,9 @@ pub fn mkdir(path: &str) -> Result<(), i64> {
     let full = normalize(&cwd, path);
     if crate::tmpfs::handles(&full) {
         return crate::tmpfs::mkdir(&full);
+    }
+    if crate::cgroup::handles(&full) {
+        return crate::cgroup::mkdir(&full);
     }
     if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
@@ -1000,6 +1064,9 @@ pub fn remove(path: &str) -> Result<(), i64> {
             crate::notify::fire(&full, crate::notify::IN_DELETE);
         }
         return r;
+    }
+    if crate::cgroup::handles(&full) {
+        return crate::cgroup::remove(&full);
     }
     if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
@@ -1034,6 +1101,8 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
         || crate::dev::handles(&t2)
         || crate::pipes::handles(&f)
         || crate::pipes::handles(&t2)
+        || crate::cgroup::handles(&f)
+        || crate::cgroup::handles(&t2)
     {
         return Err(-4);
     }

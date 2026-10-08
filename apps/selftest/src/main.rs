@@ -4801,6 +4801,79 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    check("cgroup", {
+        // Real cgroups under /sys/fs/cgroup: mkdir makes a group, a
+        // pid written to cgroup.procs joins it, cpu.stat reports live
+        // usage, and cpu.max genuinely throttles the group — a spinner
+        // capped to 200ms/s of cpu can only burn ~20 ticks per window.
+        let mut ok = true;
+        ok = ok && ustd::mkdir("/sys/fs/cgroup/t1").is_ok();
+        match ustd::fork() {
+            0 => {
+                // spinner: burn cpu for ~2.6s
+                let t0 = ustd::uptime_ms();
+                while ustd::uptime_ms().saturating_sub(t0) < 2600 {}
+                ustd::exit(0);
+            }
+            p if p > 0 => {
+                let procs_path = "/sys/fs/cgroup/t1/cgroup.procs";
+                ok = ok && ustd::write_all(
+                    procs_path,
+                    alloc::format!("{}", p).as_bytes(),
+                ).is_ok();
+                // membership is real: procs lists the child pid
+                ok = ok && ustd::read_all(procs_path)
+                    .map(|b| String::from_utf8_lossy(&b).contains(&alloc::format!("{}", p)))
+                    .unwrap_or(false);
+                // throttle: 200_000us per 1s window ≈ 20 ticks/s
+                ok = ok && ustd::write_all(
+                    "/sys/fs/cgroup/t1/cpu.max",
+                    b"200000 1000000",
+                ).is_ok();
+                ustd::sleep_ms(1800);
+                // while the child is still spinning, usage must be well
+                // below its ~1.8s of work — it got throttled for real
+                let st = ustd::read_all("/sys/fs/cgroup/t1/cpu.stat")
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                let usage: u64 = st
+                    .lines()
+                    .find(|l| l.starts_with("usage_usec"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let nrth: u64 = st
+                    .lines()
+                    .find(|l| l.starts_with("nr_throttled"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                // < 70% of the 1.8s window and at least one throttle hit
+                ok = ok && usage < 1_200_000 && usage > 0 && nrth >= 1;
+                let ev = ustd::read_all("/sys/fs/cgroup/t1/cgroup.events")
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                ok = ok && ev.contains("populated 1");
+                ok = ok && ustd::read_all("/sys/fs/cgroup/t1/memory.current")
+                    .map(|b| {
+                        String::from_utf8_lossy(&b)
+                            .trim()
+                            .parse::<u64>()
+                            .map(|v| v > 0)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                ok = ok && ustd::waitpid(p as u32, 15_000) == Ok(0);
+            }
+            _ => ok = false,
+        }
+        // root lists live pids; remove frees the group
+        ok = ok && ustd::read_all("/sys/fs/cgroup/cgroup.procs")
+            .map(|b| !b.is_empty())
+            .unwrap_or(false);
+        let _ = ustd::remove("/sys/fs/cgroup/t1");
+        ok
+    });
     check("pid-ns", {
         // unshare(CLONE_NEWPID) + fork: the child is init of a fresh
         // pid space (getpid()==1, invisible parent), its own child is 2.
