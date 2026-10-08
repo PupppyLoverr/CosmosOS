@@ -69,6 +69,7 @@ pub const SYS_NET_TCP_LISTEN: u64 = 70;   // (lport) -> 0 | ERR  mark port liste
 pub const SYS_NET_TCP_ACCEPT: u64 = 71;   // (lport, ptr to 8B out, timeout) -> cid | ERR
 pub const SYS_NET_TCP_UNLISTEN: u64 = 72; // (lport) -> 0
 pub const SYS_SHOT: u64 = 73;             // (path_ptr,path_len) -> 0 | ERR  fb -> PPM file
+pub const SYS_RAND: u64 = 74;             // (buf,cap<=4096) -> n | ERR  hardware/seeded random bytes
 
 pub const SYS_ERR: u64 = u64::MAX;
 

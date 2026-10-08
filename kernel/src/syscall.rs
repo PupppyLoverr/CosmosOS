@@ -365,6 +365,14 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
             None => ERR,
         },
+        shared::SYS_RAND => {
+            let mut v = alloc::vec![0u8; (a2 as usize).min(4096)];
+            rand_fill(&mut v);
+            match copy_out(a1, &v) {
+                Some(()) => v.len() as u64,
+                None => ERR,
+            }
+        }
         _ => {
             crate::sprint!("[syscall] unknown nr\n");
             ERR
@@ -750,6 +758,61 @@ fn power_off() -> ! {
     loop {
         x86_64::instructions::hlt();
     }
+}
+
+/// Random bytes for SYS_RAND: RDRAND when the CPU advertises it
+/// (CPUID.1:ECX bit 30), otherwise a xorshift64* PRNG seeded once from
+/// rdtsc — a real PRNG, not presented as CSPRNG in the docs.
+fn rand_fill(out: &mut [u8]) {
+    let has_rdrand = unsafe { core::arch::x86_64::__cpuid(1).ecx } & (1 << 30) != 0;
+    let mut i = 0;
+    while i < out.len() {
+        let n = if has_rdrand {
+            let mut v: u64 = 0;
+            let mut cf: u64;
+            // rdrand can legally fail (CF=0) — retry a bounded number of times
+            let mut ok = false;
+            for _ in 0..16 {
+                unsafe {
+                    core::arch::asm!(
+                        "xor {0}, {0}",
+                        "rdrand {1}",
+                        "setc {0:l}",
+                        out(reg) cf,
+                        out(reg) v,
+                        options(nostack)
+                    );
+                }
+                if cf != 0 {
+                    ok = true;
+                    break;
+                }
+            }
+            if ok { v } else { next_seed() }
+        } else {
+            next_seed()
+        };
+        let b = n.to_le_bytes();
+        let take = (out.len() - i).min(8);
+        out[i..i + take].copy_from_slice(&b[..take]);
+        i += take;
+    }
+}
+
+/// xorshift64* fallback stream, seeded once from rdtsc.
+fn next_seed() -> u64 {
+    static S: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut s = S.load(Relaxed);
+    if s == 0 {
+        s = unsafe { core::arch::x86_64::_rdtsc() } | 1;
+        S.store(s, Relaxed);
+    }
+    s ^= s >> 12;
+    s ^= s << 25;
+    s ^= s >> 27;
+    S.store(s, Relaxed);
+    s.wrapping_mul(0x2545_F491_4F6C_DD1D)
 }
 
 fn reboot() -> ! {
