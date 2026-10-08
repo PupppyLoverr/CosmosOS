@@ -270,6 +270,14 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
+        shared::SYS_ARP => {
+            let s = net::arp_stat();
+            let n = s.len().min(a2 as usize);
+            match copy_out(a1, &s.as_bytes()[..n]) {
+                Some(()) => n as u64,
+                None => ERR,
+            }
+        }
         shared::SYS_KLOG => {
             let mut v = alloc::vec![0u8; (a2 as usize).min(32 * 1024)];
             let n = crate::klog::read_tail(&mut v);

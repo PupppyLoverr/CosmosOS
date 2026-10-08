@@ -64,6 +64,7 @@ pub const SYS_CLIP_GET: u64 = 65;      // (buf,cap) -> n | ERR
 pub const SYS_NET_STAT: u64 = 66;      // (buf,cap) -> n | ERR  (socket table dump)
 pub const SYS_DF: u64 = 67;            // (ptr to [u64;2]) -> 0 | ERR  {total_bytes, free_bytes}
 pub const SYS_KLOG: u64 = 68;          // (buf,cap) -> n | ERR  kernel log ring tail
+pub const SYS_ARP: u64 = 69;           // (buf,cap) -> n | ERR  ARP cache dump
 
 pub const SYS_ERR: u64 = u64::MAX;
 
