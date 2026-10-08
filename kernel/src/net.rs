@@ -327,7 +327,7 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
     // from its peer in 15s gets a bare ACK probe (seq = snd_una-1 — the
     // classic keepalive segment real stacks send).
     {
-        let probes: Vec<([u8; 6], [u8; 4], u16, u16, u32, u32, u16)> = {
+        let probes: Vec<([u8; 6], [u8; 4], u16, u16, u32, u32, u16, u16)> = {
             let mut t = TCP_SOCKS.lock();
             let mut v = Vec::new();
             for k in t.values_mut() {
@@ -337,13 +337,41 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
                 {
                     k.ka_rx = now_ms(); // one probe per idle window
                     v.push((k.mac, k.rip, k.lport, k.rport,
-                        k.snd_una.wrapping_sub(1), k.rcv_nxt, k.cid));
+                        k.snd_una.wrapping_sub(1), k.rcv_nxt, rx_win(k), k.cid));
                 }
             }
             v
         };
-        for (mac, rip, lp, rp, seq, ack, _cid) in probes {
-            send_tcp(mac, rip, lp, rp, seq, ack, TCP_ACK, &[]);
+        for (mac, rip, lp, rp, seq, ack, win, _cid) in probes {
+            send_tcp(mac, rip, lp, rp, seq, ack, TCP_ACK, &[], win);
+        }
+    }
+    // retransmit: the oldest unacked segment past its RTO resends — this
+    // is what makes nowait writes and FINs reliable, not just hopeful
+    {
+        let now = now_ms();
+        let mut resend: Vec<([u8; 6], [u8; 4], u16, u16, u32, u32, u8, Vec<u8>, u16)> =
+            Vec::new();
+        {
+            let mut t = TCP_SOCKS.lock();
+            for k in t.values_mut() {
+                if k.state != TcpState::Open {
+                    continue;
+                }
+                if let Some(u) = k.unacked.front_mut() {
+                    if now.saturating_sub(u.tx_ms) >= 400 {
+                        u.tx_ms = now;
+                        resend.push((
+                            k.mac, k.rip, k.lport, k.rport, u.seq, k.rcv_nxt,
+                            u.flags, u.payload.clone(), rx_win(k),
+                        ));
+                    }
+                }
+            }
+        }
+        for (mac, rip, lp, rp, seq, ackn, fl, pay, win) in resend {
+            sprintln!("[net] tcp retransmit :{} -> :{} {}B", lp, rp, pay.len());
+            send_tcp(mac, rip, lp, rp, seq, ackn, fl, &pay, win);
         }
     }
     out
@@ -933,6 +961,7 @@ fn send_tcp(
     ack: u32,
     flags: u8,
     payload: &[u8],
+    win: u16,
 ) {
     let mut seg = Vec::with_capacity(20 + payload.len());
     seg.extend_from_slice(&sport.to_be_bytes());
@@ -941,7 +970,7 @@ fn send_tcp(
     seg.extend_from_slice(&ack.to_be_bytes());
     seg.push(0x50); // data offset 5 (no options)
     seg.push(flags);
-    seg.extend_from_slice(&65535u16.to_be_bytes()); // window
+    seg.extend_from_slice(&win.to_be_bytes()); // advertised rx window
     seg.extend_from_slice(&[0u8; 2]); // checksum
     seg.extend_from_slice(&[0u8; 2]); // urg
     seg.extend_from_slice(payload);
@@ -1059,12 +1088,15 @@ pub fn net_tcp() -> String {
     let mut s = String::from("  sl  local_address rem_address   st tx_queue rx_queue\n");
     let mut i = 0u32;
     for (p, k) in TCP_SOCKS.lock().iter() {
+        let txq: usize = k.unacked.iter().map(|u| u.payload.len()).sum();
         s.push_str(&alloc::format!(
-            "  {:>2}: {} {} {:02X} 00000000:00000000\n",
+            "  {:>2}: {} {} {:02X} {:08X}:{:08X}\n",
             i,
             hexaddr(lip, *p),
             hexaddr(k.rip, k.rport),
-            stcode(&k.state)
+            stcode(&k.state),
+            txq, // real unacked bytes, like /proc/net/tcp's tx_queue
+            k.q.iter().map(|c| c.len()).sum::<usize>(),
         ));
         i += 1;
     }
@@ -1436,7 +1468,7 @@ fn tcp_rst(src_ip: [u8; 4], s: &TcpSeg) {
     let consume = s.payload.len() as u32
         + if s.flags & (TCP_SYN | TCP_FIN) != 0 { 1 } else { 0 };
     if s.flags & TCP_ACK != 0 {
-        send_tcp(mac, src_ip, s.dport, s.sport, s.ack, 0, TCP_RST, &[]);
+        send_tcp(mac, src_ip, s.dport, s.sport, s.ack, 0, TCP_RST, &[], 65535);
     } else {
         send_tcp(
             mac,
@@ -1447,6 +1479,7 @@ fn tcp_rst(src_ip: [u8; 4], s: &TcpSeg) {
             s.seq.wrapping_add(consume),
             TCP_RST | TCP_ACK,
             &[],
+            65535,
         );
     }
 }
@@ -1475,10 +1508,27 @@ pub struct TcpSock {
     rcv_nxt: u32, // next rx seq we accept in-order
     state: TcpState,
     q: VecDeque<Vec<u8>>, // in-order payload chunks
+    unacked: VecDeque<UnAck>, // transmitted, awaiting peer ACK (retransmit queue)
+    rst: bool,            // peer sent RST (read path surfaces ECONNRESET)
     owner: u32,           // task id that opened/accepted it (0 = kernel side)
     wr_off: bool,         // shutdown(SHUT_WR): FIN sent, no more sends
     ka: bool,             // SO_KEEPALIVE: probe the peer after 15s idle
     ka_rx: u64,           // last rx (or probe) timestamp — keepalive clock
+}
+
+/// A transmitted segment awaiting ACK — retransmitted by tcp_tick.
+pub struct UnAck {
+    seq: u32,
+    flags: u8,
+    payload: Vec<u8>,
+    tx_ms: u64, // last transmit time (RTO clock)
+}
+
+/// Advertised receive window: shrinks as the in-order queue fills — real
+/// backpressure; peers stop sending when our app doesn't read.
+fn rx_win(k: &TcpSock) -> u16 {
+    let buffered: usize = k.q.iter().map(|c| c.len()).sum();
+    32768u32.saturating_sub(buffered as u32).min(65535) as u16
 }
 
 static TCP_SOCKS: Mutex<BTreeMap<u16, TcpSock>> = Mutex::new(BTreeMap::new());
@@ -1498,6 +1548,7 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
     match k.state {
         TcpState::SynRecv => {
             if s.flags & TCP_RST != 0 {
+                k.rst = true;
                 k.state = TcpState::Closed;
             } else if s.flags & TCP_ACK != 0 && s.ack == k.snd_nxt {
                 k.snd_una = s.ack;
@@ -1505,7 +1556,7 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
                 if s.seq == k.rcv_nxt && !s.payload.is_empty() {
                     k.q.push_back(s.payload.clone());
                     k.rcv_nxt += s.payload.len() as u32;
-                    send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[]);
+                    send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[], rx_win(k));
                 }
                 ACCEPTED
                     .lock()
@@ -1519,18 +1570,31 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
                 k.rcv_nxt = s.seq + 1;
                 k.snd_una = s.ack;
                 k.state = TcpState::Open;
-                send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[]);
+                send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[], rx_win(k));
             } else if s.flags & TCP_RST != 0 {
+                k.rst = true;
                 k.state = TcpState::Closed;
             }
         }
         TcpState::Open => {
             if s.flags & TCP_RST != 0 {
+                k.rst = true;
                 k.state = TcpState::Closed;
                 return;
             }
             if s.ack > k.snd_una {
                 k.snd_una = s.ack;
+                // drain the retransmit queue: cumulatively-acked segs
+                while let Some(u) = k.unacked.front() {
+                    let end = u.seq.wrapping_add(u.payload.len() as u32).wrapping_add(
+                        if u.flags & TCP_FIN != 0 { 1 } else { 0 },
+                    );
+                    if s.ack >= end {
+                        k.unacked.pop_front();
+                    } else {
+                        break;
+                    }
+                }
             }
             if s.seq == k.rcv_nxt && !s.payload.is_empty() {
                 k.q.push_back(s.payload.clone());
@@ -1541,7 +1605,7 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
                 k.state = TcpState::Closed;
             }
             // ack whatever we consumed (dup acks are fine)
-            send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[]);
+            send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[], rx_win(k));
         }
         TcpState::Closed => {}
     }
@@ -1568,6 +1632,8 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
             rcv_nxt: 0,
             state: TcpState::SynSent,
             q: VecDeque::new(),
+            unacked: VecDeque::new(),
+            rst: false,
             cid: lport,
             owner: crate::task::with_current(|t| t.id),
             wr_off: false,
@@ -1580,7 +1646,7 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
     let mut open = false;
     while now_ms() < deadline {
         if now_ms() - last_syn >= 1000 {
-            send_tcp(mac, rip, lport, rport, isn, 0, TCP_SYN, &[]);
+            send_tcp(mac, rip, lport, rport, isn, 0, TCP_SYN, &[], 65535);
             last_syn = now_ms();
         }
         for (src_ip, proto, p) in pump_rx() {
@@ -1659,13 +1725,15 @@ fn accept_syn(s: &TcpSeg, src_ip: [u8; 4]) {
             rcv_nxt: s.seq + 1,
             state: TcpState::SynRecv,
             q: VecDeque::new(),
+            unacked: VecDeque::new(),
+            rst: false,
             owner: 0,
             wr_off: false,
             ka: false,
             ka_rx: now_ms(),
         },
     );
-    send_tcp(mac, src_ip, s.dport, s.sport, isn, s.seq + 1, TCP_SYN | TCP_ACK, &[]);
+    send_tcp(mac, src_ip, s.dport, s.sport, isn, s.seq + 1, TCP_SYN | TCP_ACK, &[], 65535);
 }
 
 /// Wait for an accepted conn on a listener. Returns (cid, peer ip, peer port).
@@ -1709,11 +1777,43 @@ pub fn tcp_send(lport: u16, data: &[u8], timeout_ms: u64) -> Result<(), i64> {
         let n = data.len().min(1400);
         (k.snd_nxt, n)
     };
+    // send window full -> wait for ACKs to drain the queue, like a real
+    // blocking send() under backpressure
+    let mut enqueued = false;
+    while !enqueued && now_ms() < deadline {
+        {
+            let mut t = TCP_SOCKS.lock();
+            let Some(k) = t.get_mut(&lport) else {
+                return Err(-2);
+            };
+            if k.state == TcpState::Closed {
+                return Err(-2);
+            }
+            if k.unacked.len() < 32 {
+                k.unacked.push_back(UnAck {
+                    seq: seq_at_send,
+                    flags: TCP_ACK | TCP_PSH,
+                    payload: data[..sent_len].to_vec(),
+                    tx_ms: now_ms(),
+                });
+                enqueued = true;
+            }
+        }
+        if !enqueued {
+            for (src_ip, proto, p) in pump_rx() {
+                dispatch(src_ip, proto, p);
+            }
+            wait_irq();
+        }
+    }
+    if !enqueued {
+        return Err(-2);
+    }
     while now_ms() < deadline {
         if now_ms() - last_tx >= 800 {
             let t = TCP_SOCKS.lock();
             if let Some(k) = t.get(&lport) {
-                send_tcp(k.mac, k.rip, k.lport, k.rport, seq_at_send, k.rcv_nxt, TCP_ACK | TCP_PSH, &data[..sent_len]);
+                send_tcp(k.mac, k.rip, k.lport, k.rport, seq_at_send, k.rcv_nxt, TCP_ACK | TCP_PSH, &data[..sent_len], rx_win(k));
             }
             last_tx = now_ms();
         }
@@ -1771,7 +1871,7 @@ pub fn tcp_recv(lport: u16, timeout_ms: u64) -> Option<Vec<u8>> {
 /// already Closed or will be once our FIN lands).
 pub fn tcp_close(lport: u16) {
     if let Some(k) = TCP_SOCKS.lock().remove(&lport) {
-        send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_FIN | TCP_ACK, &[]);
+        send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_FIN | TCP_ACK, &[], rx_win(&k));
     }
 }
 
@@ -1815,6 +1915,12 @@ pub fn tcp_read_ready(cid: u16) -> Option<bool> {
     }
 }
 
+/// Did the peer RST this conn? Distinguishes ECONNRESET reads from EOF.
+/// None = conn gone entirely.
+pub fn tcp_was_rst(cid: u16) -> Option<bool> {
+    TCP_SOCKS.lock().get(&cid).map(|k| k.rst)
+}
+
 /// A completed inbound handshake is queued for accept on `lport`?
 pub fn tcp_accept_ready(lport: u16) -> bool {
     ACCEPTED
@@ -1827,17 +1933,26 @@ pub fn tcp_accept_ready(lport: u16) -> bool {
 /// Fire a single data segment and return without waiting for the ack — the
 /// O_NONBLOCK write path for socket fds. Err(-1) no conn, Err(-2) closed.
 pub fn tcp_send_nowait(cid: u16, data: &[u8]) -> Result<usize, i64> {
-    let (seq, mac, rip, lport, rport, ack) = {
-        let t = TCP_SOCKS.lock();
-        let Some(k) = t.get(&cid) else { return Err(-1) };
+    let (seq, mac, rip, lport, rport, ack, win) = {
+        let mut t = TCP_SOCKS.lock();
+        let Some(k) = t.get_mut(&cid) else { return Err(-1) };
         if k.state != TcpState::Open {
             return Err(-2);
         }
-        (k.snd_nxt, k.mac, k.rip, k.lport, k.rport, k.rcv_nxt)
+        if k.unacked.len() >= 32 {
+            return Err(-11); // send window full — EAGAIN
+        }
+        (k.snd_nxt, k.mac, k.rip, k.lport, k.rport, k.rcv_nxt, rx_win(k))
     };
     let n = data.len().min(1400);
-    send_tcp(mac, rip, lport, rport, seq, ack, TCP_ACK | TCP_PSH, &data[..n]);
+    send_tcp(mac, rip, lport, rport, seq, ack, TCP_ACK | TCP_PSH, &data[..n], win);
     if let Some(k) = TCP_SOCKS.lock().get_mut(&cid) {
+        k.unacked.push_back(UnAck {
+            seq,
+            flags: TCP_ACK | TCP_PSH,
+            payload: data[..n].to_vec(),
+            tx_ms: now_ms(),
+        });
         k.snd_nxt = seq.wrapping_add(n as u32);
     }
     Ok(n)
@@ -1853,7 +1968,13 @@ pub fn tcp_shutdown_wr(cid: u16) {
         return;
     }
     k.wr_off = true;
-    send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_FIN | TCP_ACK, &[]);
+    k.unacked.push_back(UnAck {
+        seq: k.snd_nxt,
+        flags: TCP_FIN | TCP_ACK,
+        payload: Vec::new(),
+        tx_ms: now_ms(),
+    });
+    send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_FIN | TCP_ACK, &[], rx_win(k));
     k.snd_nxt = k.snd_nxt.wrapping_add(1); // FIN consumes one sequence number
 }
 
