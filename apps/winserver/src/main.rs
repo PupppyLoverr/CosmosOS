@@ -334,12 +334,17 @@ fn on_mouse(s: &mut S, m: &InputMouse) {
             d.rx = nx - d.ox;
             d.ry = ny - d.oy;
             if d.mode == 1 {
-                let w = s.wins.iter().find(|w| w.id == d.win).unwrap();
-                d.rw = (w.w + (nx - px)).max(160);
-                d.rh = (w.h + (ny - py)).max(100);
-                // resize from the drag delta relative to grab, simpler:
-                d.rw = (nx - (w.x)).max(160);
-                d.rh = (ny - (w.y)).max(100);
+                // window may have been closed/reaped mid-drag — drop the
+                // drag instead of panicking on the unwrap
+                let Some(w) = s.wins.iter().find(|w| w.id == d.win) else {
+                    s.drag = None;
+                    s.dirty = true;
+                    return;
+                };
+                // resize to the pointer's position relative to the corner
+                let (wx, wy) = (w.x, w.y);
+                d.rw = (nx - wx).max(160);
+                d.rh = (ny - wy).max(100);
             }
             s.dirty = true;
         }
