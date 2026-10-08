@@ -4003,6 +4003,79 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             && ustd::write_all("/tmp/st", b"t").is_ok()
             && ustd::read_all("/tmp/st").map(|d| d == b"t").unwrap_or(false)
     });
+    check("bind-mount", {
+        // bind /bs onto /bd: reads through the alias hit the source,
+        // an fd opened through the bind survives the unbind.
+        let _ = ustd::mkdir("/bs");
+        let _ = ustd::mkdir("/bd");
+        let ok = ustd::mount("none", "/bs", "tmpfs") == 0
+            && ustd::write_all("/bs/f", b"B").is_ok()
+            && ustd::mount_flags("/bs", "/bd", "none", 0x1000) == 0
+            && ustd::read_all("/bd/f").map(|d| d == b"B").unwrap_or(false)
+            // ".." at the bind root escapes to the real parent
+            && ustd::stat("/bd/../welcome.txt").is_ok() == ustd::stat("/welcome.txt").is_ok();
+        // fd opened through the bind keeps working after unbind
+        let fd_ok = ustd::open("/bd/f", 0)
+            .map(|fd| {
+                let _ = ustd::umount("/bd");
+                let mut b = [0u8; 4];
+                let n = ustd::read(fd, &mut b).unwrap_or(0);
+                let _ = ustd::close(fd);
+                n == 1 && b[0] == b'B'
+            })
+            .unwrap_or(false);
+        let _ = ustd::umount("/bs");
+        let _ = ustd::remove("/bs");
+        let _ = ustd::remove("/bd");
+        ok && fd_ok
+    });
+    check("umount-flags", {
+        // open fd makes umount EBUSY; MNT_DETACH(2) detaches lazily and
+        // keeps the resolved path alive.
+        let _ = ustd::mkdir("/umf");
+        let ok = ustd::mount("none", "/umf", "tmpfs") == 0
+            && ustd::write_all("/umf/x", b"X").is_ok();
+        let fd = ustd::open("/umf/x", 0).unwrap_or(-1);
+        let busy = ustd::umount("/umf") == -16;
+        let lazy = busy
+            && ustd::umount2("/umf", 2) == 0
+            && {
+                let mut b = [0u8; 4];
+                ustd::read(fd, &mut b).map(|n| n == 1 && b[0] == b'X').unwrap_or(false)
+            };
+        let _ = ustd::close(fd);
+        // force-purge the detached tree
+        let _ = ustd::mkdir("/umf2");
+        let _ = ustd::mount("none", "/umf2", "tmpfs");
+        let _ = ustd::write_all("/umf2/y", b"Y");
+        let fd2 = ustd::open("/umf2/y", 0).unwrap_or(-1);
+        let frc = ustd::umount2("/umf2", 1) == 0;
+        let _ = ustd::close(fd2);
+        let _ = ustd::remove("/umf");
+        let _ = ustd::remove("/umf2");
+        ok && fd >= 0 && lazy && frc
+    });
+    check("statx", {
+        let _ = ustd::mkdir("/sx");
+        let ok = ustd::mount("none", "/sx", "tmpfs") == 0
+            && ustd::write_all("/sx/f", b"0123456789").is_ok();
+        let sx = ustd::statx("/sx/f");
+        let sd = ustd::statx("/sx");
+        let ok = ok
+            && sx.as_ref().map(|s| s.size == 10 && s.btime > 0 && s.mode == 0o100644 && s.ino != 0).unwrap_or(false)
+            && sd.as_ref().map(|s| s.mode == 0o40755).unwrap_or(false);
+        let _ = ustd::umount("/sx");
+        let _ = ustd::remove("/sx");
+        ok
+    });
+    check("mountinfo", {
+        ustd::read_all("/proc/self/mountinfo")
+            .map(|d| {
+                let s = String::from_utf8_lossy(&d).into_owned();
+                s.contains("fat32") && s.contains("/ /tmp rw - tmpfs")
+            })
+            .unwrap_or(false)
+    });
     check("gettimeofday", {
         let (s, u) = ustd::gettimeofday();
         s > 1_700_000_000 && u < 1_000_000

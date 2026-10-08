@@ -864,7 +864,8 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
         }
         shared::SYS_MOUNT => sys_mount(a1),
-        shared::SYS_UMOUNT => sys_umount(a1, a2),
+        shared::SYS_UMOUNT => sys_umount(a1, a2, a3),
+        shared::SYS_STATX => sys_statx(a1),
         shared::SYS_CHROOT => sys_chroot(a1, a2),
         shared::SYS_GETTIMEOFDAY => {
             let sec = vfs::now_unix();
@@ -3380,12 +3381,24 @@ fn sys_mount(argp: u64) -> u64 {
     else {
         return ERR;
     };
-    if fst.trim_matches('\0') != "tmpfs" {
-        return (-19i64) as u64; // ENODEV: unknown fstype
-    }
     let flags = rd(6);
     let cwd = task::with_current(|t| t.cwd.clone());
     let t = vfs::normalize(&cwd, tgt.trim_matches('\0'));
+    if flags & shared::MS_BIND != 0 {
+        // mount --bind: source must exist (dir or file); the target is
+        // an alias resolved at path time, so it only needs to exist too.
+        let Some(src_raw) = copy_str(rd(0), rd(1)) else { return ERR };
+        let s = vfs::normalize(&cwd, src_raw.trim_matches('\0'));
+        if vfs::stat_path(&s).is_err() || vfs::stat_path(&t).is_err() {
+            return (-2i64) as u64;
+        }
+        return crate::bind::mount(&s, &t)
+            .map(|_| 0)
+            .unwrap_or_else(|e| e as u64);
+    }
+    if fst.trim_matches('\0') != "tmpfs" {
+        return (-19i64) as u64; // ENODEV: unknown fstype
+    }
     let ro = flags & shared::MS_RDONLY != 0;
     if flags & shared::MS_REMOUNT != 0 {
         return crate::tmpfs::remount(&t, ro)
@@ -3422,11 +3435,70 @@ fn sys_chroot(pptr: u64, plen: u64) -> u64 {
 }
 
 /// SYS_UMOUNT(target): EBUSY on open fds/cwd/nested mounts under it.
-fn sys_umount(ptr: u64, len: u64) -> u64 {
+fn sys_umount(ptr: u64, len: u64, flags: u64) -> u64 {
     let Some(tgt) = copy_str(ptr, len) else { return ERR };
     let cwd = task::with_current(|t| t.cwd.clone());
     let t = vfs::normalize(&cwd, tgt.trim_matches('\0'));
-    crate::tmpfs::umount(&t).map(|_| 0).unwrap_or_else(|e| e as u64)
+    match crate::tmpfs::umount(&t, flags) {
+        Err(-22) => crate::bind::umount(&t)
+            .map(|_| 0)
+            .unwrap_or_else(|e| e as u64),
+        r => r.map(|_| 0).unwrap_or_else(|e| e as u64),
+    }
+}
+
+/// SYS_STATX(&[u64;6]{dirfd,pathptr,pathlen,flags,mask,bufp}): extended
+/// stat — btime/ctime/ino/mode/blocks that plain stat can't express.
+fn sys_statx(argp: u64) -> u64 {
+    let Some(a) = copy_in(argp, 48) else { return ERR };
+    let rd = |i: usize| u64::from_le_bytes(a[i * 8..i * 8 + 8].try_into().unwrap());
+    let Some(path) = resolve_at(rd(0) as u32 as i32 as i64, rd(1), rd(2)) else {
+        return ERR;
+    };
+    let flags = rd(3);
+    if path.is_empty() && flags & shared::AT_EMPTY_PATH == 0 {
+        return ERR;
+    }
+    let st = if flags & shared::AT_STATX_SYMLINK_NOFOLLOW != 0 {
+        match vfs::stat_path_nofollow(&path) {
+            Ok(st) => st,
+            Err(e) => return e as u64,
+        }
+    } else {
+        match vfs::stat_path(&path) {
+            Ok(st) => st,
+            Err(e) => return e as u64,
+        }
+    };
+    // stable inode-ish id: FNV-1a of the canonical path
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in path.as_bytes() {
+        h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    let sx = shared::Statx {
+        mask: shared::STATX_ALL as u32,
+        blksize: 512,
+        attr: st.attr as u64,
+        nlink: 1,
+        mode: if st.is_dir != 0 { 0o40755 } else { 0o100644 },
+        _pad: 0,
+        ino: h,
+        size: st.size,
+        blocks: (st.size + 511) / 512,
+        mtime: st.mtime,
+        ctime: vfs::btime(&path),
+        btime: vfs::btime(&path),
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &sx as *const _ as *const u8,
+            core::mem::size_of::<shared::Statx>(),
+        )
+    };
+    match copy_out(rd(5), bytes) {
+        Some(_) => 0,
+        None => ERR,
+    }
 }
 
 fn sys_statfs_out(path: &str, out: u64) -> u64 {

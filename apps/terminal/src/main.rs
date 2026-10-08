@@ -12880,10 +12880,15 @@ impl Term {
                                         "ro" => flags |= 1,
                                         "rw" => flags &= !1,
                                         "remount" => flags |= 32,
+                                        "bind" => flags |= 0x1000,
                                         _ => {}
                                     }
                                 }
                                 pos += 2;
+                            }
+                            "--bind" => {
+                                flags |= 0x1000;
+                                pos += 1;
                             }
                             _ => break,
                         }
@@ -12905,12 +12910,25 @@ impl Term {
                 },
                 None => self.fail("usage: chroot <dir>"),
             },
-            "umount" => match args.first() {
-                Some(p) => match ustd::umount(p) {
-                    0 => self.emit(&alloc::format!("unmounted {}", p)),
-                    e => self.fail(&alloc::format!("umount: {}: err {}", p, e)),
-                },
-                None => self.fail("usage: umount <dir>"),
+            "umount" => {
+                // umount [-f|-l] <dir>: -f force-purges busy mounts,
+                // -l lazy-detaches keeping open paths alive
+                let mut flags: u64 = 0;
+                let mut tgt: Option<&str> = None;
+                for s in args {
+                    match s {
+                        "-f" => flags |= 1,
+                        "-l" => flags |= 2,
+                        p => tgt = Some(p),
+                    }
+                }
+                match tgt {
+                    Some(p) => match ustd::umount2(p, flags) {
+                        0 => self.emit(&alloc::format!("unmounted {}", p)),
+                        e => self.fail(&alloc::format!("umount: {}: err {}", p, e)),
+                    },
+                    None => self.fail("usage: umount [-f|-l] <dir>"),
+                }
             },
             "rmdir" => match args.first() {
                 Some(p) => match ustd::remove(p) {

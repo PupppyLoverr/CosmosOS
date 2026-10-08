@@ -19,6 +19,8 @@ pub struct Node {
     pub pages: Vec<Box<[u8; 4096]>>,
     pub size: u64,
     pub mtime: u64,
+    /// inode change/birth time (unix secs) — statx ctime/btime.
+    pub ctime: u64,
     pub attr: u8,
     pub children: Vec<String>, // entry names (dirs only)
 }
@@ -26,6 +28,10 @@ pub struct Node {
 static NODES: Mutex<BTreeMap<String, Node>> = Mutex::new(BTreeMap::new());
 /// (mount path, read-only) — longest-prefix-first on insert.
 static MOUNTS: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
+/// Lazy-detached prefixes (umount2 MNT_DETACH while busy): the mount is
+/// gone but nodes under it keep serving already-resolved paths until a
+/// force unmount purges them — real lazy-umount semantics.
+static DETACHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Lock-free "anything mounted?" flag — lets `handles` short-circuit
 /// without taking MOUNTS, which matters on the page-fault read path.
 static ANY: AtomicUsize = AtomicUsize::new(0);
@@ -53,12 +59,17 @@ fn ro_of(g: &Vec<(String, bool)>, path: &str) -> bool {
     g.iter().any(|m| m.1 && under(&m.0, path))
 }
 
-/// Is `path` at or under a tmpfs mount point?
+fn detached_has(path: &str) -> bool {
+    DETACHED.lock().iter().any(|p| under(p, path))
+}
+
+/// Is `path` at or under a tmpfs mount point (or a lazily-detached
+/// tree that must keep serving resolved paths)?
 pub fn handles(path: &str) -> bool {
     if !any() {
         return false;
     }
-    mounted(&MOUNTS.lock(), path)
+    mounted(&MOUNTS.lock(), path) || detached_has(path)
 }
 
 /// Registered mount points with ro flag (for /proc/mounts).
@@ -158,6 +169,7 @@ pub fn mount(target: &str, ro: bool) -> Result<(), i64> {
             pages: Vec::new(),
             size: 0,
             mtime: crate::vfs::now_unix(),
+            ctime: crate::vfs::now_unix(),
             attr: 0,
             children: Vec::new(),
         },
@@ -170,23 +182,36 @@ pub fn mount(target: &str, ro: bool) -> Result<(), i64> {
 
 /// Unmount: EBUSY when any live fd or cwd sits under the mount, or a
 /// nested tmpfs mount lives inside it. Drops every node under the prefix.
-pub fn umount(target: &str) -> Result<(), i64> {
+/// umount2(target, flags): MNT_FORCE(1) skips the busy checks and
+/// purges; MNT_DETACH(2) drops the mount point but keeps the node tree
+/// alive for already-resolved paths (lazy umount).
+pub fn umount(target: &str, flags: u64) -> Result<(), i64> {
     let mut mg = MOUNTS.lock();
     let Some(i) = mg.iter().position(|m| m.0 == target) else {
         return Err(-22); // EINVAL: not a mount
     };
-    // busy: a nested mount, or an open fd / cwd below it
     let under = alloc::format!("{}/", target);
-    if mg.iter().any(|m| m.0.starts_with(&under)) {
-        return Err(-16);
-    }
-    if crate::task::fd_path_prefix_in_use(&under) || crate::task::cwd_under(&under) {
-        return Err(-16);
+    let force = flags & shared::MNT_FORCE != 0;
+    // MNT_DETACH (lazy) also skips busy checks — it detaches regardless.
+    if !force && flags & shared::MNT_DETACH == 0 {
+        // busy: a nested mount, or an open fd / cwd below it
+        if mg.iter().any(|m| m.0.starts_with(&under)) {
+            return Err(-16);
+        }
+        if crate::task::fd_path_prefix_in_use(&under) || crate::task::cwd_under(&under) {
+            return Err(-16);
+        }
     }
     mg.remove(i);
     ANY.store(mg.len(), Ordering::Relaxed);
+    if flags & shared::MNT_DETACH != 0 {
+        // lazy: keep the node tree serving resolved paths
+        DETACHED.lock().push(String::from(target));
+        return Ok(());
+    }
     let mut ng = NODES.lock();
     ng.retain(|k, _| k.as_str() != target && !k.starts_with(&under));
+    DETACHED.lock().retain(|p| p.as_str() != target);
     Ok(())
 }
 
@@ -238,6 +263,7 @@ pub fn open(path: &str, flags: u64) -> Result<u64, i64> {
                     pages: Vec::new(),
                     size: 0,
                     mtime: crate::vfs::now_unix(),
+            ctime: crate::vfs::now_unix(),
                     attr: 0x20,
                     children: Vec::new(),
                 },
@@ -345,10 +371,10 @@ pub fn exists(path: &str) -> bool {
     NODES.lock().contains_key(path)
 }
 
-pub fn stat(path: &str) -> Option<(u64, bool, u64, u8)> {
+pub fn stat(path: &str) -> Option<(u64, bool, u64, u64, u8)> {
     let ng = NODES.lock();
     ng.get(path)
-        .map(|n| (n.size, n.is_dir, n.mtime, n.attr))
+        .map(|n| (n.size, n.is_dir, n.mtime, n.ctime, n.attr))
 }
 
 pub fn mkdir(path: &str) -> Result<(), i64> {
@@ -374,6 +400,7 @@ pub fn mkdir(path: &str) -> Result<(), i64> {
             pages: Vec::new(),
             size: 0,
             mtime: crate::vfs::now_unix(),
+            ctime: crate::vfs::now_unix(),
             attr: 0,
             children: Vec::new(),
         },
