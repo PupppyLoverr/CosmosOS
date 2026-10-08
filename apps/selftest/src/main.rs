@@ -3892,6 +3892,79 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             set == 0 && got == 1 && dup >= 0 && dupgot == 0
         }
     });
+    check("tmpfs-mount", {
+        // mount tmpfs over an existing dir: the mount masks the FAT entry,
+        // files live in RAM, umount restores the covered dir
+        let _ = ustd::remove("/tfs-m/pre"); // clean slate on FAT
+        let _ = ustd::mkdir("/tfs-m");
+        let wrote = ustd::write_all("/tfs-m/pre", b"fat");
+        let m = ustd::mount("none", "/tfs-m", "tmpfs");
+        let mut ok = m == 0 && wrote.is_ok();
+        if ok {
+            // covered: the FAT file is hidden while mounted
+            ok = ustd::stat("/tfs-m/pre").is_err()
+                && ustd::write_all("/tfs-m/ram", b"tmpfs").is_ok()
+                && ustd::read_all("/tfs-m/ram").map(|d| d == b"tmpfs").unwrap_or(false)
+                && ustd::stat("/tfs-m/ram").map(|s| s.size == 5).unwrap_or(false)
+                && ustd::readdir("/tfs-m").map(|v| v.iter().any(|e| {
+                    let n = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("");
+                    n == "ram"
+                })).unwrap_or(false);
+            ok = ok && ustd::umount("/tfs-m") == 0;
+            // unmounted: the FAT dir + its file are visible again
+            ok = ok && ustd::read_all("/tfs-m/pre").map(|d| d == b"fat").unwrap_or(false)
+                && ustd::stat("/tfs-m/ram").is_err();
+        }
+        let _ = ustd::remove("/tfs-m/pre");
+        let _ = ustd::remove("/tfs-m");
+        ok
+    });
+    check("tmpfs-busy", {
+        let _ = ustd::mkdir("/tfs-b");
+        let ok = ustd::mount("none", "/tfs-b", "tmpfs") == 0;
+        let ok = ok && ustd::write_all("/tfs-b/f", b"x").is_ok();
+        let f = ustd::open("/tfs-b/f", ustd::O_RDONLY).unwrap_or(-1);
+        let busy = f >= 0 && ustd::umount("/tfs-b") == -16; // EBUSY
+        if f >= 0 {
+            ustd::close(f);
+        }
+        let ok = ok && busy && ustd::umount("/tfs-b") == 0;
+        let _ = ustd::remove("/tfs-b");
+        ok
+    });
+    check("tmpfs-quota", {
+        // real ENOSPC: the 4MiB quota rejects an oversized write
+        let _ = ustd::mkdir("/tfs-q");
+        let ok = ustd::mount("none", "/tfs-q", "tmpfs") == 0;
+        let big = alloc::vec![0xABu8; 5 * 1024 * 1024];
+        let r = ustd::write_all("/tfs-q/big", &big);
+        let ok = ok && r == Err(-28i64);
+        let _ = ustd::umount("/tfs-q");
+        let _ = ustd::remove("/tfs-q");
+        ok
+    });
+    check("proc-mounts", {
+        let _ = ustd::mkdir("/tfs-p");
+        let ok = ustd::mount("none", "/tfs-p", "tmpfs") == 0;
+        let has = ustd::read_all("/proc/mounts")
+            .map(|d| String::from_utf8_lossy(&d).contains("tmpfs /tfs-p tmpfs"))
+            .unwrap_or(false);
+        let ok = ok && has && ustd::umount("/tfs-p") == 0;
+        let _ = ustd::remove("/tfs-p");
+        ok
+    });
+    check("tmpfs-rename", {
+        let _ = ustd::mkdir("/tfs-r");
+        let ok = ustd::mount("none", "/tfs-r", "tmpfs") == 0
+            && ustd::write_all("/tfs-r/a", b"1").is_ok()
+            && ustd::renameat2(ustd::AT_FDCWD, "/tfs-r/a", ustd::AT_FDCWD, "/tfs-r/b", 0) == 0
+            && ustd::read_all("/tfs-r/b").map(|d| d == b"1").unwrap_or(false)
+            // cross-mount rename is EXDEV
+            && ustd::renameat2(ustd::AT_FDCWD, "/tfs-r/b", ustd::AT_FDCWD, "/rn-xdev", 0) == -18;
+        let _ = ustd::umount("/tfs-r");
+        let _ = ustd::remove("/tfs-r");
+        ok
+    });
     check("gettimeofday", {
         let (s, u) = ustd::gettimeofday();
         s > 1_700_000_000 && u < 1_000_000

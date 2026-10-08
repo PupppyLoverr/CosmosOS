@@ -1837,6 +1837,25 @@ pub fn eventfd2(initval: u64, flags: u64) -> i64 {
     sc2(shared::SYS_EVENTFD2, initval, flags) as i64
 }
 
+/// mount: only fstype "tmpfs" exists — a real in-RAM fs over `target`
+/// (an existing dir). `source` is ignored like Linux tmpfs.
+pub fn mount(source: &str, target: &str, fstype: &str) -> i64 {
+    let args: [u64; 6] = [
+        source.as_ptr() as u64,
+        source.len() as u64,
+        target.as_ptr() as u64,
+        target.len() as u64,
+        fstype.as_ptr() as u64,
+        fstype.len() as u64,
+    ];
+    sc1(shared::SYS_MOUNT, args.as_ptr() as u64) as i64
+}
+
+/// umount: unmount target — EBUSY(-16) with open fds/cwd under it.
+pub fn umount(target: &str) -> i64 {
+    sc2(217, target.as_ptr() as u64, target.len() as u64) as i64
+}
+
 /// openat(dirfd, path, flags) -> fd. Absolute paths ignore `dirfd`.
 pub fn openat(dirfd: i64, path: &str, flags: u64) -> Result<i64, i64> {
     let r = sc4(

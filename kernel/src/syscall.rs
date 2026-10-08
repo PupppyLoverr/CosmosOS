@@ -863,6 +863,8 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
+        shared::SYS_MOUNT => sys_mount(a1),
+        shared::SYS_UMOUNT => sys_umount(a1, a2),
         shared::SYS_GETTIMEOFDAY => {
             let sec = vfs::now_unix();
             let usec = (task::ticks() % 100) * 10_000; // 10ms tick granularity
@@ -2549,23 +2551,40 @@ fn sys_read(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
 }
 
 fn sys_write(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
-    let Some(data) = copy_in(buf, len.min(1 << 20)) else { return ERR };
-    match fd_write_once(fd as usize, &data) {
-        Err(-11) => {
-            if fd_nonblock(fd as usize) {
-                (-11i64) as u64
-            } else {
-                block_reenter(ctx, task::ticks() + 2, 0)
+    // Chunked: the whole write never sits in one kernel allocation — a
+    // single 1MiB Vec can OOM the 4MiB heap under fragmentation, which
+    // made write(fd, buf, 1<<20) a userspace-triggerable kernel panic.
+    let mut done = 0u64;
+    while done < len {
+        let n = (len - done).min(1 << 17); // 128KiB
+        let Some(data) = copy_in(buf + done, n) else {
+            return if done > 0 { done } else { ERR };
+        };
+        match fd_write_once(fd as usize, &data) {
+            Err(-11) => {
+                if done > 0 {
+                    return done;
+                }
+                if fd_nonblock(fd as usize) {
+                    return (-11i64) as u64;
+                }
+                return block_reenter(ctx, task::ticks() + 2, 0);
+            }
+            Err(-32) => {
+                // POSIX: a write that fails with EPIPE also raises SIGPIPE.
+                task::signal(cur_id(), 13);
+                return if done > 0 { done } else { (-32i64) as u64 };
+            }
+            Err(e) => return if done > 0 { done } else { e as u64 },
+            Ok(n) => {
+                done += n as u64;
+                if n < data.len() {
+                    return done; // short write — caller retries
+                }
             }
         }
-        Err(-32) => {
-            // POSIX: a write that fails with EPIPE also raises SIGPIPE.
-            task::signal(cur_id(), 13);
-            (-32i64) as u64
-        }
-        Err(e) => e as u64,
-        Ok(n) => n as u64,
     }
+    done
 }
 
 /// enable interrupts only for the hlt window — the syscall gate runs with
@@ -3349,7 +3368,54 @@ fn sys_symlink_impl(target: &str, link: &str) -> u64 {
 }
 
 /// statfs record out: {type=0x4d44 FAT, bsize=cluster, blocks, bfree}.
-fn sys_statfs_out(_path: &str, out: u64) -> u64 {
+/// SYS_MOUNT(&[u64;6]{sptr,slen,tptr,tlen,fptr,flen}): mount a filesystem.
+/// Only "tmpfs" exists — a real in-RAM fs over the target dir. The source
+/// string is ignored like Linux does for tmpfs.
+fn sys_mount(argp: u64) -> u64 {
+    let Some(a) = copy_in(argp, 48) else { return ERR };
+    let rd = |i: usize| u64::from_le_bytes(a[i * 8..i * 8 + 8].try_into().unwrap());
+    let (Some(tgt), Some(fst)) = (copy_str(rd(2) as u64, rd(3) as u64), copy_str(rd(4) as u64, rd(5) as u64))
+    else {
+        return ERR;
+    };
+    if fst.trim_matches('\0') != "tmpfs" {
+        return (-19i64) as u64; // ENODEV: unknown fstype
+    }
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let t = vfs::normalize(&cwd, tgt.trim_matches('\0'));
+    // target must be an existing directory on whatever fs it lands on
+    match vfs::stat_path(&t) {
+        Ok(s) if s.is_dir != 0 => {}
+        Ok(_) => return (-20i64) as u64, // ENOTDIR
+        Err(e) => return e as u64,
+    }
+    crate::tmpfs::mount(&t).map(|_| 0).unwrap_or_else(|e| e as u64)
+}
+
+/// SYS_UMOUNT(target): EBUSY on open fds/cwd/nested mounts under it.
+fn sys_umount(ptr: u64, len: u64) -> u64 {
+    let Some(tgt) = copy_str(ptr, len) else { return ERR };
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let t = vfs::normalize(&cwd, tgt.trim_matches('\0'));
+    crate::tmpfs::umount(&t).map(|_| 0).unwrap_or_else(|e| e as u64)
+}
+
+fn sys_statfs_out(path: &str, out: u64) -> u64 {
+    if crate::tmpfs::handles(path) {
+        let (total, free) = crate::tmpfs::df();
+        let cb = 4096u64;
+        let b = [
+            0x1021_994u64.to_le_bytes(), // TMPFS_MAGIC
+            cb.to_le_bytes(),
+            (total / cb).to_le_bytes(),
+            (free / cb).to_le_bytes(),
+        ]
+        .concat();
+        return match copy_out(out, &b) {
+            Some(_) => 0,
+            None => ERR,
+        };
+    }
     let Some((total, free)) = vfs::df() else {
         return ERR;
     };
@@ -4320,6 +4386,12 @@ fn block_reenter(ctx: &mut CpuContext, deadline: u64, wait_port: u32) -> ! {
     // ran without SA_RESTART, the syscall returns EINTR to user code
     // instead of re-blocking. signal() sets wake_eintr; a normal syscall
     // return clears it, so it can never fire stale.
+    // One critical section: if a deliverable signal is already pending,
+    // re-enter instead of blocking. Without this, a signal landing
+    // between the syscall's readiness check and this block is LOST —
+    // wake_for_signal no-ops on a still-Running task, and the task then
+    // sleeps forever with the pending bit set (a whole-machine hang:
+    // no runnable tasks, idle hlt loop).
     let intr = task::with_current(|t| {
         if t.sig.wake_eintr {
             t.sig.wake_eintr = false;
@@ -4333,15 +4405,17 @@ fn block_reenter(ctx: &mut CpuContext, deadline: u64, wait_port: u32) -> ! {
                 t.sigmask = t.poll_saved_mask;
                 t.poll_saved_mask = u64::MAX;
             }
-            true
+            1
+        } else if t.sigpending & !t.sigmask != 0 {
+            2 // pending deliverable: re-enter so maybe_deliver runs it
         } else {
             t.state = task::State::Blocked;
             t.wake_at = deadline;
             t.wait_port = wait_port;
-            false
+            0
         }
     });
-    if intr {
+    if intr == 1 {
         ctx.rax = (-4i64) as u64; // EINTR — ctx resumes past the int80
         task::yield_ctx(ctx);
     }

@@ -131,6 +131,9 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, i64> {
             crate::proc::read_file(path).ok_or(-2)
         };
     }
+    if crate::tmpfs::handles(path) {
+        return crate::tmpfs::read_all(path);
+    }
     let mut g = FS.lock();
     match g.as_mut() {
         Some(fs) => fs.read_file(path).map_err(err_to_i64),
@@ -142,6 +145,9 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, i64> {
 pub fn read_range(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64> {
     if crate::memfd::handles(path) {
         return crate::memfd::read_at(path, offset, buf);
+    }
+    if crate::tmpfs::handles(path) {
+        return crate::tmpfs::read_range(path, offset, buf);
     }
     if crate::pipes::handles(path) || crate::dev::handles(path) || crate::proc::handles(path) {
         return Err(-22);
@@ -161,6 +167,10 @@ pub fn read_range_pf(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i
     if crate::memfd::handles(path) {
         // RAM store — no FS lock needed, safe inside the fault handler
         return crate::memfd::read_at(path, offset, buf);
+    }
+    if let Some(r) = crate::tmpfs::read_range_pf(path, offset, buf) {
+        // RAM store — try_lock+wait_irq inside keeps the fault handler safe
+        return r;
     }
     loop {
         if let Some(mut g) = FS.try_lock() {
@@ -265,6 +275,16 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     let is_proc = crate::proc::handles(&full);
     let is_dev = crate::dev::handles(&full);
     let is_pipe = crate::pipes::handles(&full);
+    if crate::tmpfs::handles(&full) {
+        let pos = crate::tmpfs::open(&full, flags)?;
+        crate::notify::fire(&full, crate::notify::IN_ACCESS);
+        let Some(fdi) = alloc_fd() else { return Err(-24) };
+        let fd = fdi as i64;
+        task::with_current(|t| {
+            t.fds[fd as usize] = Some(FileDesc { path: full, pos, flags });
+        });
+        return Ok(fd);
+    }
     // PTY slave nodes (/dev/pts/{id}) and direct /ptym/{id} opens: real
     // objects with refcounted descs; the pair must exist already
     if crate::pty::handles(&full) {
@@ -415,6 +435,16 @@ pub fn read(fd: i64, buf: &mut [u8]) -> Result<i64, i64> {
         task::io_charge(true, n as u64);
         return Ok(n as i64);
     }
+    if crate::tmpfs::handles(&path) {
+        let n = crate::tmpfs::read_range(&path, pos, buf)? as u64;
+        task::with_current(|t| {
+            if let Some(Some(f)) = t.fds.get_mut(fd as usize) {
+                f.pos += n;
+            }
+        });
+        task::io_charge(true, n);
+        return Ok(n as i64);
+    }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     let data = fs.read_file(&path).map_err(err_to_i64)?;
@@ -492,6 +522,22 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
             }
             None => return Err(-4),
         }
+    }
+    if crate::tmpfs::handles(&path) {
+        let sz = if flags & shared::O_APPEND != 0 {
+            crate::tmpfs::stat(&path).map(|s| s.0).unwrap_or(pos)
+        } else {
+            pos
+        };
+        let n = crate::tmpfs::write_range(&path, sz, buf)? as u64;
+        crate::notify::fire(&path, crate::notify::IN_MODIFY);
+        task::with_current(|t| {
+            if let Some(Some(f)) = t.fds.get_mut(fd as usize) {
+                f.pos = sz + n;
+            }
+        });
+        task::io_charge(false, n);
+        return Ok(n as i64);
     }
     const O_APPEND: u64 = shared::O_APPEND;
     let mut g = FS.lock();
@@ -628,6 +674,17 @@ pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
             .map(|d| shared::Stat { size: d.len() as u64, is_dir: 0, mtime: 0, attr: 0 })
             .ok_or(-2);
     }
+    if crate::tmpfs::handles(&full) {
+        return match crate::tmpfs::stat(&full) {
+            Some((sz, dir, mt, at)) => Ok(shared::Stat {
+                size: sz,
+                is_dir: dir as u32,
+                mtime: mt,
+                attr: at as u32,
+            }),
+            None => Err(-2),
+        };
+    }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     let mut full = full;
@@ -641,6 +698,9 @@ pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
 pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if crate::tmpfs::handles(&full) {
+        return crate::tmpfs::utime(&full, secs);
+    }
     if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
     }
@@ -656,6 +716,9 @@ pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
 pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if crate::tmpfs::handles(&full) {
+        return crate::tmpfs::setattr(&full, attr);
+    }
     if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
     }
@@ -690,6 +753,9 @@ pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
             Err(-4) // ENOTDIR
         };
     }
+    if crate::tmpfs::handles(&full) {
+        return crate::tmpfs::listdir(&full);
+    }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     let ents = fs.readdir(&full).map_err(err_to_i64)?;
@@ -715,6 +781,9 @@ pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
 pub fn mkdir(path: &str) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if crate::tmpfs::handles(&full) {
+        return crate::tmpfs::mkdir(&full);
+    }
     if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
     }
@@ -735,6 +804,13 @@ pub fn remove(path: &str) -> Result<(), i64> {
         }
         return r;
     }
+    if crate::tmpfs::handles(&full) {
+        let r = crate::tmpfs::remove(&full);
+        if r.is_ok() {
+            crate::notify::fire(&full, crate::notify::IN_DELETE);
+        }
+        return r;
+    }
     if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) {
         return Err(-4);
     }
@@ -749,6 +825,14 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let f = normalize(&cwd, from);
     let t2 = normalize(&cwd, to);
+    let ft = crate::tmpfs::handles(&f);
+    let tt = crate::tmpfs::handles(&t2);
+    if ft && tt {
+        return crate::tmpfs::rename(&f, &t2);
+    }
+    if ft != tt {
+        return Err(-18); // EXDEV: across mounts is never a plain rename
+    }
     if crate::proc::handles(&f)
         || crate::proc::handles(&t2)
         || crate::dev::handles(&f)
@@ -805,6 +889,9 @@ pub fn truncate_path(path: &str, len: u64) -> Result<(), i64> {
     }
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if crate::tmpfs::handles(&full) {
+        return crate::tmpfs::truncate(&full, len);
+    }
     if crate::pipes::handles(&full)
         || crate::dev::handles(&full)
         || crate::proc::handles(&full)
@@ -837,6 +924,11 @@ pub fn truncate_path(path: &str, len: u64) -> Result<(), i64> {
 pub fn write_all_path(path: &str, data: &[u8]) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if crate::tmpfs::handles(&full) {
+        crate::tmpfs::open(&full, shared::O_CREATE | shared::O_TRUNC | shared::O_WRONLY)?;
+        crate::tmpfs::write_range(&full, 0, data)?;
+        return Ok(());
+    }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     if !fs.exists(&full) {
