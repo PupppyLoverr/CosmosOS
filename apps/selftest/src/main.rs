@@ -1094,6 +1094,136 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             Err(_) => false,
         }
     });
+    check("ptrace-syscall", {
+        // PTRACE_SYSCALL stops at every syscall entry AND exit —
+        // the tracer reads the syscall nr in rax each time
+        match ustd::fork() {
+            0 => {
+                ustd::ptrace(ustd::PT_TRACEME, 0, 0, 0);
+                ustd::kill2(ustd::getpid(), 19);
+                let _ = ustd::getpid();
+                let _ = ustd::getpid();
+                ustd::exit(3);
+            }
+            c if c > 0 => {
+                let mut stops = 0u64;
+                let mut saw_getpid = false;
+                let mut dead = false;
+                // consume the initial SIGSTOP, then SYSCALL-loop
+                let _ = ustd::waitpid_opt(c as u32, 1, 3000);
+                ustd::ptrace(ustd::PT_SYSCALL, c as u32, 0, 0);
+                for _ in 0..40 {
+                    match ustd::waitpid_opt(c as u32, 1, 500) {
+                        Ok(st) if st == 0x7f | (5 << 8) => {
+                            stops += 1;
+                            if let Some(r) = ustd::ptrace_getregs(c as u32) {
+                                // entry-stops show the syscall nr in rax;
+                                // exit-stops show its return value
+                                if r.rax == shared::SYS_GETPID {
+                                    saw_getpid = true;
+                                }
+                            }
+                            ustd::ptrace(ustd::PT_SYSCALL, c as u32, 0, 0);
+                        }
+                        _ => {
+                            dead = true;
+                            break;
+                        }
+                    }
+                }
+                let ex = ustd::waitpid(c as u32, 4000).unwrap_or(-1);
+                stops >= 4 && saw_getpid && ex == 3 && dead
+            }
+            _ => false,
+        }
+    });
+    check("ptrace-peekuser", {
+        // PEEKUSER/POKEUSER: offset-indexed register access on the
+        // stopped tracee's saved context
+        match ustd::fork() {
+            0 => {
+                ustd::ptrace(ustd::PT_TRACEME, 0, 0, 0);
+                ustd::kill2(ustd::getpid(), 19);
+                ustd::exit(9);
+            }
+            c if c > 0 => {
+                let _ = ustd::waitpid_opt(c as u32, 1, 3000);
+                // rax at offset 112, rflags at 136
+                let rax = ustd::ptrace(ustd::PT_PEEKUSER, c as u32, 112, 0);
+                let fl = ustd::ptrace(ustd::PT_PEEKUSER, c as u32, 136, 0);
+                let poke = ustd::ptrace(ustd::PT_POKEUSER, c as u32, 112, 777);
+                let rax2 = ustd::ptrace(ustd::PT_PEEKUSER, c as u32, 112, 0);
+                let bad = ustd::ptrace(ustd::PT_PEEKUSER, c as u32, 163, 0);
+                ustd::ptrace(ustd::PT_CONT, c as u32, 0, 0);
+                let ex = ustd::waitpid(c as u32, 4000).unwrap_or(-1);
+                rax >= 0 && fl & 0x202 == 0x202 && poke == 0 && rax2 == 777
+                    && bad < 0 && ex == 9
+            }
+            _ => false,
+        }
+    });
+    check("wait-cont", {
+        // WCONTINUED: SIGCONT'd child reports once with status 0xffff
+        match ustd::fork() {
+            0 => {
+                ustd::kill2(ustd::getpid(), 19);
+                ustd::exit(0);
+            }
+            c if c > 0 => {
+                let st = ustd::waitpid_opt(c as u32, 1, 3000).unwrap_or(-1);
+                let _ = ustd::kill2(c as u32, 18);
+                let mut cont = -1i64;
+                for _ in 0..30 {
+                    if let Ok(s) = ustd::waitpid_opt(c as u32, 2, 300) {
+                        cont = s;
+                        break;
+                    }
+                }
+                let ex = ustd::waitpid(c as u32, 4000).unwrap_or(-1);
+                (st & 0xff) == 0x7f && cont == 0xffff && ex == 0
+            }
+            _ => false,
+        }
+    });
+    check("waitid-exit", {
+        // waitid P_PID: packed (pid<<32)|(kind<<24)|status, kind 1=exit
+        match ustd::fork() {
+            0 => ustd::exit(11),
+            c if c > 0 => {
+                let r = ustd::waitid(1, c as u32, 0);
+                let pid = (r >> 32) as u32;
+                let kind = (r >> 24) & 0xff;
+                let code = r & 0xff_ffff;
+                pid == c as u32 && kind == 1 && code == 11
+            }
+            _ => false,
+        }
+    });
+    check("rlimit-cpu", {
+        // RLIMIT_CPU: past-quota task gets SIGXCPU (default kill)
+        match ustd::fork() {
+            0 => {
+                ustd::setrlimit(0, 5); // 5 ticks ~= 50ms
+                let mut x = 0u64;
+                loop {
+                    // black_box keeps the busy work real — LLVM would
+                    // otherwise prove x==MAX and delete the loop
+                    x = core::hint::black_box(x.wrapping_add(1));
+                }
+            }
+            c if c > 0 => ustd::waitpid(c as u32, 10000).unwrap_or(-1) == 152,
+            _ => false,
+        }
+    });
+    check("rlimit-as", {
+        // RLIMIT_AS: mmap past the cap fails, under it works
+        // a 1-byte cap rejects any new map; restoring to u64::MAX reopens
+        let _ = ustd::setrlimit(9, 1);
+        let over = ustd::mmap(0x1000);
+        let _ = ustd::setrlimit(9, 1 << 40);
+        let ok = ustd::mmap(1 << 20).is_some();
+        over.is_none() && ok
+    });
     check("tls-fsbase", {
         // arch_prctl SET_FS/GET_FS: real FS segment per task
         static mut CELL: u64 = 0;

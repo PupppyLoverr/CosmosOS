@@ -112,8 +112,20 @@ fn main(boot_info: &'static mut BootInfo) -> ! {
     }
 }
 
+/// Raw serial write — bypasses the SERIAL spinlock so a panic that
+/// happened while the lock was held still prints.
+fn raw_ser(s: &str) {
+    unsafe {
+        for b in s.bytes() {
+            core::arch::asm!("out dx, al", in("dx") 0x3f8u16, in("al") b);
+        }
+    }
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    raw_ser("KERNEL PANIC (raw)
+");
     sprintln!("KERNEL PANIC: {}", info);
     // Format the panic into a fixed buffer (no allocation — the heap may be
     // the thing that died) and paint it on the framebuffer so a panic while

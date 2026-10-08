@@ -175,6 +175,7 @@ pub const SA_NODEFER: u8 = 4; // don't block this signal inside its own handler
 pub const SS_DISABLE: u64 = 2;
 
 pub const SYS_PTRACE: u64 = 157;
+pub const SYS_WAITID: u64 = 158; // (idtype, id, flags) -> (pid<<32)|(kind<<24)|status
 
 // ptrace request ops
 pub const PT_TRACEME: u64 = 0;
@@ -187,6 +188,9 @@ pub const PT_GETREGS: u64 = 12;
 pub const PT_SETREGS: u64 = 13;
 pub const PT_ATTACH: u64 = 16;
 pub const PT_DETACH: u64 = 17;
+pub const PT_PEEKUSER: u64 = 3;
+pub const PT_POKEUSER: u64 = 6;
+pub const PT_SYSCALL: u64 = 24;
 
 /// Register file layout == the kernel's saved CpuContext (PTRACE_GETREGS).
 #[repr(C)]
