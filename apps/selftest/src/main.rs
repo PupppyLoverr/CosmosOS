@@ -4479,6 +4479,73 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::remove("/cc-fat");
         ok
     });
+    check("tc-pgrp-tiocsti", {
+        // tcsetpgrp/tcgetpgrp + TIOCSTI injecting input like a keystroke
+        let m = ustd::openpt();
+        let mut ok = m >= 0 && ustd::tcgetpgrp(m) == 0;
+        let me = ustd::getpid();
+        ok = ok && ustd::tcsetpgrp(m, me) == 0 && ustd::tcgetpgrp(m) == me as i64;
+        if let Some(sp) = ustd::ptsname(m) {
+            let s = ustd::open(&sp, ustd::O_RDWR | shared::O_NOCTTY).unwrap_or(-1);
+            ok = ok && s >= 0;
+            let _ = ustd::tcsets(s, 0); // raw — injected byte arrives verbatim
+            ok = ok && ustd::tiocsti(m, b'x') == 0;
+            let mut b = [0u8; 4];
+            let n = ustd::read(s, &mut b).unwrap_or(0);
+            ok = ok && n == 1 && b[0] == b'x';
+            let _ = ustd::close(s);
+        } else {
+            ok = false;
+        }
+        let _ = ustd::close(m);
+        ok
+    });
+    check("ttin-stop", {
+        // a background process reading its controlling tty is stopped by
+        // SIGTTIN (real POSIX job control)
+        let m = ustd::openpt();
+        let Some(sp) = (if m >= 0 { ustd::ptsname(m) } else { None }) else {
+            panic!("ptsname");
+        };
+        let mut ok = m >= 0;
+        match ustd::fork() {
+            0 => {
+                let _ = ustd::setsid(); // new session; pgid == my pid
+                let s = ustd::open(&sp, ustd::O_RDWR).unwrap_or(-1);
+                if s < 0 {
+                    ustd::exit(5);
+                }
+                let _ = ustd::write_all("/ttin-rdy", b"1");
+                let mut b = [0u8; 8];
+                let _ = ustd::read(s, &mut b); // SIGTTIN stops us here
+                ustd::exit(9);
+            }
+            pid if pid > 0 => {
+                // wait for the child to acquire the ctty and reach the read
+                for _ in 0..100 {
+                    if ustd::stat("/ttin-rdy").is_ok() {
+                        break;
+                    }
+                    ustd::sleep_ms(10);
+                }
+                // put OUR group in the foreground -> child is background
+                let pg = ustd::getpgid(0);
+                ok = ok && ustd::tcsetpgrp(m, if pg > 0 { pg as u32 } else { 1 }) == 0;
+                ustd::sleep_ms(300);
+                let st = ustd::waitpid_opt(pid as u32, ustd::WUNTRACED, 5000)
+                    .unwrap_or(-1);
+                ok = ok && st & 0xff == 0x7f && ((st >> 8) & 0x3f) == 21;
+                let _ = ustd::kill(pid as u32);
+                let _ = ustd::waitpid(pid as u32, 5000);
+                let _ = ustd::remove("/ttin-rdy");
+            }
+            _ => {
+                ok = false;
+            }
+        }
+        let _ = ustd::close(m);
+        ok
+    });
     check("gettimeofday", {
         let (s, u) = ustd::gettimeofday();
         s > 1_700_000_000 && u < 1_000_000

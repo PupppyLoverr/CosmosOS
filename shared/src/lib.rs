@@ -294,6 +294,9 @@ pub const SYS_FCHOWN: u64 = 240;
 /// chmod(path_ptr,len,mode): tmpfs stores real mode bits; FAT maps
 /// owner-w onto the readonly attr (vfat-style), root only
 pub const SYS_CHMOD: u64 = 241;
+pub const SYS_TCGETPGRP: u64 = 242;      // (pty_fd) -> fg pgid | err
+pub const SYS_TCSETPGRP: u64 = 243;      // (pty_fd, pgid) -> 0 | err
+pub const SYS_TIOCSTI: u64 = 244;        // (pty_fd, byte) -> 0 | err (root only)
 /// MS_MOVE: move a mount point instead of creating one
 pub const MS_MOVE: u64 = 0x2000;
 /// CLONE_NEWUTS: unshare the UTS namespace (hostname)

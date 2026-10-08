@@ -22,6 +22,10 @@ struct Pty {
     slave_open: u32,
     canon: bool,
     echo: bool,
+    /// foreground process group for job control (0 = unset)
+    fg_pgid: u32,
+    /// TOSTOP: background slave writes raise SIGTTOU
+    tostop: bool,
     /// canonical line being assembled from master input
     partial: Vec<u8>,
     /// master->slave cooked input, readable by the slave
@@ -143,7 +147,9 @@ pub fn tcget(path: &str) -> i64 {
     let Some(id) = id_of(path) else { return -1 };
     let g = PTS.lock();
     g.get(&id)
-        .map(|p| (p.canon as i64) | ((p.echo as i64) << 1))
+        .map(|p| {
+            (p.canon as i64) | ((p.echo as i64) << 1) | ((p.tostop as i64) << 2)
+        })
         .unwrap_or(-19) // ENODEV
 }
 
@@ -154,6 +160,7 @@ pub fn tcset(path: &str, flags: u64) -> i64 {
         Some(p) => {
             p.canon = flags & 1 != 0;
             p.echo = flags & 2 != 0;
+            p.tostop = flags & 4 != 0;
             if !p.canon {
                 // leftover cooked line becomes readable input in raw mode
                 while let Some(b) = p.partial.pop() {
@@ -164,6 +171,63 @@ pub fn tcset(path: &str, flags: u64) -> i64 {
         }
         None => -19,
     }
+}
+
+/// Foreground pgid reported by `tcgetpgrp`; 0 when unset.
+pub fn fg_pgid_of(path: &str) -> i64 {
+    let Some(id) = id_of(path) else { return -1 };
+    let g = PTS.lock();
+    g.get(&id).map(|p| p.fg_pgid as i64).unwrap_or(-19)
+}
+
+/// tcsetpgrp: make `pgid` the pty's foreground group. 0 clears.
+pub fn set_fg_pgid(path: &str, pgid: u32) -> i64 {
+    let Some(id) = id_of(path) else { return -1 };
+    let mut g = PTS.lock();
+    match g.get_mut(&id) {
+        Some(p) => {
+            p.fg_pgid = pgid;
+            0
+        }
+        None => -19,
+    }
+}
+
+/// TIOCSTI: push one byte into the pty's input queue — it arrives at slave
+/// readers as if it had been typed on the master. Returns -19 unknown fd,
+/// -11 when the input queue is full.
+pub fn tiocsti(path: &str, byte: u8) -> i64 {
+    let Some(id) = id_of(path) else { return -1 };
+    let mut g = PTS.lock();
+    match g.get_mut(&id) {
+        Some(p) => {
+            if p.m2s.len() >= CAP {
+                -11
+            } else {
+                p.m2s.push_back(byte);
+                0
+            }
+        }
+        None => -19,
+    }
+}
+
+/// `(caller ctty, caller pgid, caller pid)` for job-control checks, or None
+/// for kernel callers.
+fn tty_cred() -> Option<(u64, u32, u32)> {
+    let c = crate::task::with_current(|t| (t.ctty, t.pgid, t.id));
+    if c.2 == 0 {
+        None
+    } else {
+        Some(c)
+    }
+}
+
+/// True when `id` is the caller's controlling tty and the caller is NOT in
+/// the pty's foreground group — reads must stop it with SIGTTIN (and writes
+/// with SIGTTOU when TOSTOP is on).
+fn background(caller_pgid: u32, fg: u32) -> bool {
+    fg != 0 && caller_pgid != 0 && caller_pgid != fg
 }
 
 /// Non-blocking read. Err(-11) would-block, Err(-5) EIO (peer gone),
@@ -188,7 +252,22 @@ pub fn try_read(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
         }
         return Ok(n);
     }
-    // slave read: cooked input only
+    // slave read: cooked input only — but a background job that reads its
+    // controlling tty gets SIGTTIN first (POSIX job control).
+    let stop = if let Some((ctty, cpid_pgid, me)) = tty_cred() {
+        if ctty == id && background(cpid_pgid, p.fg_pgid) {
+            Some(me)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(me) = stop {
+        drop(g);
+        crate::task::signal(me, 21); // SIGTTIN
+        return Err(-11);
+    }
     if p.m2s.is_empty() {
         return if p.master_open == 0 { Err(-5) } else { Err(-11) };
     }
@@ -269,7 +348,24 @@ pub fn try_write(path: &str, data: &[u8]) -> Result<usize, i64> {
         }
         return Ok(n);
     }
-    // slave write: output straight to the master
+    // slave write: output straight to the master — TOSTOP mode stops a
+    // background writer with SIGTTOU.
+    if p.tostop {
+        let stop = if let Some((ctty, cpid_pgid, me)) = tty_cred() {
+            if ctty == id && background(cpid_pgid, p.fg_pgid) {
+                Some(me)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(me) = stop {
+            drop(g);
+            crate::task::signal(me, 22); // SIGTTOU
+            return Err(-11);
+        }
+    }
     if p.master_open == 0 {
         return Err(-5);
     }
