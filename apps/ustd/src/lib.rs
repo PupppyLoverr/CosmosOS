@@ -2387,3 +2387,97 @@ impl Drop for UnixFd {
         close(self.0);
     }
 }
+
+
+/// seccomp: install the syscall filter — one-way door.
+/// mode 1 (STRICT): only read/write/exit/sigreturn/exit_group survive.
+/// mode 2 (FILTER): `allow` is a 32-byte bitmap of permitted syscall nrs.
+pub fn seccomp(mode: u64, allow: Option<&[u8; 32]>) -> i64 {
+    match (mode, allow) {
+        (1, _) => sc3(shared::SYS_SECCOMP, 1, 0, 0) as i64,
+        (2, Some(b)) => sc3(shared::SYS_SECCOMP, 2, b.as_ptr() as u64, 32) as i64,
+        _ => -22,
+    }
+}
+
+/// set_robust_list: register the futex robust-list head (nodes are
+/// {next_va, futex_va} u64 pairs, list ends with next=0). On death the
+/// kernel ORs OWNER_DIED (bit30) into each word and wakes its waiters.
+pub fn set_robust_list(head: u64) -> i64 {
+    sc1(shared::SYS_SET_ROBUST_LIST, head) as i64
+}
+
+/// statfs(path) -> {type,bsize,blocks,bfree} real FAT volume info.
+pub fn statfs(path: &str) -> Option<(u64, u64, u64, u64)> {
+    let mut b = [0u64; 4];
+    let r = sc3(
+        shared::SYS_STATFS,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        b.as_mut_ptr() as u64,
+    ) as i64;
+    if r < 0 { None } else { Some((b[0], b[1], b[2], b[3])) }
+}
+
+/// fstatfs(fd) — same, via an open fd.
+pub fn fstatfs(fd: i64) -> Option<(u64, u64, u64, u64)> {
+    let mut b = [0u64; 4];
+    let r = sc2(shared::SYS_FSTATFS, fd as u64, b.as_mut_ptr() as u64) as i64;
+    if r < 0 { None } else { Some((b[0], b[1], b[2], b[3])) }
+}
+
+/// syncfs(fd): flush the volume the fd lives on.
+pub fn syncfs(fd: i64) -> i64 {
+    sc1(shared::SYS_SYNCFS, fd as u64) as i64
+}
+
+/// fallocate(fd, off, len): extend the file to off+len with zeros.
+pub fn fallocate(fd: i64, off: u64, len: u64) -> i64 {
+    sc3(shared::SYS_FALLOCATE, fd as u64, off, len) as i64
+}
+
+/// copy_file_range(in_fd, out_fd, len): kernel-side file copy.
+pub fn copy_file_range(in_fd: i64, out_fd: i64, len: u64) -> i64 {
+    sc3(shared::SYS_COPY_FILE_RANGE, in_fd as u64, out_fd as u64, len) as i64
+}
+
+/// tee(in_pipe, out_pipe, len): duplicate pipe data without consuming.
+pub fn tee(in_fd: i64, out_fd: i64, len: u64) -> i64 {
+    sc3(shared::SYS_TEE, in_fd as u64, out_fd as u64, len) as i64
+}
+
+/// pselect(nfds, rmask, wmask, timeout_ms, mask): fd-set select; the
+/// masks are rewritten with only the ready bits left. mask = u64::MAX
+/// means no signal-mask swap. Returns ready count, 0 timeout, -4 EINTR.
+pub fn pselect(nfds: u64, rmask: &mut u64, wmask: &mut u64, timeout_ms: u64, mask: u64) -> i64 {
+    sc5(
+        shared::SYS_PSELECT,
+        nfds,
+        rmask as *mut u64 as u64,
+        wmask as *mut u64 as u64,
+        timeout_ms,
+        mask,
+    ) as i64
+}
+
+/// dup3(oldfd, newfd, flags) — flags must be 0 (no CLOEXEC).
+pub fn dup3(oldfd: i64, newfd: i64, flags: u64) -> i64 {
+    sc3(shared::SYS_DUP3, oldfd as u64, newfd as u64, flags) as i64
+}
+
+/// sched_yield: give up the rest of this slice.
+pub fn sched_yield() {
+    sc0(shared::SYS_SCHED_YIELD);
+}
+
+/// clock_nanosleep(abs_ms): sleep until an absolute ms deadline.
+pub fn clock_nanosleep(abs_ms: u64) -> i64 {
+    sc2(shared::SYS_CLOCK_NANOSLEEP, 0, abs_ms) as i64
+}
+
+/// gettimeofday() -> (sec, usec).
+pub fn gettimeofday() -> (u64, u64) {
+    let mut b = [0u64; 2];
+    let r = sc1(shared::SYS_GETTIMEOFDAY, b.as_mut_ptr() as u64) as i64;
+    if r < 0 { (0, 0) } else { (b[0], b[1]) }
+}

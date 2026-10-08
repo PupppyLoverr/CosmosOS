@@ -120,6 +120,28 @@ pub fn dispatch(ctx: &mut CpuContext) {
         t.cur_syscall = nr;
         t.sc_args = [a1, a2, a3, a4, a5];
     });
+    // seccomp enforcement: strict kills with SIGKILL on anything outside
+    // the POSIX strict allowlist (read/write/exit/sigreturn/exit_group);
+    // filter mode returns ENOSYS on any nr outside the installed bitmap.
+    let (sc_mode, sc_allow) = task::with_current(|t| (t.seccomp_mode, t.seccomp_allow));
+    if sc_mode == 1 {
+        let ok = nr == shared::SYS_READ
+            || nr == shared::SYS_WRITE
+            || nr == shared::SYS_EXIT
+            || nr == shared::SYS_SIGRETURN
+            || nr == shared::SYS_EXIT_GROUP;
+        if !ok {
+            task::signal(cur_id(), 9);
+            ctx.rax = ERR;
+            return;
+        }
+    } else if sc_mode == 2 {
+        let ok = nr < 256 && (sc_allow[(nr / 64) as usize] >> (nr % 64)) & 1 == 1;
+        if !ok {
+            ctx.rax = (-38i64) as u64; // ENOSYS
+            return;
+        }
+    }
     let entry_stop = task::with_current(|t| {
         // phase 2 = mid-syscall (entry-stop already happened, resume
         // re-executed this int80) — anything else armed is a real entry
@@ -652,6 +674,123 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
         }
         shared::SYS_WAIT4 => sys_wait4(ctx, a1, a2, a3, a4),
+        shared::SYS_SECCOMP => {
+            // one-way door: once set, the filter can only tighten (POSIX
+            // seccomp rules — there is no unset).
+            let already = task::with_current(|t| t.seccomp_mode);
+            if already == 1 {
+                ERR
+            } else if a1 == shared::SECCOMP_MODE_STRICT {
+                task::with_current(|t| t.seccomp_mode = 1);
+                0
+            } else if a1 == shared::SECCOMP_MODE_FILTER {
+                match copy_in(a2, a3.min(32)) {
+                    Some(d) if d.len() == 32 => {
+                        let mut w = [0u64; 4];
+                        for i in 0..4 {
+                            w[i] = u64::from_le_bytes(d[i * 8..i * 8 + 8].try_into().unwrap());
+                        }
+                        task::with_current(|t| {
+                            t.seccomp_allow = w;
+                            t.seccomp_mode = 2;
+                        });
+                        0
+                    }
+                    _ => ERR,
+                }
+            } else {
+                ERR
+            }
+        }
+        shared::SYS_SET_ROBUST_LIST => {
+            task::with_current(|t| t.robust_list = a1);
+            0
+        }
+        shared::SYS_STATFS => match copy_str(a1, a2) {
+            Some(p) => sys_statfs_out(&p, a3),
+            None => ERR,
+        },
+        shared::SYS_FSTATFS => {
+            let ok = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(_)) => true,
+                _ => false,
+            });
+            if ok {
+                sys_statfs_out("/", a2)
+            } else {
+                ERR
+            }
+        }
+        shared::SYS_SYNCFS => {
+            let ok = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => !crate::pipes::handles(&f.path),
+                _ => false,
+            });
+            if ok && crate::virtio::flush_disk() { 0 } else { ERR }
+        }
+        shared::SYS_FALLOCATE => sys_fallocate(a1, a2, a3),
+        shared::SYS_COPY_FILE_RANGE => {
+            // (in_fd, out_fd, len): kernel-side file->file copy using each
+            // fd's own position (POSIX null-offset semantics — positions
+            // advance by what was moved).
+            let mut v = vec![0u8; a3.min(1 << 20) as usize];
+            match vfs::read(a1 as i64, &mut v) {
+                Ok(n) => {
+                    v.truncate(n as usize);
+                    match vfs::write(a2 as i64, &v) {
+                        Ok(w) => w as u64,
+                        Err(e) => e as u64,
+                    }
+                }
+                Err(e) => e as u64,
+            }
+        }
+        shared::SYS_TEE => {
+            let (i, o) = task::with_current(|t| {
+                (
+                    t.fds.get(a1 as usize).and_then(|s| s.as_ref()).map(|f| f.path.clone()),
+                    t.fds.get(a2 as usize).and_then(|s| s.as_ref()).map(|f| f.path.clone()),
+                )
+            });
+            match (i, o) {
+                (Some(i), Some(o)) => match crate::pipes::tee(&i, &o, a3 as usize) {
+                    Ok(n) => n,
+                    Err(e) => e as u64,
+                },
+                _ => ERR,
+            }
+        }
+        shared::SYS_PSELECT => sys_pselect(ctx, a1, a2, a3, a4, a5),
+        shared::SYS_DUP3 => {
+            if a3 != 0 {
+                ERR // no CLOEXEC support — nonzero flags are EINVAL
+            } else {
+                sys_dup2(a1, a2)
+            }
+        }
+        shared::SYS_SCHED_YIELD => {
+            ctx.rax = 0;
+            task::yield_ctx(ctx);
+        }
+        shared::SYS_CLOCK_NANOSLEEP => {
+            // absolute deadline in ms; ticks run 10ms each. A past deadline
+            // returns immediately (POSIX TIMER_ABSTIME).
+            let dl = a2.div_ceil(10);
+            if task::ticks() < dl {
+                block_reenter(ctx, dl, 0)
+            } else {
+                0
+            }
+        }
+        shared::SYS_GETTIMEOFDAY => {
+            let sec = vfs::now_unix();
+            let usec = (task::ticks() % 100) * 10_000; // 10ms tick granularity
+            let b = [sec.to_le_bytes(), usec.to_le_bytes()].concat();
+            match copy_out(a1, &b) {
+                Some(_) => 0,
+                None => ERR,
+            }
+        }
         shared::SYS_MQ_UNLINK => {
             let Some(nb) = copy_in(a1, a2.min(64)) else {
                 ctx.rax = ERR;
@@ -3074,6 +3213,148 @@ fn sys_symlink_impl(target: &str, link: &str) -> u64 {
     let attr = cur.unwrap_or(0x20) | 0x40;
     let _ = vfs::setattr(link, attr);
     0
+}
+
+/// statfs record out: {type=0x4d44 FAT, bsize=cluster, blocks, bfree}.
+fn sys_statfs_out(_path: &str, out: u64) -> u64 {
+    let Some((total, free)) = vfs::df() else {
+        return ERR;
+    };
+    let cb = {
+        let mut g = vfs::FS.lock();
+        g.as_mut().map(|fs| fs.cluster_bytes()).unwrap_or(512)
+    };
+    let blocks = if cb > 0 { total / cb } else { 0 };
+    let bfree = if cb > 0 { free / cb } else { 0 };
+    let b = [
+        0x4d44u64.to_le_bytes(), // MSDOS_SUPER_MAGIC
+        cb.to_le_bytes(),
+        blocks.to_le_bytes(),
+        bfree.to_le_bytes(),
+    ]
+    .concat();
+    match copy_out(out, &b) {
+        Some(_) => 0,
+        None => ERR,
+    }
+}
+
+/// SYS_FALLOCATE(fd, off, len): guarantee [off, off+len) exists — extends
+/// the file with zeros when it's shorter (FAT has no unwritten extents,
+/// so real allocation = real zero bytes).
+fn sys_fallocate(fd: u64, off: u64, len: u64) -> u64 {
+    let path = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) => Some(f.path.clone()),
+        _ => None,
+    });
+    let Some(path) = path else { return ERR };
+    if crate::pipes::handles(&path) || crate::dev::handles(&path) || crate::proc::handles(&path) {
+        return (-25i64) as u64; // ENOTTY-ish: not a real file
+    }
+    let cur = match vfs::stat_path(&path) {
+        Ok(s) => s.size,
+        Err(e) => return e as u64,
+    };
+    let want = off.saturating_add(len);
+    if want <= cur {
+        return 0; // already allocated
+    }
+    let mut data = match vfs::read_all(&path) {
+        Ok(d) => d,
+        Err(e) => return e as u64,
+    };
+    data.resize(want as usize, 0);
+    match vfs::write_all_path(&path, &data) {
+        Ok(()) => 0,
+        Err(e) => e as u64,
+    }
+}
+
+/// SYS_PSELECT(nfds, rmask_ptr, wmask_ptr, timeout_ms, mask): fd-set select
+/// (bitmask form, nfds <= 64) + optional signal-mask swap like ppoll.
+/// Returns the count of ready fds; the masks are rewritten in place with
+/// only the ready bits left set (POSIX select semantics).
+fn sys_pselect(ctx: &mut CpuContext, nfds: u64, rptr: u64, wptr: u64, timeout: u64, mask: u64) -> u64 {
+    if mask != u64::MAX {
+        task::with_current(|t| {
+            if t.poll_saved_mask == u64::MAX {
+                t.poll_saved_mask = t.sigmask;
+                t.sigmask = mask;
+            }
+        });
+    }
+    let eintr = task::with_current(|t| {
+        let pend = t.sigpending & !t.sigmask;
+        (0..32).any(|i| pend & (1u64 << i) != 0 && t.sighandlers[i] > 1)
+    });
+    if eintr {
+        return (-4i64) as u64;
+    }
+    let nfds = nfds.min(64) as usize;
+    let rset = if rptr != 0 {
+        match copy_in(rptr, 8) {
+            Some(d) => u64::from_le_bytes(d[..8].try_into().unwrap()),
+            None => return ERR,
+        }
+    } else {
+        0
+    };
+    let wset = if wptr != 0 {
+        match copy_in(wptr, 8) {
+            Some(d) => u64::from_le_bytes(d[..8].try_into().unwrap()),
+            None => return ERR,
+        }
+    } else {
+        0
+    };
+    let paths: Vec<String> = task::with_current(|t| {
+        (0..nfds)
+            .map(|i| match t.fds.get(i) {
+                Some(Some(f)) => f.path.clone(),
+                _ => String::new(),
+            })
+            .collect()
+    });
+    let (mut r_out, mut w_out) = (0u64, 0u64);
+    for i in 0..nfds {
+        if paths[i].is_empty() {
+            continue;
+        }
+        if rset & (1u64 << i) != 0 && fd_ready(&paths[i], 1) {
+            r_out |= 1u64 << i;
+        }
+        if wset & (1u64 << i) != 0 && fd_ready(&paths[i], 2) {
+            w_out |= 1u64 << i;
+        }
+    }
+    let n = (r_out | w_out).count_ones() as u64;
+    if n > 0 || timeout == 0 {
+        if rptr != 0 {
+            let _ = copy_out(rptr, &r_out.to_le_bytes());
+        }
+        if wptr != 0 {
+            let _ = copy_out(wptr, &w_out.to_le_bytes());
+        }
+        task::with_current(|t| t.poll_dl = 0);
+        return n;
+    }
+    let dl = task::with_current(|t| {
+        if t.poll_dl == 0 {
+            t.poll_dl = if timeout == u64::MAX { u64::MAX } else { task::ticks() + timeout.div_ceil(10) + 1 };
+        }
+        t.poll_dl
+    });
+    if dl != u64::MAX && task::ticks() >= dl {
+        task::with_current(|t| t.poll_dl = 0);
+        if rptr != 0 {
+            let _ = copy_out(rptr, &0u64.to_le_bytes());
+        }
+        if wptr != 0 {
+            let _ = copy_out(wptr, &0u64.to_le_bytes());
+        }
+        return 0;
+    }
+    block_reenter(ctx, dl, 0)
 }
 
 /// SYS_WAIT4(pid, opts, timeout, rusage_ptr): waitpid + rusage copy-out.
