@@ -373,6 +373,8 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
+        shared::SYS_GETPID => task::current_id() as u64,
+        shared::SYS_NICE => task::set_nice(a1 as u32, a2 as i64) as u64,
         shared::SYS_BEEP => {
             crate::timer::beep(a1 as u32, a2);
             0

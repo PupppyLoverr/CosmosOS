@@ -375,6 +375,17 @@ pub fn net_info() -> Option<([u8; 6], [u8; 4])> {
 
 /// Sound the PC speaker at `freq` Hz for `ms` (non-blocking; kernel silences
 /// the gate when the duration elapses). `0`/`0` silences immediately.
+/// Own process id.
+pub fn getpid() -> u32 {
+    sc0(shared::SYS_GETPID) as u32
+}
+
+/// SYS_NICE: set scheduling priority (-20 high ..= 19 low, clamped).
+/// pid 0 = self. Returns the stored nice value, or -1000 if no such pid.
+pub fn set_nice(pid: u32, nice: i64) -> i64 {
+    sc2(shared::SYS_NICE, pid as u64, nice as u64) as i64
+}
+
 pub fn beep(freq: u32, ms: u64) {
     sc2(shared::SYS_BEEP, freq as u64, ms);
 }
