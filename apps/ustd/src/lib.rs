@@ -49,6 +49,12 @@ pub fn sc4(nr: u64, a: u64, b: u64, c: u64, d: u64) -> u64 {
     unsafe { core::arch::asm!("int 0x80", inout("rax") nr => r, in("rdi") a, in("rsi") b, in("rdx") c, in("r8") d, options(nostack, preserves_flags)) };
     r
 }
+#[inline(always)]
+pub fn sc5(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64) -> u64 {
+    let r: u64;
+    unsafe { core::arch::asm!("int 0x80", inout("rax") nr => r, in("rdi") a, in("rsi") b, in("rdx") c, in("r8") d, in("r9") e, options(nostack, preserves_flags)) };
+    r
+}
 
 const ERR: u64 = shared::SYS_ERR;
 pub fn is_err(v: u64) -> bool {
@@ -134,6 +140,56 @@ pub fn net_http(host: &str) -> Option<alloc::vec::Vec<u8>> {
     } else {
         buf.truncate(n as usize);
         Some(buf)
+    }
+}
+/// Real UDP socket: bind a local port, sendto/recvfrom on the wire.
+pub struct UdpSock {
+    pub lport: u16,
+}
+impl UdpSock {
+    /// bind(lport): Err on already-bound or no device.
+    pub fn open(lport: u16) -> Option<UdpSock> {
+        if sc1(shared::SYS_NET_UDP_OPEN, lport as u64) == u64::MAX {
+            None
+        } else {
+            Some(UdpSock { lport })
+        }
+    }
+    /// sendto(dst_ip, dport, payload) — real ARP + wire send.
+    pub fn send_to(&self, dst_ip: [u8; 4], dport: u16, payload: &[u8]) -> Option<()> {
+        let ip = u32::from_be_bytes(dst_ip) as u64;
+        let r = sc5(
+            shared::SYS_NET_UDP_SEND,
+            self.lport as u64,
+            ip,
+            dport as u64,
+            payload.as_ptr() as u64,
+            payload.len() as u64,
+        );
+        if r == u64::MAX { None } else { Some(()) }
+    }
+    /// recvfrom(timeout_ms): (src_ip, src_port, payload) — real wire datagram.
+    pub fn recv_from(&self, timeout_ms: u64) -> Option<([u8; 4], u16, alloc::vec::Vec<u8>)> {
+        let mut buf = alloc::vec![0u8; 2048];
+        let n = sc4(
+            shared::SYS_NET_UDP_RECV,
+            self.lport as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            timeout_ms,
+        );
+        if n == u64::MAX || n < 6 {
+            return None;
+        }
+        buf.truncate(n as usize);
+        let ip: [u8; 4] = buf[..4].try_into().ok()?;
+        let port = u16::from_be_bytes([buf[4], buf[5]]);
+        Some((ip, port, buf.split_off(6)))
+    }
+}
+impl Drop for UdpSock {
+    fn drop(&mut self) {
+        sc1(shared::SYS_NET_UDP_CLOSE, self.lport as u64);
     }
 }
 /// (mac, ip) of the virtio-net device, if present.
