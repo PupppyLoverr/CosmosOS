@@ -137,6 +137,9 @@ pub struct Task {
     pub sc_args: [u64; 5],      // its arg registers (for /proc/<pid>/syscall)
     pub itimers: [[u64; 2]; 3], // setitimer: [REAL, VIRTUAL, PROF] = [cur,int] ticks, cur 0 = disarmed
     pub ptimers: Vec<PTimer>,   // POSIX timer_create timers (not inherited)
+    pub poll_saved_mask: u64,   // ppoll: sigmask before the ppoll swap (MAX = none)
+    pub poll_dl: u64,           // poll/epoll/ppoll absolute timeout deadline (0 = none);
+                                // persists across int80 re-entry so finite timeouts fire
     pub cont_pending: bool,     // continued (SIGCONT/ptrace) since last wait report
     pub sig: SigState,          // sa_flags, altstack, handler masking, EINTR
 }
@@ -308,6 +311,8 @@ pub fn init() {
         sc_args: [0; 5],
         itimers: [[0; 2]; 3],
         ptimers: Vec::new(),
+        poll_saved_mask: u64::MAX,
+        poll_dl: 0,
         cont_pending: false,
         sig: SigState::new(),
     };
@@ -793,6 +798,8 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         sc_args: [0; 5],
         itimers: [[0; 2]; 3],
         ptimers: Vec::new(),
+        poll_saved_mask: u64::MAX,
+        poll_dl: 0,
         cont_pending: false,
         sig: SigState::new(),
     };
@@ -888,6 +895,8 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         sc_args: [0; 5],
         itimers: [[0; 2]; 3],
         ptimers: Vec::new(),
+        poll_saved_mask: u64::MAX,
+        poll_dl: 0,
         cont_pending: false,
         sig: SigState::new(),
     }));
@@ -1059,6 +1068,8 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64) -> Option<u32> {
         sc_args: [0; 5],
         itimers: [[0; 2]; 3],
         ptimers: Vec::new(),
+        poll_saved_mask: u64::MAX,
+        poll_dl: 0,
         cont_pending: false,
         sig: s.tasks[s.cur].sig.for_thread(),
     };
@@ -1622,6 +1633,8 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         sc_args: [0; 5],
         itimers: [[0; 2]; 3],
         ptimers: Vec::new(),
+        poll_saved_mask: u64::MAX,
+        poll_dl: 0,
         cont_pending: false,
         sig: s.tasks[s.cur].sig.for_fork(),
     };

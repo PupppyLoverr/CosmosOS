@@ -30,6 +30,12 @@ pub fn create(pid: u32) -> Option<String> {
     Some(format!("/pidfd/{}", id))
 }
 
+/// The task a pidfd path references, or None.
+pub fn target(path: &str) -> Option<u32> {
+    let id = id_of(path)?;
+    PDS.lock().get(&id).copied()
+}
+
 /// Readable when the referenced task is dead (or already reaped).
 pub fn ready(path: &str, _for_read: bool) -> bool {
     let Some(id) = id_of(path) else { return false };

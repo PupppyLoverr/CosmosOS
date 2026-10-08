@@ -464,6 +464,12 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
+        shared::SYS_SPLICE => sys_splice(a1, a2, a3),
+        shared::SYS_PROCESS_VM => sys_process_vm(a1, a2, a3, a4, a5),
+        shared::SYS_PPOLL => sys_ppoll(ctx, a1, a2, a3, a4, a5),
+        shared::SYS_SYSINFO => sys_sysinfo(a1),
+        shared::SYS_CLOSE_RANGE => sys_close_range(a1, a2),
+        shared::SYS_PIDFD_SIGNAL => sys_pidfd_signal(a1, a2),
         shared::SYS_MQ_UNLINK => {
             let Some(nb) = copy_in(a1, a2.min(64)) else {
                 ctx.rax = ERR;
@@ -2444,19 +2450,230 @@ fn sys_poll(ctx: &mut CpuContext, fds: u64, evs: u64, nfds: u64, timeout_ms: u64
         }
     }
     if ready > 0 || timeout_ms == 0 {
+        task::with_current(|t| t.poll_dl = 0);
         return ready;
     }
-    // block: re-enter the syscall until something is ready or deadline hits
-    // (u64::MAX = wait forever, same sentinel as waitpid)
-    let dl = if timeout_ms == u64::MAX {
-        u64::MAX
-    } else {
-        task::ticks() + timeout_ms.div_ceil(10) + 1
-    };
+    // block: re-enter the syscall until something is ready or deadline hits.
+    // The deadline is persisted on the task — recomputing it on each
+    // re-entry would push it forward forever and the poll would never
+    // time out (u64::MAX = wait forever, same sentinel as waitpid).
+    let dl = task::with_current(|t| {
+        if t.poll_dl == 0 {
+            t.poll_dl = if timeout_ms == u64::MAX {
+                u64::MAX
+            } else {
+                task::ticks() + timeout_ms.div_ceil(10) + 1
+            };
+        }
+        t.poll_dl
+    });
     if task::ticks() >= dl {
+        task::with_current(|t| t.poll_dl = 0);
         return 0;
     }
     block_reenter(ctx, dl, 0)
+}
+
+/// SYS_SPLICE: move up to `len` bytes from `in_fd` to `out_fd`; one end
+/// must be a pipe (POSIX). We move through a single kernel buffer — the
+/// pipe's real packet queue drains/fills without touching user memory.
+fn sys_splice(in_fd: u64, out_fd: u64, len: u64) -> u64 {
+    let (ip, op) = task::with_current(|t| {
+        let a = t
+            .fds
+            .get(in_fd as usize)
+            .and_then(|f| f.as_ref())
+            .map(|f| f.path.clone());
+        let b = t
+            .fds
+            .get(out_fd as usize)
+            .and_then(|f| f.as_ref())
+            .map(|f| f.path.clone());
+        (a.unwrap_or_default(), b.unwrap_or_default())
+    });
+    if ip.is_empty() || op.is_empty() {
+        return ERR;
+    }
+    let in_pipe = crate::pipes::handles(&ip);
+    let out_pipe = crate::pipes::handles(&op);
+    if !in_pipe && !out_pipe {
+        return ERR; // EINVAL — one end must be a pipe
+    }
+    let len = len.min(1 << 20);
+    let mut tmp = alloc::vec![0u8; len.min(65536) as usize];
+    let mut done = 0u64;
+    while done < len {
+        let want = ((len - done) as usize).min(tmp.len());
+        let n = if in_pipe {
+            match crate::pipes::try_read(&ip, &mut tmp[..want]) {
+                crate::pipes::TryRead::Data(n) => n,
+                _ => break,
+            }
+        } else {
+            match fd_read_once(in_fd as usize, &mut tmp[..want]) {
+                Ok(n) => n,
+                Err(_) => break,
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        let m = if out_pipe {
+            match crate::pipes::try_write(&op, &tmp[..n]) {
+                Ok(m) if m >= 0 => m as usize,
+                _ => break,
+            }
+        } else {
+            match fd_write_once(out_fd as usize, &tmp[..n]) {
+                Ok(m) => m,
+                Err(_) => break,
+            }
+        };
+        done += m as u64;
+        if m < n {
+            break;
+        }
+    }
+    done
+}
+
+/// SYS_PROCESS_VM: copy bytes between the caller's buffer and another
+/// task's user memory (a live, demand-paged VA range on their pml4).
+/// wr=0 reads theirs → ours; wr=1 writes ours → theirs.
+fn sys_process_vm(pid: u64, addr: u64, buf: u64, len: u64, wr: u64) -> u64 {
+    let r = task::with_pid_mut(pid as u32, |t| {
+        t.pml4
+            .map(|p| p.start_address().as_u64() as i64)
+            .unwrap_or(0)
+    });
+    if r <= 0 || len == 0 {
+        return ERR;
+    }
+    let Some(pml4) =
+        x86_64::structures::paging::PhysFrame::from_start_address(x86_64::PhysAddr::new(r as u64))
+            .ok()
+    else {
+        return ERR;
+    };
+    let len = len.min(1 << 20);
+    let mut done = 0u64;
+    while done < len {
+        let va = addr + done;
+        let Some(pa) = elf::translate_user(pml4, va) else {
+            break;
+        };
+        let n = (len - done).min(0x1000 - (va & 0xfff)) as usize;
+        // translate_user returns phys INCLUDING the page offset
+        let kv = mem::phys_to_virt(pa);
+        if wr != 0 {
+            let Some(data) = copy_in(buf + done, n as u64) else {
+                break;
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(data.as_ptr(), kv as *mut u8, n);
+            }
+        } else {
+            let chunk = unsafe { core::slice::from_raw_parts(kv as *const u8, n) };
+            if copy_out_pub(buf + done, chunk).is_none() {
+                break;
+            }
+        }
+        done += n as u64;
+    }
+    if done == 0 {
+        ERR
+    } else {
+        done
+    }
+}
+
+/// SYS_PPOLL: poll under a temporary signal mask (mask = u64::MAX means
+/// "no swap", i.e. plain poll). The swap persists across the blocked
+/// wait via poll_saved_mask; the dispatch tail restores it at return.
+fn sys_ppoll(ctx: &mut CpuContext, fds: u64, evs: u64, nfds: u64, timeout: u64, mask: u64) -> u64 {
+    if mask != u64::MAX {
+        task::with_current(|t| {
+            if t.poll_saved_mask == u64::MAX {
+                t.poll_saved_mask = t.sigmask;
+                t.sigmask = mask;
+            }
+        });
+    }
+    // POSIX: a pending signal the new mask unblocks interrupts ppoll
+    // immediately — the dispatch tail runs the handler right after.
+    let eintr = task::with_current(|t| {
+        let pend = t.sigpending & !t.sigmask;
+        (0..32).any(|i| pend & (1u64 << i) != 0 && t.sighandlers[i] > 1)
+    });
+    if eintr {
+        return (-4i64) as u64;
+    }
+    sys_poll(ctx, fds, evs, nfds, timeout)
+}
+
+/// SYS_SYSINFO: { uptime_sec, totalram_kb, freeram_kb, procs } out 32B.
+fn sys_sysinfo(out: u64) -> u64 {
+    let (total, used) = mem::FRAME_ALLOC
+        .lock()
+        .as_ref()
+        .map(|a| (a.total_bytes(), a.used_bytes()))
+        .unwrap_or((0, 0));
+    let procs = task::SCHED
+        .lock()
+        .as_ref()
+        .map(|s| s.tasks.iter().filter(|t| t.state != task::State::Dead).count() as u64)
+        .unwrap_or(0);
+    let mut b = alloc::vec![0u8; 32];
+    b[0..8].copy_from_slice(&(task::ticks() / 100).to_le_bytes());
+    b[8..16].copy_from_slice(&(total / 1024).to_le_bytes());
+    b[16..24].copy_from_slice(&(total.saturating_sub(used) / 1024).to_le_bytes());
+    b[24..32].copy_from_slice(&procs.to_le_bytes());
+    if copy_out_pub(out, &b).is_some() {
+        0
+    } else {
+        ERR
+    }
+}
+
+/// SYS_CLOSE_RANGE: close every fd in [first, last] (releasing objects).
+fn sys_close_range(first: u64, last: u64) -> u64 {
+    if last < first {
+        return ERR;
+    }
+    let last = last.min(1023);
+    let rel: alloc::vec::Vec<task::FileDesc> = task::with_current(|t| {
+        let mut v = alloc::vec::Vec::new();
+        for i in first..=last {
+            if let Some(f) = t.fds.get_mut(i as usize).and_then(|s| s.take()) {
+                v.push(f);
+            }
+        }
+        v
+    });
+    for f in &rel {
+        crate::vfs::release_desc(f);
+    }
+    0
+}
+
+/// SYS_PIDFD_SIGNAL: signal the task behind a pidfd (/pidfd/{pid}).
+fn sys_pidfd_signal(pidfd: u64, sig: u64) -> u64 {
+    let path = task::with_current(|t| match t.fds.get(pidfd as usize) {
+        Some(Some(f)) => f.path.clone(),
+        _ => String::new(),
+    });
+    let Some(pid) = crate::pidfd::target(&path) else {
+        return ERR;
+    };
+    if sig == 0 {
+        // permission-style probe: 0 = target exists
+        return if task::with_pid_mut(pid, |_| 0) == 0 { 0 } else { ERR };
+    }
+    if task::signal(pid, sig) == 0 {
+        0
+    } else {
+        ERR
+    }
 }
 
 /// SYS_EPOLL_WAIT: copy {u32 fd, u32 revents} pairs for ready interests to
@@ -2473,6 +2690,7 @@ fn sys_epoll_wait(ctx: &mut CpuContext, epfd: u64, out: u64, max: u64, timeout_m
     let max = (max as usize).min(64);
     let hits = crate::epoll::collect(&ep_path, max);
     if !hits.is_empty() {
+        task::with_current(|t| t.poll_dl = 0);
         let mut buf = alloc::vec![0u8; hits.len() * 8];
         for (i, (fdn, re)) in hits.iter().enumerate() {
             buf[i * 8..i * 8 + 4].copy_from_slice(&fdn.to_le_bytes());
@@ -2484,14 +2702,23 @@ fn sys_epoll_wait(ctx: &mut CpuContext, epfd: u64, out: u64, max: u64, timeout_m
         };
     }
     if timeout_ms == 0 {
+        task::with_current(|t| t.poll_dl = 0);
         return 0;
     }
-    let dl = if timeout_ms == u64::MAX {
-        u64::MAX
-    } else {
-        task::ticks() + timeout_ms.div_ceil(10) + 1
-    };
+    // Same persisted deadline as sys_poll (see its comment) — a recomputed
+    // deadline on re-entry would slide forward and never fire.
+    let dl = task::with_current(|t| {
+        if t.poll_dl == 0 {
+            t.poll_dl = if timeout_ms == u64::MAX {
+                u64::MAX
+            } else {
+                task::ticks() + timeout_ms.div_ceil(10) + 1
+            };
+        }
+        t.poll_dl
+    });
     if task::ticks() >= dl {
+        task::with_current(|t| t.poll_dl = 0);
         return 0;
     }
     block_reenter(ctx, dl, 0)
@@ -3314,6 +3541,11 @@ fn block_reenter(ctx: &mut CpuContext, deadline: u64, wait_port: u32) -> ! {
             t.wait_port = 0;
             t.waiting_on = 0;
             t.wait_futex = 0;
+            t.poll_dl = 0;
+            if t.poll_saved_mask != u64::MAX {
+                t.sigmask = t.poll_saved_mask;
+                t.poll_saved_mask = u64::MAX;
+            }
             true
         } else {
             t.state = task::State::Blocked;

@@ -35,6 +35,10 @@ extern "C" fn vt_hit(_: u64) {
 extern "C" fn al_hit(_: u64) {
     unsafe { AL_HIT += 1 };
 }
+extern "C" fn pp_hit(_: u64) {
+    unsafe { PP_HIT += 1 };
+}
+static mut PP_HIT: u32 = 0;
 static mut VT_HIT: u32 = 0;
 static mut AL_HIT: u32 = 0;
 
@@ -1489,6 +1493,88 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         match (m1, m2, r) {
             (Some((s1, _)), Some((s2, n2)), Some((rs, _))) =>
                 (s2, n2) != (0, 0) && (s2, n2) >= (s1, 0) && rs > 1_600_000_000,
+            _ => false,
+        }
+    });
+    check("splice", {
+        // file -> pipe: bytes move kernel-side, no user read/write
+        let _ = ustd::remove("/splice-src");
+        let f = ustd::open("/splice-src", ustd::O_RDWR | ustd::O_CREATE).unwrap_or(-1);
+        let w = ustd::write(f, b"splice-ok-1234").unwrap_or(0);
+        let _ = ustd::close(f);
+        let r = ustd::open("/splice-src", ustd::O_RDONLY).unwrap_or(-1);
+        let Some((pr, pw)) = ustd::pipe() else { panic!("pipe") };
+        let moved = if r >= 0 { ustd::splice(r as i32, pw as i32, 14) } else { -1 };
+        let mut buf = [0u8; 32];
+        let n = if moved == 14 { ustd::read(pr, &mut buf).unwrap_or(0) } else { 0 };
+        let both = ustd::splice(r as i32, f as i32, 8); // file->file: EINVAL
+        let _ = ustd::close(r);
+        let _ = ustd::close(pr);
+        let _ = ustd::close(pw);
+        w == 14 && moved == 14 && n == 14 && &buf[..14] == b"splice-ok-1234" && both < 0
+    });
+    check("process-vm", {
+        // read + write OWN address space through the pid's pml4
+        static mut CELL: u64 = 0;
+        unsafe { core::ptr::write_volatile(&mut CELL, 0x5EED_5EED_5EED_5EED) };
+        let addr = unsafe { &CELL as *const u64 as u64 };
+        let mut got = [0u8; 8];
+        let n = ustd::process_vm_readv(ustd::getpid(), addr, &mut got);
+        let r_ok = n == 8 && u64::from_le_bytes(got) == 0x5EED_5EED_5EED_5EED;
+        let w_ok = ustd::process_vm_writev(ustd::getpid(), addr, &7u64.to_le_bytes()) == 8
+            && unsafe { core::ptr::read_volatile(&CELL) } == 7;
+        let bad = ustd::process_vm_readv(0x7FFF_F0F0, addr, &mut got);
+        r_ok && w_ok && bad < 0
+    });
+    check("ppoll", {
+        // empty poll times out; an unmasked pending signal returns EINTR
+        let t = ustd::ppoll(&[], &[], 30, u64::MAX);
+        unsafe { PP_HIT = 0 };
+        let _ = ustd::sigaction(10, pp_hit as u64);
+        let _ = ustd::sigprocmask(ustd::SIG_BLOCK, 1u64 << 10);
+        let _ = ustd::tgkill(ustd::getpid(), ustd::gettid(), 10);
+        let r = ustd::ppoll(&[], &[], 500, 0); // mask 0 = all unblocked
+        ustd::sleep_ms(20);
+        let hit = unsafe { PP_HIT };
+        let _ = ustd::sigprocmask(ustd::SIG_SETMASK, 0);
+        t == 0 && r == -4 && hit == 1
+    });
+    check("sysinfo", {
+        match ustd::sysinfo() {
+            Some((_, total, free, procs)) => total > 0 && free > 0 && procs >= 3,
+            None => false,
+        }
+    });
+    check("close-range", {
+        let Some((r, w)) = ustd::pipe() else { panic!("pipe") };
+        let f = ustd::open("/cr-junk", ustd::O_RDWR | ustd::O_CREATE).unwrap_or(-1);
+        let lo = r.min(w).min(f) as u32;
+        let hi = r.max(w).max(f) as u32;
+        let rc = ustd::close_range(lo, hi);
+        let mut b = [0u8; 4];
+        let dead = ustd::read(r, &mut b).is_err() && ustd::write(f, b"x").is_err();
+        rc == 0 && dead
+    });
+    check("pidfd-signal", {
+        // pidfd probe + real signal delivery through the fd
+        let Some((r, w)) = ustd::pipe() else { panic!("pipe") };
+        match ustd::fork() {
+            0 => {
+                let _ = ustd::close(w);
+                let mut b = [0u8; 8];
+                let _ = ustd::read(r, &mut b); // block until parent kills us
+                ustd::exit_group(1);
+            }
+            pid if pid > 0 => {
+                let pf = ustd::pidfd(pid as u32);
+                let probe = ustd::pidfd_send_signal(pf as i32, 0);
+                let sent = ustd::pidfd_send_signal(pf as i32, 15);
+                let st = ustd::waitpid(pid as u32, 5000).unwrap_or(-1);
+                let _ = ustd::close(pf);
+                let _ = ustd::close(r);
+                let _ = ustd::close(w);
+                pf >= 0 && probe == 0 && sent == 0 && st == 128 + 15
+            }
             _ => false,
         }
     });

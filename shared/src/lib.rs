@@ -191,6 +191,12 @@ pub const SYS_TIMER_SETTIME: u64 = 170;// (id, init_ms, int_ms) -> 0|err
 pub const SYS_TIMER_DELETE: u64 = 171; // (id) -> 0|err
 pub const SYS_CLOCK_GETTIME: u64 = 172;// (clkid, out_ptr) -> 0|err
                                      // clkid 0=REALTIME(rtc) 1=MONOTONIC
+pub const SYS_SPLICE: u64 = 173;       // (in_fd, out_fd, len) -> moved|err
+pub const SYS_PROCESS_VM: u64 = 174;   // (pid, addr, buf, len, wr) -> n|err
+pub const SYS_PPOLL: u64 = 175;        // (fds,evs,nfds,timeout,mask) -> n|err
+pub const SYS_SYSINFO: u64 = 176;      // (out_ptr) -> 0|err
+pub const SYS_CLOSE_RANGE: u64 = 177;  // (first,last) -> 0|err
+pub const SYS_PIDFD_SIGNAL: u64 = 178; // (pidfd, sig) -> 0|err
 
 // ptrace request ops
 pub const PT_TRACEME: u64 = 0;
