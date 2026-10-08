@@ -4318,7 +4318,7 @@ fn sed_parse(
                 i += 1;
             }
             let a0 = i;
-            while i < b.len() && b[i] != b';' && b[i] != b'\n' {
+            while i < b.len() && b[i] != b';' && b[i] != b'\n' && b[i] != b'}' {
                 i += 1;
             }
             let name = String::from(spec[a0..i].trim());
@@ -4345,7 +4345,7 @@ fn sed_parse(
                 let f2 = sed_field(spec, &mut i, d)
                     .ok_or("sed: unterminated second field")?;
                 let (mut g, mut pf, mut nth) = (false, false, 0usize);
-                while i < b.len() && b[i] != b';' && b[i] != b'\n' {
+                while i < b.len() && b[i] != b';' && b[i] != b'\n' && b[i] != b'}' {
                     match b[i] {
                         b'g' => g = true,
                         b'p' => pf = true,
@@ -4406,7 +4406,7 @@ fn sed_parse(
                     i += 1;
                 }
                 let t0 = i;
-                while i < b.len() && b[i] != b';' && b[i] != b'\n' {
+                while i < b.len() && b[i] != b';' && b[i] != b'\n' && b[i] != b'}' {
                     i += 1;
                 }
                 let t = String::from(spec[t0..i].trim_end());
