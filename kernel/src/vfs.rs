@@ -627,6 +627,37 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
     Ok(())
 }
 
+/// Resize a filesystem file to `len` (pad zeros or cut) — backs ftruncate(2).
+/// Pseudo-fs objects and pipes reject with -22 like a real fd-based truncate.
+pub fn truncate_path(path: &str, len: u64) -> Result<(), i64> {
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let full = normalize(&cwd, path);
+    if crate::pipes::handles(&full)
+        || crate::dev::handles(&full)
+        || crate::proc::handles(&full)
+        || crate::notify::handles(&full)
+        || crate::timerfd::handles(&full)
+        || crate::eventfd::handles(&full)
+        || crate::epoll::handles(&full)
+        || crate::sockpair::handles(&full)
+        || crate::pidfd::handles(&full)
+    {
+        return Err(-22); // EINVAL on non-regular fds
+    }
+    if len > 1 << 28 {
+        return Err(-22);
+    }
+    let mut g = FS.lock();
+    let fs = g.as_mut().ok_or(-1i64)?;
+    let mut full = full;
+    resolve_links(fs, &mut full)?;
+    let mut data = fs.read_file(&full).map_err(err_to_i64)?;
+    data.resize(len as usize, 0);
+    fs.write_file(&full, &data).map_err(err_to_i64)?;
+    crate::notify::fire(&full, crate::notify::IN_MODIFY);
+    Ok(())
+}
+
 /// Whole-file write without the fd table — for kernel-side producers
 /// (screenshots). Path is normalized against the caller's cwd.
 pub fn write_all_path(path: &str, data: &[u8]) -> Result<(), i64> {

@@ -1225,3 +1225,52 @@ pub const O_NONBLOCK: u64 = shared::O_NONBLOCK;
 pub fn fcntl(fd: i64, cmd: u64, arg: u64) -> i64 {
     sc3(shared::SYS_FCNTL, fd as u64, cmd, arg) as i64
 }
+
+/// fstat: stat through a descriptor (real files, pseudo-fs and object fds).
+pub fn fstat(fd: i64) -> Option<shared::Stat> {
+    let mut st = shared::Stat { size: 0, is_dir: 0, mtime: 0, attr: 0 };
+    match sc2(shared::SYS_FSTAT, fd as u64, &mut st as *mut _ as u64) {
+        0 => Some(st),
+        _ => None,
+    }
+}
+
+/// ftruncate: resize the file behind `fd` to `len` (pad/cut). 0 | ERR
+pub fn ftruncate(fd: i64, len: u64) -> i64 {
+    sc2(shared::SYS_FTRUNCATE, fd as u64, len) as i64
+}
+
+/// sendfile: kernel-side copy from `inf` to `outf` (no userspace bounce).
+/// `off`: Some(offset) reads from that file offset and updates it (POSIX),
+/// leaving the fd position untouched. Returns bytes copied (may be short).
+pub fn sendfile(outf: i64, inf: i64, off: Option<&mut u64>, count: u64) -> i64 {
+    let p = off.map(|o| o as *mut u64 as u64).unwrap_or(0);
+    sc4(shared::SYS_SENDFILE, outf as u64, inf as u64, p, count) as i64
+}
+
+/// Copy `inf` to `outf` entirely through sendfile (loops on short writes).
+pub fn sendfile_all(outf: i64, inf: i64, count: u64) -> i64 {
+    let mut done = 0u64;
+    while done < count {
+        match sendfile(outf, inf, None, count - done) {
+            0 => break,                 // EOF
+            e if e < 0 && e != -11 => return e,
+            -11 => break,               // EAGAIN: caller may poll+retry
+            n => done += n as u64,
+        }
+        if done >= count {
+            break;
+        }
+    }
+    done as i64
+}
+
+/// readv/writev: scatter/gather I/O over (ptr,len) pairs.
+pub fn readv(fd: i64, iovs: &mut [(*mut u8, usize)]) -> i64 {
+    let flat: Vec<u64> = iovs.iter().flat_map(|(p, l)| [*p as u64, *l as u64]).collect();
+    sc3(shared::SYS_READV, fd as u64, flat.as_ptr() as u64, iovs.len() as u64) as i64
+}
+pub fn writev(fd: i64, iovs: &[(*const u8, usize)]) -> i64 {
+    let flat: Vec<u64> = iovs.iter().flat_map(|(p, l)| [*p as u64, *l as u64]).collect();
+    sc3(shared::SYS_WRITEV, fd as u64, flat.as_ptr() as u64, iovs.len() as u64) as i64
+}

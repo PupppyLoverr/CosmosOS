@@ -1232,6 +1232,114 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             Err(_) => false,
         }
     });
+    // ---- batch 35: vectored I/O, sendfile, fstat, ftruncate ----
+    check("writev/readv", {
+        let mut ok = false;
+        if let Ok(fd) = ustd::open("/st-iov", ustd::O_RDWR | ustd::O_CREATE | ustd::O_TRUNC) {
+            let n = ustd::writev(fd, &[(b"he".as_ptr(), 2), (b"llo".as_ptr(), 3), (b"!".as_ptr(), 1)]);
+            let _ = ustd::close(fd);
+            if n == 6 {
+                if let Ok(fd) = ustd::open("/st-iov", ustd::O_RDONLY) {
+                    let (mut b1, mut b2, mut b3) = ([0u8; 2], [0u8; 3], [0u8; 4]);
+                    let n = ustd::readv(fd, &mut [
+                        (b1.as_mut_ptr(), 2),
+                        (b2.as_mut_ptr(), 3),
+                        (b3.as_mut_ptr(), 4),
+                    ]);
+                    ustd::close(fd);
+                    // 6 bytes: b3 gets a short vec (1 byte), total is the file size
+                    ok = n == 6
+                        && &b1 == b"he"
+                        && &b2 == b"llo"
+                        && b3[0] == b'!';
+                }
+            }
+        }
+        let _ = ustd::remove("/st-iov");
+        ok
+    });
+    check("sendfile", {
+        let mut ok = false;
+        if let Ok(f) = ustd::open("/st-sf", ustd::O_WRONLY | ustd::O_CREATE | ustd::O_TRUNC) {
+            let _ = ustd::write(f, b"sendfile-data-1234567890");
+            let _ = ustd::close(f);
+        }
+        match (
+            ustd::open("/st-sf", ustd::O_RDONLY),
+            ustd::open("/st-sf2", ustd::O_WRONLY | ustd::O_CREATE | ustd::O_TRUNC),
+        ) {
+            (Ok(inf), Ok(outf)) => {
+                let n = ustd::sendfile(outf, inf, None, 24);
+                ustd::close(inf);
+                ustd::close(outf);
+                ok = n == 24
+                    && ustd::read_all("/st-sf2").map(|d| d == b"sendfile-data-1234567890").unwrap_or(false);
+            }
+            _ => {}
+        }
+        let _ = ustd::remove("/st-sf");
+        let _ = ustd::remove("/st-sf2");
+        ok
+    });
+    check("sendfile-offset", {
+        // POSIX offset semantics: reads from *off, reports new off, keeps fd pos
+        let mut ok = false;
+        if let Ok(f) = ustd::open("/st-sfo", ustd::O_WRONLY | ustd::O_CREATE | ustd::O_TRUNC) {
+            let _ = ustd::write(f, b"0123456789ABCDEF");
+            let _ = ustd::close(f);
+        }
+        match (
+            ustd::open("/st-sfo", ustd::O_RDONLY),
+            ustd::open("/st-sfo2", ustd::O_WRONLY | ustd::O_CREATE | ustd::O_TRUNC),
+        ) {
+            (Ok(inf), Ok(outf)) => {
+                let mut off = 10u64;
+                let n = ustd::sendfile(outf, inf, Some(&mut off), 6);
+                // fd position must be untouched (still 0): one byte read == '0'
+                let mut b = [0u8; 1];
+                let rn = ustd::read(inf, &mut b).unwrap_or(0);
+                ustd::close(inf);
+                ustd::close(outf);
+                ok = n == 6
+                    && off == 16
+                    && rn == 1
+                    && b[0] == b'0'
+                    && ustd::read_all("/st-sfo2").map(|d| d == b"ABCDEF").unwrap_or(false);
+            }
+            _ => {}
+        }
+        let _ = ustd::remove("/st-sfo");
+        let _ = ustd::remove("/st-sfo2");
+        ok
+    });
+    check("fstat/ftruncate", {
+        let mut ok = false;
+        if let Ok(fd) = ustd::open("/st-ftr", ustd::O_RDWR | ustd::O_CREATE | ustd::O_TRUNC) {
+            let _ = ustd::write(fd, b"0123456789");
+            // shrink to 4, then grow to 8 (zero-pad)
+            ok = ustd::fstat(fd).map(|s| s.size == 10).unwrap_or(false)
+                && ustd::ftruncate(fd, 4) == 0
+                && ustd::fstat(fd).map(|s| s.size == 4).unwrap_or(false)
+                && ustd::ftruncate(fd, 8) == 0
+                && ustd::fstat(fd).map(|s| s.size == 8).unwrap_or(false)
+                && ustd::read_all("/st-ftr")
+                    .map(|d| &d[..4] == b"0123" && d[4..].iter().all(|&x| x == 0))
+                    .unwrap_or(false);
+            // object fd: EINVAL on truncate, zeroed stat
+            let efd = ustd::eventfd(0, 0);
+            if efd >= 0 {
+                ok = ok
+                    && ustd::ftruncate(efd, 4) == -22
+                    && ustd::fstat(efd).map(|s| s.size == 0).unwrap_or(false);
+                ustd::close(efd);
+            } else {
+                ok = false;
+            }
+            let _ = ustd::close(fd);
+        }
+        let _ = ustd::remove("/st-ftr");
+        ok
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

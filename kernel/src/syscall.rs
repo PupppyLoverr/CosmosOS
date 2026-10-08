@@ -671,6 +671,61 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 _ => ERR,
             }
         }),
+        shared::SYS_FSTAT => {
+            // (fd,&mut Stat): stat via the descriptor — real files, pseudo-fs
+            // and object fds alike (objects report a zeroed stat)
+            let path = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => Some(f.path.clone()),
+                _ => None,
+            });
+            let Some(path) = path else {
+                ctx.rax = ERR;
+                return;
+            };
+            let st = vfs::stat_path(&path).unwrap_or(shared::Stat {
+                size: 0,
+                is_dir: 0,
+                mtime: 0,
+                attr: 0,
+            });
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &st as *const _ as *const u8,
+                    core::mem::size_of::<shared::Stat>(),
+                )
+            };
+            match copy_out(a2, bytes) {
+                Some(_) => 0,
+                None => ERR,
+            }
+        }
+        shared::SYS_FTRUNCATE => {
+            // (fd,len): resize through the descriptor's path; clamps fd.pos
+            let path = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => Some(f.path.clone()),
+                _ => None,
+            });
+            let Some(path) = path else {
+                ctx.rax = ERR;
+                return;
+            };
+            match vfs::truncate_path(&path, a2) {
+                Ok(()) => {
+                    task::with_current(|t| {
+                        if let Some(Some(f)) = t.fds.get_mut(a1 as usize) {
+                            if f.pos > a2 {
+                                f.pos = a2;
+                            }
+                        }
+                    });
+                    0
+                }
+                Err(e) => e as u64,
+            }
+        }
+        shared::SYS_SENDFILE => sys_sendfile(ctx, a1, a2, a3, a4),
+        shared::SYS_READV => sys_iov(ctx, a1, a2, a3, true),
+        shared::SYS_WRITEV => sys_iov(ctx, a1, a2, a3, false),
         shared::SYS_ARP => {
             let s = net::arp_stat();
             let n = s.len().min(a2 as usize);
@@ -992,133 +1047,272 @@ fn sys_open(pptr: u64, plen: u64, flags: u64) -> u64 {
     }
 }
 
+/// One non-blocking read attempt against `fd`'s backend — the shared read
+/// path used by sys_read/readv/sendfile. Err(-11) = would block.
+fn fd_read_once(fd: usize, buf: &mut [u8]) -> Result<usize, i64> {
+    let path = task::with_current(|t| match t.fds.get(fd) {
+        Some(Some(f)) => Some(f.path.clone()),
+        _ => None,
+    })
+    .ok_or(-3i64)?;
+    if crate::pipes::handles(&path) {
+        return match crate::pipes::try_read(&path, buf) {
+            crate::pipes::TryRead::WouldBlock => Err(-11),
+            crate::pipes::TryRead::Eof => Ok(0),
+            crate::pipes::TryRead::Data(n) => Ok(n),
+        };
+    }
+    if crate::notify::handles(&path) {
+        return crate::notify::try_read(&path, buf);
+    }
+    if crate::eventfd::handles(&path) {
+        return crate::eventfd::try_read(&path, buf);
+    }
+    if crate::sockpair::handles(&path) {
+        return crate::sockpair::try_read(&path, buf);
+    }
+    if crate::pidfd::handles(&path) {
+        return crate::pidfd::try_read(&path, buf);
+    }
+    if crate::timerfd::handles(&path) {
+        return crate::timerfd::try_read(&path, buf);
+    }
+    match vfs::read(fd as i64, buf) {
+        Ok(n) => Ok(n as usize),
+        Err(e) => Err(e),
+    }
+}
+
+/// One non-blocking write attempt against `fd`'s backend. Err(-11) = would
+/// block; Err(-32) = EPIPE.
+fn fd_write_once(fd: usize, data: &[u8]) -> Result<usize, i64> {
+    let path = task::with_current(|t| match t.fds.get(fd) {
+        Some(Some(f)) => Some(f.path.clone()),
+        _ => None,
+    })
+    .ok_or(-3i64)?;
+    if crate::eventfd::handles(&path) {
+        return crate::eventfd::try_write(&path, data);
+    }
+    if crate::sockpair::handles(&path) {
+        return crate::sockpair::try_write(&path, data);
+    }
+    // pipes are dispatched inside vfs::write (try_write -> -11 full / -32
+    // no-readers); real files and dev/proc go the normal route
+    match vfs::write(fd as i64, data) {
+        Ok(n) => Ok(n as usize),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `fd` was opened (or fcntl'd) O_NONBLOCK.
+fn fd_nonblock(fd: usize) -> bool {
+    task::with_current(|t| match t.fds.get(fd) {
+        Some(Some(f)) => f.flags & shared::O_NONBLOCK != 0,
+        _ => false,
+    })
+}
+
 fn sys_read(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
     if len > 1 << 20 {
         return ERR;
     }
-    // named pipes: block (rewind the syscall) while the queue is empty and a
-    // writer is still attached; EOF once the last writer closes
-    let pipe_path = task::with_current(|t| match t.fds.get(fd as usize) {
-        Some(Some(f)) if crate::pipes::handles(&f.path) => Some(f.path.clone()),
-        _ => None,
-    });
     let mut tmp = vec![0u8; len as usize];
-    let nonblock = task::with_current(|t| match t.fds.get(fd as usize) {
-        Some(Some(f)) => f.flags & shared::O_NONBLOCK != 0,
-        _ => false,
-    });
-    if let Some(p) = pipe_path {
-        match crate::pipes::try_read(&p, &mut tmp) {
-            crate::pipes::TryRead::WouldBlock => {
-                if nonblock {
-                    return (-11i64) as u64; // EAGAIN instead of blocking
-                }
-                block_reenter(ctx, task::ticks() + 2, 0); // poll every ~20ms
-            }
-            crate::pipes::TryRead::Eof => return 0,
-            crate::pipes::TryRead::Data(n) => {
-                return match copy_out(buf, &tmp[..n]) {
-                    Some(_) => n as u64,
-                    None => ERR,
-                };
+    match fd_read_once(fd as usize, &mut tmp) {
+        Err(-11) => {
+            if fd_nonblock(fd as usize) {
+                (-11i64) as u64 // EAGAIN instead of blocking
+            } else {
+                block_reenter(ctx, task::ticks() + 2, 0) // poll every ~20ms
             }
         }
-    }
-    // inotify / timerfd / eventfd objects: block while empty, drain when ready
-    let obj_path = task::with_current(|t| match t.fds.get(fd as usize) {
-        Some(Some(f))
-            if crate::notify::handles(&f.path)
-                || crate::timerfd::handles(&f.path)
-                || crate::eventfd::handles(&f.path)
-                || crate::sockpair::handles(&f.path)
-                || crate::pidfd::handles(&f.path) =>
-        {
-            Some(f.path.clone())
-        }
-        _ => None,
-    });
-    if let Some(p) = obj_path {
-        let r = if crate::notify::handles(&p) {
-            crate::notify::try_read(&p, &mut tmp)
-        } else if crate::eventfd::handles(&p) {
-            crate::eventfd::try_read(&p, &mut tmp)
-        } else if crate::sockpair::handles(&p) {
-            crate::sockpair::try_read(&p, &mut tmp)
-        } else if crate::pidfd::handles(&p) {
-            crate::pidfd::try_read(&p, &mut tmp)
-        } else {
-            crate::timerfd::try_read(&p, &mut tmp)
-        };
-        return match r {
-            Err(-11) if nonblock => (-11i64) as u64,
-            Err(-11) => block_reenter(ctx, task::ticks() + 2, 0),
-            Err(e) => e as u64,
-            Ok(n) => match copy_out(buf, &tmp[..n]) {
-                Some(_) => n as u64,
-                None => ERR,
-            },
-        };
-    }
-    match vfs::read(fd as i64, &mut tmp) {
-        Ok(n) => match copy_out(buf, &tmp[..n as usize]) {
+        Err(e) => e as u64,
+        Ok(n) => match copy_out(buf, &tmp[..n]) {
             Some(_) => n as u64,
             None => ERR,
         },
-        Err(e) => e as u64,
     }
 }
 
 fn sys_write(ctx: &mut CpuContext, fd: u64, buf: u64, len: u64) -> u64 {
     let Some(data) = copy_in(buf, len.min(1 << 20)) else { return ERR };
-    // named pipes: a full queue with a reader attached re-blocks and retries;
-    // full with no readers is EPIPE
-    let is_pipe = task::with_current(|t| match t.fds.get(fd as usize) {
-        Some(Some(f)) => crate::pipes::handles(&f.path),
-        _ => false,
-    });
-    // eventfd objects: adding past the cap re-blocks like a full pipe
-    let efd_path = task::with_current(|t| match t.fds.get(fd as usize) {
-        Some(Some(f)) if crate::eventfd::handles(&f.path) => Some(f.path.clone()),
-        _ => None,
-    });
-    if let Some(p) = efd_path {
-        return match crate::eventfd::try_write(&p, &data) {
-            Err(-11) => block_reenter(ctx, task::ticks() + 2, 0),
-            Err(e) => e as u64,
-            Ok(n) => n as u64,
-        };
-    }
-    // socketpair objects: full buffer re-blocks, closed peer is EPIPE
-    let sp_path = task::with_current(|t| match t.fds.get(fd as usize) {
-        Some(Some(f)) if crate::sockpair::handles(&f.path) => Some(f.path.clone()),
-        _ => None,
-    });
-    if let Some(p) = sp_path {
-        let nb = task::with_current(|t| match t.fds.get(fd as usize) {
-            Some(Some(f)) => f.flags & shared::O_NONBLOCK != 0,
-            _ => false,
-        });
-        return match crate::sockpair::try_write(&p, &data) {
-            Err(-11) if nb => (-11i64) as u64,
-            Err(-11) => block_reenter(ctx, task::ticks() + 2, 0),
-            Err(e) => e as u64,
-            Ok(n) => n as u64,
-        };
-    }
-    match vfs::write(fd as i64, &data) {
-        Err(-11) if is_pipe => {
-            let nb = task::with_current(|t| match t.fds.get(fd as usize) {
-                Some(Some(f)) => f.flags & shared::O_NONBLOCK != 0,
-                _ => false,
-            });
-            if nb {
+    match fd_write_once(fd as usize, &data) {
+        Err(-11) => {
+            if fd_nonblock(fd as usize) {
                 (-11i64) as u64
             } else {
                 block_reenter(ctx, task::ticks() + 2, 0)
             }
         }
-        Ok(n) => n as u64,
         Err(e) => e as u64,
+        Ok(n) => n as u64,
+    }
+}
+
+/// enable interrupts only for the hlt window — the syscall gate runs with
+/// interrupts OFF, so waiting for readiness means sti;hlt;cli around a tick.
+fn wait_irq() {
+    unsafe { core::arch::asm!("sti; hlt; cli", options(nomem, nostack)) };
+}
+
+/// SYS_READV/SYS_WRITEV: scatter/gather I/O. iov entries are {ptr,len} u64
+/// pairs; per-vec ops go through the same fd backend as sys_read/sys_write,
+/// blocking (via wait_irq retry) only until the first vec makes progress —
+/// partial results return the short count like POSIX.
+fn sys_iov(ctx: &mut CpuContext, fd: u64, iov_ptr: u64, iovcnt: u64, rd: bool) -> u64 {
+    let _ = ctx;
+    let fd = fd as usize;
+    let n = iovcnt.min(16) as usize;
+    if fd > 4096 || iov_ptr == 0 {
+        return ERR;
+    }
+    let mut total = 0usize;
+    let nonblock = fd_nonblock(fd);
+    for i in 0..n {
+        let Some(ent) = copy_in(iov_ptr + i as u64 * 16, 16) else {
+            return if total > 0 { total as u64 } else { ERR };
+        };
+        let (ptr, len) = (
+            u64::from_le_bytes(ent[..8].try_into().unwrap()) as usize,
+            u64::from_le_bytes(ent[8..].try_into().unwrap()) as usize,
+        );
+        if len == 0 {
+            continue;
+        }
+        if len > 1 << 20 {
+            return ERR;
+        }
+        if rd {
+            let mut tmp = vec![0u8; len];
+            loop {
+                match fd_read_once(fd, &mut tmp) {
+                    Ok(cnt) => {
+                        match copy_out(ptr as u64, &tmp[..cnt]) {
+                            Some(_) => total += cnt,
+                            None => return ERR,
+                        }
+                        break;
+                    }
+                    Err(-11) if total > 0 => return total as u64,
+                    Err(-11) if nonblock => return (-11i64) as u64,
+                    Err(-11) => wait_irq(), // nothing read yet: block for ready
+                    Err(e) => return e as u64,
+                }
+            }
+        } else {
+            let Some(data) = copy_in(ptr as u64, len as u64) else {
+                return if total > 0 { total as u64 } else { ERR };
+            };
+            loop {
+                match fd_write_once(fd, &data) {
+                    Ok(cnt) => {
+                        total += cnt;
+                        // a partial write ends the writev (POSIX)
+                        return if cnt < data.len() { total as u64 } else { break };
+                    }
+                    Err(-11) if total > 0 => return total as u64,
+                    Err(-11) if nonblock => return (-11i64) as u64,
+                    Err(-11) => wait_irq(),
+                    Err(e) => return e as u64,
+                }
+            }
+        }
+    }
+    total as u64
+}
+
+/// SYS_SENDFILE(out_fd, in_fd, off_ptr|0, count): kernel-side copy — data
+/// never crosses userspace. With an offset, the input fd's position is
+/// preserved (POSIX: *offset updated, fd pos untouched). Blocks via wait_irq
+/// when a blocking fd isn't ready; short count on EOF/EAGAIN-partial.
+fn sys_sendfile(ctx: &mut CpuContext, out_fd: u64, in_fd: u64, off_ptr: u64, count: u64) -> u64 {
+    let _ = ctx;
+    let (out, inp) = (out_fd as usize, in_fd as usize);
+    if out > 4096 || inp > 4096 {
+        return ERR;
+    }
+    // count is a maximum, not a contract — clamp to one call's work budget;
+    // callers (sendfile_all) loop for the rest
+    let count = count.min(1 << 24);
+    // optional explicit offset: save the fd pos, seek to *offset, restore
+    // after; the new position is reported back through off_ptr
+    let saved_pos = if off_ptr != 0 {
+        let Some(offb) = copy_in(off_ptr, 8) else { return ERR };
+        let off = u64::from_le_bytes(offb.try_into().unwrap());
+        let old = task::with_current(|t| match t.fds.get(inp) {
+            Some(Some(f)) => Some(f.pos),
+            _ => None,
+        });
+        let _ = vfs::seek(inp as i64, off);
+        old
+    } else {
+        None
+    };
+    let mut buf = vec![0u8; 4096];
+    let mut done = 0u64;
+    let nonblock = fd_nonblock(inp) && fd_nonblock(out);
+    let res = loop {
+        if done >= count {
+            break done;
+        }
+        let want = ((count - done) as usize).min(buf.len());
+        match fd_read_once(inp, &mut buf[..want]) {
+            Ok(0) => break done, // EOF
+            Ok(n) => {
+                let mut w = 0usize;
+                while w < n {
+                    match fd_write_once(out, &buf[w..n]) {
+                        Ok(m) => {
+                            w += m;
+                            done += m as u64;
+                        }
+                        Err(-11) if done > 0 => break,
+                        Err(-11) if nonblock => {
+                            restore_pos(inp, saved_pos, off_ptr);
+                            return (-11i64) as u64;
+                        }
+                        Err(-11) => wait_irq(),
+                        Err(e) => {
+                            restore_pos(inp, saved_pos, off_ptr);
+                            return e as u64;
+                        }
+                    }
+                    if done >= count {
+                        break;
+                    }
+                }
+                if w < n {
+                    break done;
+                }
+            }
+            Err(-11) if done > 0 => break done,
+            Err(-11) if nonblock => {
+                restore_pos(inp, saved_pos, off_ptr);
+                return (-11i64) as u64;
+            }
+            Err(-11) => wait_irq(),
+            Err(e) => {
+                restore_pos(inp, saved_pos, off_ptr);
+                return e as u64;
+            }
+        }
+    };
+    restore_pos(inp, saved_pos, off_ptr);
+    res
+}
+
+/// POSIX sendfile offset semantics: write the final offset back to *off_ptr
+/// and restore the input fd's own position.
+fn restore_pos(inp: usize, saved: Option<u64>, off_ptr: u64) {
+    if let Some(old) = saved {
+        let end = task::with_current(|t| match t.fds.get(inp) {
+            Some(Some(f)) => Some(f.pos),
+            _ => None,
+        });
+        if let Some(end) = end {
+            let _ = copy_out(off_ptr, &end.to_le_bytes());
+        }
+        let _ = vfs::seek(inp as i64, old);
     }
 }
 
