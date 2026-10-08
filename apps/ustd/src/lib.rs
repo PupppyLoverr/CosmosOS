@@ -887,7 +887,13 @@ pub fn poweroff() -> ! {
     loop {}
 }
 pub fn reboot() -> ! {
-    sc0(shared::SYS_REBOOT);
+    // real Linux semantics: RB_RESTART under the magic pair
+    sc3(
+        shared::SYS_REBOOT,
+        shared::RB_MAGIC1,
+        shared::RB_MAGIC2,
+        shared::RB_RESTART,
+    );
     loop {}
 }
 
@@ -1940,6 +1946,36 @@ pub fn setns(fd: u64) -> i64 {
 /// pidfd_getfd(pidfd, fd): duplicate descriptor fd out of the target.
 pub fn pidfd_getfd(pidfd: u64, fd: u64) -> i64 {
     sc3(shared::SYS_PIDFD_GETFD, pidfd, fd, 0) as i64
+}
+
+/// syslog(action, buf): kernel log ring. Actions: 2 read-new, 3 read-all,
+/// 4 read+clear, 5 clear, 9 unread count, 10 buffer size.
+pub fn syslog(action: u64, buf: &mut [u8]) -> i64 {
+    sc3(shared::SYS_SYSLOG, action, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+
+/// syslog(action) without a buffer (5 clear / 9 unread / 10 capacity).
+pub fn syslog_n(action: u64) -> i64 {
+    sc3(shared::SYS_SYSLOG, action, 0, 0) as i64
+}
+
+/// timerfd_gettime(fd) -> (remaining_ms, interval_ms).
+pub fn timerfd_gettime(fd: u64) -> Option<(u64, u64)> {
+    let mut b = [0u64; 2];
+    let r = sc2(shared::SYS_TFD_GET, fd, b.as_mut_ptr() as u64) as i64;
+    if r < 0 { None } else { Some((b[0], b[1])) }
+}
+
+/// reboot_cmd(cmd): RB_RESTART 0x1234567 / RB_HALT 0xcdef0123 /
+/// RB_POWER_OFF 0x4321fedc — never returns on success; EINVAL(-22) on
+/// a bad magic/cmd. The bare reboot() above is restart semantics.
+pub fn reboot_cmd(cmd: u64) -> i64 {
+    sc3(
+        shared::SYS_REBOOT,
+        shared::RB_MAGIC1,
+        shared::RB_MAGIC2,
+        cmd,
+    ) as i64
 }
 
 

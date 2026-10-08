@@ -97,6 +97,23 @@ pub fn umount(target: &str) -> Result<(), i64> {
     Ok(())
 }
 
+/// MS_MOVE: relocate an existing bind target onto `new`. The bind's
+/// alias semantics are unchanged; only its mount point moves.
+/// EINVAL when `old` isn't a bind, EBUSY if `new` is covered.
+pub fn move_mount(old: &str, new: &str) -> Result<(), i64> {
+    let ns = crate::task::ns_of();
+    let mut g = ns.lock();
+    let Some(i) = g.binds.iter().position(|b| b.0 == old) else {
+        return Err(-22);
+    };
+    if g.binds.iter().any(|b| b.0 == new) {
+        return Err(-16);
+    }
+    g.binds[i].0 = String::from(new);
+    g.binds.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    Ok(())
+}
+
 /// (target, source) list in the current namespace — /proc output.
 pub fn mounts() -> Vec<(String, String)> {
     let ns = crate::task::ns_of();

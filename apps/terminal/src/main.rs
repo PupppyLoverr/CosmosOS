@@ -12882,6 +12882,7 @@ impl Term {
                                         "nosuid" => flags |= 2,
                                         "nodev" => flags |= 4,
                                         "noexec" => flags |= 8,
+                                        "move" => flags |= 0x2000,
                                         "remount" => flags |= 32,
                                         "bind" => flags |= 0x1000,
                                         _ => {}
@@ -12906,6 +12907,7 @@ impl Term {
                     }
                 }
             }
+            "reboot" => ustd::reboot(),
             "unshare" => {
                 // unshare [-m]: apply to THIS shell's namespace — mounts
                 // and unmounts stop propagating to the rest of the system
@@ -20594,7 +20596,7 @@ impl Term {
         "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
         "alias", "unalias", "type", "hostname", "id", "printf", "dd", "split",
         "source", "comm", "join", "paste", "expand", "unexpand", "at", "file",
-        "test", "[", "rand", "mount", "umount", "chroot", "pivot_root", "unshare", "rmdir",
+        "test", "[", "rand", "mount", "umount", "chroot", "pivot_root", "unshare", "reboot", "rmdir",
         "export", "unset", "man",
         "lspci", "lscpu", "factor", "shuf", "cksum",
         "eval", "break", "continue", "return",

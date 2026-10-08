@@ -380,9 +380,9 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
         if crate::proc::is_dir(&full) {
             return Err(-4);
         }
-        // /proc/<pid>/ns/mntns opens as a namespace OBJECT fd pinning the
-        // task's MountNs — the fd survives the task swapping namespaces
-        // (setns's adopt source), not just its current table entry.
+        // /proc/<pid>/ns/{mntns,uts} opens as a namespace OBJECT fd pinning
+        // the task's MountNs/UtsNs — the fd survives the task swapping
+        // namespaces (setns's adopt source), not just its current entry.
         if let Some(obj) = crate::nsfd::open(&full) {
             let Some(fdi) = alloc_fd() else { return Err(-24) };
             let fd = fdi as i64;

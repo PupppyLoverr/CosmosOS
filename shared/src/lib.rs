@@ -273,6 +273,20 @@ pub const SYS_UNSHARE: u64 = 225;
 pub const SYS_SETNS: u64 = 226;
 /// pidfd_getfd(pidfd, fd, flags) — duplicate a descriptor out of another task
 pub const SYS_PIDFD_GETFD: u64 = 229;
+/// syslog(action, buf, len) — kernel log ring access
+pub const SYS_SYSLOG: u64 = 230;
+/// timerfd_gettime(fd, &mut [u64;2]{init_ms,interval_ms})
+pub const SYS_TFD_GET: u64 = 231;
+/// MS_MOVE: move a mount point instead of creating one
+pub const MS_MOVE: u64 = 0x2000;
+/// CLONE_NEWUTS: unshare the UTS namespace (hostname)
+pub const CLONE_NEWUTS: u64 = 0x0400_0000;
+/// LINUX_REBOOT_CMD values for SYS_REBOOT
+pub const RB_RESTART: u64 = 0x0123_4567;
+pub const RB_HALT: u64 = 0xcdef_0123;
+pub const RB_POWER_OFF: u64 = 0x4321_fedc;
+pub const RB_MAGIC1: u64 = 0xfee1_dead;
+pub const RB_MAGIC2: u64 = 0x2812_1969;
 /// MS_NOSUID: ignore setuid bits under the mount
 pub const MS_NOSUID: u64 = 2;
 /// MS_NODEV: do not interpret device files under the mount

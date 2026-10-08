@@ -84,7 +84,9 @@ pub fn exists(path: &str) -> bool {
             return task::pids().contains(&p) && PID_FILES.contains(&f);
         }
         // /proc/<pid>/ns/<nsfile> — the setns fd targets
-        if path.matches('/').count() == 4 && path.ends_with("/ns/mntns") {
+        if path.matches('/').count() == 4
+            && (path.ends_with("/ns/mntns") || path.ends_with("/ns/uts"))
+        {
             return task::pids().contains(&p);
         }
         return false;
@@ -104,10 +106,12 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
     if let Some(p) = pid_of(path) {
         if is_dir(path) {
             if path.ends_with("/ns") {
-                let mut de = shared::DirEntry::default();
-                de.name[..5].copy_from_slice(b"mntns");
-                de.name_len = 5;
-                out.push(de);
+                for n in ["mntns", "uts"] {
+                    let mut de = shared::DirEntry::default();
+                    de.name[..n.len()].copy_from_slice(n.as_bytes());
+                    de.name_len = n.len() as u8;
+                    out.push(de);
+                }
                 return out;
             }
             for name in PID_FILES {
@@ -227,11 +231,16 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         if path.matches('/').count() == 3 && PID_FILES.contains(&file) {
             return pid_file(p, file);
         }
-        // /proc/<pid>/ns/mntns — content is the namespace's own id,
-        // like Linux's mnt:[inum] link target
+        // /proc/<pid>/ns/<name> — content is the namespace's own id,
+        // like Linux's mnt:[inum] / uts:[inum] link targets
         if path.matches('/').count() == 4 && path.ends_with("/ns/mntns") {
             return task::ns_arc_of(p)
                 .map(|ns| alloc::format!("mntns:[{}]
+", ns.lock().id).into_bytes());
+        }
+        if path.matches('/').count() == 4 && path.ends_with("/ns/uts") {
+            return task::uts_arc_of(p)
+                .map(|ns| alloc::format!("uts:[{}]
 ", ns.lock().id).into_bytes());
         }
         return None;

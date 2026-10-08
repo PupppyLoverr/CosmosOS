@@ -13,22 +13,19 @@ const ERR: u64 = u64::MAX;
 static CLIPBOARD: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
 
 /// System nodename — read via SYS_HOSTNAME_GET, /proc/sys/kernel/hostname and
-/// `uname -n`; set via SYS_HOSTNAME_SET / `hostname <name>`.
-static HOSTNAME: spin::Mutex<String> = spin::Mutex::new(String::new());
-
+/// `uname -n`; set via SYS_HOSTNAME_SET / `hostname <name>`. Lives in the
+/// task's UTS namespace so unshare(CLONE_NEWUTS) privatizes it.
 pub fn hostname() -> String {
-    let g = HOSTNAME.lock();
+    let g = task::uts_of().lock().hostname.clone();
     if g.is_empty() {
-        String::from("cosmos")
-    } else {
-        g.clone()
+        return String::from("cosmos");
     }
+    g
 }
 
 /// Set the nodename (also writable via /proc/sys/kernel/hostname).
 pub fn set_hostname(s: String) {
-    let mut g = HOSTNAME.lock();
-    *g = s.chars().take(64).collect();
+    task::uts_of().lock().hostname = s.chars().take(64).collect();
 }
 
 /// Copy `len` bytes from user buffer `ptr` (current task's address space).
@@ -318,10 +315,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
             crate::sprint!("poweroff\n");
             power_off();
         }
-        shared::SYS_REBOOT => {
-            crate::sprint!("reboot\n");
-            reboot();
-        }
+        shared::SYS_REBOOT => sys_reboot_call(a1, a2, a3),
         shared::SYS_FB_INFO => sys_fb_info(a1),
         shared::SYS_CHDIR => sys_chdir(a1, a2),
         shared::SYS_GETCWD => sys_getcwd(a1, a2),
@@ -874,6 +868,8 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_UNSHARE => sys_unshare(a1),
         shared::SYS_SETNS => sys_setns(a1),
         shared::SYS_PIDFD_GETFD => sys_pidfd_getfd(a1, a2, a3),
+        shared::SYS_SYSLOG => sys_syslog(a1, a2, a3),
+        shared::SYS_TFD_GET => sys_tfd_gettime(a1, a2),
         shared::SYS_CHROOT => sys_chroot(a1, a2),
         shared::SYS_GETTIMEOFDAY => {
             let sec = vfs::now_unix();
@@ -3392,6 +3388,25 @@ fn sys_mount(argp: u64) -> u64 {
     let flags = rd(6);
     let cwd = task::with_current(|t| t.cwd.clone());
     let t = vfs::normalize(&cwd, tgt.trim_matches('\0'));
+    if flags & shared::MS_MOVE != 0 {
+        // mount --move old new: relocate an existing mount. Tries bind
+        // aliases first, then a real tmpfs mount (which re-keys its
+        // whole node tree). Source arg carries the OLD mount path.
+        // Both names are mount-point NAMES: resolve without the bind
+        // tail (a bind target is the mount itself, not what it covers).
+        let Some(src_raw) = copy_str(rd(0), rd(1)) else { return ERR };
+        let s = vfs::normalize_prebind(&cwd, src_raw.trim_matches('\0'));
+        let tn = vfs::normalize_prebind(&cwd, tgt.trim_matches('\0'));
+        if vfs::stat_path(&s).is_err() || vfs::stat_path(&tn).is_err() {
+            return (-2i64) as u64;
+        }
+        return match crate::bind::move_mount(&s, &tn) {
+            Ok(()) => 0,
+            Err(_) => crate::tmpfs::move_mount(&s, &tn)
+                .map(|_| 0)
+                .unwrap_or_else(|e| e as u64),
+        };
+    }
     if flags & shared::MS_BIND != 0 {
         // mount --bind: source must exist (dir or file); the target is
         // an alias resolved at path time, so it only needs to exist too.
@@ -3638,17 +3653,96 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
 /// SYS_UNSHARE(flags): CLONE_NEWNS gives the task a private mount
 /// namespace — mounts/binds/unmounts stop propagating to the parent.
 fn sys_unshare(flags: u64) -> u64 {
-    if flags & !shared::CLONE_NEWNS != 0 {
+    if flags & !(shared::CLONE_NEWNS | shared::CLONE_NEWUTS) != 0 {
         return (-22i64) as u64; // EINVAL: unsupported share bits
     }
     if flags & shared::CLONE_NEWNS != 0 {
         task::unshare_ns();
     }
+    if flags & shared::CLONE_NEWUTS != 0 {
+        task::unshare_uts();
+    }
     0
 }
 
-/// SYS_SETNS(fd): the fd must be an open /proc/<pid>/ns/mntns node
-/// (or /proc/self's); the task adopts that namespace wholesale.
+/// SYS_SYSLOG(action, buf, len): kernel log ring access. Actions: 0/1
+/// open-close (noop), 2 read-new (shared unread cursor), 3 read-all,
+/// 4 read-all+clear, 5 clear, 9 unread-bytes, 10 buffer-capacity.
+fn sys_syslog(action: u64, ptr: u64, len: u64) -> u64 {
+    match action {
+        0 | 1 => 0,
+        2 => {
+            let mut b = vec![0u8; len.min(32 * 1024) as usize];
+            let n = crate::klog::read_unread(&mut b);
+            b.truncate(n);
+            if n > 0 && copy_out(ptr, &b).is_none() {
+                return (-14i64) as u64;
+            }
+            n as u64
+        }
+        3 => {
+            let mut b = vec![0u8; len.min(32 * 1024) as usize];
+            let n = crate::klog::read_tail(&mut b);
+            b.truncate(n);
+            if n > 0 && copy_out(ptr, &b).is_none() {
+                return (-14i64) as u64;
+            }
+            n as u64
+        }
+        4 => {
+            let mut b = vec![0u8; len.min(32 * 1024) as usize];
+            let n = crate::klog::read_tail(&mut b);
+            crate::klog::clear();
+            b.truncate(n);
+            if n > 0 && copy_out(ptr, &b).is_none() {
+                return (-14i64) as u64;
+            }
+            n as u64
+        }
+        5 => {
+            crate::klog::clear();
+            0
+        }
+        9 => crate::klog::unread_len() as u64,
+        10 => crate::klog::buffer_size() as u64,
+        _ => (-22i64) as u64,
+    }
+}
+
+/// SYS_TFD_GET(fd, &mut [u64;2]{init_ms,interval_ms}): remaining time on
+/// the armed timer (0 = disarmed) plus its interval.
+fn sys_tfd_gettime(fd: u64, ptr: u64) -> u64 {
+    let path = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) if crate::timerfd::handles(&f.path) => Some(f.path.clone()),
+        _ => None,
+    });
+    let Some(p) = path else { return (-9i64) as u64 };
+    let Some((init, iv)) = crate::timerfd::gettime(&p) else {
+        return (-9i64) as u64;
+    };
+    let a = [init, iv];
+    match copy_out(ptr, &a.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()) {
+        Some(_) => 0,
+        None => (-14i64) as u64,
+    }
+}
+
+/// SYS_REBOOT(magic1, magic2, cmd): RB_RESTART / RB_HALT / RB_POWER_OFF.
+/// Bad magic is EINVAL before anything destructive can run.
+fn sys_reboot_call(m1: u64, m2: u64, cmd: u64) -> u64 {
+    if m1 != shared::RB_MAGIC1 || m2 != shared::RB_MAGIC2 {
+        return (-22i64) as u64;
+    }
+    match cmd {
+        shared::RB_RESTART => reboot(),
+        shared::RB_HALT | shared::RB_POWER_OFF => power_off(),
+        _ => (-22i64) as u64,
+    }
+}
+
+/// SYS_SETNS(fd): the fd must be an ns-object fd — an open
+/// /proc/<pid>/ns/{mntns,uts} whose stored path is /nsfd/{n} pinning a
+/// MountNs or UtsNs object. EINVAL on a non-ns fd.
 fn sys_setns(fd: u64) -> u64 {
     let path = task::with_current(|t| match t.fds.get(fd as usize) {
         Some(Some(f)) => f.path.clone(),
@@ -3659,9 +3753,13 @@ fn sys_setns(fd: u64) -> u64 {
     if !crate::nsfd::handles(&path) {
         return (-22i64) as u64;
     }
-    match crate::nsfd::arc(&path) {
-        Some(arc) => {
+    match crate::nsfd::obj(&path) {
+        Some(crate::nsfd::NsObj::Mount(arc)) => {
             task::set_ns(arc);
+            0
+        }
+        Some(crate::nsfd::NsObj::Uts(arc)) => {
+            task::set_uts(arc);
             0
         }
         None => (-9i64) as u64,
