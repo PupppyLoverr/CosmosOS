@@ -19133,29 +19133,226 @@ impl Term {
                     self.emit(&out[..out.len().saturating_sub(1)]);
                 }
             }
-            "strings" => match args.first() {
-                Some(p) => match ustd::read_all(p) {
-                    Ok(d) => {
-                        let mut run = String::new();
-                        let emit_run = |term: &mut Self, run: &mut String| {
-                            if run.len() >= 4 {
-                                term.emit(run);
+            "strings" => {
+                // strings [-n N] [-f] file...: -n sets the min run length
+                // (default 4), -f prefixes every line with the filename
+                let mut minlen = 4usize;
+                let mut showf = false;
+                let mut files: Vec<&str> = Vec::new();
+                let mut ai = 0usize;
+                while ai < args.len() {
+                    let a = args[ai];
+                    if a == "-n" || a == "--bytes" {
+                        minlen = args
+                            .get(ai + 1)
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(4);
+                        ai += 2;
+                    } else if a.starts_with("-n") && a.len() > 2 {
+                        minlen = a[2..].parse().unwrap_or(4);
+                        ai += 1;
+                    } else if a == "-f" || a == "--print-file-name" {
+                        showf = true;
+                        ai += 1;
+                    } else if a.starts_with('-') {
+                        ai += 1;
+                    } else {
+                        files.push(a);
+                        ai += 1;
+                    }
+                }
+                if files.is_empty() {
+                    self.fail("usage: strings [-n N] [-f] <file>...");
+                    return;
+                }
+                for p in files {
+                    match ustd::read_all(p) {
+                        Ok(d) => {
+                            let mut run = String::new();
+                            for &b in d.iter() {
+                                if b.is_ascii_graphic() || b == b' ' {
+                                    run.push(b as char);
+                                } else if run.len() >= minlen {
+                                    if showf {
+                                        self.emit(&alloc::format!("{}: {}", p, run));
+                                    } else {
+                                        self.emit(&run);
+                                    }
+                                    run.clear();
+                                } else {
+                                    run.clear();
+                                }
                             }
-                            run.clear();
-                        };
-                        for &b in d.iter() {
-                            if b.is_ascii_graphic() || b == b' ' {
-                                run.push(b as char);
-                            } else {
-                                emit_run(self, &mut run);
+                            if run.len() >= minlen {
+                                if showf {
+                                    self.emit(&alloc::format!("{}: {}", p, run));
+                                } else {
+                                    self.emit(&run);
+                                }
                             }
                         }
-                        emit_run(self, &mut run);
+                        Err(e) => {
+                            self.fail(&alloc::format!("strings: {}: err {}", p, e))
+                        }
                     }
-                    Err(e) => self.fail(&alloc::format!("strings: {}: err {}", p, e)),
-                },
-                None => self.fail("usage: strings <file>"),
-            },
+                }
+            }
+            "pwck" | "grpck" => {
+                // shadow-utils consistency checks.
+                // pwck <file>: every line = 7 colon fields, non-empty name,
+                // numeric + unique uid, gid present in /etc/group, home dir
+                // exists, non-empty shell path exists on disk.
+                // grpck <file>: 4 fields, non-empty name, numeric + unique
+                // gid, every member resolvable in /etc/passwd.
+                // Silent + exit 0 when clean; diagnostics + exit 1 on any
+                // finding (file arg defaults to the system database).
+                let group_mode = cmd == "grpck";
+                let file = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .copied()
+                    .unwrap_or(if group_mode { "/etc/group" } else { "/etc/passwd" });
+                let d = match ustd::read_all(file) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.fail(&alloc::format!("{}: {}: err {}", cmd, file, e));
+                        return;
+                    }
+                };
+                let s = String::from_utf8_lossy(&d).into_owned();
+                let mut errs = 0u32;
+                let mut seen: Vec<u32> = Vec::new();
+                let bad = |term: &mut Self, ln: usize, msg: &str| {
+                    term.emit(&alloc::format!(
+                        "{}: {}:{}: {}", cmd, file, ln, msg
+                    ));
+                };
+                if !group_mode {
+                    let mut gids: Vec<u32> = Vec::new();
+                    if let Ok(gd) = ustd::read_all("/etc/group") {
+                        for l in String::from_utf8_lossy(&gd).lines() {
+                            let f: Vec<&str> = l.split(':').collect();
+                            if f.len() >= 3 {
+                                if let Ok(g) = f[2].parse::<u32>() {
+                                    gids.push(g);
+                                }
+                            }
+                        }
+                    }
+                    for (ln0, l) in s.lines().enumerate() {
+                        let ln = ln0 + 1;
+                        if l.is_empty() {
+                            continue;
+                        }
+                        let f: Vec<&str> = l.split(':').collect();
+                        if f.len() != 7 {
+                            bad(self, ln, "wrong number of fields");
+                            errs += 1;
+                            continue;
+                        }
+                        if f[0].is_empty()
+                            || f[0].chars().any(|c| c.is_whitespace())
+                        {
+                            bad(self, ln, "invalid user name");
+                            errs += 1;
+                        }
+                        match f[2].parse::<u32>() {
+                            Ok(u) => {
+                                if seen.contains(&u) {
+                                    bad(self, ln, "duplicate user id");
+                                    errs += 1;
+                                }
+                                seen.push(u);
+                            }
+                            Err(_) => {
+                                bad(self, ln, "nonnumeric user id");
+                                errs += 1;
+                            }
+                        }
+                        match f[3].parse::<u32>() {
+                            Ok(g) => {
+                                if !gids.contains(&g) {
+                                    bad(self, ln, "unknown group id");
+                                    errs += 1;
+                                }
+                            }
+                            Err(_) => {
+                                bad(self, ln, "nonnumeric group id");
+                                errs += 1;
+                            }
+                        }
+                        if !f[5].is_empty() {
+                            match ustd::stat(f[5]) {
+                                Ok(st) if st.is_dir != 0 => {}
+                                _ => {
+                                    bad(self, ln, "home directory does not exist");
+                                    errs += 1;
+                                }
+                            }
+                        }
+                        if !f[6].is_empty() && ustd::stat(f[6]).is_err() {
+                            bad(self, ln, "shell does not exist");
+                            errs += 1;
+                        }
+                    }
+                } else {
+                    let mut users: Vec<String> = Vec::new();
+                    if let Ok(pd) = ustd::read_all("/etc/passwd") {
+                        for l in String::from_utf8_lossy(&pd).lines() {
+                            let f: Vec<&str> = l.split(':').collect();
+                            if f.len() >= 1 {
+                                users.push(String::from(f[0]));
+                            }
+                        }
+                    }
+                    for (ln0, l) in s.lines().enumerate() {
+                        let ln = ln0 + 1;
+                        if l.is_empty() {
+                            continue;
+                        }
+                        let f: Vec<&str> = l.split(':').collect();
+                        if f.len() != 4 {
+                            bad(self, ln, "wrong number of fields");
+                            errs += 1;
+                            continue;
+                        }
+                        if f[0].is_empty()
+                            || f[0].chars().any(|c| c.is_whitespace())
+                        {
+                            bad(self, ln, "invalid group name");
+                            errs += 1;
+                        }
+                        match f[2].parse::<u32>() {
+                            Ok(g) => {
+                                if seen.contains(&g) {
+                                    bad(self, ln, "duplicate group id");
+                                    errs += 1;
+                                }
+                                seen.push(g);
+                            }
+                            Err(_) => {
+                                bad(self, ln, "nonnumeric group id");
+                                errs += 1;
+                            }
+                        }
+                        for m in f[3].split(',') {
+                            if !m.is_empty()
+                                && !users.iter().any(|u| u == m)
+                            {
+                                bad(
+                                    self,
+                                    ln,
+                                    &alloc::format!("unknown member '{}'", m),
+                                );
+                                errs += 1;
+                            }
+                        }
+                    }
+                }
+                if errs > 0 {
+                    self.last_ok = false;
+                }
+            }
             "find" => {
                 // find <dir> [preds...] [-o preds...]... — each -o arm is an
                 // independent predicate set with its own optional action;
@@ -25256,6 +25453,7 @@ impl Term {
                     "          tail -c +K  head -c -N  uniq -s/-z",
                     "          grep -z  find -print0  shuf -z  sed -z  cut -z",
                     "          sed -f FILE  awk -f FILE  sh -c CMD name args",
+                    "          pwck [file]  grpck [file]  strings -n N -f",
                     "          setsid <cmd>  dir/vdir  mkdir -m  df -P  stat -t  chown -R",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];
