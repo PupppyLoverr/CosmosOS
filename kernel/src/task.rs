@@ -677,7 +677,7 @@ pub fn cpu_sums() -> (u64, u64) {
 }
 
 /// (name, argv, mem_bytes, cpu_ticks, is_user, state, nice, vrun) for /proc/<pid>/*.
-pub fn pid_info(pid: u32) -> Option<(String, String, u64, u64, bool, &'static str, i8, u64)> {
+pub fn pid_info(pid: u32) -> Option<(String, String, u64, u64, bool, &'static str, i8, u64, u32)> {
     let g = SCHED.lock();
     let s = g.as_ref()?;
     s.tasks.iter().find(|t| t.id == pid).map(|t| {
@@ -695,6 +695,7 @@ pub fn pid_info(pid: u32) -> Option<(String, String, u64, u64, bool, &'static st
             },
             t.nice,
             t.vrun,
+            t.parent,
         )
     })
 }

@@ -314,11 +314,11 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
 
 /// Render a `/proc/<pid>/<file>` — live task state each read.
 fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
-    let (name, argv, mem, ticks, is_user, state, nice, vrun) = task::pid_info(pid)?;
+    let (name, argv, mem, ticks, is_user, state, nice, vrun, ppid) = task::pid_info(pid)?;
     let s = match file {
         "status" => alloc::format!(
-            "Name:\t{}\nPid:\t{}\nState:\t{}\nUser:\t{}\nVmSize:\t{} kB\nCpuTicks:\t{}\nNice:\t{}\nVrun:\t{}\n",
-            name, pid, state, is_user, mem / 1024, ticks, nice, vrun
+            "Name:\t{}\nPid:\t{}\nPPid:\t{}\nState:\t{}\nUser:\t{}\nVmSize:\t{} kB\nCpuTicks:\t{}\nNice:\t{}\nVrun:\t{}\n",
+            name, pid, ppid, state, is_user, mem / 1024, ticks, nice, vrun
         ),
         "cmdline" => alloc::format!("{} {}\n", name, argv).trim_end().to_string() + "\n",
         "stat" => alloc::format!(

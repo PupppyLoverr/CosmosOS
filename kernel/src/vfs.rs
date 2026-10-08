@@ -312,20 +312,47 @@ pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
             size: 0,
             is_dir: crate::dev::is_dir(&full) as u32,
             mtime: 0,
+            attr: 0,
         });
     }
     if crate::proc::handles(&full) {
         if crate::proc::is_dir(&full) {
-            return Ok(shared::Stat { size: 0, is_dir: 1, mtime: 0 });
+            return Ok(shared::Stat { size: 0, is_dir: 1, mtime: 0, attr: 0 });
         }
         return crate::proc::read_file(&full)
-            .map(|d| shared::Stat { size: d.len() as u64, is_dir: 0, mtime: 0 })
+            .map(|d| shared::Stat { size: d.len() as u64, is_dir: 0, mtime: 0, attr: 0 })
             .ok_or(-2);
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     let e = fs.stat(&full).map_err(err_to_i64)?;
-    Ok(shared::Stat { size: e.size, is_dir: e.is_dir as u32, mtime: e.mtime })
+    Ok(shared::Stat { size: e.size, is_dir: e.is_dir as u32, mtime: e.mtime, attr: e.attr as u32 })
+}
+
+/// Set a file's modify time (unix seconds) — the FAT dir entry is patched
+/// in place. Pseudo-filesystems are read-only: always an error.
+pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let full = normalize(&cwd, path);
+    if crate::proc::handles(&full) || crate::dev::handles(&full) {
+        return Err(-4);
+    }
+    let mut g = FS.lock();
+    let fs = g.as_mut().ok_or(-1i64)?;
+    fs.set_meta(&full, Some(secs), None).map_err(err_to_i64)
+}
+
+/// Set the user-settable FAT attribute bits (0x01 ro, 0x02 hidden, 0x04 sys)
+/// on a path. Pseudo-filesystems are read-only: always an error.
+pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let full = normalize(&cwd, path);
+    if crate::proc::handles(&full) || crate::dev::handles(&full) {
+        return Err(-4);
+    }
+    let mut g = FS.lock();
+    let fs = g.as_mut().ok_or(-1i64)?;
+    fs.set_meta(&full, None, Some(attr)).map_err(err_to_i64)
 }
 
 pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
@@ -361,6 +388,7 @@ pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
         de.is_dir = e.is_dir as u8;
         de.size = e.size;
         de.mtime = e.mtime;
+        de.attr = e.attr;
         out.push(de);
     }
     Ok(out)

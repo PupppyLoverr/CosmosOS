@@ -45,6 +45,7 @@ pub struct DirEntry {
     pub is_dir: bool,
     pub size: u64,
     pub mtime: u64, // unix seconds
+    pub attr: u8,   // FAT attribute byte (0x01 ro, 0x02 hidden, 0x04 sys, 0x10 dir)
 }
 
 #[derive(Clone, Copy)]
@@ -473,6 +474,7 @@ impl<D: BlockDevice> Fat32<D> {
                 is_dir: e.attr & ATTR_DIR != 0,
                 size: e.size as u64,
                 mtime: e.mtime,
+                attr: e.attr,
             })
             .collect())
     }
@@ -480,14 +482,34 @@ impl<D: BlockDevice> Fat32<D> {
     pub fn stat(&mut self, path: &str) -> Result<DirEntry> {
         let (_, entry) = self.resolve(path)?;
         match entry {
-            None => Ok(DirEntry { name: String::from("/"), is_dir: true, size: 0, mtime: 0 }),
+            None => Ok(DirEntry { name: String::from("/"), is_dir: true, size: 0, mtime: 0, attr: ATTR_DIR }),
             Some(e) => Ok(DirEntry {
                 name: e.name,
                 is_dir: e.attr & ATTR_DIR != 0,
                 size: e.size as u64,
                 mtime: e.mtime,
+                attr: e.attr,
             }),
         }
+    }
+
+    /// Patch a dir entry's modify-time and/or attribute byte in place.
+    /// `mtime` is unix seconds (FAT stores DOS date/time, 2s granularity).
+    /// `attr` replaces only the user-settable bits (0x01 read-only,
+    /// 0x02 hidden, 0x04 system); volume/dir/archive bits are preserved.
+    pub fn set_meta(&mut self, path: &str, mtime: Option<u64>, attr: Option<u8>) -> Result<()> {
+        let (_, entry) = self.resolve(path)?;
+        let e = entry.ok_or(Error::NotFound)?;
+        let mut raw = self.read_dir_entry(e.slot_cluster, e.slot_offset)?;
+        if let Some(unix) = mtime {
+            let (d, t) = unix_to_dos(unix);
+            raw[22..24].copy_from_slice(&t.to_le_bytes());
+            raw[24..26].copy_from_slice(&d.to_le_bytes());
+        }
+        if let Some(a) = attr {
+            raw[11] = (raw[11] & 0x38) | (a & 0x07);
+        }
+        self.write_dir_entry(e.slot_cluster, e.slot_offset, &raw)
     }
 
     pub fn exists(&mut self, path: &str) -> bool {

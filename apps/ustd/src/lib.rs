@@ -526,6 +526,34 @@ pub fn readdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
         Ok(buf)
     }
 }
+/// Set a file's modify time (unix seconds) via SYS_UTIME.
+pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
+    let r = sc3(
+        shared::SYS_UTIME,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        secs,
+    );
+    if is_err(r) {
+        Err(r as i64)
+    } else {
+        Ok(())
+    }
+}
+/// Set the user-settable FAT attribute bits (0x01 ro, 0x02 hidden, 0x04 sys).
+pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
+    let r = sc3(
+        shared::SYS_SETATTR,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        attr as u64,
+    );
+    if is_err(r) {
+        Err(r as i64)
+    } else {
+        Ok(())
+    }
+}
 pub fn mkdir(path: &str) -> Result<(), i64> {
     let r = sc2(shared::SYS_MKDIR, path.as_ptr() as u64, path.len() as u64);
     if is_err(r) {
