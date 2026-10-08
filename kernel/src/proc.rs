@@ -60,6 +60,7 @@ const PID_FILES: &[&str] = &[
     "status", "cmdline", "stat", "fds", "fdinfo", "cwd", "maps", "io",
     "statm", "exe", "smaps", "wchan", "children", "task", "syscall",
     "sig", "mountinfo", "timens_offsets", "uid_map", "gid_map",
+    "limits",
 ];
 
 pub fn is_dir(path: &str) -> bool {
@@ -659,6 +660,7 @@ fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
         "syscall" => task::pid_syscall(pid).unwrap_or_else(|| alloc::format!("-1\n")),
         "mountinfo" => mountinfo(),
         "sig" => task::pid_sig(pid).unwrap_or_default(),
+        "limits" => task::pid_limits(pid).unwrap_or_default(),
         // Linux timens_offsets: monotonic + boottime offsets, in
         // seconds + nanoseconds — ours fold into one tick offset.
         "timens_offsets" => {
