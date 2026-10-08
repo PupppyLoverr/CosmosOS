@@ -17749,6 +17749,445 @@ impl Term {
                     self.emit(&alloc::format!("  flags: {}", flags.join(" ")));
                 }
             }
+            "fallocate" => {
+                // fallocate [-o OFF] -l LEN file — real SYS_FALLOCATE:
+                // extends the file to off+len filled with zeros on disk.
+                let mut off = 0u64;
+                let mut len: Option<u64> = None;
+                let mut file: Option<&str> = None;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-o" | "--offset" => {
+                            off = args
+                                .get(i + 1)
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            i += 1;
+                        }
+                        "-l" | "--length" => {
+                            len = args
+                                .get(i + 1)
+                                .and_then(|s| s.parse().ok());
+                            i += 1;
+                        }
+                        "-n" | "--keep-size" => {}
+                        a if a.starts_with("-l") => {
+                            len = a[2..].parse().ok();
+                        }
+                        a if a.starts_with("-o") => {
+                            off = a[2..].parse().unwrap_or(0);
+                        }
+                        a if !a.starts_with('-') => file = Some(a),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let (Some(l), Some(f)) = (len, file) else {
+                    self.fail("usage: fallocate -l LEN [-o OFF] <file>");
+                    return;
+                };
+                match ustd::open(f, ustd::O_WRONLY | ustd::O_CREATE) {
+                    Ok(fd) => {
+                        let r = ustd::fallocate(fd, off, l);
+                        ustd::close(fd);
+                        if r < 0 {
+                            self.fail(&alloc::format!(
+                                "fallocate: {}: err {}",
+                                f,
+                                r
+                            ));
+                        }
+                    }
+                    Err(e) => self.fail(&alloc::format!(
+                        "fallocate: {}: err {}",
+                        f,
+                        e
+                    )),
+                }
+            }
+            "tftp" => {
+                // tftp HOST [PORT] -c get REMOTE [LOCAL] — real RFC1350:
+                // RRQ -> DATA blocks -> per-block ACK, server's TID port
+                // learned from the first reply.
+                let mut host: Option<&str> = None;
+                let mut port = 69u16;
+                let mut get: Option<&str> = None;
+                let mut local: Option<String> = None;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-c" => {}
+                        "get" => {
+                            get = args.get(i + 1).copied();
+                            if let Some(l) = args.get(i + 2) {
+                                local = Some(String::from(*l));
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                        a if !a.starts_with('-') && host.is_none() => {
+                            host = Some(a);
+                        }
+                        a if !a.starts_with('-') && host.is_some() => {
+                            port = a.parse().unwrap_or(69);
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let (Some(h), Some(rem)) = (host, get) else {
+                    self.fail("usage: tftp HOST [PORT] get REMOTE [LOCAL]");
+                    return;
+                };
+                let Some(ip) = parse_ipv4(h).or_else(|| ustd::net_dns(h))
+                else {
+                    self.fail(&alloc::format!("tftp: cannot resolve {}", h));
+                    return;
+                };
+                let Some(sock) = (41000..41400)
+                    .find_map(|lp| ustd::UdpSock::open(lp))
+                else {
+                    self.fail("tftp: no free local port");
+                    return;
+                };
+                // RRQ: \0001 file \0 octet \0
+                let mut rrq = Vec::new();
+                rrq.extend_from_slice(&[0, 1]);
+                rrq.extend_from_slice(rem.as_bytes());
+                rrq.push(0);
+                rrq.extend_from_slice(b"octet");
+                rrq.push(0);
+                if sock.send_to(ip, port, &rrq).is_none() {
+                    self.fail("tftp: RRQ send failed");
+                    return;
+                }
+                let mut data: Vec<u8> = Vec::new();
+                let mut expect_blk = 1u16;
+                let mut srv_port = port;
+                let mut done = false;
+                let mut tries = 0;
+                while !done && tries < 200 {
+                    tries += 1;
+                    match sock.recv_from(3000) {
+                        Some((_, sp, p)) if p.len() >= 4 => {
+                            srv_port = sp;
+                            let op = u16::from_be_bytes([p[0], p[1]]);
+                            if op == 5 {
+                                // ERROR pkt
+                                let code =
+                                    u16::from_be_bytes([p[2], p[3]]);
+                                let msg = String::from_utf8_lossy(&p[4..]);
+                                self.fail(&alloc::format!(
+                                    "tftp: error {} {}",
+                                    code,
+                                    msg.trim_end_matches('\0')
+                                ));
+                                return;
+                            }
+                            if op != 3 {
+                                continue;
+                            }
+                            let blk = u16::from_be_bytes([p[2], p[3]]);
+                            if blk == expect_blk {
+                                data.extend_from_slice(&p[4..]);
+                                expect_blk = expect_blk.wrapping_add(1);
+                                if p.len() < 516 {
+                                    done = true;
+                                }
+                            }
+                            let ack = [0, 4, (blk >> 8) as u8, blk as u8];
+                            let _ = sock.send_to(ip, srv_port, &ack);
+                        }
+                        _ => {
+                            // timeout: resend the last RRQ/ACK
+                            if expect_blk == 1 {
+                                let _ = sock.send_to(ip, port, &rrq);
+                            }
+                        }
+                    }
+                }
+                if data.is_empty() {
+                    self.fail("tftp: transfer timed out");
+                    return;
+                }
+                let out = local.unwrap_or_else(|| {
+                    String::from(
+                        rem.rsplit('/').next().unwrap_or("tftp.out"),
+                    )
+                });
+                match ustd::write_all(&out, &data) {
+                    Ok(_) => self.emit(&alloc::format!(
+                        "Received {} bytes in {} blocks",
+                        data.len(),
+                        expect_blk.wrapping_sub(1)
+                    )),
+                    Err(e) => self.fail(&alloc::format!(
+                        "tftp: {}: err {}",
+                        out,
+                        e
+                    )),
+                }
+            }
+            "lsmem" => {
+                // lsmem — memory ranges from /proc/meminfo (one online
+                // range; the kernel has no hotplug blocks to enumerate).
+                let data = ustd::read_all("/proc/meminfo").unwrap_or_default();
+                let txt = String::from_utf8_lossy(&data).into_owned();
+                let mut total_kb = 0u64;
+                for l in txt.lines() {
+                    if let Some(v) = l.strip_prefix("MemTotal:") {
+                        total_kb = v
+                            .trim()
+                            .trim_end_matches(" kB")
+                            .trim_end_matches("kB")
+                            .trim()
+                            .parse()
+                            .unwrap_or(0);
+                    }
+                }
+                let bytes = total_kb * 1024;
+                let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                self.emit("RANGE                                 SIZE  STATE REMOVABLE BLOCK");
+                self.emit(&alloc::format!(
+                    "0x{:016x}-0x{:016x} {:>4.1}G online       no     0-{}",
+                    0u64,
+                    bytes.saturating_sub(1),
+                    gib,
+                    bytes / (2 * 1024 * 1024)
+                ));
+                self.emit("");
+                self.emit(&alloc::format!("Memory block size:       {:>3}M", 2));
+                self.emit(&alloc::format!(
+                    "Total online memory:     {:>4.1}G",
+                    gib
+                ));
+            }
+            "findfs" => {
+                // findfs LABEL=x | UUID=x — real BPB read off /dev/vda.
+                let Some(spec) = args.iter().find(|a| !a.starts_with('-'))
+                else {
+                    self.fail("usage: findfs LABEL=x|UUID=x");
+                    return;
+                };
+                let (key, want) = match spec.split_once('=') {
+                    Some((k, v)) => (k.to_uppercase(), String::from(v)),
+                    None => (String::from("LABEL"), String::from(*spec)),
+                };
+                let Ok(fd) = ustd::open("/dev/vda", ustd::O_RDONLY) else {
+                    self.fail("findfs: no disk");
+                    return;
+                };
+                let mut sec = [0u8; 512];
+                let _ = ustd::read(fd, &mut sec);
+                ustd::close(fd);
+                let label =
+                    String::from_utf8_lossy(&sec[71..82]).trim().to_string();
+                let serial = alloc::format!(
+                    "{:04X}-{:04X}",
+                    u16::from_le_bytes([sec[69], sec[70]]),
+                    u16::from_le_bytes([sec[67], sec[68]])
+                );
+                let hit = match key.as_str() {
+                    "LABEL" => label == want,
+                    "UUID" => {
+                        serial.replace('-', "")
+                            == want.replace('-', "")
+                    }
+                    _ => false,
+                };
+                if hit {
+                    self.emit("/dev/vda");
+                } else {
+                    self.fail(&alloc::format!(
+                        "findfs: unable to find '{}'",
+                        spec
+                    ));
+                }
+            }
+            "chfn" => {
+                // chfn -f NAME [-r ROOM -w WPH -h HPH] [user] — real
+                // /etc/passwd GECOS field edit via db_rows/db_write.
+                let mut full: Option<String> = None;
+                let mut room = "";
+                let mut wph = "";
+                let mut hph = "";
+                let mut user: Option<&str> = None;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-f" | "--full-name" => {
+                            full = args.get(i + 1).map(|s| String::from(*s));
+                            i += 1;
+                        }
+                        "-r" | "--room" => {
+                            room = args.get(i + 1).copied().unwrap_or("");
+                            i += 1;
+                        }
+                        "-w" | "--work-phone" => {
+                            wph = args.get(i + 1).copied().unwrap_or("");
+                            i += 1;
+                        }
+                        "-h" | "--home-phone" => {
+                            hph = args.get(i + 1).copied().unwrap_or("");
+                            i += 1;
+                        }
+                        a if !a.starts_with('-') => user = Some(a),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let uname = user.unwrap_or("root");
+                let gecos = alloc::format!(
+                    "{},{},{},{}",
+                    full.unwrap_or_default(),
+                    room,
+                    wph,
+                    hph
+                );
+                let mut rows = db_rows("/etc/passwd");
+                let mut hit = false;
+                for r in rows.iter_mut() {
+                    if r.first().map(|s| s.as_str()) == Some(uname) {
+                        while r.len() < 7 {
+                            r.push(String::new());
+                        }
+                        r[4] = gecos.clone();
+                        hit = true;
+                    }
+                }
+                if !hit {
+                    self.fail(&alloc::format!("chfn: unknown user {}", uname));
+                } else if db_write("/etc/passwd", &rows).is_err() {
+                    self.fail("chfn: cannot update /etc/passwd");
+                } else {
+                    self.emit(&alloc::format!(
+                        "chfn: gecos for {} updated",
+                        uname
+                    ));
+                }
+            }
+            "chsh" => {
+                // chsh -s SHELL [user] — real /etc/passwd shell field.
+                let mut shell: Option<String> = None;
+                let mut user: Option<&str> = None;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-s" | "--shell" => {
+                            shell =
+                                args.get(i + 1).map(|s| String::from(*s));
+                            i += 1;
+                        }
+                        a if !a.starts_with('-') => user = Some(a),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let Some(sh) = shell else {
+                    self.fail("usage: chsh -s SHELL [user]");
+                    return;
+                };
+                let uname = user.unwrap_or("root");
+                let mut rows = db_rows("/etc/passwd");
+                let mut hit = false;
+                for r in rows.iter_mut() {
+                    if r.first().map(|s| s.as_str()) == Some(uname) {
+                        while r.len() < 7 {
+                            r.push(String::new());
+                        }
+                        r[6] = sh.clone();
+                        hit = true;
+                    }
+                }
+                if !hit {
+                    self.fail(&alloc::format!("chsh: unknown user {}", uname));
+                } else if db_write("/etc/passwd", &rows).is_err() {
+                    self.fail("chsh: cannot update /etc/passwd");
+                } else {
+                    self.emit(&alloc::format!(
+                        "chsh: {}'s shell is now {}",
+                        uname,
+                        sh
+                    ));
+                }
+            }
+            "sg" => {
+                // sg GROUP cmd... — run cmd with a different primary gid
+                // (real setgid, restored after). sg GROUP alone = newgrp.
+                let Some(g) = args.first() else {
+                    self.fail("usage: sg group [cmd...]");
+                    return;
+                };
+                let gid =
+                    g.parse::<u32>().ok().unwrap_or_else(|| gid_of(g));
+                if gid == u32::MAX {
+                    self.fail(&alloc::format!("sg: unknown group {}", g));
+                    return;
+                }
+                if args.len() == 1 {
+                    // same behavior as newgrp
+                    if ustd::setgid(gid) == 0 && ustd::setgroups(&[gid]) == 0
+                    {
+                        self.emit(&alloc::format!("sg: gid={} ({})", gid, g));
+                    } else {
+                        self.fail("sg: setgid failed");
+                    }
+                    return;
+                }
+                let cmdline = args[1..].join(" ");
+                let old = ustd::getgid();
+                if ustd::setgid(gid) != 0 {
+                    self.fail("sg: setgid failed");
+                    return;
+                }
+                let lines = self.run_captured(&cmdline);
+                let _ = ustd::setgid(old);
+                for l in lines {
+                    self.emit(&l);
+                }
+            }
+            "lsipc" => {
+                // lsipc [-s] — kernel IPC inventory (shm segments from
+                // SYS_IPCS; -s prints the summary).
+                let rows: Vec<(u32, String, u64, u64)> = ustd::ipcs()
+                    .lines()
+                    .filter_map(|l| {
+                        let mut it = l.split_whitespace();
+                        match (it.next(), it.next(), it.next(), it.next()) {
+                            (Some(a), Some(b), Some(c), Some(d)) => Some((
+                                a.parse().unwrap_or(0),
+                                String::from(b),
+                                c.parse().unwrap_or(0),
+                                d.parse().unwrap_or(0),
+                            )),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                let total: u64 = rows.iter().map(|r| r.2).sum();
+                if args.iter().any(|a| *a == "-s" || *a == "--summary") {
+                    self.emit(&alloc::format!(
+                        "Total shared memory: {} segments, {} bytes",
+                        rows.len(),
+                        total
+                    ));
+                    return;
+                }
+                self.emit("RESOURCE DESCRIPTION              LIMIT USED  USE%");
+                for (id, owner, size, refs) in &rows {
+                    self.emit(&alloc::format!(
+                        "shmid {:<10} owner {:<6} {:>8}B refs {}",
+                        id,
+                        owner,
+                        size,
+                        refs
+                    ));
+                }
+                if rows.is_empty() {
+                    self.emit("(none)");
+                }
+            }
             "curl" => {
                 // curl — real HTTP/1.1 client on the raw TCP stack.
                 // -s silent, -i include response headers, -I/--head,
@@ -32602,6 +33041,7 @@ impl Term {
         "jobs", "fg", "bg", "disown", "halt", "arch", "nproc", "iostat", "strace",
         "tput", "builtin", "command", "exec", "dos2unix", "unix2dos", "base32", "sysctl",
         "curl", "whatis", "lsb_release", "basenc", "ipcmk", "getopt",
+        "fallocate", "tftp", "lsmem", "findfs", "chfn", "chsh", "sg", "lsipc",
         "fortune", "uuidgen", "mcookie", "logger", "whois", "fdisk", "vol", "blkid", "script",
         "nice", "renice", "pgrep", "pkill", "top", "dc", "vmstat", "free",
         "pcap", "ftp", "lsof", "fuser", "burn", "cron", "browse",
