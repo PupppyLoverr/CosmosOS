@@ -14,8 +14,8 @@ struct Spair {
     b2a: VecDeque<u8>, // side 1 -> side 0
     ca2b: VecDeque<String>, // side 0 -> side 1 ancillary (passed fd paths)
     cb2a: VecDeque<String>, // side 1 -> side 0 ancillary
-    open_a: bool,
-    open_b: bool,
+    open_a: u32, // live desc count on side 0 (dup/clone adds holders)
+    open_b: u32,
     wr_a: bool, // side 0 shutdown(SHUT_WR): its writes stopped
     wr_b: bool,
     rd_a: bool, // side 0 shutdown(SHUT_RD): its reads return EOF
@@ -46,8 +46,8 @@ pub fn create() -> Option<(String, String)> {
             b2a: VecDeque::new(),
             ca2b: VecDeque::new(),
             cb2a: VecDeque::new(),
-            open_a: true,
-            open_b: true,
+            open_a: 1,
+            open_b: 1,
             wr_a: false,
             wr_b: false,
             rd_a: false,
@@ -68,7 +68,7 @@ pub fn ready(path: &str, for_read: bool) -> bool {
     };
     let g = SP.lock();
     let Some(s) = g.get(&id) else { return false };
-    let peer_open = if side == 0 { s.open_b } else { s.open_a };
+    let peer_open = if side == 0 { s.open_b > 0 } else { s.open_a > 0 };
     let peer_wr = if side == 0 { s.wr_b } else { s.wr_a };
     let my_rd = if side == 0 { s.rd_a } else { s.rd_b };
     let my_wr = if side == 0 { s.wr_a } else { s.wr_b };
@@ -99,7 +99,7 @@ pub fn try_read(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
     }
     let inbox = if side == 0 { &mut s.b2a } else { &mut s.a2b };
     if inbox.is_empty() {
-        let peer_open = if side == 0 { s.open_b } else { s.open_a };
+        let peer_open = if side == 0 { s.open_b > 0 } else { s.open_a > 0 };
         let peer_wr = if side == 0 { s.wr_b } else { s.wr_a };
         return if peer_open && !peer_wr { Err(-11) } else { Ok(0) };
     }
@@ -126,7 +126,7 @@ pub fn peek_read(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
     }
     let inbox = if side == 0 { &s.b2a } else { &s.a2b };
     if inbox.is_empty() {
-        let peer_open = if side == 0 { s.open_b } else { s.open_a };
+        let peer_open = if side == 0 { s.open_b > 0 } else { s.open_a > 0 };
         let peer_wr = if side == 0 { s.wr_b } else { s.wr_a };
         return if peer_open && !peer_wr { Err(-11) } else { Ok(0) };
     }
@@ -146,7 +146,7 @@ pub fn try_write(path: &str, buf: &[u8]) -> Result<usize, i64> {
     let Some(s) = g.get_mut(&id) else {
         return Err(-2);
     };
-    let peer_open = if side == 0 { s.open_b } else { s.open_a };
+    let peer_open = if side == 0 { s.open_b > 0 } else { s.open_a > 0 };
     let my_wr = if side == 0 { s.wr_a } else { s.wr_b };
     if !peer_open || my_wr {
         return Err(-32);
@@ -176,7 +176,7 @@ pub fn send_msg(path: &str, data: &[u8], pass: Option<String>) -> Result<usize, 
     let Some(s) = g.get_mut(&id) else {
         return Err(-2);
     };
-    let peer_open = if side == 0 { s.open_b } else { s.open_a };
+    let peer_open = if side == 0 { s.open_b > 0 } else { s.open_a > 0 };
     let my_wr = if side == 0 { s.wr_a } else { s.wr_b };
     if !peer_open || my_wr {
         return Err(-32);
@@ -255,15 +255,29 @@ pub fn close_obj(path: &str) {
     let drop_it = match g.get_mut(&id) {
         Some(s) => {
             if side == 0 {
-                s.open_a = false;
+                s.open_a = s.open_a.saturating_sub(1);
             } else {
-                s.open_b = false;
+                s.open_b = s.open_b.saturating_sub(1);
             }
-            !s.open_a && !s.open_b
+            s.open_a == 0 && s.open_b == 0
         }
         None => false,
     };
     if drop_it {
         g.remove(&id);
+    }
+}
+
+/// Another live desc now references this side (dup'd or clone'd fd table).
+pub fn acquire(path: &str) {
+    let Some((id, side)) = parse(path) else {
+        return;
+    };
+    if let Some(s) = SP.lock().get_mut(&id) {
+        if side == 0 {
+            s.open_a += 1;
+        } else {
+            s.open_b += 1;
+        }
     }
 }

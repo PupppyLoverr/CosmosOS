@@ -456,18 +456,49 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
 /// close() and from the
 /// task-exit reaper so dead tasks can't pin objects (e.g. a dead writer
 /// would otherwise keep a pipe's `writers` count elevated forever).
-pub fn release_desc(f: &task::FileDesc) {
+/// A new desc now references `f`'s kernel object (the fd table was dup'd
+/// or a clone() copied it). Per-desc registrations acquire one hold each
+/// so the matching release stays balanced.
+pub fn acquire_desc(f: &task::FileDesc) {
+    if crate::pipes::handles(&f.path) {
+        let writer = f.flags & (shared::O_WRONLY | shared::O_TRUNC | shared::O_APPEND) != 0;
+        crate::pipes::open_role(&f.path, writer);
+    }
+    crate::sockpair::acquire(&f.path);
+}
+
+/// Release one desc's hold on its kernel object. Pipe roles and socketpair
+/// sides are per-desc registrations — they release unconditionally (the
+/// counters were acquired at open/dup/clone). Destructive objects
+/// (notify/timerfd/eventfd/epoll/socket/pidfd) die only when `still_open`
+/// says no other live desc references the path.
+fn release_desc_obj(f: &task::FileDesc, still_open: bool) {
     if crate::pipes::handles(&f.path) {
         let writer = f.flags & (shared::O_WRONLY | shared::O_TRUNC | shared::O_APPEND) != 0;
         crate::pipes::close_role(&f.path, writer);
+    }
+    // sockpair sides are counted — close decrements, drops at zero
+    crate::sockpair::close_obj(&f.path);
+    if still_open {
+        return;
     }
     crate::notify::close_obj(&f.path);
     crate::timerfd::close_obj(&f.path);
     crate::eventfd::close_obj(&f.path);
     crate::epoll::close_obj(&f.path);
-    crate::sockpair::close_obj(&f.path);
     crate::sockfd::close_obj(&f.path);
     crate::pidfd::close_obj(&f.path);
+}
+
+pub fn release_desc(f: &task::FileDesc) {
+    release_desc_obj(f, task::fd_path_in_use(&f.path));
+}
+
+/// Exit-path variant used while the caller already holds SCHED (spin mutex
+/// is not recursive): `still_open` was computed against the live task list
+/// AND the dying task's own remaining slots inline.
+pub fn release_desc_locked(f: &task::FileDesc, still_open: bool) {
+    release_desc_obj(f, still_open);
 }
 
 pub fn close(fd: i64) {

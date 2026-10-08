@@ -108,6 +108,30 @@ pub fn waitpid(pid: u32, timeout_ms: u64) -> Result<i64, ()> {
     }
 }
 
+/// pthread-style thread: `f(arg)` runs in the caller's address space on a
+/// private 256KiB stack; the thread exits with `f`'s return code (reap
+/// with `waitpid`, same as a process). Err = no stack slot / bad entry.
+pub fn thread_spawn(f: extern "C" fn(u64) -> i64, arg: u64) -> Result<u32, ()> {
+    extern "C" fn entry(raw: u64) -> ! {
+        // the (f,arg) pair is a heap cell in our shared address space —
+        // free it after reading (leaks nothing on either side)
+        let pair = unsafe { *alloc::boxed::Box::from_raw(raw as *mut (extern "C" fn(u64) -> i64, u64)) };
+        let code = (pair.0)(pair.1);
+        exit(code)
+    }
+    let b = alloc::boxed::Box::new((f, arg));
+    let raw = alloc::boxed::Box::into_raw(b) as u64;
+    let pid = sc2(shared::SYS_CLONE, entry as u64, raw);
+    if is_err(pid) {
+        unsafe {
+            drop(alloc::boxed::Box::from_raw(raw as *mut (extern "C" fn(u64) -> i64, u64)));
+        }
+        Err(())
+    } else {
+        Ok(pid as u32)
+    }
+}
+
 /// POSIX wait(-1): (pid, exit_code) of the first dead child — reaped by
 /// the kernel. Err = no children / timeout.
 pub fn waitpid_any(timeout_ms: u64) -> Result<(u32, i64), ()> {

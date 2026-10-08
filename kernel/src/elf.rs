@@ -352,6 +352,22 @@ pub fn unmap_user_page(pml4: PhysFrame, vaddr: u64) -> Option<u64> {
     Some(phys)
 }
 
+/// Unmap every page in `[lo, hi)`; returns the physical frames that were
+/// removed (caller decides ownership — e.g. borrowed shm frames stay).
+/// Used to reclaim a dead thread's private stack slot while the shared
+/// address space lives on.
+pub fn unmap_user_range(pml4: PhysFrame, lo: u64, hi: u64) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut a = lo;
+    while a < hi {
+        if let Some(p) = unmap_user_page(pml4, a) {
+            out.push(p);
+        }
+        a += 0x1000;
+    }
+    out
+}
+
 /// Rewrite the WRITABLE/NO_EXECUTE bits of a mapped user page (mprotect).
 /// Returns Some(()) when the page was mapped.
 pub fn protect_user_page(pml4: PhysFrame, vaddr: u64, writable: bool, executable: bool) -> Option<()> {

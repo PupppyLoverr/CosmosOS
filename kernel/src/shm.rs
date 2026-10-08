@@ -81,6 +81,17 @@ pub fn size_of(id: u32) -> u64 {
         .unwrap_or(0)
 }
 
+/// Register one more mapper of `id` (clone/thread inherits the shared mm):
+/// balances a later `release` so the frames outlive every sharer.
+pub fn acquire(id: u32) {
+    let mut g = SHM.lock();
+    if let Some(r) = g.as_mut() {
+        if let Some(s) = r.map.get_mut(&id) {
+            s.refs = s.refs.saturating_add(1);
+        }
+    }
+}
+
 /// Process `t` releases its mapping of `id` (frames owned by shm stay alive).
 pub fn release(t: &mut Task, id: u32) {
     let mut g = SHM.lock();

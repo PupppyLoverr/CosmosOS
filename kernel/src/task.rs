@@ -4,6 +4,7 @@ use crate::{gdt, ipc, mem, shm, vfs, sprintln};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
@@ -17,6 +18,11 @@ pub static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
 pub const USER_STACK_TOP: u64 = 0x7F00_0000;
 pub const USER_STACK_PAGES: u64 = 64; // 256 KiB
 pub const USER_STACK_MIN: u64 = USER_STACK_TOP - USER_STACK_PAGES * 0x1000;
+/// Arena of private thread stack slots just below the main stack:
+/// 64-page (256KiB) slots, grow-down on fault like the main stack.
+pub const THREAD_STK_MIN: u64 = 0x7C00_0000;
+pub const THREAD_STK_MAX: u64 = USER_STACK_MIN;
+pub const THREAD_STK_PAGES: u64 = 64;
 pub const USER_MMAP_BASE: u64 = 0x2000_0000;
 pub const USER_ARG_PAGE: u64 = 0x7EFF_F000;
 
@@ -37,6 +43,7 @@ pub struct FileDesc {
 
 /// One `/proc/<pid>/maps` line: a live tracked mapping in the task's
 /// user address space. `perm`: R=1, W=2, X=4.
+#[derive(Clone)]
 pub struct MapEnt {
     pub start: u64,
     pub end: u64,
@@ -47,6 +54,7 @@ pub struct MapEnt {
 /// A file-backed mmap region: VA range -> (path, file offset of `start`).
 /// Pages are NOT mapped at mmap(2) time — the #PF handler fills each one
 /// from the file on first touch (real demand paging).
+#[derive(Clone)]
 pub struct FileMap {
     pub start: u64,
     pub end: u64,
@@ -93,6 +101,8 @@ pub struct Task {
     pub filemaps: Vec<FileMap>, // file-backed regions for demand paging
     pub min_flt: u64,       // minor faults: zero-fill/bss/stack demand pages
     pub maj_flt: u64,       // major faults: pages read in from the image file
+    pub stack_min: u64,     // this task's demand-grow stack region (0 = none)
+    pub stack_max: u64,
     pub rbytes: u64,         // bytes read via vfs (/proc/<pid>/io)
     pub wbytes: u64,         // bytes written via vfs
 }
@@ -104,6 +114,32 @@ pub struct Sched {
 }
 
 pub static SCHED: Mutex<Option<Sched>> = Mutex::new(None);
+
+/// Address-space (mm) reference counts keyed by pml4 physical frame.
+/// Cloned threads share their creator's pml4 — user space is torn down
+/// only when the last sharer exits.
+static MM_REFS: Mutex<BTreeMap<u64, usize>> = Mutex::new(BTreeMap::new());
+
+fn mm_inc(phys: u64) {
+    *MM_REFS.lock().entry(phys).or_insert(0) += 1;
+}
+
+/// Decrement the mm refcount; true when this was the last sharer.
+fn mm_dec_last(phys: u64) -> bool {
+    let mut g = MM_REFS.lock();
+    match g.get_mut(&phys) {
+        Some(n) => {
+            *n -= 1;
+            if *n == 0 {
+                g.remove(&phys);
+                true
+            } else {
+                false
+            }
+        }
+        None => true,
+    }
+}
 pub static IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
@@ -147,6 +183,8 @@ pub fn init() {
         filemaps: Vec::new(),
         min_flt: 0,
         maj_flt: 0,
+        stack_min: 0,
+        stack_max: 0,
         rbytes: 0,
         wbytes: 0,
     };
@@ -483,9 +521,12 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         filemaps,
         min_flt: 0,
         maj_flt: 0,
+        stack_min: USER_STACK_MIN,
+        stack_max: USER_STACK_TOP,
         rbytes: 0,
         wbytes: 0,
     };
+    mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
     sprintln!("[task] spawned pid={} '{}' entry={:#x}", pid, name, entry);
     Ok(pid)
@@ -549,10 +590,162 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         filemaps: Vec::new(),
         min_flt: 0,
         maj_flt: 0,
+        stack_min: 0,
+        stack_max: 0,
         rbytes: 0,
         wbytes: 0,
     }));
     pid
+}
+
+/// SYS_CLONE: start a thread inside the caller's address space — shares
+/// the pml4 (mm refcount +1) but gets its own kernel stack and a private
+/// 256KiB user-stack slot in the thread arena, demand-grown on fault.
+/// (entry, arg): the thread starts at `entry` with `arg` in rdi.
+pub fn clone_user(entry: u64, arg: u64) -> Option<u32> {
+    // entry must be a plausible user text address (below the thread arena)
+    if entry == 0 || entry >= THREAD_STK_MIN || entry & 0xFFFF_8000_0000_0000 != 0 {
+        return None;
+    }
+    let mut g = SCHED.lock();
+    let s = g.as_mut().unwrap();
+    let pml4 = s.tasks[s.cur].pml4?;
+    // find a free slot: an unmapped top page marks the slot unused
+    let mut slot = THREAD_STK_MIN;
+    let stack_top = loop {
+        if slot + THREAD_STK_PAGES * 0x1000 > THREAD_STK_MAX {
+            return None;
+        }
+        let top = slot + THREAD_STK_PAGES * 0x1000;
+        if crate::elf::translate(pml4, top - 0x1000).is_none() {
+            break top;
+        }
+        slot += THREAD_STK_PAGES * 0x1000;
+    };
+    // eager top page: marks the slot busy AND gives the thread somewhere
+    // to land; deeper pages demand-grow on #PF like the main stack
+    let mut scratch = Vec::new();
+    crate::elf::map_user_page_flags(pml4, stack_top - 0x1000, true, false, &mut scratch)?;
+    if scratch.is_empty() {
+        return None;
+    }
+    let mut kframes = Vec::new();
+    let (kbase, ktop) = alloc_kstack(&mut kframes);
+    let ctx = (ktop - core::mem::size_of::<CpuContext>() as u64) as *mut CpuContext;
+    unsafe {
+        core::ptr::write(ctx, CpuContext::default());
+        let c = &mut *ctx;
+        c.rip = entry;
+        c.cs = gdt::USER_CS.0 as u64;
+        c.rflags = 0x202;
+        c.rsp = stack_top - 8;
+        c.ss = gdt::USER_DS.0 as u64;
+        c.rdi = arg;
+    }
+    let pid = s.next_pid;
+    s.next_pid += 1;
+    // snapshot the parent's mm-facing state BEFORE mutating the list
+    let cur = &mut s.tasks[s.cur];
+    let parent = cur.id;
+    let name = alloc::format!("{}:t{}", cur.name, pid);
+    let mut maps = cur.maps.clone();
+    maps.push(MapEnt {
+        start: slot,
+        end: stack_top,
+        perm: 1 | 2,
+        name: String::from("[tstack]"),
+    });
+    let filemaps = cur.filemaps.clone();
+    let fds = cur.fds.clone();
+    // each copied desc is a new holder of its kernel object (pipe role,
+    // sockpair side counts); destructive objects stay live via the
+    // last-reference scan in release_desc
+    for f in fds.iter().flatten() {
+        crate::vfs::acquire_desc(f);
+    }
+    let cwd = cur.cwd.clone();
+    let borrowed = cur.borrowed.clone();
+    let shm_ids = cur.shm.clone();
+    let (nice, rt, vrun, umask, exe) = (cur.nice, cur.rt, cur.vrun, cur.umask, cur.exe.clone());
+    for id in &shm_ids {
+        shm::acquire(*id);
+    }
+    let t = Task {
+        id: pid,
+        name,
+        argv: String::new(),
+        is_user: true,
+        state: State::Running,
+        saved_rsp: ctx as u64,
+        kstack: kbase,
+        kstack_top: ktop,
+        pml4: Some(pml4),
+        wake_at: 0,
+        exit_code: 0,
+        parent,
+        fds,
+        cwd,
+        ports: Vec::new(),
+        shm: shm_ids,
+        frames: kframes,
+        mem_bytes: 0,
+        waiting_on: 0,
+        wait_port: 0,
+        borrowed,
+        mmap_next: s.tasks[s.cur].mmap_next,
+        arg_page: USER_ARG_PAGE,
+        sleep_deadline: 0,
+        wait_timeout: 0,
+        cpu_ticks: 0,
+        nice,
+        rt,
+        vrun,
+        trace: false,
+        trbuf: Vec::new(),
+        umask,
+        exe,
+        maps,
+        filemaps,
+        min_flt: 0,
+        maj_flt: 0,
+        stack_min: slot,
+        stack_max: stack_top,
+        rbytes: 0,
+        wbytes: 0,
+    };
+    mm_inc(pml4.start_address().as_u64());
+    s.tasks.push(Box::new(t));
+    sprintln!("[task] cloned pid={} entry={:#x} stk={:#x}", pid, entry, stack_top);
+    Some(pid)
+}
+
+/// Apply `f` to every live task sharing the given mm (pml4 phys frame).
+/// Callers must NOT hold SCHED — this locks it itself.
+pub fn for_mm_peers(pml4_phys: u64, f: impl Fn(&mut Task)) {
+    let mut g = SCHED.lock();
+    let Some(s) = g.as_mut() else { return };
+    for t in s.tasks.iter_mut() {
+        if t.state != State::Dead
+            && t.pml4.map(|p| p.start_address().as_u64()) == Some(pml4_phys)
+        {
+            f(t);
+        }
+    }
+}
+
+/// Does ANY live task still hold an fd on `path`? Object fds (pipes,
+/// sockets, event objects) are refcounted by live references — a thread
+/// inherits a dup'd table, so teardown must skip objects another task
+/// still holds.
+pub fn fd_path_in_use(path: &str) -> bool {
+    let g = SCHED.lock();
+    let Some(s) = g.as_ref() else { return false };
+    s.tasks.iter().any(|t| {
+        t.state != State::Dead
+            && t.fds
+                .iter()
+                .any(|f| f.as_ref().map(|d| d.path == path).unwrap_or(false))
+    })
 }
 
 /// User frames are all freed via elf::free_user_space; Task::frames only
@@ -640,24 +833,51 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
     crate::locks::release_pid(t.id);
     // release fd-table objects (pipe roles, inotify/timerfd objects) — a
     // dead task must not pin e.g. a pipe's writer count, or readers block
-    // forever waiting for an EOF that can never come
-    for slot in t.fds.iter_mut() {
-        if let Some(f) = slot.take() {
-            crate::vfs::release_desc(&f);
+    // forever waiting for an EOF that can never come. Another live task
+    // (thread sharing a dup'd table) or one of this task's own remaining
+    // dup slots keeps the object alive — only the last release destroys it.
+    let mut i = 0;
+    while i < t.fds.len() {
+        if let Some(f) = t.fds[i].take() {
+            let held = s.tasks.iter().any(|o| {
+                o.state != State::Dead
+                    && o.fds
+                        .iter()
+                        .any(|x| x.as_ref().map(|d| d.path == f.path).unwrap_or(false))
+            }) || t
+                .fds
+                .iter()
+                .any(|x| x.as_ref().map(|d| d.path == f.path).unwrap_or(false));
+            crate::vfs::release_desc_locked(&f, held);
         }
+        i += 1;
     }
     if let Some(pml4) = t.pml4 {
-        // walk the user tree; free every leaf+PT frame except shm-borrowed ones
-        let borrowed = core::mem::take(&mut t.borrowed);
-        let freed = crate::elf::free_user_space(pml4);
-        for f in freed {
-            if !borrowed.contains(&f) {
+        // reclaim THIS task's own stack slot (main or thread): its pages
+        // are plain PT leaves — freeing them lets a later clone reuse the
+        // arena slot while the shared mm stays alive.
+        let lo = t.stack_min;
+        let hi = t.stack_max;
+        for f in crate::elf::unmap_user_range(pml4, lo, hi) {
+            if !t.borrowed.contains(&f) {
                 mem::free_frame(f);
+            }
+        }
+        if mm_dec_last(pml4.start_address().as_u64()) {
+            // last sharer: walk the user tree; free every leaf+PT frame
+            // except shm-borrowed ones
+            let borrowed = core::mem::take(&mut t.borrowed);
+            let freed = crate::elf::free_user_space(pml4);
+            for f in freed {
+                if !borrowed.contains(&f) {
+                    mem::free_frame(f);
+                }
             }
         }
         // Keep the pml4 frame: CR3 still points at it until the scheduler
         // activates another task, so freeing it here could unmap the parked
-        // exit path if the frame got reallocated.
+        // exit path if the frame got reallocated. For an mm that survives
+        // (threads still running) this is just a tombstone record.
         t.frames.push(pml4.start_address().as_u64());
     }
     // Kernel-stack frames stay in the tombstone: the dying task may still be
@@ -1083,6 +1303,20 @@ pub fn pid_maps(pid: u32) -> Option<String> {
 }
 
 /// `/proc/<pid>/io` — real vfs byte counters.
+/// Tids of every live task sharing pid's address space — /proc/<pid>/task.
+pub fn pid_threads(pid: u32) -> Option<Vec<u32>> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    let mm = s.tasks.iter().find(|t| t.id == pid)?.pml4;
+    Some(
+        s.tasks
+            .iter()
+            .filter(|t| t.state != State::Dead && t.pml4.is_some() && t.pml4 == mm)
+            .map(|t| t.id)
+            .collect(),
+    )
+}
+
 /// (min_flt, maj_flt, resident user pages) for /proc/<pid>/status.
 pub fn pid_faults(pid: u32) -> Option<(u64, u64, u64)> {
     let g = SCHED.lock();
@@ -1239,11 +1473,11 @@ pub fn filemap_hit(va: u64) -> Option<(String, u64)> {
 /// satisfied and the instruction may retry.
 pub fn demand_page(va: u64) -> bool {
     let page = va & !0xFFFu64;
-    // demand-grown user stack: any unmapped page inside the stack region
-    // maps a fresh zero page (the eager top page is seeded at spawn; the
-    // region bound itself is the guard — a fault below USER_STACK_MIN is
-    // a genuine overflow and falls through to kill the task)
-    if page >= USER_STACK_MIN && page < USER_STACK_TOP {
+    // demand-grown user stack: an unmapped page inside THIS task's stack
+    // region maps a fresh zero page (main stack or a clone's private
+    // slot). The region bound is the guard — a fault outside is a real
+    // overflow and falls through to kill the task.
+    if with_current(|t| page >= t.stack_min && page < t.stack_max) {
         let Some(pml4) = with_current(|t| t.pml4) else {
             return false;
         };
