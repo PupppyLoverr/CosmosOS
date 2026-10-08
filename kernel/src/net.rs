@@ -5,6 +5,7 @@ use crate::sprintln;
 use crate::virtio_net::{self, NET};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
@@ -81,6 +82,149 @@ pub(crate) fn wait_irq() {
 
 /// Next-hop MAC for `ip`: same-subnet addresses resolve directly, anything
 /// else goes via the gateway (real routing, not ARP-for-the-world).
+/// Kernel routing table — the real thing `next_hop` consults. Built
+/// lazily from the configured IP so a DHCP lease lands in it too.
+/// `gw == 0.0.0.0` = directly connected; `dev` names the interface.
+pub struct Route {
+    pub dest: [u8; 4],
+    pub mask: [u8; 4],
+    pub gw: [u8; 4],
+    pub dev: &'static str,
+}
+static ROUTES: Mutex<Option<Vec<Route>>> = Mutex::new(None);
+
+fn mask_to_u32(m: [u8; 4]) -> u32 {
+    u32::from_be_bytes(m)
+}
+fn ip_to_u32(ip: [u8; 4]) -> u32 {
+    u32::from_be_bytes(ip)
+}
+
+fn default_routes() -> Vec<Route> {
+    let me = our_ip();
+    vec![
+        Route { dest: [127, 0, 0, 0], mask: [255, 0, 0, 0], gw: [0; 4], dev: "lo" },
+        Route {
+            dest: [me[0], me[1], me[2], 0],
+            mask: [255, 255, 255, 0],
+            gw: [0; 4],
+            dev: "eth0",
+        },
+        Route { dest: [0; 4], mask: [0; 4], gw: GW_IP, dev: "eth0" },
+    ]
+}
+
+/// Drop the synthesized table (called when the configured IP changes —
+/// the connected/default routes are rebuilt from the new lease).
+pub fn routes_invalidate() {
+    *ROUTES.lock() = None;
+}
+
+/// Longest-prefix match: returns the next-hop IP to ARP for (`dst` itself
+/// on connected routes, `gw` on routed ones). None = no route.
+fn route_lookup(ip: [u8; 4]) -> Option<[u8; 4]> {
+    let mut g = ROUTES.lock();
+    let r = g.get_or_insert_with(default_routes);
+    let mut best: Option<&Route> = None;
+    for rt in r.iter() {
+        if ip_to_u32(ip) & mask_to_u32(rt.mask) == ip_to_u32(rt.dest) & mask_to_u32(rt.mask) {
+            if best.map(|b| mask_to_u32(rt.mask) > mask_to_u32(b.mask)).unwrap_or(true) {
+                best = Some(rt);
+            }
+        }
+    }
+    best.map(|rt| if rt.gw == [0; 4] { ip } else { rt.gw })
+}
+
+/// `/proc/net/route` in Linux's exact column format (hex, little-endian
+/// fields like the real file: destination/mask as hex bytes).
+pub fn net_route() -> String {
+    let mut g = ROUTES.lock();
+    let r = g.get_or_insert_with(default_routes);
+    let mut out = String::from(
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n",
+    );
+    for rt in r.iter() {
+        let hx = |ip: [u8; 4]| -> u32 {
+            u32::from_le_bytes(ip)
+        };
+        let flags = if rt.gw == [0; 4] { "0003" } else { "0007" }; // U+up / U+G+up
+        out.push_str(&alloc::format!(
+            "{}\t{:08X}\t{:08X}\t{}\t0\t0\t0\t{:08X}\t0\t0\t0\n",
+            rt.dev,
+            hx(rt.dest),
+            hx(rt.gw),
+            flags,
+            hx(rt.mask)
+        ));
+    }
+    out
+}
+
+/// `/proc/net/route` write grammar (kernel-side of `route add/del`):
+///   "add <dest>/<plen> <gw|*>"   "del <dest>[/<plen>]"
+/// `*` = connected (no gateway). Returns false on a parse miss.
+pub fn route_ctl(line: &str) -> bool {
+    let mut f = line.split_whitespace();
+    let add = match f.next() {
+        Some("add") => true,
+        Some("del") => return route_del(f.next().unwrap_or("")),
+        _ => return false,
+    };
+    let Some(spec) = f.next() else { return false };
+    let (dest, plen) = match spec.split_once('/') {
+        Some((d, p)) => (parse_ip(d), p.parse::<u32>().unwrap_or(32)),
+        None => (parse_ip(spec), 32),
+    };
+    let Some(dest) = dest else { return false };
+    if plen > 32 {
+        return false;
+    }
+    let mask = if plen == 0 { 0 } else { u32::MAX << (32 - plen) };
+    let gw = match f.next() {
+        Some("*") | None => [0; 4],
+        Some(g) => match parse_ip(g) {
+            Some(g) => g,
+            None => return false,
+        },
+    };
+    let _ = add;
+    let mut g = ROUTES.lock();
+    let r = g.get_or_insert_with(default_routes);
+    // replace an exact existing route (dest+mask) — like RTM_NEWROUTE replace
+    let mask_b = mask.to_be_bytes();
+    r.retain(|rt| !(rt.dest == dest && rt.mask == mask_b));
+    r.push(Route { dest, mask: mask_b, gw, dev: "eth0" });
+    true
+}
+
+fn route_del(spec: &str) -> bool {
+    let (dest, plen) = match spec.split_once('/') {
+        Some((d, p)) => (parse_ip(d), p.parse::<u32>().unwrap_or(32)),
+        None => (parse_ip(spec), 32),
+    };
+    let Some(dest) = dest else { return false };
+    let mask = if plen == 0 { 0 } else { u32::MAX << (32 - plen) };
+    let mut g = ROUTES.lock();
+    let r = g.get_or_insert_with(default_routes);
+    let before = r.len();
+    r.retain(|rt| !(rt.dest == dest && rt.mask == mask.to_be_bytes()));
+    r.len() != before
+}
+
+fn parse_ip(s: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut i = 0;
+    for part in s.split('.') {
+        if i >= 4 {
+            return None;
+        }
+        out[i] = part.parse().ok()?;
+        i += 1;
+    }
+    (i == 4).then_some(out)
+}
+
 fn next_hop(ip: [u8; 4], timeout_ms: u64) -> Option<[u8; 6]> {
     if is_loopback(ip) {
         return Some([0; 6]); // looped at the IP layer — no next-hop
@@ -88,9 +232,8 @@ fn next_hop(ip: [u8; 4], timeout_ms: u64) -> Option<[u8; 6]> {
     if is_bcast(ip) {
         return Some([0xFF; 6]); // broadcast: ff:ff:ff:ff:ff:ff, no ARP
     }
-    let me = our_ip();
-    let on_net = ip[0] == me[0] && ip[1] == me[1] && ip[2] == me[2];
-    arp_resolve(if on_net { ip } else { GW_IP }, timeout_ms)
+    let nh = route_lookup(ip)?; // no route -> unrouteable (EHOSTUNREACH)
+    arp_resolve(nh, timeout_ms)
 }
 
 /// Broadcast destination: 255.255.255.255 or our subnet-directed .255.
@@ -1091,6 +1234,7 @@ pub fn dhcp() -> Option<[u8; 4]> {
     dhcp_send(&dhcp_packet(3, Some(offer), server));
     let (ack_ip, _) = dhcp_recv(5, now_ms() + 3000)?;
     *CUR_IP.lock() = ack_ip;
+    routes_invalidate(); // rebuild synthesized routes on the new lease
     sprintln!(
         "[net] dhcp lease {}.{}.{}.{}",
         ack_ip[0], ack_ip[1], ack_ip[2], ack_ip[3]
@@ -1167,13 +1311,24 @@ pub fn udp_peek(lport: u16) -> Option<([u8; 4], u16, Vec<u8>)> {
 
 /// Send a datagram from `lport` to `dst_ip:dst_port` (real ARP next-hop).
 pub fn udp_send(lport: u16, dst_ip: [u8; 4], dport: u16, payload: &[u8]) -> Result<(), i64> {
+    udp_send_ttl(lport, dst_ip, dport, payload, 64)
+}
+
+/// `udp_send` with an explicit TTL — SO_IP_TTL / traceroute-grade probes.
+pub fn udp_send_ttl(
+    lport: u16,
+    dst_ip: [u8; 4],
+    dport: u16,
+    payload: &[u8],
+    ttl: u8,
+) -> Result<(), i64> {
     if !SOCKS.lock().contains_key(&lport) {
         return Err(-2); // not bound
     }
     let Some(mac) = next_hop(dst_ip, 1500) else {
         return Err(-3);
     };
-    send_udp(mac, dst_ip, lport, dport, payload);
+    send_udp_ttl(mac, dst_ip, lport, dport, payload, ttl);
     Ok(())
 }
 

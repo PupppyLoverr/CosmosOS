@@ -154,6 +154,7 @@ pub const SO_RCVBUF: u64 = 8;
 pub const SO_BROADCAST: u64 = 6;
 pub const SO_KEEPALIVE: u64 = 9;
 pub const SO_RCVTIMEO: u64 = 20;
+pub const SO_SNDTIMEO: u64 = 21;
 pub const SO_ACCEPTCONN: u64 = 30;
 pub const SO_PROTOCOL: u64 = 38;
 pub const SO_DOMAIN: u64 = 39;

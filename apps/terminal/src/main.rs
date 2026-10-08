@@ -15463,6 +15463,45 @@ impl Term {
                     None => self.fail(&alloc::format!("rusage: {}: no such task", pid)),
                 }
             }
+            "route" => {
+                // route [-n]: kernel table (Linux-style); add/del writes
+                // /proc/net/route. `route add -net D/P gw G`,
+                // `route add default gw G`, `route del -net D/P`.
+                match args.first().copied() {
+                    Some("add") | Some("del") => {
+                        let op = args.first().copied().unwrap_or("");
+                        let net = args.get(1) == Some(&"-net");
+                        let spec = if net { args.get(2).copied() } else { args.get(1).copied() };
+                        let Some(spec) = spec else {
+                            self.fail("usage: route {add,del} [-net] <dest>[/<plen>] [gw <gw>]");
+                            return;
+                        };
+                        let (dest, plen) = if spec == "default" {
+                            ("0.0.0.0", "0")
+                        } else {
+                            match spec.split_once('/') {
+                                Some((d, p)) => (d, p),
+                                None => (spec, "32"),
+                            }
+                        };
+                        let gw = args
+                            .iter()
+                            .position(|a| *a == "gw")
+                            .and_then(|i| args.get(i + 1))
+                            .copied()
+                            .unwrap_or("*");
+                        let line = if op == "add" {
+                            alloc::format!("add {}/{} {}", dest, plen, gw)
+                        } else {
+                            alloc::format!("del {}/{}", dest, plen)
+                        };
+                        if ustd::write_all("/proc/net/route", line.as_bytes()).is_err() {
+                            self.fail("route: invalid or unrouteable spec");
+                        }
+                    }
+                    _ => self.route_show(true),
+                }
+            }
             "arp" => {
                 // arp [-d <ip>] [ip]: dump cache, delete an entry, or query one
                 match args.first() {
@@ -19087,15 +19126,35 @@ impl Term {
                     }
                 }
                 Some("r") | Some("route") => {
-                    self.emit("default via 10.0.2.2 dev eth0");
-                    if let Some((_, ip)) = ustd::net_info() {
-                        self.emit(&alloc::format!(
-                            "10.0.2.0/24 dev eth0 proto kernel scope link src {}.{}.{}.{}",
-                            ip[0], ip[1], ip[2], ip[3]
-                        ));
+                    match args.get(1).copied() {
+                        Some("add") | Some("del") => {
+                            // ip route {add,del} <dest>/<plen> [via gw]
+                            let op = args.get(1).copied().unwrap_or("");
+                            let Some(dest) = args.get(2).copied() else {
+                                self.fail("usage: ip route {add,del} <dest>/<plen> [via <gw>]");
+                                return;
+                            };
+                            let gw = if args.get(3) == Some(&"via") {
+                                args.get(4).copied().unwrap_or("*")
+                            } else {
+                                "*"
+                            };
+                            let line = if op == "add" {
+                                alloc::format!("add {} {}", dest, gw)
+                            } else {
+                                alloc::format!("del {}", dest)
+                            };
+                            if ustd::write_all("/proc/net/route", line.as_bytes()).is_err() {
+                                self.fail("route: invalid or unrouteable spec");
+                            }
+                        }
+                        _ => self.route_show(false),
                     }
                 }
-                _ => self.fail("usage: ip a|addr | ip l|link [set eth0 up|down] | ip r|route"),
+                Some("n") | Some("neigh") | Some("neighbour") => {
+                    self.run(&String::from("arp"));
+                }
+                _ => self.fail("usage: ip a|addr | ip l|link [set eth0 up|down] | ip r|route [add|del ...] | ip n|neigh"),
             },
             "ss" => {
                 // socket snapshot over the kernel's /proc/net dumps;
@@ -20252,7 +20311,7 @@ impl Term {
         "help", "ls", "cd", "pwd", "cat", "mkdir", "touch", "rm", "mv", "cp",
         "echo", "clear", "ps", "mem", "uname", "whoami", "date", "ping",
         "resolve", "httpget", "wget", "ifconfig", "dhcp", "netstat", "kill", "grep",
-        "traceroute", "tracepath",
+        "traceroute", "tracepath", "route",
         "uptime", "reboot", "shutdown", "exit", "history", "time",
         "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
         "set", "env", "printenv", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
@@ -20991,6 +21050,55 @@ impl Term {
             }
         }
         out
+    }
+
+    /// Parse /proc/net/route (hex-LE fields) and render it — `classic`
+    /// picks `route -n` columns, otherwise ip-route style lines.
+    fn route_show(&mut self, classic: bool) {
+        let Ok(d) = ustd::read_all("/proc/net/route") else {
+            self.fail("route: /proc/net/route unavailable");
+            return;
+        };
+        let text = String::from_utf8_lossy(&d);
+        if classic {
+            self.emit("Kernel IP routing table");
+            self.emit("Destination     Gateway         Genmask         Flags Iface");
+        }
+        let dot = |hex: &str| -> String {
+            let v = u32::from_str_radix(hex, 16).unwrap_or(0);
+            alloc::format!(
+                "{}.{}.{}.{}",
+                v & 0xff,
+                (v >> 8) & 0xff,
+                (v >> 16) & 0xff,
+                (v >> 24) & 0xff
+            )
+        };
+        for line in text.lines().skip(1) {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 8 {
+                continue;
+            }
+            let (dev, dest, gw, mask) = (f[0], dot(f[1]), dot(f[2]), dot(f[7]));
+            if classic {
+                let flags = if gw == "0.0.0.0" { "U" } else { "UG" };
+                self.emit(&alloc::format!(
+                    "{:<15} {:<15} {:<15} {:<5} {}",
+                    dest, gw, mask, flags, dev
+                ));
+            } else {
+                let plen = mask.split('.').fold(0u32, |a, o| {
+                    a + o.parse::<u8>().unwrap_or(0).count_ones()
+                });
+                if gw == "0.0.0.0" {
+                    self.emit(&alloc::format!("{}/{} dev {}", dest, plen, dev));
+                } else if dest == "0.0.0.0" {
+                    self.emit(&alloc::format!("default via {} dev {}", gw, dev));
+                } else {
+                    self.emit(&alloc::format!("{}/{} via {} dev {}", dest, plen, gw, dev));
+                }
+            }
+        }
     }
 
     fn find_run(&mut self, dir: &str, pat: &str, want_dir: Option<bool>, maxd: usize, newer: Option<u64>) {

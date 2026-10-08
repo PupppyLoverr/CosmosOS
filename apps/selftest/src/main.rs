@@ -1867,6 +1867,55 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    check("routes", {
+        // kernel routing table via /proc/net/route — real lookup backs
+        // next_hop, so deleting the default breaks off-net sends for real
+        let mut ok = ustd::read_all("/proc/net/route")
+            .map(|d| {
+                let t = String::from_utf8_lossy(&d);
+                t.contains("eth0") && t.contains("lo") && t.contains("0202000A")
+            })
+            .unwrap_or(false);
+        if ok {
+            // del default -> remote send now unrouteable
+            ok = ustd::write_all("/proc/net/route", b"del 0.0.0.0/0").is_ok();
+            let a = ustd::socket(ustd::SOCK_DGRAM);
+            ok = ok && a >= 0
+                && ustd::sendto(a, b"x", [8, 8, 8, 8], 53) < 0;
+            // restore -> send works again
+            ok = ok
+                && ustd::write_all("/proc/net/route", b"add 0.0.0.0/0 10.0.2.2").is_ok()
+                && ustd::sendto(a, b"x", [8, 8, 8, 8], 53) == 1;
+            // add/del a real net route, visible in the table
+            ok = ok
+                && ustd::write_all("/proc/net/route", b"add 192.168.9.0/24 10.0.2.2").is_ok()
+                && ustd::read_all("/proc/net/route")
+                    .map(|d| String::from_utf8_lossy(&d).contains("0009A8C0"))
+                    .unwrap_or(false)
+                && ustd::write_all("/proc/net/route", b"del 192.168.9.0/24").is_ok()
+                && ustd::read_all("/proc/net/route")
+                    .map(|d| !String::from_utf8_lossy(&d).contains("0009A8C0"))
+                    .unwrap_or(false);
+            if a >= 0 {
+                ustd::close(a);
+            }
+        }
+        ok
+    });
+    check("sockopts2", {
+        // IP_TTL on IPPROTO_IP + SO_SNDTIMEO roundtrips
+        let a = ustd::socket(ustd::SOCK_DGRAM);
+        let mut ok = a >= 0;
+        if ok {
+            ok = ustd::setsockopt(a, 0, 2, 5) == 0 // IPPROTO_IP, IP_TTL
+                && ustd::getsockopt(a, 0, 2) == Ok(5)
+                && ustd::setsockopt(a, shared::SOL_SOCKET, shared::SO_SNDTIMEO, 500) == 0
+                && ustd::getsockopt(a, shared::SOL_SOCKET, shared::SO_SNDTIMEO) == Ok(500)
+                && ustd::sendto(a, b"t", [127, 0, 0, 1], 19999) == 1; // ttl'd send works
+            ustd::close(a);
+        }
+        ok
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64
