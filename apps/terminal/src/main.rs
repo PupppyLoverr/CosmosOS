@@ -153,6 +153,7 @@ struct Term {
     vars: alloc::collections::BTreeMap<String, String>, // shell vars ($NAME)
     prev_cwd: String,                                  // for `cd -`
     pager: Option<(Vec<String>, usize)>,               // (all lines, page top) for `more`
+    httpd: Option<ustd::TcpListener>,                  // `httpd <port>` server mode
 }
 
 impl Term {
@@ -824,6 +825,19 @@ impl Term {
                     self.emit("usage: more <file>   (Space/PgDn next, b back, q quit)");
                 }
             }
+            "httpd" => match args.first().and_then(|s| s.parse::<u16>().ok()) {
+                Some(port) => match ustd::TcpListener::bind(port) {
+                    Some(l) => {
+                        self.httpd = Some(l);
+                        self.emit(&alloc::format!(
+                            "httpd: listening on :{} — Esc to stop",
+                            port
+                        ));
+                    }
+                    None => self.emit(&alloc::format!("httpd: :{} already in use", port)),
+                },
+                None => self.emit("usage: httpd <port>  (serves a status page, Esc stops)"),
+            },
             "watch" => {
                 // watch [-n secs] <cmd...>: re-run every N secs until Esc/Enter
                 let (mut ms, mut i) = (1000u64, 0usize);
@@ -1018,6 +1032,13 @@ impl Term {
             self.dirty_all = true;
             return;
         }
+        // httpd mode: Esc stops the listener (other keys keep working)
+        if self.httpd.is_some() && k.key == KeyCode::Escape as u32 {
+            self.httpd = None; // Drop -> SYS_NET_TCP_UNLISTEN
+            self.push_line("httpd: stopped");
+            self.dirty_all = true;
+            return;
+        }
         // during watch mode, Esc or Enter stops it; other keys are ignored
         if self.watch.is_some() {
             if k.key == KeyCode::Escape as u32 || k.key == KeyCode::Enter as u32 {
@@ -1122,7 +1143,7 @@ impl Term {
             "uptime", "reboot", "shutdown", "exit", "history", "time",
             "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
             "set", "env", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
-            "dmesg", "arp",
+            "dmesg", "arp", "httpd",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
@@ -1316,6 +1337,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         capture: None,
         pipe_in: None,
         watch: None,
+        httpd: None,
         vars: alloc::collections::BTreeMap::new(),
         prev_cwd: String::new(),
         pager: None,
@@ -1355,6 +1377,31 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             _ => {}
         }
         let now = ustd::uptime_ms();
+        // httpd mode: poll for one accepted conn per loop turn
+        if let Some(l) = &t.httpd {
+            if let Some((sock, rip, rport)) = l.accept(0) {
+                let req = sock.recv(400).unwrap_or_default();
+                let line = String::from_utf8_lossy(&req);
+                let first = line.lines().next().unwrap_or("");
+                let up = ustd::uptime_ms() / 1000;
+                let body = alloc::format!(
+                    "<html><body><h1>CosmosOS</h1><p>real inbound TCP — this page is served from inside the guest</p><p>uptime {}s</p></body></html>",
+                    up
+                );
+                let resp = alloc::format!(
+                    "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.send(resp.as_bytes());
+                t.push_line(&alloc::format!(
+                    "httpd: {} <- {}.{}.{}.{}:{}",
+                    if first.is_empty() { "conn" } else { first },
+                    rip[0], rip[1], rip[2], rip[3], rport
+                ));
+                t.dirty_all = true;
+            }
+        }
         // watch mode: re-run the command, repaint with fresh output
         if let Some((cmd, ms, last)) = t.watch.clone() {
             if now - last >= ms {

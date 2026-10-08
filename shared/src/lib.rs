@@ -65,6 +65,9 @@ pub const SYS_NET_STAT: u64 = 66;      // (buf,cap) -> n | ERR  (socket table du
 pub const SYS_DF: u64 = 67;            // (ptr to [u64;2]) -> 0 | ERR  {total_bytes, free_bytes}
 pub const SYS_KLOG: u64 = 68;          // (buf,cap) -> n | ERR  kernel log ring tail
 pub const SYS_ARP: u64 = 69;           // (buf,cap) -> n | ERR  ARP cache dump
+pub const SYS_NET_TCP_LISTEN: u64 = 70;   // (lport) -> 0 | ERR  mark port listening
+pub const SYS_NET_TCP_ACCEPT: u64 = 71;   // (lport, ptr to 8B out, timeout) -> cid | ERR
+pub const SYS_NET_TCP_UNLISTEN: u64 = 72; // (lport) -> 0
 
 pub const SYS_ERR: u64 = u64::MAX;
 

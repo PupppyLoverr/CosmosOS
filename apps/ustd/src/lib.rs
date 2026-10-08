@@ -234,6 +234,42 @@ impl Drop for TcpSock {
     }
 }
 
+/// A TCP listener: mark a port, then `accept` inbound conns as TcpSock
+/// handles keyed by kernel conn id (several clients may share a port).
+pub struct TcpListener {
+    pub lport: u16,
+}
+impl TcpListener {
+    pub fn bind(lport: u16) -> Option<Self> {
+        if sc1(shared::SYS_NET_TCP_LISTEN, lport as u64) == shared::SYS_ERR {
+            None
+        } else {
+            Some(Self { lport })
+        }
+    }
+    /// Next fully-handshaken conn: (socket, peer ip, peer port).
+    pub fn accept(&self, timeout_ms: u64) -> Option<(TcpSock, [u8; 4], u16)> {
+        let mut out = [0u8; 8];
+        let cid = sc3(
+            shared::SYS_NET_TCP_ACCEPT,
+            self.lport as u64,
+            out.as_mut_ptr() as u64,
+            timeout_ms,
+        );
+        if cid == shared::SYS_ERR {
+            return None;
+        }
+        let rip: [u8; 4] = out[..4].try_into().ok()?;
+        let rport = u16::from_be_bytes([out[4], out[5]]);
+        Some((TcpSock { lport: cid as u16 }, rip, rport))
+    }
+}
+impl Drop for TcpListener {
+    fn drop(&mut self) {
+        sc1(shared::SYS_NET_TCP_UNLISTEN, self.lport as u64);
+    }
+}
+
 /// (total_bytes, free_bytes) of the data volume.
 pub fn df() -> Option<(u64, u64)> {
     let mut out = [0u64; 2];
