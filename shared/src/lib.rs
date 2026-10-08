@@ -179,6 +179,12 @@ pub const SYS_WAITID: u64 = 158; // (idtype, id, flags) -> (pid<<32)|(kind<<24)|
 pub const SYS_EXIT_GROUP: u64 = 159;   // (code) -> !  kill every thread of the mm
 pub const SYS_GETTID: u64 = 160;       // () -> tid (task id of this thread)
 pub const SYS_TGKILL: u64 = 161;       // (tgid, tid, sig) -> 0 | err
+pub const SYS_SETITIMER: u64 = 162;    // (which, init_ms, interval_ms) -> 0
+pub const SYS_GETITIMER: u64 = 163;    // (which) -> (cur_ms<<32)|int_ms
+pub const SYS_MQ_OPEN: u64 = 164;      // (name_ptr,len,maxmsg,msgsize) -> fd|err
+pub const SYS_MQ_SEND: u64 = 165;      // (fd,buf,len,prio) -> 0|err
+pub const SYS_MQ_RECV: u64 = 166;      // (fd,buf,len) -> n | prio<<32 | err
+pub const SYS_MQ_UNLINK: u64 = 167;    // (name_ptr,len) -> 0|err
 
 // ptrace request ops
 pub const PT_TRACEME: u64 = 0;
