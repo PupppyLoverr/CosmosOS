@@ -18,6 +18,10 @@ pub struct Pipe {
     pub buf: VecDeque<u8>,
     pub writers: u32,
     pub readers: u32,
+    /// A reader has been attached at least once — writes may only EPIPE
+    /// after this is true (a fifo writer opened before any reader buffers
+    /// instead, since our open doesn't rendezvous like POSIX).
+    pub readers_seen: bool,
     pub mtime: u64,
 }
 
@@ -84,7 +88,7 @@ pub fn create(path: &str) -> Result<(), i64> {
     }
     g.insert(
         String::from(path),
-        Pipe { buf: VecDeque::new(), writers: 0, readers: 0, mtime: crate::vfs::now_unix() },
+        Pipe { buf: VecDeque::new(), writers: 0, readers: 0, readers_seen: false, mtime: crate::vfs::now_unix() },
     );
     Ok(())
 }
@@ -96,6 +100,7 @@ pub fn open_role(path: &str, writer: bool) {
             p.writers += 1;
         } else {
             p.readers += 1;
+            p.readers_seen = true;
         }
     }
 }
@@ -148,14 +153,18 @@ pub fn try_read(path: &str, buf: &mut [u8]) -> TryRead {
     TryRead::WouldBlock
 }
 
-/// nonblocking push: Err(-5)=EPIPE (full, no readers),
-/// Err(-11)=EAGAIN (full, a reader may drain it -- caller re-blocks).
+/// nonblocking push: Err(-32)=EPIPE (no read end anywhere — POSIX also
+/// raises SIGPIPE in the writer), Err(-11)=EAGAIN (full, a reader may
+/// drain it -- caller re-blocks).
 pub fn try_write(path: &str, data: &[u8]) -> Result<i64, i64> {
     let mut g = PIPES.lock();
     let Some(p) = g.get_mut(path) else { return Err(-2) };
+    if p.readers == 0 && p.readers_seen {
+        return Err(-32);
+    }
     let space = PIPE_CAP.saturating_sub(p.buf.len());
     if space == 0 {
-        return Err(if p.readers == 0 { -5 } else { -11 });
+        return Err(-11);
     }
     let n = space.min(data.len());
     p.buf.extend(&data[..n]);

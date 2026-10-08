@@ -201,6 +201,26 @@ pub const SYS_OPENPT: u64 = 179;        // () -> master fd (/ptym/{id})
 pub const SYS_TCSETS: u64 = 180;        // (pty_fd, flags) -> 0|err
 pub const SYS_TCGETS: u64 = 181;        // (pty_fd) -> flags|err
 pub const SYS_PTSNAME: u64 = 182;       // (master_fd, out, len) -> 0|err
+pub const SYS_OPENAT: u64 = 183;        // (dirfd, path,len, flags) -> fd|err  AT_FDCWD
+pub const SYS_FSTATAT: u64 = 184;       // (dirfd, path,len, flags, &mut Stat) -> 0|err
+pub const SYS_FACCESSAT: u64 = 185;     // (dirfd, path,len, mode) -> 0|err
+pub const SYS_UNLINKAT: u64 = 186;      // (dirfd, path,len, flags) -> 0|err  AT_REMOVEDIR
+pub const SYS_RENAMEAT: u64 = 187;      // (odfd,opath,olen, ndfd,npath,nlen) -> 0|err
+pub const SYS_MKDIRAT: u64 = 188;       // (dirfd, path,len) -> 0|err
+pub const SYS_LINKAT: u64 = 189;        // (odfd,opath,olen, ndfd,npath,nlen) -> -38 (FAT: no hard links)
+pub const SYS_SYMLINKAT: u64 = 190;     // (target_ptr,tlen, ndfd,npath,nlen) -> 0|err
+pub const SYS_READLINKAT: u64 = 191;    // (dirfd, path,len, out,cap) -> n|err
+pub const SYS_FCHDIR: u64 = 193;        // (fd) -> 0|err   chdir to a dir fd's path
+pub const SYS_FCHMOD: u64 = 194;        // (fd, mode) -> 0|err  FAT: bit0 -> ro attr
+pub const SYS_GETDENTS: u64 = 195;      // (fd, &mut DirEntry, max) -> n|err
+pub const SYS_ACCESS: u64 = 196;        // (path,len, mode) -> 0|err
+pub const SYS_WAIT4: u64 = 197;         // (pid, opts, timeout, rusage_ptr) -> status|err
+pub const AT_FDCWD: i64 = -100;
+pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+pub const AT_REMOVEDIR: u64 = 0x200;
+pub const AT_EMPTY_PATH: u64 = 0x1000;
+pub const O_EXCL: u64 = 128;
+pub const O_PATH: u64 = 256;
 
 // ptrace request ops
 pub const PT_TRACEME: u64 = 0;

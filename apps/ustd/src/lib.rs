@@ -1770,6 +1770,169 @@ pub fn tcgets(fd: i64) -> i64 {
     sc1(shared::SYS_TCGETS, fd as u64) as i64
 }
 
+/// Dirfd-relative filesystem operations (the *at() family). `dirfd` is a
+/// real open fd whose path is the base dir, or AT_FDCWD for the task cwd.
+pub const AT_FDCWD: i64 = shared::AT_FDCWD;
+pub const AT_REMOVEDIR: u64 = shared::AT_REMOVEDIR;
+pub const AT_SYMLINK_NOFOLLOW: u64 = shared::AT_SYMLINK_NOFOLLOW;
+pub const AT_EMPTY_PATH: u64 = shared::AT_EMPTY_PATH;
+pub const O_EXCL: u64 = shared::O_EXCL;
+pub const O_PATH: u64 = shared::O_PATH;
+
+/// openat(dirfd, path, flags) -> fd. Absolute paths ignore `dirfd`.
+pub fn openat(dirfd: i64, path: &str, flags: u64) -> Result<i64, i64> {
+    let r = sc4(
+        shared::SYS_OPENAT,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        flags,
+    ) as i64;
+    if r < 0 { Err(r) } else { Ok(r) }
+}
+
+/// fstatat(dirfd, path, flags) -> Stat. AT_SYMLINK_NOFOLLOW reports the
+/// link itself; AT_EMPTY_PATH stats the dirfd's own object.
+pub fn fstatat(dirfd: i64, path: &str, flags: u64) -> Result<shared::Stat, i64> {
+    let mut st = shared::Stat { size: 0, is_dir: 0, mtime: 0, attr: 0 };
+    let r = sc5(
+        shared::SYS_FSTATAT,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        flags,
+        &mut st as *mut _ as u64,
+    ) as i64;
+    if r < 0 { Err(r) } else { Ok(st) }
+}
+
+/// faccessat(dirfd, path, mode): F_OK=0 exists, bit1=W_OK, bit2=X_OK.
+/// Returns true when access is permitted.
+pub fn faccessat(dirfd: i64, path: &str, mode: u64) -> bool {
+    sc4(
+        shared::SYS_FACCESSAT,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        mode,
+    ) as i64 == 0
+}
+
+/// access(path, mode) — faccessat against the cwd.
+pub fn access(path: &str, mode: u64) -> bool {
+    sc3(
+        shared::SYS_ACCESS,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        mode,
+    ) as i64 == 0
+}
+
+/// unlinkat(dirfd, path, flags): AT_REMOVEDIR for directories.
+pub fn unlinkat(dirfd: i64, path: &str, flags: u64) -> Result<(), i64> {
+    let r = sc4(
+        shared::SYS_UNLINKAT,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        flags,
+    ) as i64;
+    if r < 0 { Err(r) } else { Ok(()) }
+}
+
+/// renameat(olddirfd, old, newdirfd, new).
+pub fn renameat(odfd: i64, opath: &str, ndfd: i64, npath: &str) -> Result<(), i64> {
+    let packed = (odfd as u32 as u64) | ((ndfd as u32 as u64) << 32);
+    let r = sc5(
+        shared::SYS_RENAMEAT,
+        packed,
+        opath.as_ptr() as u64,
+        opath.len() as u64,
+        npath.as_ptr() as u64,
+        npath.len() as u64,
+    ) as i64;
+    if r < 0 { Err(r) } else { Ok(()) }
+}
+
+/// mkdirat(dirfd, path).
+pub fn mkdirat(dirfd: i64, path: &str) -> Result<(), i64> {
+    let r = sc3(
+        shared::SYS_MKDIRAT,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+    ) as i64;
+    if r < 0 { Err(r) } else { Ok(()) }
+}
+
+/// symlinkat(target, linkdirfd, linkpath) — writes the LNK> body + attr.
+pub fn symlinkat(target: &str, ndfd: i64, link: &str) -> Result<(), i64> {
+    let r = sc5(
+        shared::SYS_SYMLINKAT,
+        target.as_ptr() as u64,
+        target.len() as u64,
+        ndfd as u64,
+        link.as_ptr() as u64,
+        link.len() as u64,
+    ) as i64;
+    if r < 0 { Err(r) } else { Ok(()) }
+}
+
+/// readlinkat(dirfd, path): raw symlink target.
+pub fn readlinkat(dirfd: i64, path: &str) -> Option<String> {
+    let mut b = [0u8; 256];
+    let n = sc5(
+        shared::SYS_READLINKAT,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        b.as_mut_ptr() as u64,
+        b.len() as u64,
+    ) as i64;
+    if n < 0 { None } else { Some(String::from_utf8_lossy(&b[..n as usize]).into_owned()) }
+}
+
+/// fchdir(fd): set cwd to the directory an fd refers to. ENOTDIR on files.
+pub fn fchdir(fd: i64) -> i64 {
+    sc1(shared::SYS_FCHDIR, fd as u64) as i64
+}
+
+/// fchmod(fd, mode): FAT mapping — clearing owner-write sets the ro attr.
+pub fn fchmod(fd: i64, mode: u64) -> i64 {
+    sc2(shared::SYS_FCHMOD, fd as u64, mode) as i64
+}
+
+/// getdents(fd): real directory listing through a directory fd.
+pub fn getdents(fd: i64, max: usize) -> Option<alloc::vec::Vec<shared::DirEntry>> {
+    let mut v: alloc::vec::Vec<shared::DirEntry> = alloc::vec::Vec::with_capacity(max);
+    let n = sc3(
+        shared::SYS_GETDENTS,
+        fd as u64,
+        v.as_mut_ptr() as u64,
+        max as u64,
+    ) as i64;
+    if n < 0 {
+        None
+    } else {
+        unsafe { v.set_len(n as usize) };
+        Some(v)
+    }
+}
+
+/// wait4(pid, opts, timeout_ms) -> (status, rusage) — like waitpid but
+/// also returns the child's {cpu_ticks, ticks} rusage pair.
+pub fn wait4(pid: i64, opts: u64, timeout_ms: u64) -> (i64, Option<(u64, u64)>) {
+    let mut ru = [0u64; 2];
+    let r = sc4(
+        shared::SYS_WAIT4,
+        pid as u64,
+        opts,
+        timeout_ms,
+        ru.as_mut_ptr() as u64,
+    ) as i64;
+    (r, if r >= 0 { Some((ru[0], ru[1])) } else { None })
+}
+
 /// pidfd_send_signal: send `sig` to the task behind `pidfd` (0 = probe).
 pub fn pidfd_send_signal(pidfd: i32, sig: u64) -> i64 {
     sc2(shared::SYS_PIDFD_SIGNAL, pidfd as u64, sig) as i64
