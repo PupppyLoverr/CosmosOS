@@ -256,6 +256,19 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
     fs.rename(&f, &t2).map_err(err_to_i64)
 }
 
+/// Whole-file write without the fd table — for kernel-side producers
+/// (screenshots). Path is normalized against the caller's cwd.
+pub fn write_all_path(path: &str, data: &[u8]) -> Result<(), i64> {
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let full = normalize(&cwd, path);
+    let mut g = FS.lock();
+    let fs = g.as_mut().ok_or(-1i64)?;
+    if !fs.exists(&full) {
+        fs.create_file(&full).map_err(err_to_i64)?;
+    }
+    fs.write_file(&full, data).map_err(err_to_i64)
+}
+
 /// (total_bytes, free_bytes) for the mounted volume.
 pub fn df() -> Option<(u64, u64)> {
     let mut g = FS.lock();

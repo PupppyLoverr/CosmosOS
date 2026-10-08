@@ -476,7 +476,7 @@ impl Term {
                     "          a | b   cmd > file   cmd >> file   watch [-n s] cmd",
                     "          df  (volume usage)  more  cal  tree  seq  sleep  sh  calc  ntp",
                     "          httpd <port>  arp  dmesg  nc <ip> <port>  true  false",
-                    "          fserve <port> <file>  fget <ip> <port> <out>",
+                    "          fserve <port> <file>  fget <ip> <port> <out>  shot [path]",
                     "          ops: a ; b   a && b   a || b",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
@@ -938,6 +938,24 @@ impl Term {
                 }
                 None => self.emit("df: no volume mounted"),
             },
+            "shot" => {
+                // shot [path]: kernel dumps the live framebuffer to a P6 PPM
+                let path = match args.first() {
+                    Some(p) => String::from(*p),
+                    None => (1..100)
+                        .map(|i| alloc::format!("/shot-{}.ppm", i))
+                        .find(|p| ustd::stat(p).is_err())
+                        .unwrap_or_else(|| String::from("/shot.ppm")),
+                };
+                if ustd::shot(&path) {
+                    match ustd::stat(&path) {
+                        Ok(st) => self.emit(&alloc::format!("shot: {} ({}B)", path, st.size)),
+                        Err(_) => self.emit(&alloc::format!("shot: {}", path)),
+                    }
+                } else {
+                    self.fail("shot: failed (no framebuffer?)");
+                }
+            }
             "more" => {
                 let content = match args.first() {
                     Some(p) => match ustd::read_all(p) {
@@ -1406,6 +1424,7 @@ impl Term {
             "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
             "set", "env", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
             "dmesg", "arp", "httpd", "ntp", "nc", "fserve", "fget", "true", "false",
+            "shot",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];

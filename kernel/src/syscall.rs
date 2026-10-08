@@ -277,6 +277,19 @@ pub fn dispatch(ctx: &mut CpuContext) {
             net::tcp_unlisten(a1 as u16);
             0
         }
+        shared::SYS_SHOT => match copy_in(a1, a2.min(256)) {
+            Some(p) => match core::str::from_utf8(&p) {
+                Ok(path) => match fb::snapshot_ppm() {
+                    Some(ppm) => match vfs::write_all_path(path, &ppm) {
+                        Ok(()) => 0,
+                        Err(_) => ERR,
+                    },
+                    None => ERR,
+                },
+                Err(_) => ERR,
+            },
+            None => ERR,
+        },
         shared::SYS_CLIP_SET => match copy_in(a1, a2.min(1 << 16)) {
             Some(d) => {
                 *CLIPBOARD.lock() = d;

@@ -301,6 +301,12 @@ pub fn klog() -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// Kernel framebuffer screenshot: writes a P6 PPM of the live display
+/// to `path` on the data volume.
+pub fn shot(path: &str) -> bool {
+    sc3(shared::SYS_SHOT, path.as_ptr() as u64, path.len() as u64, 0) != shared::SYS_ERR
+}
+
 /// `netstat` dump of the kernel socket tables.
 pub fn net_stat() -> String {
     let mut buf = alloc::vec![0u8; 4096];

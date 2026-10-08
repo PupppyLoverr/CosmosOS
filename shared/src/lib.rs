@@ -68,6 +68,7 @@ pub const SYS_ARP: u64 = 69;           // (buf,cap) -> n | ERR  ARP cache dump
 pub const SYS_NET_TCP_LISTEN: u64 = 70;   // (lport) -> 0 | ERR  mark port listening
 pub const SYS_NET_TCP_ACCEPT: u64 = 71;   // (lport, ptr to 8B out, timeout) -> cid | ERR
 pub const SYS_NET_TCP_UNLISTEN: u64 = 72; // (lport) -> 0
+pub const SYS_SHOT: u64 = 73;             // (path_ptr,path_len) -> 0 | ERR  fb -> PPM file
 
 pub const SYS_ERR: u64 = u64::MAX;
 
