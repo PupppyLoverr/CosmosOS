@@ -4021,6 +4021,11 @@ enum SedK {
     Get,    // g: pattern space = hold space
     GetAp,  // G: append hold space to pattern space
     Swap,   // x: exchange pattern and hold spaces
+    Next,   // N: append the next input line to the pattern space
+    NextP,  // n: flush the pattern space, then fetch the next input line
+    PrintF, // P: print up to the first embedded newline
+    DelF,   // D: delete up to the first newline, restart the cycle
+    List,   // l: print the pattern space unambiguously (escaped + $)
 }
 
 /// Parse one sed address: N | $ | /re/ (a `\/` inside the regex stays an
@@ -4200,7 +4205,7 @@ fn sed_parse(
                 ));
             }
             b'p' | b'd' | b'q' | b'=' | b'h' | b'H' | b'g' | b'G'
-            | b'x' => {
+            | b'x' | b'N' | b'n' | b'P' | b'D' | b'l' => {
                 let k = match b[i] {
                     b'p' => SedK::P,
                     b'd' => SedK::D,
@@ -4210,6 +4215,11 @@ fn sed_parse(
                     b'g' => SedK::Get,
                     b'G' => SedK::GetAp,
                     b'x' => SedK::Swap,
+                    b'N' => SedK::Next,
+                    b'n' => SedK::NextP,
+                    b'P' => SedK::PrintF,
+                    b'D' => SedK::DelF,
+                    b'l' => SedK::List,
                     _ => SedK::Q,
                 };
                 i += 1;
@@ -22761,13 +22771,21 @@ impl Term {
                 let mut rstate: Vec<bool> =
                     alloc::vec![false; cmds.len()];
                 let mut hold = String::new();
-                'outer: for (i, l0) in lines.iter().enumerate() {
-                    let ln = i + 1;
-                    let last = ln == nlines;
-                    let mut cur = l0.clone();
+                // `N` consumes following lines, `D` restarts the cycle —
+                // the input position is a manual index
+                let mut li = 0usize;
+                'outer: while li < lines.len() {
+                    let mut ln = li + 1;
+                    let mut last = ln == nlines;
+                    let mut cur = lines[li].clone();
                     let mut pre: Vec<String> = Vec::new();
                     let mut post: Vec<String> = Vec::new();
                     let mut print = !quiet;
+                    // `d`/`D`-without-\n kill the cycle: pending `i` text
+                    // and the pattern space are dropped, queued `a` text
+                    // still flushes
+                    let mut kill = false;
+                    'cycle: loop {
                     for (ci, (addr, neg, k)) in cmds.iter().enumerate() {
                         let inr = match addr {
                             None => true,
@@ -22869,11 +22887,87 @@ impl Term {
                             SedK::LineNo => out.push(alloc::format!("{}", ln)),
                             SedK::P => out.push(cur.clone()),
                             SedK::D => {
-                                print = false;
+                                kill = true;
                                 break;
                             }
                             SedK::A(t) => post.push(t.clone()),
                             SedK::I(t) => pre.push(t.clone()),
+                            // N: pull the next input line into the
+                            // pattern space (GNU: at EOF sed exits
+                            // without printing the pending space)
+                            SedK::Next => {
+                                if li + 1 < lines.len() {
+                                    li += 1;
+                                    ln = li + 1;
+                                    last = ln == nlines;
+                                    cur.push('\n');
+                                    cur.push_str(&lines[li]);
+                                } else {
+                                    break 'outer;
+                                }
+                            }
+                            // n: print the pattern space (when auto-
+                            // print is on), then replace it with the
+                            // next input line; at EOF sed exits
+                            SedK::NextP => {
+                                if print {
+                                    out.push(cur.clone());
+                                }
+                                if li + 1 < lines.len() {
+                                    li += 1;
+                                    ln = li + 1;
+                                    last = ln == nlines;
+                                    cur = lines[li].clone();
+                                    print = !quiet;
+                                } else {
+                                    break 'outer;
+                                }
+                            }
+                            // l: print the pattern space unambiguously:
+                            // escapes and control bytes shown escaped,
+                            // `$` marks the end
+                            SedK::List => {
+                                let mut s = String::new();
+                                for ch in cur.chars() {
+                                    match ch {
+                                        '\\' => s.push_str("\\\\"),
+                                        '\n' => s.push_str("\\n"),
+                                        '\t' => s.push_str("\\t"),
+                                        '\r' => s.push_str("\\r"),
+                                        c if (c as u32) < 0x20
+                                            || c as u32 == 0x7f =>
+                                        {
+                                            s.push_str(&alloc::format!(
+                                                "\\{:03o}",
+                                                c as u32
+                                            ));
+                                        }
+                                        c => s.push(c),
+                                    }
+                                }
+                                s.push('$');
+                                out.push(s);
+                            }
+                            // P: print the pattern space up to the
+                            // first embedded newline
+                            SedK::PrintF => out.push(match cur.find('\n')
+                            {
+                                Some(p) => String::from(&cur[..p]),
+                                None => cur.clone(),
+                            }),
+                            // D: delete through the first newline and
+                            // restart the cycle on what remains; with
+                            // no newline it works like `d`
+                            SedK::DelF => match cur.find('\n') {
+                                Some(p) => {
+                                    cur = String::from(&cur[p + 1..]);
+                                    continue 'cycle;
+                                }
+                                None => {
+                                    kill = true;
+                                    break 'cycle;
+                                }
+                            },
                             // hold space: h/H set/append it from the
                             // pattern space, g/G the reverse, x swaps
                             SedK::Hold => hold = cur.clone(),
@@ -22925,15 +23019,27 @@ impl Term {
                             }
                         }
                     }
-                    for l in pre {
-                        out.push(l);
+                    break 'cycle;
                     }
-                    if print {
-                        out.push(cur);
+                    // `i` text rides with the pattern space (a `d`/`D`
+                    // cycle-kill drops it); `a` text always flushes at
+                    // the end of the cycle — even a killed one
+                    if kill {
+                        for l in post {
+                            out.push(l);
+                        }
+                    } else {
+                        for l in pre {
+                            out.push(l);
+                        }
+                        if print {
+                            out.push(cur);
+                        }
+                        for l in post {
+                            out.push(l);
+                        }
                     }
-                    for l in post {
-                        out.push(l);
-                    }
+                    li += 1;
                 }
                 let _ = quit;
                 if inplace {
