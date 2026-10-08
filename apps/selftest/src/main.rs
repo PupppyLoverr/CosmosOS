@@ -4874,6 +4874,58 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::remove("/sys/fs/cgroup/t1");
         ok
     });
+    check("cgroup-mem", {
+        // memory.max is enforced for real: the child eats pages until
+        // the group's rss crosses the cap and the kernel OOM-kills it —
+        // waitpid reports the SIGKILL exit (137) and memory.events
+        // counts the kill.
+        let mut ok = true;
+        ok = ok && ustd::mkdir("/sys/fs/cgroup/m1").is_ok();
+        ok = ok && ustd::write_all(
+            "/sys/fs/cgroup/m1/memory.max",
+            b"4194304",
+        ).is_ok();
+        match ustd::fork() {
+            0 => {
+                // ~16MB of touched anon pages — far over the 4MB cap
+                let mut v = alloc::vec![0xAAu8; 16 * 1024 * 1024];
+                v[0] = 1;
+                ustd::exit(0); // unreachable once the cap bites
+            }
+            p if p > 0 => {
+                ok = ok && ustd::write_all(
+                    "/sys/fs/cgroup/m1/cgroup.procs",
+                    alloc::format!("{}", p).as_bytes(),
+                ).is_ok();
+                let code = ustd::waitpid(p as u32, 20_000).unwrap_or(-1);
+                ok = ok && code == 128 + 9;
+                let ev = ustd::read_all("/sys/fs/cgroup/m1/memory.events")
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                ok = ok && ev.contains("oom_kill 1");
+                // peak rode up to ~the cap before the kill
+                let peak: u64 = ustd::read_all("/sys/fs/cgroup/m1/memory.peak")
+                    .map(|b| String::from_utf8_lossy(&b).trim().parse().unwrap_or(0))
+                    .unwrap_or(0);
+                ok = ok && peak >= 4 * 1024 * 1024 - 64 * 4096;
+            }
+            _ => ok = false,
+        }
+        let _ = ustd::remove("/sys/fs/cgroup/m1");
+        ok
+    });
+    check("cgroup-weight", {
+        // cpu.weight is read back verbatim and clamps to 1..=10000
+        let mut ok = true;
+        ok = ok && ustd::mkdir("/sys/fs/cgroup/w1").is_ok();
+        ok = ok && ustd::write_all("/sys/fs/cgroup/w1/cpu.weight", b"8000").is_ok();
+        ok = ok && ustd::read_all("/sys/fs/cgroup/w1/cpu.weight")
+            .map(|b| String::from_utf8_lossy(&b).trim() == "8000")
+            .unwrap_or(false);
+        ok = ok && ustd::write_all("/sys/fs/cgroup/w1/cpu.weight", b"99999").is_err();
+        let _ = ustd::remove("/sys/fs/cgroup/w1");
+        ok
+    });
     check("pid-ns", {
         // unshare(CLONE_NEWPID) + fork: the child is init of a fresh
         // pid space (getpid()==1, invisible parent), its own child is 2.
