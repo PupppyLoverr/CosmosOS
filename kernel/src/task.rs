@@ -122,6 +122,7 @@ pub struct Task {
     pub pgid: u32,              // process-group id (kill(-pgid) targets it)
     pub sid: u32,               // session id (setsid detaches)
     pub ctty: u64,              // controlling tty: /dev/pts/{id} index (0 = none)
+    pub ctid_va: u64,           // clear_child_tid: user u64 zeroed+futex-woken on exit
     pub pdeathsig: u8,          // PR_SET_PDEATHSIG: signal on parent's death
     pub stop_notified: bool,    // this stop already reported to waitpid
     pub stop_sig: u8,           // signal that stopped it (for WUNTRACED)
@@ -300,6 +301,7 @@ pub fn init() {
         pgid: 0,
         sid: 0,
         ctty: 0,
+        ctid_va: 0,
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
@@ -791,6 +793,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         pgid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.pgid).unwrap_or(0),
         sid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.sid).unwrap_or(0),
         ctty: s.tasks.iter().find(|t| t.id == parent).map(|t| t.ctty).unwrap_or(0),
+        ctid_va: 0,
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
@@ -892,6 +895,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         pgid: 0,
         sid: 0,
         ctty: 0,
+        ctid_va: 0,
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
@@ -923,7 +927,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
 /// the pml4 (mm refcount +1) but gets its own kernel stack and a private
 /// 256KiB user-stack slot in the thread arena, demand-grown on fault.
 /// (entry, arg): the thread starts at `entry` with `arg` in rdi.
-pub fn clone_user(entry: u64, arg: u64, tls: u64) -> Option<u32> {
+pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
     // RLIMIT_NPROC: live user-task count against the caller's limit
     {
         let g = SCHED.lock();
@@ -1069,6 +1073,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64) -> Option<u32> {
         pgid: s.tasks[s.cur].pgid,
         sid: s.tasks[s.cur].sid,
         ctty: s.tasks[s.cur].ctty,
+        ctid_va: ctid,
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
@@ -1094,6 +1099,12 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64) -> Option<u32> {
         sig: s.tasks[s.cur].sig.for_thread(),
     };
     mm_inc(pml4.start_address().as_u64());
+    if ctid != 0 {
+        // CLONE_CHILD_SETTID: the tid lands at the child's ctid address
+        if let Some(pa) = crate::elf::translate_user(pml4, ctid) {
+            unsafe { *(crate::mem::phys_to_virt(pa) as *mut u64) = pid as u64 };
+        }
+    }
     s.tasks.push(Box::new(t));
     if tls != 0 {
         // CLONE_SETTLS contract: store the child tid at fs:8 — same mm,
@@ -1638,6 +1649,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         pgid: cur.pgid,
         sid: cur.sid,
         ctty: cur.ctty,
+        ctid_va: 0,
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
@@ -2014,6 +2026,25 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
             }
         }
         t.robust_list = 0;
+    }
+    // clear_child_tid: a joiner futex-waits on this word — write 0 and
+    // wake it inline (SCHED already held; futex_wake would self-deadlock)
+    if t.ctid_va != 0 {
+        if let Some(pml4) = t.pml4 {
+            if let Some(pa) = crate::elf::translate_user(pml4, t.ctid_va) {
+                let w = crate::mem::phys_to_virt(pa) as *mut u64;
+                unsafe { *w = 0 };
+                for o in s.tasks.iter_mut() {
+                    if o.wait_futex == pa {
+                        o.wait_futex = 0;
+                        if o.state == State::Blocked {
+                            o.state = State::Running;
+                        }
+                    }
+                }
+            }
+        }
+        t.ctid_va = 0;
     }
     // thread teardown: while mm peers still run on this pml4, unmap the
     // dead task's stack region — clone_user's slot scan can reuse it and

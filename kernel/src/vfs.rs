@@ -766,6 +766,37 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
     Ok(())
 }
 
+/// renameat2(2): `flags` = RENAME_NOREPLACE (fail -17 if `to` exists) or
+/// RENAME_EXCHANGE (swap two live names). The exchange is done through a
+/// per-pid scratch name — FAT rename preserves the directory entry, so both
+/// files' data and metadata survive the swap.
+pub fn rename2(from: &str, to: &str, flags: u64) -> Result<(), i64> {
+    match flags {
+        0 => rename(from, to),
+        shared::RENAME_NOREPLACE => {
+            let cwd = task::with_current(|t| t.cwd.clone());
+            if stat_path(&normalize(&cwd, to)).is_ok() {
+                return Err(-17); // EEXIST
+            }
+            rename(from, to)
+        }
+        shared::RENAME_EXCHANGE => {
+            let cwd = task::with_current(|t| t.cwd.clone());
+            let f = normalize(&cwd, from);
+            let t2 = normalize(&cwd, to);
+            if stat_path(&f).is_err() || stat_path(&t2).is_err() {
+                return Err(-2); // ENOENT: both names must exist
+            }
+            let tmp = alloc::format!("/.rn2-swap-{}", task::current_id());
+            rename(&f, &tmp)?;
+            rename(&t2, &f)?;
+            rename(&tmp, &t2)?;
+            Ok(())
+        }
+        _ => Err(-22), // EINVAL
+    }
+}
+
 /// Resize a filesystem file to `len` (pad zeros or cut) — backs ftruncate(2).
 /// Pseudo-fs objects and pipes reject with -22 like a real fd-based truncate.
 pub fn truncate_path(path: &str, len: u64) -> Result<(), i64> {

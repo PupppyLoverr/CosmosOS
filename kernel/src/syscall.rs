@@ -189,7 +189,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_SLEEP_MS => sys_sleep(ctx, a1),
         shared::SYS_MMAP => sys_mmap(a1, a2, a3),
         shared::SYS_MMAP_FILE => sys_mmap_file(a1, a2, a3),
-        shared::SYS_CLONE => match task::clone_user(a1, a2, a3) {
+        shared::SYS_CLONE => match task::clone_user(a1, a2, a3, a4) {
             Some(pid) => pid as u64,
             None => ERR,
         },
@@ -765,10 +765,18 @@ pub fn dispatch(ctx: &mut CpuContext) {
         }
         shared::SYS_PSELECT => sys_pselect(ctx, a1, a2, a3, a4, a5),
         shared::SYS_DUP3 => {
-            if a3 != 0 {
-                ERR // no CLOEXEC support — nonzero flags are EINVAL
+            if a3 & !shared::O_CLOEXEC != 0 {
+                (-22i64) as u64 // EINVAL: dup3 only accepts O_CLOEXEC
             } else {
-                sys_dup2(a1, a2)
+                let r = sys_dup2(a1, a2);
+                if r != ERR && a3 != 0 {
+                    task::with_current(|t| {
+                        if let Some(Some(f)) = t.fds.get_mut(a2 as usize) {
+                            f.flags |= shared::O_CLOEXEC;
+                        }
+                    });
+                }
+                r
             }
         }
         shared::SYS_SCHED_YIELD => {
@@ -783,6 +791,76 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 block_reenter(ctx, dl, 0)
             } else {
                 0
+            }
+        }
+        shared::SYS_SET_TID_ADDRESS => task::with_current(|t| {
+            t.ctid_va = a1;
+            t.id as u64
+        }),
+        shared::SYS_PIPE2 => sys_pipe_flags(a1 & (shared::O_NONBLOCK | shared::O_CLOEXEC)),
+        shared::SYS_EVENTFD2 => {
+            // a2: EFD_SEMAPHORE|EFD_NONBLOCK|EFD_CLOEXEC
+            let sem = if a2 & 1 != 0 { 1u32 } else { 0u32 };
+            let Ok(path) = crate::eventfd::create(a1, sem) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let fl = a2 & (shared::EFD_NONBLOCK | shared::EFD_CLOEXEC);
+            task::with_current(|t| {
+                let Some(fd) = alloc_slot(t) else { return ERR };
+                t.fds[fd] = Some(task::FileDesc {
+                    path,
+                    pos: 0,
+                    flags: fl,
+                });
+                fd as u64
+            })
+        }
+        shared::SYS_RENAMEAT2 => {
+            // 7 args don't fit the register ABI: a1 points at a u64[7]
+            // {odfd, optr, olen, ndfd, nptr, nlen, flags}
+            let Some(args) = copy_in(a1, 56) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let rd = |i: usize| u64::from_le_bytes(args[i * 8..i * 8 + 8].try_into().unwrap());
+            let (o, n) = (
+                resolve_at(rd(0) as u32 as i32 as i64, rd(1), rd(2)),
+                resolve_at(rd(3) as u32 as i32 as i64, rd(4), rd(5)),
+            );
+            match (o, n) {
+                (Some(o), Some(n)) => vfs::rename2(&o, &n, rd(6))
+                    .map(|_| 0)
+                    .unwrap_or_else(|e| e as u64),
+                _ => ERR,
+            }
+        }
+        shared::SYS_UTIMENSAT => {
+            // (dirfd, path, plen, times[4u64]|0, flags); times = {atime, mtime}
+            // each {sec, nsec}. FAT32 stores mtime at 2s granularity — atime
+            // is accepted and discarded like other coarse-fs fields.
+            let p = if a3 == 0 && a5 & shared::AT_EMPTY_PATH != 0 {
+                task::with_current(|t| match t.fds.get(a1 as usize) {
+                    Some(Some(f)) => Some(f.path.clone()),
+                    _ => None,
+                })
+            } else {
+                resolve_at(a1 as i64, a2, a3)
+            };
+            let secs = if a4 == 0 {
+                vfs::now_unix()
+            } else {
+                match copy_in(a4, 32) {
+                    Some(t) => u64::from_le_bytes(t[16..24].try_into().unwrap()),
+                    None => {
+                        ctx.rax = ERR;
+                        return;
+                    }
+                }
+            };
+            match p {
+                Some(p) => vfs::utime(&p, secs).map(|_| 0).unwrap_or_else(|e| e as u64),
+                None => ERR,
             }
         }
         shared::SYS_GETTIMEOFDAY => {
@@ -1273,7 +1351,12 @@ pub fn dispatch(ctx: &mut CpuContext) {
             match a2 {
                 shared::F_DUPFD => {
                     let Some(Some(src)) = t.fds.get(i) else { return ERR };
-                    let nf = task::FileDesc { path: src.path.clone(), pos: src.pos, flags: src.flags };
+                    // POSIX: dup clears CLOEXEC on the new descriptor
+                    let nf = task::FileDesc {
+                        path: src.path.clone(),
+                        pos: src.pos,
+                        flags: src.flags & !shared::O_CLOEXEC,
+                    };
                     let mut s = a3 as usize;
                     while s < t.fds.len() && t.fds[s].is_some() {
                         s += 1;
@@ -1304,6 +1387,21 @@ pub fn dispatch(ctx: &mut CpuContext) {
                         _ => ERR,
                     }
                 }
+                shared::F_GETFD => match t.fds.get(i) {
+                    Some(Some(f)) => (f.flags & shared::O_CLOEXEC != 0) as u64,
+                    _ => ERR,
+                },
+                shared::F_SETFD => match t.fds.get_mut(i) {
+                    Some(Some(f)) => {
+                        if a3 & 1 != 0 {
+                            f.flags |= shared::O_CLOEXEC;
+                        } else {
+                            f.flags &= !shared::O_CLOEXEC;
+                        }
+                        0
+                    }
+                    _ => ERR,
+                },
                 _ => ERR,
             }
         }),
@@ -2696,9 +2794,14 @@ fn alloc_slot(t: &mut task::Task) -> Option<usize> {
     Some(t.fds.len() - 1)
 }
 
-/// SYS_PIPE: an anonymous pipe bound to two fresh fds in the caller's
-/// table — read end + write end. Returns rfd | wfd<<32.
+/// SYS_PIPE/SYS_PIPE2: an anonymous pipe bound to two fresh fds in the
+/// caller's table — read end + write end. Returns rfd | wfd<<32.
+/// `flags` = O_NONBLOCK|O_CLOEXEC applied to both ends (pipe2).
 fn sys_pipe() -> u64 {
+    sys_pipe_flags(0)
+}
+
+fn sys_pipe_flags(fl: u64) -> u64 {
     let Ok(path) = crate::pipes::create_anon() else {
         return ERR;
     };
@@ -2707,13 +2810,14 @@ fn sys_pipe() -> u64 {
         t.fds[rfd] = Some(task::FileDesc {
             path: path.clone(),
             pos: 0,
-            flags: shared::O_RDONLY,
+            flags: shared::O_RDONLY | fl,
         });
         let Some(wfd) = alloc_slot(t) else { return ERR; };
         t.fds[wfd] = Some(task::FileDesc {
             path: path.clone(),
             pos: 0,
-            flags: shared::O_TRUNC, // pipes count TRUNC|APPEND|WRONLY as writer
+            // pipes count TRUNC|APPEND|WRONLY as writer
+            flags: shared::O_TRUNC | fl,
         });
         rfd as u64 | ((wfd as u64) << 32)
     });
@@ -2734,13 +2838,14 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
         });
         return if held { newfd } else { ERR };
     }
-    let f = match task::with_current(|t| match t.fds.get(oldfd as usize) {
+    let mut f = match task::with_current(|t| match t.fds.get(oldfd as usize) {
         Some(Some(f)) => Some(f.clone()),
         _ => None,
     }) {
         Some(f) => f,
         None => return ERR,
     };
+    f.flags &= !shared::O_CLOEXEC; // a dup'ed descriptor is never cloexec
     // close the occupying fd first so pipe roles stay honest
     vfs::close(newfd as i64);
     vfs::acquire_desc(&f);
@@ -3621,7 +3726,24 @@ fn sys_execve(ctx: &mut CpuContext, pptr: u64, plen: u64, aptr: u64, alen: u64) 
     let args = String::from(
         String::from_utf8_lossy(&ab).trim_matches('\0'),
     );
+    // snapshot CLOEXEC descriptors first: on success they must not reach
+    // the new image (POSIX exec closes them); on failure nothing changes
+    let clo: Vec<usize> = task::with_current(|t| {
+        t.fds
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                f.as_ref()
+                    .map(|f| f.flags & shared::O_CLOEXEC != 0)
+                    .unwrap_or(false)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    });
     if task::exec_current(ctx, &path, &args) {
+        for i in clo {
+            vfs::close(i as i64);
+        }
         0 // unreachable in practice — the frame is already the new image's
     } else {
         ERR
