@@ -11724,6 +11724,7 @@ impl Term {
                 let update = args.iter().any(|a| a.starts_with('-') && a.contains('u'));
                 let verb = args.iter().any(|a| a.starts_with('-') && a.contains('v'));
                 let pres = args.iter().any(|a| a.starts_with('-') && a.contains('p'));
+                let parents = args.iter().any(|a| *a == "--parents");
                 let pos: Vec<&str> = args
                     .iter()
                     .filter(|a| !a.starts_with('-'))
@@ -11731,6 +11732,29 @@ impl Term {
                     .collect();
                 match (pos.first(), pos.get(1)) {
                     (Some(f), Some(t)) => {
+                        // --parents: the destination is dst-dir + the
+                        // source's path (leading slashes stripped like GNU)
+                        if parents {
+                            let rel = f.trim_start_matches('/');
+                            let dst = alloc::format!(
+                                "{}/{}",
+                                t.trim_end_matches('/'),
+                                rel
+                            );
+                            if let Some(dp) = dst.rfind('/') {
+                                let mut acc = String::new();
+                                for seg in dst[..dp]
+                                    .split('/')
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    acc.push('/');
+                                    acc.push_str(seg);
+                                    let _ = ustd::mkdir(&acc);
+                                }
+                            }
+                            self.cp_any(f, &dst, rec, verb, pres);
+                            return;
+                        }
                         // -P/-d: copy a symlink verbatim instead of its target
                         if nolink {
                             if let Some(tgt) = ustd::readlink(f) {
@@ -12898,15 +12922,52 @@ impl Term {
                 }
             }
             "mktemp" => {
-                // create a unique empty file under /tmp, print its name
-                let _ = ustd::mkdir("/tmp");
+                // mktemp [-d] [-u] [-p DIR] [TEMPLATE]: unique name from a
+                // random base; -d makes a directory, -u prints the name
+                // without creating, TEMPLATE's trailing X's are replaced
+                let mut dirmode = false;
+                let mut dry = false;
+                let mut dir = "/tmp";
+                let mut tmpl: Option<&str> = None;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-d" => dirmode = true,
+                        "-u" | "--dry-run" => dry = true,
+                        "-p" | "--tmpdir" => {
+                            dir = args.get(i + 1).copied().unwrap_or("/tmp");
+                            i += 1;
+                        }
+                        a if !a.starts_with('-') => tmpl = Some(a),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let _ = ustd::mkdir(dir);
+                let mkname = |n: u64| -> String {
+                    match tmpl {
+                        // trailing X's become the random digits
+                        Some(t) if t.ends_with('X') => {
+                            let keep = t.trim_end_matches('X');
+                            alloc::format!("{}{:06}", keep, n % 1_000_000)
+                        }
+                        Some(t) => {
+                            alloc::format!("{}.{:06}", t, n % 1_000_000)
+                        }
+                        None => alloc::format!("{}/tmp{:06}", dir, n % 1_000_000),
+                    }
+                };
                 for _ in 0..100 {
-                    let p = alloc::format!(
-                        "/tmp/tmp{:06}",
-                        ustd::rand_u64().unwrap_or(0) % 1_000_000
-                    );
+                    let p = mkname(ustd::rand_u64().unwrap_or(0));
                     if ustd::stat(&p).is_err() {
-                        match ustd::write_all(&p, b"") {
+                        let r = if dry {
+                            Ok(())
+                        } else if dirmode {
+                            ustd::mkdir(&p)
+                        } else {
+                            ustd::write_all(&p, b"")
+                        };
+                        match r {
                             Ok(()) => {
                                 self.emit(&p);
                                 break;
@@ -14020,6 +14081,40 @@ impl Term {
                                 }
                                 Some('z') => out.push_str("+0000"),
                                 Some('Z') => out.push_str("UTC"),
+                                Some('I') => out.push_str(&alloc::format!(
+                                    "{:02}",
+                                    if d.hour % 12 == 0 { 12 } else { d.hour % 12 }
+                                )),
+                                Some('k') => out.push_str(&alloc::format!(
+                                    "{:>2}",
+                                    d.hour
+                                )),
+                                Some('l') => out.push_str(&alloc::format!(
+                                    "{:>2}",
+                                    if d.hour % 12 == 0 { 12 } else { d.hour % 12 }
+                                )),
+                                Some('p') => out.push_str(if d.hour < 12 {
+                                    "AM"
+                                } else {
+                                    "PM"
+                                }),
+                                Some('r') => out.push_str(&alloc::format!(
+                                    "{:02}:{:02}:{:02} {}",
+                                    if d.hour % 12 == 0 { 12 } else { d.hour % 12 },
+                                    d.minute,
+                                    d.second,
+                                    if d.hour < 12 { "AM" } else { "PM" }
+                                )),
+                                Some('R') => out.push_str(&alloc::format!(
+                                    "{:02}:{:02}",
+                                    d.hour, d.minute
+                                )),
+                                Some('D') => out.push_str(&alloc::format!(
+                                    "{:02}/{:02}/{:02}",
+                                    d.month, d.day, d.year % 100
+                                )),
+                                Some('n') => out.push('\n'),
+                                Some('t') => out.push('\t'),
                                 Some('%') => out.push('%'),
                                 Some(o) => {
                                     out.push('%');
@@ -17632,6 +17727,9 @@ impl Term {
                 let unified = args.iter().any(|a| *a == "-u");
                 let side = args.iter().any(|a| *a == "-y" || *a == "--side-by-side");
                 let brief = args.iter().any(|a| *a == "-q" || *a == "--brief");
+                let rpt_id = args.iter().any(|a| {
+                    *a == "-s" || *a == "--report-identical-files"
+                });
                 let ci = args.iter().any(|a| *a == "-i");
                 let nows = args.iter().any(|a| *a == "-w");
                 let noblank = args.iter().any(|a| *a == "-B");
@@ -17680,7 +17778,12 @@ impl Term {
                                     self.last_ok = false;
                                 }
                             } else {
-                                if out.is_empty() {
+                                if out.is_empty() && rpt_id {
+                                    self.emit(&alloc::format!(
+                                        "Files {} and {} are identical",
+                                        pa, pb
+                                    ));
+                                } else if out.is_empty() {
                                     self.emit("(identical)");
                                 } else {
                                     self.last_ok = false; // diff exits nonzero on differences
@@ -19340,31 +19443,73 @@ impl Term {
                 }
             }
             "cmp" => {
-                // byte-compare two files; reports first differing byte
-                match (args.first(), args.get(1)) {
+                // cmp [-s] [-l] [-n N] f1 f2 — byte-compare; default reports
+                // the first differing byte, -s is silent (status only),
+                // -l lists every differing byte (position, octal values),
+                // -n N compares at most N bytes
+                let silent = args.iter().any(|a| *a == "-s");
+                let listall = args.iter().any(|a| *a == "-l");
+                let mut lim = usize::MAX;
+                let mut files: Vec<&str> = Vec::new();
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-n" => {
+                            lim = args.get(i + 1).and_then(|v| v.parse().ok())
+                                .unwrap_or(usize::MAX);
+                            i += 1;
+                        }
+                        a if !a.starts_with('-') => files.push(a),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                match (files.first(), files.get(1)) {
                     (Some(a), Some(b)) => {
                         match (ustd::read_all(a), ustd::read_all(b)) {
                             (Ok(da), Ok(db)) => {
-                                let n = da.len().min(db.len());
-                                let mut diff = None;
+                                let n = da.len().min(db.len()).min(lim);
+                                let mut diffs = 0usize;
                                 for i in 0..n {
                                     if da[i] != db[i] {
-                                        diff = Some(i);
-                                        break;
+                                        diffs += 1;
+                                        if listall && !silent {
+                                            self.emit(&alloc::format!(
+                                                "{:>6} {:>3o} {:>3o}",
+                                                i + 1, da[i], db[i]
+                                            ));
+                                        }
+                                        if !listall {
+                                            break;
+                                        }
                                     }
                                 }
-                                match diff {
-                                    Some(i) => self.emit(&alloc::format!("{} {} differ: byte {}", a, b, i)),
-                                    None if da.len() != db.len() => self.emit(&alloc::format!(
-                                        "{} {} differ: length ({} vs {} bytes)", a, b, da.len(), db.len()
-                                    )),
-                                    None => {}
+                                let len_diff = da.len() != db.len()
+                                    && lim >= da.len().min(db.len());
+                                if !silent && !listall {
+                                    if diffs > 0 {
+                                        let i = (0..n)
+                                            .find(|i| da[*i] != db[*i])
+                                            .unwrap_or(0);
+                                        self.emit(&alloc::format!(
+                                            "{} {} differ: byte {}",
+                                            a, b, i + 1
+                                        ));
+                                    } else if len_diff {
+                                        self.emit(&alloc::format!(
+                                            "{} {} differ: length ({} vs {} bytes)",
+                                            a, b, da.len(), db.len()
+                                        ));
+                                    }
                                 }
+                                self.last_ok = diffs == 0 && !len_diff;
                             }
-                            (Err(e), _) | (_, Err(e)) => self.fail(&alloc::format!("cmp: err {}", e)),
+                            (Err(e), _) | (_, Err(e)) => {
+                                self.fail(&alloc::format!("cmp: err {}", e))
+                            }
                         }
                     }
-                    _ => self.fail("usage: cmp <file1> <file2>"),
+                    _ => self.fail("usage: cmp [-s] [-l] [-n N] <file1> <file2>"),
                 }
             }
             "read" => {
