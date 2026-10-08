@@ -2720,6 +2720,93 @@ fn ar_parse(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
     Ok(out)
 }
 
+/// vis(3)-style encoding: C escapes for controls, visible \v and \s, ^X for
+/// other controls, M-x for high-bit bytes.
+fn vis_encode(data: &[u8]) -> String {
+    let mut out = String::new();
+    for &b in data {
+        match b {
+            b'\n' => out.push_str("\n"),
+            b'\t' => out.push_str("\t"),
+            b'\r' => out.push_str("\r"),
+            b'\x07' => out.push_str("\\a"),
+            b'\x08' => out.push_str("\\b"),
+            b'\x0b' => out.push_str("\\v"),
+            b'\x0c' => out.push_str("\\f"),
+            b' ' => out.push_str("\\s"),
+            b'\\' => out.push_str("\\"),
+            0x20..=0x7e => out.push(b as char),
+            0..=0x1f => {
+                out.push('^');
+                out.push((b + 64) as char);
+            }
+            0x7f => out.push_str("^?"),
+            _ => {
+                out.push_str("M-");
+                let b = b - 0x80;
+                if b < 0x20 {
+                    out.push('^');
+                    out.push((b + 64) as char);
+                } else if b == 0x7f {
+                    out.push('^');
+                    out.push('?');
+                } else {
+                    out.push(b as char);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Emacs TAGS file section for one source file: per-tag `line\x7fname\x01ln,col`
+/// records plus a `\x0c\npath,size` header.
+fn etags_section(path: &str, text: &str) -> String {
+    let mut body = String::new();
+    for (ln, line) in text.lines().enumerate() {
+        // reuse the ctags scanner to find names, but we need (name,line_no)
+        // pairs: rescan cheaply with the same ruleset.
+        let t = line.trim();
+        let mut seg = t;
+        for q in ["pub ", "pub(crate) ", "unsafe ", "async ", "extern \"C\" "] {
+            if let Some(r) = seg.strip_prefix(q) {
+                seg = r;
+            }
+        }
+        let mut name: Option<String> = None;
+        for pfx in ["fn ", "struct ", "enum ", "trait ", "type ", "const ", "static ", "mod "] {
+            if let Some(r) = seg.strip_prefix(pfx) {
+                let n: String = r
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !n.is_empty() {
+                    name = Some(n);
+                }
+                break;
+            }
+        }
+        if name.is_none() {
+            if let Some(r) = t.strip_prefix("#define") {
+                let n: String = r
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !n.is_empty() {
+                    name = Some(n);
+                }
+            }
+        }
+        if let Some(n) = name {
+            body.push_str(&alloc::format!(
+                "{}\x7f{}\x01{},0\n", line, n, ln + 1
+            ));
+        }
+    }
+    alloc::format!("\x0c\n{},{}\n{}", path, body.len(), body)
+}
+
 /// Minimal ELF64 reader — enough of the format for readelf/nm/size:
 /// header, program headers, section headers (+shstrtab names), .symtab.
 struct Elf<'a> {
@@ -13638,6 +13725,16 @@ impl Term {
             "jot" => {
                 // jot [-r] [n [start [step]]] | jot -r n lo hi — integer
                 // sequence generator (all integer math, like everything here)
+                if args.first() == Some(&"-c") {
+                    // char mode: n chars starting at start (ASCII)
+                    let n: i64 = args.get(1).and_then(|x| x.parse().ok()).unwrap_or(26);
+                    let start: i64 = args.get(2).and_then(|x| x.parse().ok()).unwrap_or(97);
+                    for i in 0..n.min(256) {
+                        let c = (start + i).clamp(32, 126) as u8;
+                        self.emit(&alloc::format!("{}", c as char));
+                    }
+                    return;
+                }
                 if args.first() == Some(&"-r") {
                     // random: n draws uniform in [lo,hi]
                     let n: u64 = args.get(1).and_then(|x| x.parse().ok()).unwrap_or(1);
@@ -23096,6 +23193,268 @@ impl Term {
                         "{:>7} {:>7} {:>7} {:>7}",
                         text, data, bss, text + data + bss
                     ));
+                }
+            }
+            "etags" => {
+                // etags [-o TAGS] files... — Emacs TAGS format via ctags rules
+                let mut outfile = String::from("TAGS");
+                let mut files: Vec<String> = Vec::new();
+                let mut ai = 0usize;
+                while ai < args.len() {
+                    match args[ai] {
+                        "-o" => {
+                            ai += 1;
+                            outfile = args.get(ai).map(|s| String::from(*s))
+                                .unwrap_or_else(|| String::from("TAGS"));
+                        }
+                        f => files.push(String::from(f)),
+                    }
+                    ai += 1;
+                }
+                if files.is_empty() {
+                    self.fail("usage: etags [-o TAGS] <src>...");
+                    return;
+                }
+                let mut out = String::new();
+                let mut n = 0usize;
+                for f in &files {
+                    if let Ok(d) = ustd::read_all(f) {
+                        let sec = etags_section(f, &String::from_utf8_lossy(&d));
+                        n += sec.matches('\x7f').count();
+                        out.push_str(&sec);
+                    }
+                }
+                match ustd::write_all(&outfile, out.as_bytes()) {
+                    Ok(_) => self.emit(&alloc::format!(
+                        "etags: {} tags -> {}", n, outfile)),
+                    Err(e) => self.fail(&alloc::format!(
+                        "etags: {}: err {}", outfile, e)),
+                }
+            }
+            "strip" => {
+                // strip <elf>... — remove .symtab/.strtab section bodies in
+                // place (set size=0 in the section headers: content stays but
+                // is dead — honest strip without moving file bytes).
+                let files: Vec<String> = args.iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .map(|a| String::from(*a)).collect();
+                if files.is_empty() {
+                    self.fail("usage: strip <elf>...");
+                    return;
+                }
+                for f in &files {
+                    let Ok(mut d) = ustd::read_all(f) else {
+                        self.fail(&alloc::format!("strip: {}: err", f));
+                        continue;
+                    };
+                    if d.len() < 64 || &d[0..4] != b"\x7fELF" {
+                        self.fail(&alloc::format!("strip: {}: not ELF", f));
+                        continue;
+                    }
+                    let shoff = u64::from_le_bytes(d[40..48].try_into().unwrap()) as usize;
+                    let shnum = u16::from_le_bytes([d[60], d[61]]) as usize;
+                    let shstrndx = u16::from_le_bytes([d[62], d[63]]) as usize;
+                    let shentsize = u16::from_le_bytes([d[58], d[59]]) as usize;
+                    if shentsize != 64 || shoff + shnum * 64 > d.len() {
+                        self.fail(&alloc::format!("strip: {}: bad shdrs", f));
+                        continue;
+                    }
+                    // shstrtab lives at sh[shstrndx].off
+                    let so = shoff + shstrndx * 64;
+                    let stroff = u64::from_le_bytes(
+                        d[so + 24..so + 32].try_into().unwrap()) as usize;
+                    let mut dropped = 0usize;
+                    for i in 0..shnum {
+                        let o = shoff + i * 64;
+                        let noff = u32::from_le_bytes(
+                            d[o..o + 4].try_into().unwrap()) as usize;
+                        let typ = u32::from_le_bytes(
+                            d[o + 4..o + 8].try_into().unwrap());
+                        let mut e = stroff + noff;
+                        let mut nb = Vec::new();
+                        while e < d.len() && d[e] != 0 {
+                            nb.push(d[e]);
+                            e += 1;
+                        }
+                        let nm = String::from_utf8_lossy(&nb).into_owned();
+                        if nm == ".symtab" || nm == ".strtab" || typ == 2 {
+                            // zero size + entsize: section becomes inert
+                            for b in &mut d[o + 32..o + 40] { *b = 0; }
+                            for b in &mut d[o + 56..o + 64] { *b = 0; }
+                            dropped += 1;
+                        }
+                    }
+                    match ustd::write_all(f, &d) {
+                        Ok(_) => self.emit(&alloc::format!(
+                            "strip: {} ({} sections emptied)", f, dropped)),
+                        Err(e) => self.fail(&alloc::format!(
+                            "strip: {}: err {}", f, e)),
+                    }
+                }
+            }
+            "ldd" => {
+                // ldd <file> — DT_NEEDED names from .dynamic + .dynstr;
+                // our static-PIE binaries honestly report statically linked.
+                let file = args.iter().find(|a| !a.starts_with('-'));
+                let Some(f) = file else {
+                    self.fail("usage: ldd <elf>");
+                    return;
+                };
+                let Ok(d) = ustd::read_all(f) else {
+                    self.fail(&alloc::format!("ldd: {}: err", f));
+                    return;
+                };
+                let Some(e) = Elf::new(&d) else {
+                    self.fail(&alloc::format!("ldd: {}: not ELF64", f));
+                    return;
+                };
+                // find .dynamic (SHT_DYNAMIC=6) and its linked .dynstr
+                let mut needed: Vec<String> = Vec::new();
+                for i in 0..e.shnum() {
+                    let sh = e.sh(i);
+                    if sh.typ != 6 {
+                        continue;
+                    }
+                    let strh = e.sh(sh.link as usize);
+                    let strbase = strh.off as usize;
+                    let n = (sh.size / sh.entsize.max(1)) as usize;
+                    for k in 0..n {
+                        let o = sh.off as usize + k * sh.entsize as usize;
+                        if o + 16 > d.len() { break; }
+                        let tag = i64::from_le_bytes(
+                            d[o..o + 8].try_into().unwrap());
+                        let val = u64::from_le_bytes(
+                            d[o + 8..o + 16].try_into().unwrap()) as usize;
+                        if tag == 1 {
+                            // DT_NEEDED: val = offset into dynstr
+                            let mut e2 = strbase + val;
+                            let mut nb = Vec::new();
+                            while e2 < d.len() && d[e2] != 0 {
+                                nb.push(d[e2]);
+                                e2 += 1;
+                            }
+                            needed.push(
+                                String::from_utf8_lossy(&nb).into_owned());
+                        }
+                    }
+                }
+                if needed.is_empty() {
+                    self.emit("\tstatically linked");
+                } else {
+                    for n in needed {
+                        self.emit(&alloc::format!("\t{} => (0x0)", n));
+                    }
+                }
+            }
+            "lam" => {
+                // lam f1 f2 ... — interleave files line-by-line (laminate)
+                let files: Vec<&&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).collect();
+                let mut cols: Vec<alloc::vec::IntoIter<String>> = Vec::new();
+                for f in &files {
+                    match ustd::read_all(f) {
+                        Ok(d) => cols.push(String::from_utf8_lossy(&d)
+                            .lines().map(String::from).collect::<Vec<_>>().into_iter()),
+                        Err(e) => self.fail(&alloc::format!("lam: {}: err {}", f, e)),
+                    }
+                }
+                loop {
+                    let mut row = String::new();
+                    let mut got = false;
+                    for (i, c) in cols.iter_mut().enumerate() {
+                        if i > 0 { row.push('\t'); }
+                        if let Some(l) = c.next() {
+                            row.push_str(&l);
+                            got = true;
+                        }
+                    }
+                    if !got { break; }
+                    self.emit(&row);
+                }
+            }
+            "vis" => {
+                // vis [file...] — encode control/high-bit chars visibly
+                let data = match args.iter().find(|a| !a.starts_with('-')) {
+                    Some(f) => match ustd::read_all(f) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            self.fail(&alloc::format!("vis: {}: err {}", f, e));
+                            return;
+                        }
+                    },
+                    None => self.pipe_in.clone()
+                        .map(|s| s.into_bytes()).unwrap_or_default(),
+                };
+                let enc = vis_encode(&data);
+                for l in enc.lines() {
+                    self.emit(l);
+                }
+            }
+            "what" => {
+                // what files... — print @(#) SCCS keyword strings
+                let files: Vec<&&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).collect();
+                if files.is_empty() {
+                    self.fail("usage: what <file>...");
+                    return;
+                }
+                for f in files {
+                    if let Ok(d) = ustd::read_all(f) {
+                        self.emit(&alloc::format!("{}:", f));
+                        let mut i = 0usize;
+                        while i + 4 < d.len() {
+                            if &d[i..i + 4] == b"@(#)" {
+                                let mut s = String::new();
+                                let mut j = i + 4;
+                                while j < d.len() {
+                                    let c = d[j];
+                                    if c == b'"' || c == b'>' || c == b'\n'
+                                        || c == b'\0' || c == b'\\' {
+                                        break;
+                                    }
+                                    s.push(c as char);
+                                    j += 1;
+                                }
+                                self.emit(&alloc::format!("   {}", s));
+                                i = j;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            "col" => {
+                // col [-b] — filter reverse line feeds/backspaces from stdin
+                let data = self.pipe_in.clone()
+                    .map(|s| s.into_bytes())
+                    .or_else(|| args.iter().find(|a| !a.starts_with('-'))
+                        .and_then(|f| ustd::read_all(f).ok()))
+                    .unwrap_or_default();
+                // col semantics: backspace overstrike + \x0b reverse feeds;
+                // keep last-written char per position.
+                let mut lines: Vec<Vec<u8>> = vec![Vec::new()];
+                for &b in &data {
+                    match b {
+                        b'\n' => lines.push(Vec::new()),
+                        b'\x08' => {
+                            if let Some(l) = lines.last_mut() {
+                                l.pop();
+                            }
+                        }
+                        b'\x0b' => {
+                            if lines.len() > 1 { lines.pop(); }
+                        }
+                        b'\r' => {}
+                        _ => {
+                            if let Some(l) = lines.last_mut() {
+                                l.push(b);
+                            }
+                        }
+                    }
+                }
+                for l in lines {
+                    self.emit(&String::from_utf8_lossy(&l));
                 }
             }
             "patch" => {
