@@ -5322,7 +5322,10 @@ fn sys_chdir(pptr: u64, plen: u64) -> u64 {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = vfs::normalize(&cwd, &path);
     // verify it's a dir (procfs/dev roots are dirs too, though not on the fs)
-    if crate::proc::is_dir(&full) || crate::dev::is_dir(&full) {
+    if crate::proc::is_dir(&full)
+        || crate::dev::is_dir(&full)
+        || crate::tmpfs::stat(&full).map(|s| s.1).unwrap_or(false)
+    {
         task::with_current(|t| t.cwd = full);
         return 0;
     }
