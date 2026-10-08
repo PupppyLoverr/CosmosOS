@@ -361,6 +361,10 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 .map(|_| 0)
                 .unwrap_or_else(|e| e as u64)
         }
+        shared::SYS_RTC_SET => {
+            crate::timer::set_unix(a1);
+            0
+        }
         shared::SYS_ARP => {
             let s = net::arp_stat();
             let n = s.len().min(a2 as usize);
