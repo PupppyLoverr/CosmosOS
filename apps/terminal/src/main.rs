@@ -18148,6 +18148,8 @@ impl Term {
                             })
                             .unwrap_or_default();
                         let complement = args.iter().any(|a| *a == "--complement");
+                        // -z/--zero-terminated: records NUL-separated in/out
+                        let cz = args.iter().any(|a| *a == "-z" || *a == "--zero-terminated");
                         let src = args.iter().enumerate().find(|(i, a)| {
                             !a.starts_with('-') && *i > 0
                                 && args[i - 1] != "-d" && args[i - 1] != "-f"
@@ -18166,7 +18168,15 @@ impl Term {
                         match (content, fields.is_empty()) {
                             (Some(s), false) if cspec.is_some() => {
                                 // char positions over the line, ranges OR'd
-                                for l in s.lines() {
+                                let mut recs: Vec<&str> = if cz {
+                                    s.split('\0').collect()
+                                } else {
+                                    s.lines().collect()
+                                };
+                                if cz && recs.last() == Some(&"") {
+                                    recs.pop();
+                                }
+                                for l in recs {
                                     let cs: Vec<char> = l.chars().collect();
                                     let mut out = String::new();
                                     for (idx, ch) in cs.iter().enumerate() {
@@ -18178,12 +18188,20 @@ impl Term {
                                             out.push(*ch);
                                         }
                                     }
-                                    self.emit(&out);
+                                    self.emit_rec(&out, cz);
                                 }
                             }
                             (Some(s), false) => {
                                 let dstr = alloc::format!("{}", delim);
-                                for l in s.lines() {
+                                let mut recs: Vec<&str> = if cz {
+                                    s.split('\0').collect()
+                                } else {
+                                    s.lines().collect()
+                                };
+                                if cz && recs.last() == Some(&"") {
+                                    recs.pop();
+                                }
+                                for l in recs {
                                     let parts: Vec<&str> = l.split(delim).collect();
                                     let in_sel = |f: usize| {
                                         fields.iter().any(|(lo, hi)| {
@@ -18194,7 +18212,7 @@ impl Term {
                                         .filter(|f| in_sel(*f) != complement)
                                         .filter_map(|f| parts.get(f - 1).copied())
                                         .collect();
-                                    self.emit(&got.join(&dstr));
+                                    self.emit_rec(&got.join(&dstr), cz);
                                 }
                             }
                             (Some(_), true) => self.fail("cut: need -f|-c N[,M..]"),
@@ -21651,13 +21669,15 @@ impl Term {
                 self.emit("yes running -- Esc/Enter to stop");
             }
             "sed" => {
-                // sed [-i] [-n] [-E|-r] [-e script]... 'script' [file...]
+                // sed [-i] [-n] [-E|-r] [-z] [-e script]... 'script' [file...]
                 // commands (all real, applied per line in order):
                 //   s///[g][p]  y/src/dst/  N[,M]p  N[,M]d  a/i/c text
                 //   q  r file  w file  ; separates commands in one script
+                // -z/--null-data: records are NUL-separated in and out
                 let inplace = args.iter().any(|a| a == &"-i");
                 let quiet = args.iter().any(|a| a == &"-n");
                 let ere = args.iter().any(|a| a == &"-E" || a == &"-r");
+                let zrec = args.iter().any(|a| a == &"-z" || a == &"--null-data");
                 let mut scripts: Vec<String> = Vec::new();
                 let mut files: Vec<&str> = Vec::new();
                 let mut it = args.iter().peekable();
@@ -21716,7 +21736,14 @@ impl Term {
                 let Some(s) = input_text else {
                     return;
                 };
-                let lines: Vec<String> = s.lines().map(String::from).collect();
+                let mut lines: Vec<String> = if zrec {
+                    s.split('\0').map(String::from).collect()
+                } else {
+                    s.lines().map(String::from).collect()
+                };
+                if zrec && lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+                    lines.pop();
+                }
                 let nlines = lines.len();
                 let mut out: Vec<String> = Vec::new();
                 let mut quit = false;
@@ -21808,7 +21835,7 @@ impl Term {
                                 let mut d =
                                     ustd::read_all(p).unwrap_or_default();
                                 d.extend_from_slice(cur.as_bytes());
-                                d.push(b'\n');
+                                d.push(if zrec { b'\0' } else { b'\n' });
                                 let _ = ustd::write_all(p, &d);
                             }
                         }
@@ -21827,9 +21854,13 @@ impl Term {
                 if inplace {
                     match files.first() {
                         Some(f) => {
-                            let mut body = out.join("\n");
+                            let mut body = if zrec {
+                                out.join("\u{0}")
+                            } else {
+                                out.join("\n")
+                            };
                             if !body.is_empty() {
-                                body.push('\n');
+                                body.push(if zrec { '\0' } else { '\n' });
                             }
                             match ustd::write_all(f, body.as_bytes()) {
                                 Ok(_) => self.emit(&alloc::format!(
@@ -21846,7 +21877,7 @@ impl Term {
                     }
                 } else {
                     for l in &out {
-                        self.emit(l);
+                        self.emit_rec(l, zrec);
                     }
                 }
             }
@@ -22928,14 +22959,24 @@ impl Term {
                 match (pos.first(), pos.get(1)) {
                     (Some(pa), Some(pb)) => match (ustd::read_all(pa), ustd::read_all(pb)) {
                         (Ok(da), Ok(db)) => {
-                            let la: Vec<String> = String::from_utf8_lossy(&da)
-                                .lines()
-                                .map(String::from)
-                                .collect();
-                            let lb: Vec<String> = String::from_utf8_lossy(&db)
-                                .lines()
-                                .map(String::from)
-                                .collect();
+                            // -z/--zero-terminated on comm/paste (GNU join
+                            // has no -z): records NUL-separated in and out
+                            let cz = cmd != "join"
+                                && args.iter().any(|a| *a == "-z" || *a == "--zero-terminated");
+                            let recs = |d: &[u8]| -> Vec<String> {
+                                let s = String::from_utf8_lossy(d);
+                                let mut v: Vec<String> = if cz {
+                                    s.split('\0').map(String::from).collect()
+                                } else {
+                                    s.lines().map(String::from).collect()
+                                };
+                                if cz && v.last().map(|l| l.is_empty()).unwrap_or(false) {
+                                    v.pop();
+                                }
+                                v
+                            };
+                            let la = recs(&da);
+                            let lb = recs(&db);
                             match cmd {
                                 "comm" => {
                                     // comm [-1|-2|-3] f1 f2 — -N suppresses
@@ -22977,7 +23018,7 @@ impl Term {
                                                 s.push('\t');
                                             }
                                             s.push_str(line);
-                                            self.emit(&s);
+                                            self.emit_rec(&s, cz);
                                         }
                                     };
                                     let (mut i, mut j) = (0usize, 0usize);
@@ -23051,7 +23092,7 @@ impl Term {
                                                         sep,
                                                         rest2
                                                     );
-                                                    self.emit(&out);
+                                                    self.emit_rec(&out, cz);
                                                 }
                                             }
                                         }
@@ -23068,7 +23109,7 @@ impl Term {
                                                         continue 'o1;
                                                     }
                                                 }
-                                                self.emit(l1);
+                                                self.emit_rec(l1, cz);
                                             }
                                         }
                                         if join_v & 2 != 0 {
@@ -23082,7 +23123,7 @@ impl Term {
                                                         continue 'o2;
                                                     }
                                                 }
-                                                self.emit(l2);
+                                                self.emit_rec(l2, cz);
                                             }
                                         }
                                     }
@@ -23099,8 +23140,8 @@ impl Term {
                                         // serial: join each file's lines on
                                         // the first delim
                                         let d = d_at(0);
-                                        self.emit(&la.join(&alloc::format!("{}", d)));
-                                        self.emit(&lb.join(&alloc::format!("{}", d)));
+                                        self.emit_rec(&la.join(&alloc::format!("{}", d)), cz);
+                                        self.emit_rec(&lb.join(&alloc::format!("{}", d)), cz);
                                     } else {
                                         let n = la.len().max(lb.len());
                                         for i in 0..n {
@@ -23108,7 +23149,7 @@ impl Term {
                                             let b = lb.get(i).map(|s| s.as_str()).unwrap_or("");
                                             let out =
                                                 alloc::format!("{}{}{}", a, d_at(i), b);
-                                            self.emit(&out);
+                                            self.emit_rec(&out, cz);
                                         }
                                     }
                                 }
@@ -25038,7 +25079,7 @@ impl Term {
                     "          sh -n  break/continue N  which -a  truncate -r/-s  numfmt",
                     "          seq (fractional)  test -O/-G  shuf -e/-r  expr length/index/substr",
                     "          tail -c +K  head -c -N  uniq -s/-z",
-                    "          grep -z  find -print0  shuf -z  sed '='",
+                    "          grep -z  find -print0  shuf -z  sed -z  cut -z",
                     "          setsid <cmd>  dir/vdir  mkdir -m  df -P  stat -t  chown -R",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];
