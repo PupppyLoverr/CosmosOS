@@ -191,6 +191,37 @@ impl Mutex {
     }
 }
 
+/// Real fork(): the child resumes here with 0, in a private copy of the
+/// parent's whole address space; the parent gets the child pid.
+pub fn fork() -> i64 {
+    sc0(shared::SYS_FORK) as i64
+}
+
+/// execve: replace this task's image with `path` (args string) — returns
+/// only on failure; open fds carry over.
+pub fn execve(path: &str, args: &str) -> i64 {
+    sc4(
+        shared::SYS_EXECVE,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        args.as_ptr() as u64,
+        args.len() as u64,
+    ) as i64
+}
+
+/// posix_spawn-style: fork + exec in one call — the child execs `path`
+/// and the parent gets its pid. Err = fork failed.
+pub fn spawnv(path: &str, args: &str) -> Result<u32, ()> {
+    match fork() {
+        0 => {
+            let _ = execve(path, args);
+            exit(-1);
+        }
+        p if p > 0 => Ok(p as u32),
+        _ => Err(()),
+    }
+}
+
 /// POSIX wait(-1): (pid, exit_code) of the first dead child — reaped by
 /// the kernel. Err = no children / timeout.
 pub fn waitpid_any(timeout_ms: u64) -> Result<(u32, i64), ()> {

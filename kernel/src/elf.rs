@@ -116,6 +116,39 @@ pub fn map_phys_user(pml4: PhysFrame, vaddr: u64, phys: u64, writable: bool) -> 
     true
 }
 
+/// map_phys_user with an exec flag — fork/exec need to recreate shared
+/// or copied mappings with the source page's real permissions.
+pub fn map_phys_user_flags(
+    pml4: PhysFrame,
+    vaddr: u64,
+    phys: u64,
+    writable: bool,
+    exec: bool,
+    frames: &mut Vec<u64>,
+) -> bool {
+    use x86_64::structures::paging::PageTableFlags as F;
+    let l4 = user_l4(pml4);
+    let i4 = ((vaddr >> 39) & 0x1FF) as usize;
+    let Some(pdpt) = next_table(&mut l4[i4], frames) else { return false };
+    let i3 = ((vaddr >> 30) & 0x1FF) as usize;
+    let Some(pd) = next_table(&mut pdpt[i3], frames) else { return false };
+    let i2 = ((vaddr >> 21) & 0x1FF) as usize;
+    let Some(pt) = next_table(&mut pd[i2], frames) else { return false };
+    let i1 = ((vaddr >> 12) & 0x1FF) as usize;
+    if !pt[i1].is_unused() {
+        return false;
+    }
+    let mut fl = F::PRESENT | F::USER_ACCESSIBLE;
+    if writable {
+        fl |= F::WRITABLE;
+    }
+    if !exec {
+        fl |= F::NO_EXECUTE;
+    }
+    pt[i1].set_addr(PhysAddr::new(phys), fl);
+    true
+}
+
 /// Load ELF64 segments from `data` into the user table `pml4`.
 /// Returns entry point.
 /// Load an ELF image. Every PT_LOAD is also recorded in `maps` as a
@@ -324,6 +357,40 @@ pub fn translate_user(pml4: PhysFrame, vaddr: u64) -> Option<u64> {
         return None;
     }
     Some(pt[i1].addr().as_u64() + (vaddr & 0xFFF))
+}
+
+/// Enumerate every present 4KiB user leaf: (vaddr, phys, writable, exec).
+/// fork() copies the address space by walking this and rebuilding each
+/// page in the child's own table.
+pub fn collect_user_pages(pml4: PhysFrame) -> Vec<(u64, u64, bool, bool)> {
+    use x86_64::structures::paging::PageTableFlags as F;
+    let l4 = unsafe { &*(mem::phys_to_virt(pml4.start_address().as_u64()) as *const PageTable) };
+    let mut out = Vec::new();
+    if l4[0].is_unused() {
+        return out;
+    }
+    let pdpt = unsafe { &*(mem::phys_to_virt(l4[0].addr().as_u64()) as *const PageTable) };
+    for i3 in 0..512usize {
+        if pdpt[i3].is_unused() {
+            continue;
+        }
+        let pd = unsafe { &*(mem::phys_to_virt(pdpt[i3].addr().as_u64()) as *const PageTable) };
+        for i2 in 0..512usize {
+            if pd[i2].is_unused() || pd[i2].flags().contains(F::HUGE_PAGE) {
+                continue;
+            }
+            let pt = unsafe { &*(mem::phys_to_virt(pd[i2].addr().as_u64()) as *const PageTable) };
+            for i1 in 0..512usize {
+                if pt[i1].is_unused() {
+                    continue;
+                }
+                let va = ((i3 as u64) << 30) | ((i2 as u64) << 21) | ((i1 as u64) << 12);
+                let fl = pt[i1].flags();
+                out.push((va, pt[i1].addr().as_u64(), fl.contains(F::WRITABLE), !fl.contains(F::NO_EXECUTE)));
+            }
+        }
+    }
+    out
 }
 
 /// Count present 4KiB leaf mappings in the user half (PML4[0] only — the

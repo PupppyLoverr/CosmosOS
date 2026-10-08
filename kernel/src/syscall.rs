@@ -118,6 +118,8 @@ pub fn dispatch(ctx: &mut CpuContext) {
             None => ERR,
         },
         shared::SYS_FUTEX => sys_futex(ctx, a1, a2, a3, a4),
+        shared::SYS_FORK => task::fork_current(ctx).map(|p| p as u64).unwrap_or(ERR),
+        shared::SYS_EXECVE => sys_execve(ctx, a1, a2, a3, a4),
         shared::SYS_DEBUG => sys_debug(a1, a2),
         shared::SYS_OPEN => sys_open(a1, a2, a3),
         shared::SYS_CLOSE => {
@@ -2323,6 +2325,28 @@ fn sys_futex(ctx: &mut CpuContext, uaddr: u64, op: u64, val: u64, timeout_ms: u6
     }
     ctx.rip -= 2;
     task::yield_ctx(ctx)
+}
+
+/// SYS_EXECVE(path_ptr,path_len,args_ptr,args_len): replace the current
+/// image — on success the task irets into the new program's entry.
+fn sys_execve(ctx: &mut CpuContext, pptr: u64, plen: u64, aptr: u64, alen: u64) -> u64 {
+    let Some(pb) = copy_in(pptr, plen.min(4096)) else {
+        return ERR;
+    };
+    let Some(ab) = copy_in(aptr, alen.min(4096)) else {
+        return ERR;
+    };
+    let path = String::from(
+        String::from_utf8_lossy(&pb).trim_matches('\0'),
+    );
+    let args = String::from(
+        String::from_utf8_lossy(&ab).trim_matches('\0'),
+    );
+    if task::exec_current(ctx, &path, &args) {
+        0 // unreachable in practice — the frame is already the new image's
+    } else {
+        ERR
+    }
 }
 
 fn sys_sleep(ctx: &mut CpuContext, ms: u64) -> u64 {
