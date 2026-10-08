@@ -13798,6 +13798,16 @@ impl Term {
             "jot" => {
                 // jot [-r] [n [start [step]]] | jot -r n lo hi — integer
                 // sequence generator (all integer math, like everything here)
+                if args.first() == Some(&"-c") {
+                    // char mode: n chars starting at start (ASCII)
+                    let n: i64 = args.get(1).and_then(|x| x.parse().ok()).unwrap_or(26);
+                    let start: i64 = args.get(2).and_then(|x| x.parse().ok()).unwrap_or(97);
+                    for i in 0..n.min(256) {
+                        let c = (start + i).clamp(32, 126) as u8;
+                        self.emit(&alloc::format!("{}", c as char));
+                    }
+                    return;
+                }
                 if args.first() == Some(&"-r") {
                     // random: n draws uniform in [lo,hi]
                     let n: u64 = args.get(1).and_then(|x| x.parse().ok()).unwrap_or(1);
@@ -23258,73 +23268,6 @@ impl Term {
                     ));
                 }
             }
-            "cpio" => {
-                // cpio -o (stdin names -> archive) | -i (archive -> files) | -t (list)
-                // newc SVR4-ASCII format.
-                let mode = args.iter().find(|a| a.starts_with('-'))
-                    .map(|s| *s).unwrap_or("");
-                if !mode.contains('o') && !mode.contains('i') && !mode.contains('t') {
-                    self.fail("usage: cpio -o|i|t [archive]");
-                    return;
-                }
-                let file = args.iter().find(|a| !a.starts_with('-'));
-                if mode.contains('o') {
-                    let names = self.pipe_in.clone().unwrap_or_default();
-                    let mut mem: Vec<(String, Vec<u8>)> = Vec::new();
-                    for n in names.lines().filter(|l| !l.is_empty()) {
-                        match ustd::read_all(n) {
-                            Ok(d) => mem.push((String::from(n), d)),
-                            Err(e) => self.fail(&alloc::format!(
-                                "cpio: {}: err {}", n, e)),
-                        }
-                    }
-                    let arc = cpio_newc_pack(&mem);
-                    if let Some(f) = file {
-                        match ustd::write_all(f, &arc) {
-                            Ok(_) => self.emit(&alloc::format!(
-                                "cpio: {} blocks", arc.len() / 512)),
-                            Err(e) => self.fail(&alloc::format!(
-                                "cpio: {}: err {}", f, e)),
-                        }
-                    } else {
-                        // stdout as text — archives are binary; emit size
-                        // (terminal is text-only; use -o with a file arg)
-                        self.emit(&alloc::format!(
-                            "cpio: {} blocks (write to a file)", arc.len() / 512));
-                    }
-                } else {
-                    let data = match file {
-                        Some(f) => match ustd::read_all(f) {
-                            Ok(d) => d,
-                            Err(e) => {
-                                self.fail(&alloc::format!("cpio: {}: err {}", f, e));
-                                return;
-                            }
-                        },
-                        None => self
-                            .pipe_in
-                            .clone()
-                            .map(|s| s.into_bytes())
-                            .unwrap_or_default(),
-                    };
-                    match cpio_newc_parse(&data) {
-                        Ok(mems) => {
-                            for (n, d) in mems {
-                                if mode.contains('t') {
-                                    self.emit(&alloc::format!("{:>8} {}", d.len(), n));
-                                } else {
-                                    match ustd::write_all(&n, &d) {
-                                        Ok(_) => self.emit(&alloc::format!("x {}", n)),
-                                        Err(e) => self.fail(&alloc::format!(
-                                            "cpio: {}: err {}", n, e)),
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => self.fail(&alloc::format!("cpio: {}", e)),
-                    }
-                }
-            }
             "etags" => {
                 // etags [-o TAGS] files... — Emacs TAGS format via ctags rules
                 let mut outfile = String::from("TAGS");
@@ -23474,42 +23417,6 @@ impl Term {
                     for n in needed {
                         self.emit(&alloc::format!("\t{} => (0x0)", n));
                     }
-                }
-            }
-            "jot" => {
-                // jot [-c] [reps [start [end]]] — BSD sequential/char print
-                let mut chr = false;
-                let mut nums: Vec<i64> = Vec::new();
-                for a in args.iter() {
-                    match *a {
-                        "-c" => chr = true,
-                        _ if !a.starts_with('-') => {
-                            if let Ok(v) = a.parse::<i64>() {
-                                nums.push(v);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                let (reps, start, end) = match nums.len() {
-                    0 => (100, 1, 100),
-                    1 => (nums[0], 1, 100),
-                    2 => (nums[0], nums[1], 100),
-                    _ => (nums[0], nums[1], nums[2]),
-                };
-                let mut i = start;
-                let mut left = reps;
-                while left > 0 && (end >= start && i <= end
-                                   || end < start && i >= end) {
-                    if chr {
-                        if i >= 32 && i < 127 {
-                            self.emit(&alloc::format!("{}", (i as u8) as char));
-                        }
-                    } else {
-                        self.emit(&alloc::format!("{}", i));
-                    }
-                    i += if end >= start { 1 } else { -1 };
-                    left -= 1;
                 }
             }
             "lam" => {
