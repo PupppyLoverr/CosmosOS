@@ -24,6 +24,7 @@ struct Editor {
     saveas_q: Option<String>, // Ctrl-Shift-S: save-as path prompt
     open_q: Option<String>,   // Ctrl-O: open-file path prompt
     open_confirm: bool,       // dirty-buffer: Ctrl-O pressed once (confirm pending)
+    close_confirm: bool,      // dirty-buffer: Ctrl-W pressed once (confirm pending)
     scroll: usize, // first visible line
     dirty_text: bool,
     dirty_ui: bool,
@@ -189,6 +190,12 @@ impl Editor {
         if !is_ctrlo {
             self.open_confirm = false;
         }
+        let is_ctrlw = k.key == KeyCode::Char as u32
+            && k.mods & 1 != 0
+            && k.chr.to_ascii_lowercase() == b'w';
+        if !is_ctrlw {
+            self.close_confirm = false;
+        }
         // save-as mode: keys go to the path prompt
         if self.saveas_q.is_some() {
             match k.key as u32 {
@@ -337,8 +344,14 @@ impl Editor {
             self.dirty_ui = true;
             return;
         }
-        // Ctrl+W closes the window
+        // Ctrl+W closes the window (double-press when the buffer is dirty)
         if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 && k.chr.to_ascii_lowercase() == b'w' {
+            if self.dirty_text && !self.close_confirm {
+                self.close_confirm = true;
+                self.status = String::from("unsaved changes - Ctrl-W again to close");
+                self.dirty_ui = true;
+                return;
+            }
             self.win.close();
             return;
         }
@@ -493,6 +506,7 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         saveas_q: None,
         open_q: None,
         open_confirm: false,
+        close_confirm: false,
         scroll: 0,
         dirty_text: false,
         dirty_ui: true,
