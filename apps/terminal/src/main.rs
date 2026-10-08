@@ -51,6 +51,8 @@ struct Term {
     view: usize, // scrollback: lines hidden from the bottom (0 = tail)
     dirty_all: bool,
     needs_cursor_flip: bool,
+    capture: Option<Vec<String>>, // output capture for pipes/redirects
+    pipe_in: Option<String>,     // stdin text delivered by the previous stage
 }
 
 impl Term {
@@ -80,6 +82,25 @@ impl Term {
             self.lines.drain(0..drop);
             self.view = self.view.saturating_sub(drop);
         }
+    }
+
+    /// Command output: goes to the capture buffer during a pipe/redirect
+    /// stage, else to the scrollback.
+    fn emit(&mut self, s: &str) {
+        if let Some(c) = self.capture.as_mut() {
+            c.push(String::from(s));
+        } else {
+            self.push_line(s);
+        }
+    }
+
+    /// Run `cmd` with output captured; returns the captured lines.
+    fn run_captured(&mut self, cmd: &str) -> Vec<String> {
+        let saved = self.capture.replace(Vec::new());
+        self.run(cmd);
+        let out = self.capture.take().unwrap_or_default();
+        self.capture = saved;
+        out
     }
 
     fn prompt_str(&self) -> String {
@@ -122,7 +143,47 @@ impl Term {
         if let Some(rest) = input.strip_prefix("time ") {
             let t0 = ustd::uptime_ms();
             self.run(rest);
-            self.push_line(&alloc::format!("  {} ms", ustd::uptime_ms() - t0));
+            self.emit(&alloc::format!("  {} ms", ustd::uptime_ms() - t0));
+            return;
+        }
+        // pipe: left | right  (right may itself contain pipes/redirects)
+        if let Some(pi) = input.find('|') {
+            let left = input[..pi].trim();
+            let right = input[pi + 1..].trim();
+            let out = self.run_captured(left);
+            let saved = self.pipe_in.replace(out.join("\n"));
+            self.run(right);
+            self.pipe_in = saved;
+            return;
+        }
+        // redirect: cmd > file  /  cmd >> file
+        if let Some(pi) = input.find('>') {
+            let left = input[..pi].trim();
+            let mut rest = input[pi + 1..].trim();
+            let append = rest.starts_with('>');
+            if append {
+                rest = rest[1..].trim_start();
+            }
+            let fname = rest.split_whitespace().next().unwrap_or("");
+            if fname.is_empty() {
+                self.emit("usage: <cmd> > file  (or >> to append)");
+                return;
+            }
+            let out = self.run_captured(left);
+            let mut body = out.join("\n");
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            let r = if append {
+                let mut prev = ustd::read_all(fname).unwrap_or_default();
+                prev.extend_from_slice(body.as_bytes());
+                ustd::write_all(fname, &prev)
+            } else {
+                ustd::write_all(fname, body.as_bytes())
+            };
+            if let Err(e) = r {
+                self.emit(&alloc::format!("{}: err {}", fname, e));
+            }
             return;
         }
         self.hist.push(String::from(input));
@@ -138,10 +199,11 @@ impl Term {
                     "          netstat kill <pid> grep <pat> <file> (or -r <dir>) uptime",
                     "          hex <file> wc <file> du <path> history time <cmd>",
                     "          head/tail [-n N] <file> sort <file>",
+                    "          a | b   cmd > file   cmd >> file",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
-                    self.push_line(l);
+                    self.emit(l);
                 }
             }
             "ls" => {
@@ -150,7 +212,7 @@ impl Term {
                 match ustd::readdir(&dir) {
                     Ok(ents) => {
                         if ents.is_empty() {
-                            self.push_line("  (empty)");
+                            self.emit("  (empty)");
                         }
                         for e in ents {
                             let name = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("?");
@@ -159,46 +221,53 @@ impl Term {
                             } else {
                                 alloc::format!("  {}  ({} B)", name, e.size)
                             };
-                            self.push_line(&line);
+                            self.emit(&line);
                         }
                     }
-                    Err(e) => self.push_line(&alloc::format!("ls: {}: err {}", dir, e)),
+                    Err(e) => self.emit(&alloc::format!("ls: {}: err {}", dir, e)),
                 }
             }
             "cd" => {
                 let p = args.first().copied().unwrap_or("/");
                 if !ustd::chdir(p) {
-                    self.push_line(&alloc::format!("cd: {}: no such dir", p));
+                    self.emit(&alloc::format!("cd: {}: no such dir", p));
                 }
             }
-            "pwd" => self.push_line(&ustd::getcwd()),
+            "pwd" => self.emit(&ustd::getcwd()),
             "cat" => match args.first() {
                 Some(p) => match ustd::read_all(p) {
                     Ok(d) => {
                         let s = String::from_utf8_lossy(&d);
                         for l in s.lines() {
-                            self.push_line(l);
+                            self.emit(l);
                         }
                     }
-                    Err(e) => self.push_line(&alloc::format!("cat: {}: err {}", p, e)),
+                    Err(e) => self.emit(&alloc::format!("cat: {}: err {}", p, e)),
                 },
-                None => self.push_line("usage: cat <file>"),
+                None => match self.pipe_in.clone() {
+                    Some(s) => {
+                        for l in s.lines() {
+                            self.emit(l);
+                        }
+                    }
+                    None => self.emit("usage: cat <file>"),
+                },
             },
             "mkdir" => match args.first() {
                 Some(p) => {
                     if let Err(e) = ustd::mkdir(p) {
-                        self.push_line(&alloc::format!("mkdir: err {}", e));
+                        self.emit(&alloc::format!("mkdir: err {}", e));
                     }
                 }
-                None => self.push_line("usage: mkdir <dir>"),
+                None => self.emit("usage: mkdir <dir>"),
             },
             "touch" => match args.first() {
                 Some(p) => {
                     if let Err(e) = ustd::write_all(p, b"") {
-                        self.push_line(&alloc::format!("touch: err {}", e));
+                        self.emit(&alloc::format!("touch: err {}", e));
                     }
                 }
-                None => self.push_line("usage: touch <file>"),
+                None => self.emit("usage: touch <file>"),
             },
             "rm" => {
                 let (rec, target) = if args.first() == Some(&"-r") {
@@ -210,30 +279,30 @@ impl Term {
                     Some(p) => {
                         let r = if rec { self.rm_tree(p) } else { ustd::remove(p) };
                         if let Err(e) = r {
-                            self.push_line(&alloc::format!("rm: {}: err {}", p, e));
+                            self.emit(&alloc::format!("rm: {}: err {}", p, e));
                         }
                     }
-                    None => self.push_line("usage: rm [-r] <path>"),
+                    None => self.emit("usage: rm [-r] <path>"),
                 }
             }
             "mv" => {
                 if args.len() < 2 {
-                    self.push_line("usage: mv <from> <to>");
+                    self.emit("usage: mv <from> <to>");
                 } else if let Err(e) = ustd::rename(args[0], args[1]) {
-                    self.push_line(&alloc::format!("mv: err {}", e));
+                    self.emit(&alloc::format!("mv: err {}", e));
                 }
             }
             "cp" => {
                 if args.len() < 2 {
-                    self.push_line("usage: cp <from> <to>");
+                    self.emit("usage: cp <from> <to>");
                 } else {
                     match ustd::read_all(args[0]) {
                         Ok(d) => {
                             if let Err(e) = ustd::write_all(args[1], &d) {
-                                self.push_line(&alloc::format!("cp: err {}", e));
+                                self.emit(&alloc::format!("cp: err {}", e));
                             }
                         }
-                        Err(e) => self.push_line(&alloc::format!("cp: {}: err {}", args[0], e)),
+                        Err(e) => self.emit(&alloc::format!("cp: {}: err {}", args[0], e)),
                     }
                 }
             }
@@ -246,10 +315,10 @@ impl Term {
                     let mut d = String::from(text.trim());
                     d.push('\n');
                     if let Err(e) = ustd::write_all(path, d.as_bytes()) {
-                        self.push_line(&alloc::format!("echo: err {}", e));
+                        self.emit(&alloc::format!("echo: err {}", e));
                     }
                 } else {
-                    self.push_line(&joined);
+                    self.emit(&joined);
                 }
             }
             "clear" => self.lines.clear(),
@@ -258,7 +327,7 @@ impl Term {
                     let name = core::str::from_utf8(&p.name)
                         .unwrap_or("?")
                         .trim_end_matches('\0');
-                    self.push_line(&alloc::format!(
+                    self.emit(&alloc::format!(
                         "  pid={} {} mem={}KB cpu={}ms",
                         p.pid,
                         name,
@@ -269,25 +338,25 @@ impl Term {
             }
             "mem" => {
                 let mi = ustd::meminfo();
-                self.push_line(&alloc::format!(
+                self.emit(&alloc::format!(
                     "  total={}KB used={}KB heap={}KB tasks={}",
                     mi.total_kb, mi.used_kb, mi.kernel_heap_kb, mi.tasks
                 ));
             }
-            "uname" => self.push_line("CosmosOS 0.1 x86_64 (rust kernel)"),
+            "uname" => self.emit("CosmosOS 0.1 x86_64 (rust kernel)"),
             "uptime" => {
                 let ms = ustd::uptime_ms();
-                self.push_line(&alloc::format!(
+                self.emit(&alloc::format!(
                     "up {}h {:02}m {:02}s",
                     ms / 3_600_000,
                     (ms / 60_000) % 60,
                     (ms / 1000) % 60
                 ));
             }
-            "whoami" => self.push_line("cosmos"),
+            "whoami" => self.emit("cosmos"),
             "date" => {
                 let d = ustd::datetime();
-                self.push_line(&alloc::format!(
+                self.emit(&alloc::format!(
                     "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
                     d.year, d.month, d.day, d.hour, d.minute, d.second
                 ));
@@ -299,39 +368,39 @@ impl Term {
                         let packed = ((a as u32) << 24) | ((b as u32) << 16)
                             | ((c as u32) << 8) | d as u32;
                         match ustd::net_ping(packed, 2000) {
-                            Some(rtt) => self.push_line(&alloc::format!(
+                            Some(rtt) => self.emit(&alloc::format!(
                                 "reply from {}.{}.{}.{}: time={}ms", a, b, c, d, rtt
                             )),
-                            None => self.push_line(&alloc::format!(
+                            None => self.emit(&alloc::format!(
                                 "ping {}.{}.{}.{}: timeout", a, b, c, d
                             )),
                         }
                     }
-                    None => self.push_line(&alloc::format!("ping: bad ip '{}'", s)),
+                    None => self.emit(&alloc::format!("ping: bad ip '{}'", s)),
                 },
-                None => self.push_line("usage: ping <a.b.c.d>  (try 10.0.2.2)"),
+                None => self.emit("usage: ping <a.b.c.d>  (try 10.0.2.2)"),
             },
             "resolve" => match args.first() {
                 Some(host) => match ustd::net_dns(host) {
-                    Some(ip) => self.push_line(&alloc::format!(
+                    Some(ip) => self.emit(&alloc::format!(
                         "{} -> {}.{}.{}.{}",
                         host, ip[0], ip[1], ip[2], ip[3]
                     )),
-                    None => self.push_line(&alloc::format!("resolve: {}: no answer", host)),
+                    None => self.emit(&alloc::format!("resolve: {}: no answer", host)),
                 },
-                None => self.push_line("usage: resolve <hostname>  (real DNS over UDP/53)"),
+                None => self.emit("usage: resolve <hostname>  (real DNS over UDP/53)"),
             },
             "httpget" => match args.first() {
                 Some(host) => match ustd::net_http(host) {
                     Some(body) => {
                         let s = String::from_utf8_lossy(&body);
                         for l in s.lines().take(12) {
-                            self.push_line(l);
+                            self.emit(l);
                         }
                     }
-                    None => self.push_line(&alloc::format!("httpget: {}: failed", host)),
+                    None => self.emit(&alloc::format!("httpget: {}: failed", host)),
                 },
-                None => self.push_line("usage: httpget <host>  (real TCP/80 GET /)"),
+                None => self.emit("usage: httpget <host>  (real TCP/80 GET /)"),
             },
             "grep" => {
                 // grep <pat> <file> | grep -r <pat> <dir>
@@ -342,7 +411,17 @@ impl Term {
                 };
                 match (pat, path) {
                     (Some(p), Some(path)) => self.grep_run(p, path, rec),
-                    _ => self.push_line("usage: grep <pat> <file> | grep -r <pat> <dir>"),
+                    (Some(p), None) => match self.pipe_in.clone() {
+                        Some(s) => {
+                            for l in s.lines() {
+                                if l.contains(p) {
+                                    self.emit(l);
+                                }
+                            }
+                        }
+                        None => self.emit("usage: grep <pat> <file> | grep -r <pat> <dir>"),
+                    },
+                    _ => self.emit("usage: grep <pat> <file> | grep -r <pat> <dir>"),
                 }
             }
             "hex" => match args.first() {
@@ -360,112 +439,110 @@ impl Term {
                             for b in ch {
                                 line.push(if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' });
                             }
-                            self.push_line(&line);
+                            self.emit(&line);
                         }
                         if d.len() > 1024 {
-                            self.push_line(&alloc::format!("  ... ({} bytes total)", d.len()));
+                            self.emit(&alloc::format!("  ... ({} bytes total)", d.len()));
                         }
                     }
-                    Err(e) => self.push_line(&alloc::format!("hex: {}: err {}", p, e)),
+                    Err(e) => self.emit(&alloc::format!("hex: {}: err {}", p, e)),
                 },
-                None => self.push_line("usage: hex <file>  (first 1KiB)"),
-            },
-            "wc" => match args.first() {
-                Some(p) => match ustd::read_all(p) {
-                    Ok(d) => {
-                        let s = String::from_utf8_lossy(&d);
-                        let (mut l, mut w) = (0usize, 0usize);
-                        let mut in_w = false;
-                        for ch in s.chars() {
-                            if ch == '\n' {
-                                l += 1;
-                            }
-                            if ch.is_whitespace() {
-                                in_w = false;
-                            } else if !in_w {
-                                in_w = true;
-                                w += 1;
-                            }
-                        }
-                        self.push_line(&alloc::format!("  {} lines {} words {} bytes", l, w, d.len()));
-                    }
-                    Err(e) => self.push_line(&alloc::format!("wc: {}: err {}", p, e)),
-                },
-                None => self.push_line("usage: wc <file>"),
+                None => self.emit("usage: hex <file>  (first 1KiB)"),
             },
             "du" => match args.first() {
                 Some(p) => {
                     let n = self.du_tree(p, 0);
-                    self.push_line(&alloc::format!("  {} B total", n));
+                    self.emit(&alloc::format!("  {} B total", n));
                 }
-                None => self.push_line("usage: du <path>  (recursive bytes)"),
+                None => self.emit("usage: du <path>  (recursive bytes)"),
             },
             "history" => {
                 for i in 0..self.hist.len() {
                     let line = alloc::format!("  {:>3}  {}", i + 1, self.hist[i]);
-                    self.push_line(&line);
+                    self.emit(&line);
                 }
             }
-            "head" | "tail" | "sort" => match args.iter().position(|a| !a.starts_with('-')) {
-                Some(pi) => {
-                    let p = args[pi];
-                    let n: usize = args
-                        .iter()
-                        .position(|a| a == &"-n")
-                        .and_then(|i| args.get(i + 1))
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(10);
-                    match ustd::read_all(p) {
-                        Ok(d) => {
-                            let s = String::from_utf8_lossy(&d);
-                            let mut ls: Vec<&str> = s.lines().collect();
-                            if cmd == "sort" {
-                                ls.sort();
-                                for l in ls {
-                                    self.push_line(l);
+            "head" | "tail" | "sort" | "wc" => {
+                let popt = args.iter().position(|a| !a.starts_with('-')).map(|i| args[i]);
+                let n: usize = args
+                    .iter()
+                    .position(|a| a == &"-n")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(10);
+                let content = match popt {
+                    Some(p) => match ustd::read_all(p) {
+                        Ok(d) => Some(String::from_utf8_lossy(&d).into_owned()),
+                        Err(e) => {
+                            self.emit(&alloc::format!("{}: {}: err {}", cmd, p, e));
+                            None
+                        }
+                    },
+                    None => self.pipe_in.clone(),
+                };
+                match content {
+                    Some(s) => {
+                        let mut ls: Vec<&str> = s.lines().collect();
+                        if cmd == "wc" {
+                            let (mut l, mut w) = (0usize, 0usize);
+                            let mut in_w = false;
+                            for ch in s.chars() {
+                                if ch == '\n' {
+                                    l += 1;
                                 }
-                            } else if cmd == "head" {
-                                for l in ls.iter().take(n) {
-                                    self.push_line(l);
-                                }
-                            } else {
-                                for l in ls.iter().skip(ls.len().saturating_sub(n)) {
-                                    self.push_line(l);
+                                if ch.is_whitespace() {
+                                    in_w = false;
+                                } else if !in_w {
+                                    in_w = true;
+                                    w += 1;
                                 }
                             }
+                            self.emit(&alloc::format!("  {} lines {} words {} bytes", l, w, s.len()));
+                        } else if cmd == "sort" {
+                            ls.sort();
+                            for l in ls {
+                                self.emit(l);
+                            }
+                        } else if cmd == "head" {
+                            for l in ls.iter().take(n) {
+                                self.emit(l);
+                            }
+                        } else {
+                            for l in ls.iter().skip(ls.len().saturating_sub(n)) {
+                                self.emit(l);
+                            }
                         }
-                        Err(e) => self.push_line(&alloc::format!("{}: {}: err {}", cmd, p, e)),
                     }
+                    None => self.emit(&alloc::format!("usage: {} [-n N] <file>", cmd)),
                 }
-                None => self.push_line(&alloc::format!("usage: {} [-n N] <file>", cmd)),
-            },
+            }
             "netstat" => {
                 for l in ustd::net_stat().lines() {
-                    self.push_line(l);
+                    self.emit(l);
                 }
             }
             "kill" => match args.first() {
                 Some(p) => match p.parse::<u32>() {
-                    Ok(pid) if ustd::kill(pid) => self.push_line(&alloc::format!("killed {}", pid)),
-                    _ => self.push_line("kill: no such pid"),
+                    Ok(pid) if ustd::kill(pid) => self.emit(&alloc::format!("killed {}", pid)),
+                    _ => self.emit("kill: no such pid"),
                 },
-                None => self.push_line("usage: kill <pid>"),
+                None => self.emit("usage: kill <pid>"),
             },
             "dhcp" => match ustd::net_dhcp() {
-                Some(ip) => self.push_line(&alloc::format!(
+                Some(ip) => self.emit(&alloc::format!(
                     "dhcp: lease {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]
                 )),
-                None => self.push_line("dhcp: no response (net down or no server)"),
+                None => self.emit("dhcp: no response (net down or no server)"),
             },
             "ifconfig" => match ustd::net_info() {
                 Some((mac, ip)) => {
-                    self.push_line(&alloc::format!(
+                    self.emit(&alloc::format!(
                         "net0: ip {}.{}.{}.{} mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                         ip[0], ip[1], ip[2], ip[3],
                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
                     ));
                 }
-                None => self.push_line("no network device"),
+                None => self.emit("no network device"),
             },
             "reboot" => ustd::reboot(),
             "shutdown" | "poweroff" => ustd::poweroff(),
@@ -476,12 +553,12 @@ impl Term {
                 if ustd::stat(&path).is_ok() {
                     match ustd::spawn(&path, &args.join(" ")) {
                         Ok(pid) => {
-                            self.push_line(&alloc::format!("spawned {} (pid {})", cmd, pid));
+                            self.emit(&alloc::format!("spawned {} (pid {})", cmd, pid));
                         }
-                        Err(_) => self.push_line(&alloc::format!("{}: spawn failed", cmd)),
+                        Err(_) => self.emit(&alloc::format!("{}: spawn failed", cmd)),
                     }
                 } else {
-                    self.push_line(&alloc::format!("{}: unknown command", cmd));
+                    self.emit(&alloc::format!("{}: unknown command", cmd));
                 }
             }
         }
@@ -517,7 +594,7 @@ impl Term {
             let line = core::mem::take(&mut self.cur);
             self.cx = 0;
             let prompt = self.prompt_str();
-            self.push_line(&alloc::format!("{}{}", prompt, line));
+            self.emit(&alloc::format!("{}{}", prompt, line));
             self.run(&line);
         } else if k.key == KeyCode::Backspace as u32 {
             if self.cx > 0 {
@@ -566,7 +643,7 @@ impl Term {
             "echo", "clear", "ps", "mem", "uname", "whoami", "date", "ping",
             "resolve", "httpget", "ifconfig", "dhcp", "netstat", "kill", "grep",
             "uptime", "reboot", "shutdown", "exit", "history", "time",
-            "head", "tail", "sort",
+            "head", "tail", "sort", "wc", "hex", "du",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
@@ -641,7 +718,7 @@ impl Term {
         } else {
             // ambiguous — list the matches
             for c in &cands {
-                self.push_line(&alloc::format!("  {}", c));
+                self.emit(&alloc::format!("  {}", c));
             }
         }
     }
@@ -659,7 +736,7 @@ impl Term {
                     } else {
                         total += e.size;
                         if depth == 0 {
-                            self.push_line(&alloc::format!("  {:>8} {}", e.size, p));
+                            self.emit(&alloc::format!("  {:>8} {}", e.size, p));
                         }
                     }
                 }
@@ -668,7 +745,7 @@ impl Term {
             Err(_) => match ustd::stat(path) {
                 Ok(st) => st.size,
                 Err(_) => {
-                    self.push_line(&alloc::format!("du: {}: not found", path));
+                    self.emit(&alloc::format!("du: {}: not found", path));
                     0
                 }
             },
@@ -700,11 +777,11 @@ impl Term {
                 let s = String::from_utf8_lossy(&d);
                 for l in s.lines() {
                     if l.contains(pat) {
-                        self.push_line(&alloc::format!("{}: {}", path, l));
+                        self.emit(&alloc::format!("{}: {}", path, l));
                     }
                 }
             }
-            Err(e) => self.push_line(&alloc::format!("grep: {}: err {}", path, e)),
+            Err(e) => self.emit(&alloc::format!("grep: {}: err {}", path, e)),
         }
     }
 
@@ -757,6 +834,8 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         view: 0,
         dirty_all: true,
         needs_cursor_flip: true,
+        capture: None,
+        pipe_in: None,
     };
     t.push_line("CosmosOS terminal - type 'help'");
     t.push_line("");
