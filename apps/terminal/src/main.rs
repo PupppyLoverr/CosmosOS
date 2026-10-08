@@ -2462,7 +2462,8 @@ fn esc_interp(s: &str) -> String {
                 }
             }
             b'0'..=b'7' => {
-                // \0ooo — up to 3 octal digits including the one matched
+                // \0ooo — up to 3 octal digits including the one matched;
+                // \0 itself is a real NUL byte (GNU %b semantics)
                 let mut v = (b[i] - b'0') as u32;
                 let mut took = 1usize;
                 while took < 3 && i + 1 < b.len() && (b'0'..=b'7').contains(&b[i + 1])
@@ -2471,9 +2472,7 @@ fn esc_interp(s: &str) -> String {
                     i += 1;
                     took += 1;
                 }
-                if v > 0 {
-                    out.push(char::from_u32(v.min(255)).unwrap_or('?'));
-                }
+                out.push(char::from_u32(v.min(255)).unwrap_or('\0'));
             }
             o => {
                 out.push('\\');
@@ -5524,6 +5523,7 @@ struct GrepOpts {
     fname: u8,   // 0 auto, 1 = -h (never prefix), 2 = -H (always prefix)
     multi: bool, // >1 file operand: auto filename prefixes
     quieterr: bool, // -s: suppress unreadable-file errors
+    zrec: bool,     // -z/--null-data: records separated and emitted with NUL
     before: usize,
     after: usize,
     maxm: usize,
@@ -5582,7 +5582,7 @@ struct Term {
     top_prev: Vec<(u32, u64)>,  // (pid, cpu_ticks) snapshot for %CPU deltas                      // `tail -f`: (path, next byte offset)
     tailf_last: u64,                                   // last poll ms
     yesing: Option<String>,                            // `yes`: repeated line (mode)
-    shufr: Option<Vec<String>>,                        // `shuf -r` (no -n): random pick stream
+    shufr: Option<(Vec<String>, bool)>,               // `shuf -r` (no -n): random pick stream (+ -z)
     at_q: Vec<(u64, String)>,                          // `at`: (fire_ms, cmd) deferred commands
     cron_q: Vec<(u64, u64, String)>,                   // `cron`: (period_ms, next_fire_ms, cmd)
     yank: String,                                       // readline kill-ring (Ctrl-K/U/W -> Ctrl-Y)
@@ -5745,6 +5745,16 @@ impl Term {
                 Some(last) => last.push_str(s),
                 None => self.push_line(s),
             }
+        }
+    }
+
+    /// Emit one NUL-terminated record when `nul` (the -z/-print0 family),
+    /// else a normal line.
+    fn emit_rec(&mut self, s: &str, nul: bool) {
+        if nul {
+            self.emit_no_nl(&alloc::format!("{}\u{0}", s));
+        } else {
+            self.emit(s);
         }
     }
 
@@ -13478,10 +13488,12 @@ impl Term {
                 }
             }
             "shuf" => {
-                // shuf [file|-n N|-i lo-hi|-e args...|-r]: Fisher-Yates over
+                // shuf [file|-n N|-i lo-hi|-e args...|-r|-z]: Fisher-Yates over
                 // input lines using kernel rand; -i shuffles lo..hi, -e takes
                 // the remaining args as input lines, -r samples with
-                // replacement (infinite without -n → streams like `yes`)
+                // replacement (infinite without -n → streams like `yes`),
+                // -z/--zero-terminated: NUL-separated output records
+                let znul = args.iter().any(|a| *a == "-z" || *a == "--zero-terminated");
                 let mut lo = 1u64;
                 let mut hi = 0u64;
                 let mut limit = usize::MAX;
@@ -13553,7 +13565,7 @@ impl Term {
                     if !n_set {
                         // shuf -r with no -n never stops — stream picks like
                         // `yes` does (Esc/Enter to stop)
-                        self.shufr = Some(lines);
+                        self.shufr = Some((lines, znul));
                         self.emit("shuf -r running -- Esc/Enter to stop");
                         return;
                     }
@@ -13562,7 +13574,7 @@ impl Term {
                         let j = (ustd::rand_u64().unwrap_or(0)
                             % lines.len() as u64)
                             as usize;
-                        self.emit(&lines[j]);
+                        self.emit_rec(&lines[j], znul);
                     }
                     return;
                 }
@@ -13571,8 +13583,16 @@ impl Term {
                     let j = (ustd::rand_u64().unwrap_or(i as u64) % (i as u64 + 1)) as usize;
                     lines.swap(i, j);
                 }
-                for l in lines.iter().take(limit) {
-                    self.emit(l);
+                if znul {
+                    let out = alloc::format!(
+                        "{}\u{0}",
+                        lines.iter().take(limit).cloned().collect::<Vec<String>>().join("\u{0}")
+                    );
+                    self.emit_no_nl(&out);
+                } else {
+                    for l in lines.iter().take(limit) {
+                        self.emit(l);
+                    }
                 }
             }
             "cksum" => {
@@ -15962,6 +15982,7 @@ impl Term {
                                     b'h' => o.fname = 1,      // never prefix
                                     b'H' => o.fname = 2,      // always prefix
                                     b's' => o.quieterr = true, // -s: no file errors
+                                    b'z' => o.zrec = true,     // -z: NUL records
                                     _ => {}
                                 }
                             }
@@ -16048,10 +16069,17 @@ impl Term {
                     }
                     (Some(p), None) => match self.pipe_in.clone() {
                         Some(s) => {
-                            let lines: Vec<&str> = s.lines().collect();
+                            let mut lines: Vec<&str> = if o.zrec {
+                                s.split('\0').collect()
+                            } else {
+                                s.lines().collect()
+                            };
+                            if o.zrec && lines.last() == Some(&"") {
+                                lines.pop();
+                            }
                             let hits = self.grep_lines(&p, &lines, "", &o);
                             if o.cnt {
-                                self.emit(&alloc::format!("{}", hits));
+                                self.emit_rec(&alloc::format!("{}", hits), o.zrec);
                             }
                             if o.quiet {
                                 self.last_ok = hits > 0;
@@ -19063,7 +19091,7 @@ impl Term {
                 let bare_pat: Option<&str> = lead.get(1).copied();
                 let has_action = groups.iter().any(|g| {
                     g.iter()
-                        .any(|a| *a == "-exec" || *a == "-delete" || *a == "-print" || *a == "-printf" || *a == "-execdir" || *a == "-ok")
+                        .any(|a| *a == "-exec" || *a == "-delete" || *a == "-print" || *a == "-print0" || *a == "-printf" || *a == "-execdir" || *a == "-ok")
                 });
                 let dir_is_dir = ustd::stat(dir)
                     .map(|st| st.is_dir != 0)
@@ -19091,6 +19119,7 @@ impl Term {
                     let mut want_empty = false;
                     let mut del = false;
                     let mut want_print = false;
+                    let mut nul0 = false; // -print0: NUL-separated output
                     let mut printf_fmt: Option<String> = None;
                     let mut size_test: Option<(i8, u64)> = None;
                     let mut mmin: Option<(i8, u64)> = None;
@@ -19233,7 +19262,7 @@ impl Term {
                                     }
                                 }
                             }
-                            "-exec" | "-delete" | "-print" | "-printf" | "-execdir" | "-ok"
+                            "-exec" | "-delete" | "-print" | "-print0" | "-printf" | "-execdir" | "-ok"
                                 if neg_next =>
                             {
                                 // `! ACTION` — the arm matches nothing (GNU)
@@ -19258,6 +19287,10 @@ impl Term {
                             }
                             "-delete" => del = true,
                             "-print" => want_print = true,
+                            "-print0" => {
+                                want_print = true;
+                                nul0 = true;
+                            }
                             "-printf" => {
                                 if let Some(v) = g.get(i + 1) {
                                     printf_fmt = Some(String::from(*v));
@@ -19913,7 +19946,7 @@ impl Term {
                             } else if want_print {
                                 for m in &ms {
                                     if printed.insert(m.clone()) {
-                                        self.emit(m);
+                                        self.emit_rec(m, nul0);
                                     }
                                 }
                             }
@@ -19941,7 +19974,7 @@ impl Term {
                             if has_action {
                                 if want_print && printed.insert(String::from(dir))
                                 {
-                                    self.emit(dir);
+                                    self.emit_rec(dir, nul0);
                                 }
                             } else if printed.insert(String::from(dir)) {
                                 self.emit(dir);
@@ -21833,6 +21866,11 @@ impl Term {
                         "-n" => {
                             nbatch = args.get(ci + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
                             ci += 2;
+                        }
+                        a if a.starts_with("-n") && a.len() > 2 => {
+                            // GNU attached form: -n1 / -n5
+                            nbatch = a[2..].parse().unwrap_or(0);
+                            ci += 1;
                         }
                         "-d" => {
                             delim = args.get(ci + 1).and_then(|s| s.chars().next());
@@ -25000,6 +25038,7 @@ impl Term {
                     "          sh -n  break/continue N  which -a  truncate -r/-s  numfmt",
                     "          seq (fractional)  test -O/-G  shuf -e/-r  expr length/index/substr",
                     "          tail -c +K  head -c -N  uniq -s/-z",
+                    "          grep -z  find -print0  shuf -z  sed '='",
                     "          setsid <cmd>  dir/vdir  mkdir -m  df -P  stat -t  chown -R",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];
@@ -25527,7 +25566,7 @@ impl Term {
                         let mut rest = hay.clone();
                         let mut li = 0usize;
                         while let Some((a, b)) = re_search(pat, &rest) {
-                            self.emit(&l[li + a..li + b]);
+                            self.emit_rec(&l[li + a..li + b], o.zrec);
                             if b == a {
                                 li += b + 1;
                             } else {
@@ -25539,14 +25578,14 @@ impl Term {
                             rest = String::from(&hay[li.min(hay.len())..]);
                         }
                     } else if o.word || o.exact {
-                        self.emit(pat);
+                        self.emit_rec(pat, o.zrec);
                     } else {
                         let pb = pat.as_bytes();
                         let hb = hay.as_bytes();
                         let mut s = 0usize;
                         while s + pb.len() <= hb.len() {
                             if &hb[s..s + pb.len()] == pb {
-                                self.emit(&l[s..s + pb.len()]);
+                                self.emit_rec(&l[s..s + pb.len()], o.zrec);
                                 s += pb.len();
                             } else {
                                 s += 1;
@@ -25556,9 +25595,9 @@ impl Term {
                 } else if show {
                     let from = i.saturating_sub(o.before).max(printed_up_to);
                     for j in from..i {
-                        self.emit(&fmt(j, lines[j], true));
+                        self.emit_rec(&fmt(j, lines[j], true), o.zrec);
                     }
-                    self.emit(&fmt(i, l, false));
+                    self.emit_rec(&fmt(i, l, false), o.zrec);
                     printed_up_to = i + 1;
                     after_left = o.after;
                 }
@@ -25567,7 +25606,7 @@ impl Term {
                     let mut j = i + 1;
                     while after_left > 0 && j < lines.len() {
                         if show {
-                            self.emit(&fmt(j, lines[j], true));
+                            self.emit_rec(&fmt(j, lines[j], true), o.zrec);
                         }
                         after_left -= 1;
                         j += 1;
@@ -25576,7 +25615,7 @@ impl Term {
                 }
             } else if after_left > 0 {
                 if show {
-                    self.emit(&fmt(i, l, true));
+                    self.emit_rec(&fmt(i, l, true), o.zrec);
                     printed_up_to = i + 1;
                 }
                 after_left -= 1;
@@ -25589,7 +25628,14 @@ impl Term {
         match ustd::read_all(path) {
             Ok(d) => {
                 let s = String::from_utf8_lossy(&d).into_owned();
-                let lines: Vec<&str> = s.lines().collect();
+                let mut lines: Vec<&str> = if o.zrec {
+                    s.split('\0').collect()
+                } else {
+                    s.lines().collect()
+                };
+                if o.zrec && lines.last() == Some(&"") {
+                    lines.pop();
+                }
                 // GNU prefixing: recursive or multi-file search shows the
                 // path; -h suppresses it, -H forces it
                 let prefix = if o.fname == 1 {
@@ -25601,11 +25647,11 @@ impl Term {
                 };
                 let hits = self.grep_lines(pat, &lines, prefix, o);
                 if o.files == 1 && hits > 0 {
-                    self.emit(path);
+                    self.emit_rec(path, o.zrec);
                 } else if o.files == 2 && hits == 0 {
-                    self.emit(path);
+                    self.emit_rec(path, o.zrec);
                 } else if o.cnt {
-                    self.emit(&alloc::format!("{}: {}", path, hits));
+                    self.emit_rec(&alloc::format!("{}: {}", path, hits), o.zrec);
                 }
                 hits
             }
@@ -27085,12 +27131,16 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             t.dirty_all = true;
         }
         // shuf -r (no -n): random pick per tick, forever
-        if let Some(pool) = t.shufr.clone() {
+        if let Some((pool, znul)) = t.shufr.clone() {
             if !pool.is_empty() {
                 for _ in 0..4 {
                     let j = (ustd::rand_u64().unwrap_or(0)
                         % pool.len() as u64) as usize;
-                    t.push_line(&pool[j]);
+                    if znul {
+                        t.emit_no_nl(&alloc::format!("{}\u{0}", pool[j]));
+                    } else {
+                        t.push_line(&pool[j]);
+                    }
                 }
             }
             t.dirty_all = true;
