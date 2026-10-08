@@ -1264,6 +1264,220 @@ fn dos_datetime() -> (u16, u16) {
 }
 
 /// Create any missing parents of `path` (mkdir -p semantics, tolerant).
+fn uu_encode(data: &[u8]) -> String {
+    let mut out = String::new();
+    for chunk in data.chunks(45) {
+        out.push((chunk.len() as u8 + 32) as char);
+        for trip in chunk.chunks(3) {
+            let b = [trip.first().copied().unwrap_or(0),
+                     trip.get(1).copied().unwrap_or(0),
+                     trip.get(2).copied().unwrap_or(0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            for s in [18, 12, 6, 0] {
+                let c = ((n >> s) & 63) as u8;
+                out.push(if c == 0 { '`' } else { (c + 32) as char });
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Decode a uuencoded text: (target filename, bytes).
+fn uu_decode(text: &str) -> Option<(String, Vec<u8>)> {
+    let mut it = text.lines();
+    let begin = it.find(|l| l.starts_with("begin "))?;
+    let name = begin.split_whitespace().nth(2).unwrap_or("out.bin");
+    let name = name.rsplit('/').next().unwrap_or(name);
+    let mut out = Vec::new();
+    for line in it {
+        if line == "end" || line.is_empty() {
+            break;
+        }
+        let b = line.as_bytes();
+        if b.is_empty() {
+            break;
+        }
+        let len = (b[0].wrapping_sub(32)) as usize;
+        if len == 0 {
+            break; // '`' or ' ' end-of-data line
+        }
+        let mut got = 0usize;
+        for quad in b[1..].chunks(4) {
+            if got >= len {
+                break;
+            }
+            let mut n = 0u32;
+            for (i, &c) in quad.iter().enumerate() {
+                let v = if c == b'`' || c == b' ' { 0u32 } else { c.wrapping_sub(32) as u32 };
+                n |= v << (18 - i * 6);
+            }
+            for shift in [16, 8, 0] {
+                if got < len {
+                    out.push((n >> shift) as u8);
+                    got += 1;
+                }
+            }
+        }
+    }
+    Some((String::from(name), out))
+}
+
+fn dns_name(out: &mut Vec<u8>, name: &str) {
+    for part in name.trim_end_matches('.').split('.') {
+        out.push(part.len() as u8);
+        out.extend_from_slice(part.as_bytes());
+    }
+    out.push(0);
+}
+
+/// Read a (possibly compressed) domain name at `pos` in `pkt`.
+fn dns_read_name(pkt: &[u8], pos: usize, depth: usize) -> Option<(String, usize)> {
+    if depth > 8 {
+        return None;
+    }
+    let mut s = String::new();
+    let mut i = pos;
+    let mut end = 0usize;
+    loop {
+        let l = *pkt.get(i)? as usize;
+        if l & 0xc0 == 0xc0 {
+            let off = ((l & 0x3f) << 8) | *pkt.get(i + 1)? as usize;
+            let (rest, _) = dns_read_name(pkt, off, depth + 1)?;
+            if !s.is_empty() {
+                s.push('.');
+            }
+            s.push_str(&rest);
+            if end == 0 {
+                end = i + 2;
+            }
+            break;
+        }
+        if l == 0 {
+            if end == 0 {
+                end = i + 1;
+            }
+            break;
+        }
+        if !s.is_empty() {
+            s.push('.');
+        }
+        s.push_str(&String::from_utf8_lossy(pkt.get(i + 1..i + 1 + l)?));
+        i += 1 + l;
+    }
+    Some((s, end))
+}
+
+/// Real dig: build a wire-format DNS query, send it through UdpSock,
+/// parse the answer section. Returns display lines.
+fn dig_query(name: &str, qtype: u16) -> Result<Vec<String>, String> {
+    let mut q = Vec::with_capacity(64);
+    q.extend_from_slice(&0x1a2bu16.to_be_bytes()); // id
+    q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+    q.extend_from_slice(&1u16.to_be_bytes()); // qd
+    q.extend_from_slice(&0u16.to_be_bytes());
+    q.extend_from_slice(&0u16.to_be_bytes());
+    q.extend_from_slice(&0u16.to_be_bytes());
+    dns_name(&mut q, name);
+    q.extend_from_slice(&qtype.to_be_bytes());
+    q.extend_from_slice(&1u16.to_be_bytes());
+    let sock = ustd::UdpSock::open(15353).ok_or_else(|| String::from("dig: socket failed"))?;
+    sock.send_to([10, 0, 2, 3], 53, &q)
+        .ok_or_else(|| String::from("dig: send failed"))?;
+    let (_, _, p) = sock
+        .recv_from(3000)
+        .ok_or_else(|| String::from("dig: no answer (timeout)"))?;
+    if p.len() < 12 {
+        return Err(String::from("dig: short reply"));
+    }
+    let id = u16::from_be_bytes([p[0], p[1]]);
+    let rcode = p[3] & 0x0f;
+    let qd = u16::from_be_bytes([p[4], p[5]]) as usize;
+    let an = u16::from_be_bytes([p[6], p[7]]) as usize;
+    let ns = u16::from_be_bytes([p[8], p[9]]) as usize;
+    let mut out = alloc::vec![
+        alloc::format!(";; id {} rcode {} answers {} authority {}", id, rcode, an, ns),
+        alloc::format!(";; QUESTION: {} {}", name, qtype),
+    ];
+    let mut pos = 12;
+    // skip questions
+    for _ in 0..qd {
+        let (_, e) = dns_read_name(&p, pos, 0).ok_or_else(|| String::from("dig: bad qname"))?;
+        pos = e + 4;
+    }
+    let tname = |t: u16| match t {
+        1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        6 => "SOA",
+        12 => "PTR",
+        15 => "MX",
+        16 => "TXT",
+        28 => "AAAA",
+        _ => "?",
+    };
+    for _ in 0..an {
+        let (nm, e) = dns_read_name(&p, pos, 0).ok_or_else(|| String::from("dig: bad answer"))?;
+        pos = e;
+        if pos + 10 > p.len() {
+            break;
+        }
+        let ty = u16::from_be_bytes([p[pos], p[pos + 1]]);
+        let ttl = u32::from_be_bytes([p[pos + 4], p[pos + 5], p[pos + 6], p[pos + 7]]);
+        let rd = u16::from_be_bytes([p[pos + 8], p[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rd > p.len() {
+            break;
+        }
+        let data = &p[pos..pos + rd];
+        let val = match ty {
+            1 if rd == 4 => alloc::format!("{}.{}.{}.{}", data[0], data[1], data[2], data[3]),
+            2 | 5 | 12 => dns_read_name(&p, pos, 0).map(|(n, _)| n).unwrap_or_default(),
+            15 if rd > 2 => alloc::format!(
+                "{} {}",
+                u16::from_be_bytes([data[0], data[1]]),
+                dns_read_name(&p, pos + 2, 0).map(|(n, _)| n).unwrap_or_default()
+            ),
+            16 => {
+                let mut t = String::from("\"");
+                let mut i = 0;
+                while i < data.len() {
+                    let l = data[i] as usize;
+                    i += 1;
+                    t.push_str(&String::from_utf8_lossy(&data[i..(i + l).min(data.len())]));
+                    i += l;
+                }
+                t.push('"');
+                t
+            }
+            28 if rd == 16 => alloc::format!(
+                "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+                u16::from_be_bytes([data[0], data[1]]),
+                u16::from_be_bytes([data[2], data[3]]),
+                u16::from_be_bytes([data[4], data[5]]),
+                u16::from_be_bytes([data[6], data[7]]),
+                u16::from_be_bytes([data[8], data[9]]),
+                u16::from_be_bytes([data[10], data[11]]),
+                u16::from_be_bytes([data[12], data[13]]),
+                u16::from_be_bytes([data[14], data[15]])
+            ),
+            _ => {
+                let mut h = String::from("0x");
+                for b in data {
+                    h.push_str(&alloc::format!("{:02x}", b));
+                }
+                h
+            }
+        };
+        out.push(alloc::format!("{}  {}  IN  {}  {}", nm, ttl, tname(ty), val));
+        pos += rd;
+    }
+    if an == 0 {
+        out.push(String::from(";; no answers"));
+    }
+    Ok(out)
+}
+
 fn mkdir_parents(path: &str) {
     let mut acc = String::new();
     if path.starts_with('/') {
@@ -1468,6 +1682,9 @@ struct Term {
     tailf_last: u64,                                   // last poll ms
     yesing: Option<String>,                            // `yes`: repeated line (mode)
     at_q: Vec<(u64, String)>,                          // `at`: (fire_ms, cmd) deferred commands
+    yank: String,                                       // readline kill-ring (Ctrl-K/U/W -> Ctrl-Y)
+    cap_bin: Option<Vec<u8>>,                           // binary capture channel (gzip -c etc.)
+    last_cap_bin: Vec<u8>,                              // bin captured by the last run_captured
     prev_buttons: u8,                                  // pointer buttons last event (edge detect)
     aliases: Vec<(String, String)>,                    // `alias` table (name -> expansion)
     subst_depth: u8,                                   // $(...) recursion guard
@@ -1528,6 +1745,17 @@ impl Term {
             } else {
                 self.push_line(l);
             }
+        }
+    }
+
+    /// Binary command output: captured byte-exact during pipes/redirects,
+    /// lossy-printed to the scrollback otherwise.
+    fn emit_bin(&mut self, data: &[u8]) {
+        if let Some(c) = self.cap_bin.as_mut() {
+            c.extend_from_slice(data);
+        } else {
+            let s = String::from_utf8_lossy(data).into_owned();
+            self.emit(&s);
         }
     }
 
@@ -1702,11 +1930,15 @@ impl Term {
     }
 
     /// Run `cmd` with output captured; returns the captured lines.
+    /// Binary output (emit_bin) is collected into `last_cap_bin`.
     fn run_captured(&mut self, cmd: &str) -> Vec<String> {
         let saved = self.capture.replace(Vec::new());
+        let saved_bin = self.cap_bin.replace(Vec::new());
         self.run(cmd);
         let out = self.capture.take().unwrap_or_default();
+        self.last_cap_bin = self.cap_bin.take().unwrap_or_default();
         self.capture = saved;
+        self.cap_bin = saved_bin;
         out
     }
 
@@ -2601,16 +2833,28 @@ impl Term {
             // `echo -n ... > f` suppresses the trailing newline
             let nonl = left == "echo -n" || left.starts_with("echo -n ");
             let out = self.run_captured(left);
-            let mut body = out.join("\n");
-            if !body.is_empty() && !nonl {
-                body.push('\n');
-            }
-            let r = if append {
-                let mut prev = ustd::read_all(fname).unwrap_or_default();
-                prev.extend_from_slice(body.as_bytes());
-                ustd::write_all(fname, &prev)
+            let bin = core::mem::take(&mut self.last_cap_bin);
+            let r = if !bin.is_empty() {
+                // binary output (e.g. gzip -c): byte-exact, no trailing NL
+                if append {
+                    let mut prev = ustd::read_all(fname).unwrap_or_default();
+                    prev.extend_from_slice(&bin);
+                    ustd::write_all(fname, &prev)
+                } else {
+                    ustd::write_all(fname, &bin)
+                }
             } else {
-                ustd::write_all(fname, body.as_bytes())
+                let mut body = out.join("\n");
+                if !body.is_empty() && !nonl {
+                    body.push('\n');
+                }
+                if append {
+                    let mut prev = ustd::read_all(fname).unwrap_or_default();
+                    prev.extend_from_slice(body.as_bytes());
+                    ustd::write_all(fname, &prev)
+                } else {
+                    ustd::write_all(fname, body.as_bytes())
+                }
             };
             if let Err(e) = r {
                 self.fail(&alloc::format!("{}: err {}", fname, e));
@@ -2635,7 +2879,7 @@ impl Term {
         const GLOBBABLE: &[&str] = &[
             "ls", "cat", "rm", "cp", "mv", "du", "wc", "head", "tail", "hex", "stat",
             "sha256sum", "strings", "sort", "uniq", "cut", "more", "diff", "base64",
-            "show", "tar",
+            "show", "tar", "md5sum", "uuencode", "uudecode",
         ];
         let gexp: Vec<String> = if GLOBBABLE.contains(&cmd)
             && toks[1.min(toks.len())..]
@@ -2746,7 +2990,10 @@ impl Term {
                     "          zip (deflate)/unzip/zipinfo  gzip [-c]  gunzip  zcat  /proc/*",
                     "          sh: case W in p|p) .. ;; esac   cmd <<EOF heredoc",
                     "          diff -u <a> <b>  patch <file.diff>  awk [-F c] 'prog' [file]",
-                    "          tar cf|tf|tv|xf (dirs recurse, xf honors paths)",
+                    "          tar cf|tf|tv|xf (dirs recurse, xf honors paths, 'z' = gz)",
+                    "          /dev/{null,zero,full,random,urandom}  md5sum  uuencode/uudecode",
+                    "          zgrep <pat> <file.gz>  portscan <host> [lo-hi|p..]  dig <name> [type]",
+                    "          readline: Ctrl-A/E/K/U/W/Y",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ];
@@ -3678,9 +3925,7 @@ impl Term {
                     Ok(d) => {
                         let gz = ustd::deflate::gzip_data(&d);
                         if to_stdout {
-                            for l in String::from_utf8_lossy(&gz).lines() {
-                                self.emit(l);
-                            }
+                            self.emit_bin(&gz);
                         } else {
                             let outp = alloc::format!("{}.gz", p);
                             match ustd::write_all(&outp, &gz) {
@@ -3719,10 +3964,7 @@ impl Term {
                                     if out.len() != isize_ || ustd::inflate::crc32(&out) != crc {
                                         self.fail("gunzip: CRC/size mismatch");
                                     } else if to_stdout {
-                                        let s = String::from_utf8_lossy(&out);
-                                        for l in s.lines() {
-                                            self.emit(l);
-                                        }
+                                        self.emit_bin(&out);
                                     } else {
                                         let outp = if let Some(st) = p.strip_suffix(".gz") {
                                             String::from(st)
@@ -4705,6 +4947,8 @@ impl Term {
                         // cf walks dirs recursively emitting '5' dir entries;
                         // xf honors member paths (mkdir -p parents, '..' dropped).
                         let sub = args.first().copied().unwrap_or("");
+                        // 'z' in the flag word = gzip layer (tar czf/xzf/tzf)
+                        let zflag = sub.contains('z');
                         let op = if sub.contains('c') {
                             "cf"
                         } else if sub.contains('x') {
@@ -4731,12 +4975,17 @@ impl Term {
                                     }
                                     if ok {
                                         arc.resize(arc.len() + 1024, 0);
-                                        match ustd::write_all(out, &arc) {
+                                        let payload = if zflag {
+                                            ustd::deflate::gzip_data(&arc)
+                                        } else {
+                                            arc
+                                        };
+                                        match ustd::write_all(out, &payload) {
                                             Ok(()) => self.emit(&alloc::format!(
                                                 "tar: {} -> {} ({} B)",
                                                 nmem,
                                                 out,
-                                                arc.len()
+                                                payload.len()
                                             )),
                                             Err(e) => self
                                                 .fail(&alloc::format!("tar: {}: err {}", out, e)),
@@ -4746,7 +4995,19 @@ impl Term {
                                 _ => self.fail("usage: tar cf out.tar <file|dir...>"),
                             },
                             "tf" | "tv" | "xf" => match args.get(1) {
-                                Some(path) => match ustd::read_all(path) {
+                                Some(path) => match ustd::read_all(path).and_then(|raw| {
+                                    // tar xzf/tzf: transparent gzip unwrap —
+                                    // also auto-detect the magic when 'z' is
+                                    // omitted, like GNU tar -a
+                                    if zflag || raw.starts_with(&[0x1f, 0x8b]) {
+                                        ustd::inflate::gzip_body(&raw)
+                                            .ok()
+                                            .and_then(|o| ustd::inflate::inflate(&raw[o..raw.len() - 8]).ok())
+                                            .ok_or(-99)
+                                    } else {
+                                        Ok(raw)
+                                    }
+                                }) {
                                     Ok(d) => {
                                         // optional member filter: tar xf a.tar m1 m2
                                         let filter: Vec<&str> = args[2..]
@@ -5258,6 +5519,185 @@ impl Term {
                     return;
                 }
                 self.run_patch(&text);
+            }
+            "md5sum" => {
+                // real MD5 (RFC 1321) of each file or stdin
+                let mut any = false;
+                for a in args.iter() {
+                    match ustd::read_all(a) {
+                        Ok(d) => {
+                            any = true;
+                            let h = ustd::md5(&d);
+                            let mut hx = String::new();
+                            for b in h {
+                                hx.push_str(&alloc::format!("{:02x}", b));
+                            }
+                            self.emit(&alloc::format!("{}  {}", hx, a));
+                        }
+                        Err(e) => self.fail(&alloc::format!("md5sum: {}: err {}", a, e)),
+                    }
+                }
+                if !any {
+                    if let Some(t) = &self.pipe_in {
+                        let h = ustd::md5(t.as_bytes());
+                        let mut hx = String::new();
+                        for b in h {
+                            hx.push_str(&alloc::format!("{:02x}", b));
+                        }
+                        self.emit(&alloc::format!("{}  -", hx));
+                    } else {
+                        self.fail("usage: md5sum <file>...");
+                    }
+                }
+            }
+            "uuencode" => match args.first() {
+                Some(p) => match ustd::read_all(p) {
+                    Ok(d) => {
+                        let name = p.rsplit('/').next().unwrap_or(p);
+                        self.emit(&alloc::format!("begin 644 {}", name));
+                        for line in uu_encode(&d).lines() {
+                            self.emit(line);
+                        }
+                        self.emit("`");
+                        self.emit("end");
+                    }
+                    Err(e) => self.fail(&alloc::format!("uuencode: {}: err {}", p, e)),
+                },
+                None => self.fail("usage: uuencode <file>   (binary->text on stdout)"),
+            },
+            "uudecode" => match args.first() {
+                Some(p) => match ustd::read_all(p) {
+                    Ok(d) => match uu_decode(&String::from_utf8_lossy(&d)) {
+                        Some((name, data)) => match ustd::write_all(&name, &data) {
+                            Ok(()) => self.emit(&alloc::format!("uudecode: {} ({} B)", name, data.len())),
+                            Err(e) => self.fail(&alloc::format!("uudecode: {}: err {}", name, e)),
+                        },
+                        None => self.fail("uudecode: no 'begin' line"),
+                    },
+                    Err(e) => self.fail(&alloc::format!("uudecode: {}: err {}", p, e)),
+                },
+                None => self.fail("usage: uudecode <file.uu>"),
+            },
+            "zgrep" => {
+                // zgrep [-flags] <pat> <file.gz>... — grep inside gzipped files
+                let mut o = GrepOpts::default();
+                let mut pos: Vec<&str> = Vec::new();
+                for a in args.iter() {
+                    match *a {
+                        "-n" => o.num = true,
+                        "-i" => o.ci = true,
+                        "-v" => o.inv = true,
+                        "-w" => o.word = true,
+                        "-x" => o.exact = true,
+                        "-c" => o.cnt = true,
+                        _ if a.starts_with('-') => {}
+                        _ => pos.push(*a),
+                    }
+                }
+                match (pos.first(), pos.get(1)) {
+                    (Some(pat), Some(_)) => {
+                        let pat = String::from(*pat);
+                        for p in &pos[1..] {
+                            match ustd::read_all(p) {
+                                Ok(raw) => match ustd::inflate::gzip_body(&raw)
+                                    .ok()
+                                    .and_then(|off| ustd::inflate::inflate(&raw[off..raw.len() - 8]).ok())
+                                {
+                                    Some(d) => {
+                                        let text = String::from_utf8_lossy(&d).into_owned();
+                                        let lines: Vec<&str> = text.lines().collect();
+                                        let pref = if pos.len() > 2 { *p } else { "" };
+                                        self.grep_lines(&pat, &lines, pref, &o);
+                                    }
+                                    None => self.fail(&alloc::format!("zgrep: {}: not gzip", p)),
+                                },
+                                Err(e) => self.fail(&alloc::format!("zgrep: {}: err {}", p, e)),
+                            }
+                        }
+                    }
+                    _ => self.fail("usage: zgrep [-nivcwx] <pat> <file.gz>..."),
+                }
+            }
+            "portscan" => {
+                // real TCP connect() scan through the stack (SYN -> SYN-ACK or RST)
+                let Some(host) = args.first() else {
+                    self.fail("usage: portscan <host> [lo-hi | port...] (<=64 ports)");
+                    return;
+                };
+                let ip = match parse_ipv4(host) {
+                    Some(ip) => Some(ip),
+                    None => ustd::net_dns(host),
+                };
+                let Some(ip) = ip else {
+                    self.fail(&alloc::format!("portscan: {}: no such host", host));
+                    return;
+                };
+                let mut ports: Vec<u16> = Vec::new();
+                match args.get(1) {
+                    Some(r) if r.contains('-') => {
+                        let mut it = r.split('-');
+                        let lo: u16 = it.next().and_then(|x| x.parse().ok()).unwrap_or(1);
+                        let hi: u16 = it.next().and_then(|x| x.parse().ok()).unwrap_or(lo).min(lo + 63);
+                        ports = (lo..=hi).collect();
+                    }
+                    None => ports = alloc::vec![21, 22, 23, 53, 80, 110, 443, 3306, 8080],
+                    _ => {
+                        for a in &args[1..] {
+                            if let Ok(p) = a.parse::<u16>() {
+                                ports.push(p);
+                            }
+                            if ports.len() >= 64 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                self.emit(&alloc::format!("scanning {}.{}.{}.{} ({} ports)...", ip[0], ip[1], ip[2], ip[3], ports.len()));
+                let nports = ports.len();
+                let mut lport = 16300u16;
+                let mut open = 0u32;
+                for p in ports {
+                    lport += 1;
+                    match ustd::TcpSock::connect(lport, ip, p) {
+                        Some(s) => {
+                            drop(s);
+                            open += 1;
+                            self.emit(&alloc::format!("  {}/tcp  open", p));
+                        }
+                        None => self.emit(&alloc::format!("  {}/tcp  closed", p)),
+                    }
+                }
+                self.emit(&alloc::format!("portscan: {} open of {}", open, nports));
+            }
+            "dig" => {
+                // dig <name> [A|MX|NS|TXT|CNAME|AAAA|ANY] — raw DNS over UDP/53
+                let Some(name) = args.first() else {
+                    self.fail("usage: dig <name> [type]");
+                    return;
+                };
+                let qt = match args.get(1).map(|s| s.to_uppercase()).as_deref() {
+                    None | Some("A") => 1u16,
+                    Some("NS") => 2,
+                    Some("CNAME") => 5,
+                    Some("SOA") => 6,
+                    Some("PTR") => 12,
+                    Some("MX") => 15,
+                    Some("TXT") => 16,
+                    Some("AAAA") => 28,
+                    Some("ANY") => 255,
+                    Some(t) => {
+                        self.fail(&alloc::format!("dig: unknown type '{}'", t));
+                        return;
+                    }
+                };
+                match dig_query(name, qt) {
+                    Ok(lines) => {
+                        for l in lines {
+                            self.emit(&l);
+                        }
+                    }
+                    Err(e) => self.fail(&e),
+                }
             }
             "stat" => match args.first() {
                 Some(p) => match ustd::stat(p) {
@@ -6393,6 +6833,66 @@ impl Term {
             self.dirty_all = true;
             return;
         }
+        // readline editing: Ctrl-A home, Ctrl-E end, Ctrl-K kill to EOL,
+        // Ctrl-U kill to BOL, Ctrl-W kill word, Ctrl-Y yank
+        if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 {
+            match k.chr {
+                b'a' | b'A' => {
+                    self.cx = 0;
+                    self.dirty_all = true;
+                    return;
+                }
+                b'e' | b'E' => {
+                    self.cx = self.cur.len();
+                    self.dirty_all = true;
+                    return;
+                }
+                b'k' | b'K' => {
+                    if self.cx < self.cur.len() {
+                        self.yank = self.cur[self.cx..].to_string();
+                        self.cur.truncate(self.cx);
+                        self.dirty_all = true;
+                    }
+                    return;
+                }
+                b'u' | b'U' => {
+                    if self.cx > 0 {
+                        self.yank = self.cur[..self.cx].to_string();
+                        self.cur.replace_range(..self.cx, "");
+                        self.cx = 0;
+                        self.dirty_all = true;
+                    }
+                    return;
+                }
+                b'w' | b'W' => {
+                    if self.cx > 0 {
+                        let mut s = self.cx;
+                        let b = self.cur.as_bytes();
+                        while s > 0 && b[s - 1] == b' ' {
+                            s -= 1;
+                        }
+                        while s > 0 && b[s - 1] != b' ' {
+                            s -= 1;
+                        }
+                        self.yank = self.cur[s..self.cx].to_string();
+                        self.cur.replace_range(s..self.cx, "");
+                        self.cx = s;
+                        self.dirty_all = true;
+                    }
+                    return;
+                }
+                b'y' | b'Y' => {
+                    if !self.yank.is_empty() {
+                        let y = self.yank.clone();
+                        self.cur.insert_str(self.cx, &y);
+                        self.cx += y.len();
+                        self.dirty_all = true;
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         if k.key == KeyCode::PageUp as u32 {
             let max = self.lines.len().saturating_sub(1);
             self.view = (self.view + 20).min(max);
@@ -6470,6 +6970,7 @@ impl Term {
         "tac", "fold", "column", "truncate", "mktemp", "clip", "pushd", "popd",
         "dirs", "zip", "unzip", "zipinfo", "beep", "play", "gzip", "gunzip", "zcat",
         "patch", "awk", "case", "esac",
+        "md5sum", "uuencode", "uudecode", "zgrep", "portscan", "dig",
     ];
 
     /// Tab-complete: command names before the first space, paths after.
@@ -6930,6 +7431,9 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         tailf: None,
         tailf_last: 0,
         at_q: Vec::new(),
+        yank: String::new(),
+        cap_bin: None,
+        last_cap_bin: Vec::new(),
         yesing: None,
         prev_buttons: 0,
         aliases: Vec::new(),

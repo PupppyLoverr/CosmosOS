@@ -756,8 +756,8 @@ fn sys_chdir(pptr: u64, plen: u64) -> u64 {
     let Some(path) = copy_str(pptr, plen) else { return ERR };
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = vfs::normalize(&cwd, &path);
-    // verify it's a dir (procfs root is a dir too, though not on the fs)
-    if crate::proc::is_dir(&full) {
+    // verify it's a dir (procfs/dev roots are dirs too, though not on the fs)
+    if crate::proc::is_dir(&full) || crate::dev::is_dir(&full) {
         task::with_current(|t| t.cwd = full);
         return 0;
     }
@@ -801,7 +801,7 @@ fn power_off() -> ! {
 /// Random bytes for SYS_RAND: RDRAND when the CPU advertises it
 /// (CPUID.1:ECX bit 30), otherwise a xorshift64* PRNG seeded once from
 /// rdtsc — a real PRNG, not presented as CSPRNG in the docs.
-fn rand_fill(out: &mut [u8]) {
+pub(crate) fn rand_fill(out: &mut [u8]) {
     let has_rdrand = unsafe { core::arch::x86_64::__cpuid(1).ecx } & (1 << 30) != 0;
     let mut i = 0;
     while i < out.len() {
