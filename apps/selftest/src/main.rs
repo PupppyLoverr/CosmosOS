@@ -4615,6 +4615,80 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    check("caps", {
+        // Capability model: euid 0 wields the permitted set, non-root
+        // only its stored effective set — so dropping uid empties the
+        // gate. A PR_CAPBSET_DROP is permanent and shrinks prm+eff too.
+        let mut ok = ustd::capget(0).map(|c| c[1] != 0).unwrap_or(false);
+        match ustd::fork() {
+            0 => {
+                if !ustd::capbset_drop(21) {
+                    ustd::exit(6); // CAP_SYS_ADMIN out of the bounding set
+                }
+                let Some(v) = ustd::capget(0) else {
+                    ustd::exit(7);
+                };
+                if (v[0] | v[1] | v[2]) & (1u64 << 21) != 0 {
+                    ustd::exit(7);
+                }
+                // mount needs CAP_SYS_ADMIN — denied even though uid==0
+                if ustd::mount_flags("", "/capm", "tmpfs", 0) == 0 {
+                    ustd::exit(8);
+                }
+                // capset can't re-add a bit that left the bounding set
+                if ustd::capset(0, 1u64 << 21) {
+                    ustd::exit(9);
+                }
+                ustd::exit(0);
+            }
+            pid if pid > 0 => ok = ok && ustd::waitpid(pid as u32, 10_000) == Ok(0),
+            _ => ok = false,
+        }
+        // a root-owned sleeper for the kill-permission leg
+        let sleeper = ustd::fork();
+        if sleeper == 0 {
+            ustd::sleep_ms(30_000);
+            ustd::exit(0);
+        }
+        if sleeper > 0 {
+            match ustd::fork() {
+                0 => {
+                    if ustd::setresuid(1000, 1000, 1000) != 0 {
+                        ustd::exit(6);
+                    }
+                    let Some(v) = ustd::capget(0) else {
+                        ustd::exit(7);
+                    };
+                    if v[0] != 0 {
+                        ustd::exit(7);
+                    }
+                    if ustd::mount_flags("", "/capm2", "tmpfs", 0) == 0 {
+                        ustd::exit(8);
+                    }
+                    // uid 1000 may not signal a root-owned task: EPERM
+                    if ustd::kill2(sleeper as u32, 0) != -1 {
+                        ustd::exit(9);
+                    }
+                    // but it may still signal itself (same ruid)
+                    if ustd::kill2(ustd::getpid() as u32, 0) != 0 {
+                        ustd::exit(10);
+                    }
+                    ustd::exit(0);
+                }
+                pid if pid > 0 => {
+                    ok = ok && ustd::waitpid(pid as u32, 10_000) == Ok(0)
+                }
+                _ => ok = false,
+            }
+            let _ = ustd::kill2(sleeper as u32, 9);
+            let _ = ustd::waitpid(sleeper as u32, 10_000);
+        }
+        // CapEff visible in /proc/self/status while root
+        ok = ok && ustd::read_all("/proc/self/status")
+            .map(|b| String::from_utf8_lossy(&b).contains("CapEff:\t") && !String::from_utf8_lossy(&b).contains("CapEff:\t0000000000000000"))
+            .unwrap_or(false);
+        ok
+    });
     check("pid-ns", {
         // unshare(CLONE_NEWPID) + fork: the child is init of a fresh
         // pid space (getpid()==1, invisible parent), its own child is 2.

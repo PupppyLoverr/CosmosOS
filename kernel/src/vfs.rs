@@ -317,6 +317,13 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
         if task::mount_opts(&pre) & shared::MS_NODEV != 0 {
             return Err(-13);
         }
+        // Raw hardware exposure is capability-gated: /dev/mem (physical
+        // RAM) and /dev/port (PIO space) need CAP_SYS_RAWIO.
+        if (full == "/dev/mem" || full == "/dev/port")
+            && !task::capable(task::CAP_SYS_RAWIO)
+        {
+            return Err(-1);
+        }
     }
     if crate::tmpfs::handles(&full) {
         let pos = crate::tmpfs::open(&full, flags)?;

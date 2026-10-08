@@ -46,7 +46,13 @@ fn fresh(is_dir: bool) -> (u32, u32, u16) {
 /// (0o400 read / 0o200 write / 0o100 exec). Root (euid 0) passes all.
 pub fn allows(n: &Node, want: u16) -> bool {
     let (eu, _eg) = crate::task::cred();
-    eu == 0
+    // root is not magic here: the bypass is CAP_DAC_OVERRIDE on writes /
+    // CAP_DAC_READ_SEARCH on reads, so a bounding-set drop really bites.
+    crate::task::capable(if want == 0o200 {
+        crate::task::CAP_DAC_OVERRIDE
+    } else {
+        crate::task::CAP_DAC_READ_SEARCH
+    })
         || (eu == n.uid && n.mode & want != 0)
         || (crate::task::in_group(n.gid) && n.mode & (want >> 3) != 0)
         || n.mode & (want >> 6) != 0
@@ -94,7 +100,7 @@ pub fn chmod(path: &str, mode: u16) -> Result<(), i64> {
     let mut g = NODES.lock();
     let n = g.get_mut(path).ok_or(-2i64)?;
     let (eu, _) = crate::task::cred();
-    if eu != 0 && eu != n.uid {
+    if eu != n.uid && !crate::task::capable(crate::task::CAP_FOWNER) {
         return Err(-1);
     }
     n.mode = mode & 0o7777;
@@ -104,8 +110,7 @@ pub fn chmod(path: &str, mode: u16) -> Result<(), i64> {
 
 /// chown: root only, like Linux; gid u32::MAX keeps the current one.
 pub fn chown(path: &str, uid: u32, gid: u32) -> Result<(), i64> {
-    let (eu, _) = crate::task::cred();
-    if eu != 0 {
+    if !crate::task::capable(crate::task::CAP_CHOWN) {
         return Err(-1);
     }
     let mut g = NODES.lock();

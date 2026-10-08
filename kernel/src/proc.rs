@@ -438,6 +438,10 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
 /// single command letter. Returns bytes consumed.
 pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
     if path == "/proc/sysrq-trigger" {
+        // sysrq reboot/poweroff are privileged — CAP_SYS_ADMIN.
+        if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+            return None;
+        }
         match buf.first().copied().unwrap_or(0) {
             b'b' => crate::syscall::reboot(),
             b'o' => crate::syscall::power_off(),
@@ -539,10 +543,11 @@ fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
                 .map(|g| g.to_string())
                 .collect::<Vec<_>>()
                 .join(" ");
+            let (ce, cp, cb) = task::pid_caps(pid).unwrap_or((0, 0, 0));
             alloc::format!(
-                "Name:\t{}\nPid:\t{}\nPPid:\t{}\nState:\t{}\nUser:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nGroups:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nMinFlt:\t{}\nMajFlt:\t{}\nCpuTicks:\t{}\nNice:\t{}\nRt:\t{}\nVrun:\t{}\n",
+                "Name:\t{}\nPid:\t{}\nPPid:\t{}\nState:\t{}\nUser:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nGroups:\t{}\nCapEff:\t{:016x}\nCapPrm:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nMinFlt:\t{}\nMajFlt:\t{}\nCpuTicks:\t{}\nNice:\t{}\nRt:\t{}\nVrun:\t{}\n",
                 name, pid, ppid, state, is_user, c.0, c.1, c.2, c.0, c.3, c.4, c.5, c.3,
-                glist, mem / 1024, rss * 4,
+                glist, ce, cp, cb, 0u64, mem / 1024, rss * 4,
                 min_flt, maj_flt, ticks, nice,
                 task::pid_rt(pid).unwrap_or(false) as u8, vrun
             )

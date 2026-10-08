@@ -18592,6 +18592,40 @@ impl Term {
                     ));
                 }
             }
+            "getpcaps" => {
+                // getpcaps [pid]: effective/permitted/bounding capability
+                // masks for a task (default self), plus decoded names.
+                let pid = match args.first() {
+                    Some(a) => a.parse().unwrap_or(0),
+                    None => 0,
+                };
+                match ustd::capget(pid) {
+                    Some(v) => {
+                        const NAMES: [(u64, &str); 14] = [
+                            (0, "CAP_CHOWN"), (1, "CAP_DAC_OVERRIDE"),
+                            (2, "CAP_DAC_READ_SEARCH"), (3, "CAP_FOWNER"),
+                            (5, "CAP_KILL"), (6, "CAP_SETGID"),
+                            (7, "CAP_SETUID"), (8, "CAP_SETPCAP"),
+                            (17, "CAP_SYS_RAWIO"), (18, "CAP_SYS_CHROOT"),
+                            (19, "CAP_SYS_PTRACE"), (21, "CAP_SYS_ADMIN"),
+                            (23, "CAP_SYS_NICE"), (27, "CAP_SYS_BOOT"),
+                        ];
+                        let names = |m: u64| -> String {
+                            NAMES
+                                .iter()
+                                .filter(|(b, _)| m & (1u64 << b) != 0)
+                                .map(|(_, n)| *n)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        };
+                        println!("pid {} capabilities:", pid);
+                        println!("  CapEff: {:016x}  {}", v[0], names(v[0]));
+                        println!("  CapPrm: {:016x}  {}", v[1], names(v[1]));
+                        println!("  CapBnd: {:016x}  {}", v[2], names(v[2]));
+                    }
+                    None => println!("getpcaps: pid {}: no such task", pid),
+                }
+            }
             "groups" => {
                 // groups [user]: supplementary membership list
                 match args.first() {

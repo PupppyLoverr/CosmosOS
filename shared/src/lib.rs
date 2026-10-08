@@ -302,7 +302,11 @@ pub const SYS_SETGROUPS: u64 = 246;      // (u32[], count) -> 0 | err (root only
 pub const SYS_SETRESUID: u64 = 247;      // (ruid,euid,suid u32::MAX=keep) -> 0|EPERM
 pub const SYS_SETRESGID: u64 = 248;      // same shape for gids
 pub const SYS_GETRESUID: u64 = 249;      // (out u32[3]) -> 0 | err
-pub const SYS_GETRESGID: u64 = 250;      // (out u32[3]) -> 0 | err
+pub const SYS_GETRESGID: u64 = 250;
+/// (pid, out u64[3]{eff,prm,bnd}) — pid 0 = caller.
+pub const SYS_CAPGET: u64 = 251;
+/// (pid, in u64[2]{eff,prm}) — self only; prm ⊆ bnd, eff ⊆ prm.
+pub const SYS_CAPSET: u64 = 252;      // (out u32[3]) -> 0 | err
 /// MS_MOVE: move a mount point instead of creating one
 pub const MS_MOVE: u64 = 0x2000;
 /// CLONE_NEWUTS: unshare the UTS namespace (hostname)

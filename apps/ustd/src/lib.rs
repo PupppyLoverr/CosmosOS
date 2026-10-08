@@ -1473,6 +1473,30 @@ pub fn strace(op: u64, pid: u32, out: &mut [u8]) -> i64 {
 }
 
 /// (pid, sig): POSIX-lite signal — 9/15 kill, 19 STOP, 18 CONT. 0 | <0.
+/// capget(pid): (effective, permitted, bounding) capability masks —
+/// pid 0 = caller. None when the pid doesn't exist.
+pub fn capget(pid: u32) -> Option<[u64; 3]> {
+    let mut out = [0u64; 3];
+    if sc2(shared::SYS_CAPGET, pid as u64, out.as_mut_ptr() as u64) == 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// capset(pid, eff, prm): self only. The new permitted set must stay
+/// inside the bounding set and effective inside permitted — else EPERM.
+pub fn capset(eff: u64, prm: u64) -> bool {
+    let v = [eff, prm];
+    sc2(shared::SYS_CAPSET, 0, v.as_ptr() as u64) == 0
+}
+
+/// prctl(PR_CAPBSET_DROP): permanently drop `cap` from the bounding
+/// set (needs CAP_SETPCAP). Irreversible.
+pub fn capbset_drop(cap: u64) -> bool {
+    sc2(shared::SYS_PRCTL, 24, cap) == 0
+}
+
 pub fn kill2(pid: u32, sig: u64) -> i64 {
     sc2(shared::SYS_KILL2, pid as u64, sig) as i64
 }

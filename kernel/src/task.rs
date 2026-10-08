@@ -12,6 +12,25 @@ use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{PageTable, PhysFrame};
 use x86_64::PhysAddr;
 
+/// POSIX capability bits (Linux CAP_* numbering).
+pub const CAP_CHOWN: u64 = 1;
+pub const CAP_DAC_OVERRIDE: u64 = 1 << 1;
+pub const CAP_DAC_READ_SEARCH: u64 = 1 << 2;
+pub const CAP_FOWNER: u64 = 1 << 3;
+pub const CAP_KILL: u64 = 1 << 5;
+pub const CAP_SETGID: u64 = 1 << 6;
+pub const CAP_SETUID: u64 = 1 << 7;
+pub const CAP_SETPCAP: u64 = 1 << 8;
+pub const CAP_SYS_RAWIO: u64 = 1 << 17;
+pub const CAP_SYS_CHROOT: u64 = 1 << 18;
+pub const CAP_SYS_PTRACE: u64 = 1 << 19;
+pub const CAP_SYS_ADMIN: u64 = 1 << 21;
+pub const CAP_SYS_NICE: u64 = 1 << 23;
+pub const CAP_SYS_TIME: u64 = 1 << 25;
+pub const CAP_SYS_BOOT: u64 = 1 << 27;
+/// Linux CAP_LAST_CAP — every defined bit (no ambient set modelled).
+pub const CAP_ALL: u64 = (1u64 << 41) - 1;
+
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 pub static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
 
@@ -142,6 +161,12 @@ pub struct Task {
     pub sgid: u32,
     /// supplementary group list (setgroups/getgroups)
     pub groups: Vec<u32>,
+    /// POSIX capabilities: permitted = what euid==0 wields, effective =
+    /// what a non-root task holds (capset-granted), bounding = the
+    /// irrecoverable ceiling (PR_CAPBSET_DROP). prm ⊆ bnd is enforced.
+    pub cap_eff: u64,
+    pub cap_prm: u64,
+    pub cap_bnd: u64,
     /// PID namespace this task lives in (0 = the initial namespace).
     pub pid_ns: u64,
     /// virtual pid inside `pid_ns` (0 in the global namespace — `id`
@@ -339,6 +364,9 @@ pub fn init() {
             suid: 0,
             sgid: 0,
             groups: Vec::new(),
+            cap_eff: 0,
+            cap_prm: CAP_ALL,
+            cap_bnd: CAP_ALL,
             pid_ns: 0,
             nspid: 0,
             child_ns: 0,
@@ -854,6 +882,9 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         suid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.suid).unwrap_or(0),
         sgid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.sgid).unwrap_or(0),
         groups: s.tasks.iter().find(|t| t.id == parent).map(|t| t.groups.clone()).unwrap_or_default(),
+        cap_eff: s.tasks.iter().find(|t| t.id == parent).map(|t| t.cap_eff).unwrap_or(0),
+        cap_prm: s.tasks.iter().find(|t| t.id == parent).map(|t| t.cap_prm).unwrap_or(CAP_ALL),
+        cap_bnd: s.tasks.iter().find(|t| t.id == parent).map(|t| t.cap_bnd).unwrap_or(CAP_ALL),
         pid_ns: pns,
         nspid: pnsv,
         child_ns: s.tasks.iter().find(|t| t.id == parent).map(|t| t.child_ns).unwrap_or(0),
@@ -969,6 +1000,9 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
             suid: 0,
             sgid: 0,
             groups: Vec::new(),
+            cap_eff: 0,
+            cap_prm: CAP_ALL,
+            cap_bnd: CAP_ALL,
             pid_ns: 0,
             nspid: 0,
             child_ns: 0,
@@ -1087,7 +1121,11 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
     let nsr = cur.ns.clone();
     let utsr = cur.uts.clone();
     let creds = (cur.uid, cur.gid, cur.euid, cur.egid);
-    let (sids, grps) = ((cur.suid, cur.sgid), cur.groups.clone());
+    let (sids, grps, caps) = (
+        (cur.suid, cur.sgid),
+        cur.groups.clone(),
+        (cur.cap_eff, cur.cap_prm, cur.cap_bnd),
+    );
     let cns = if cur.child_ns != 0 { cur.child_ns } else { cur.pid_ns };
     let (pns, pnsv) = (cns, alloc_nspid(cns));
     let borrowed = cur.borrowed.clone();
@@ -1133,6 +1171,9 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         suid: sids.0,
         sgid: sids.1,
         groups: grps,
+        cap_eff: caps.0,
+        cap_prm: caps.1,
+        cap_bnd: caps.2,
         pid_ns: pns,
         nspid: pnsv,
         child_ns: cur.child_ns,
@@ -1733,6 +1774,9 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         suid: cur.suid,
         sgid: cur.sgid,
         groups: cur.groups.clone(),
+        cap_eff: cur.cap_eff,
+        cap_prm: cur.cap_prm,
+        cap_bnd: cur.cap_bnd,
         pid_ns: pns,
         nspid: pnsv,
         child_ns: cur.child_ns,
@@ -2760,6 +2804,89 @@ pub fn groups_of() -> Vec<u32> {
     with_current(|t| t.groups.clone())
 }
 
+/// Effective set of `t`: euid 0 wields the permitted set; a non-root
+/// task only what capset granted it (POSIX: euid 0->!0 clears eff,
+/// !0->0 sets eff=prm — this derives both transitions).
+pub fn caps_eff_of(t: &Task) -> u64 {
+    if t.euid == 0 { t.cap_prm } else { t.cap_eff }
+}
+
+/// CAP_* check for the current task — all privilege gates go through
+/// this rather than bare euid==0 comparisons.
+pub fn capable(cap: u64) -> bool {
+    with_current(|t| caps_eff_of(t) & cap != 0)
+}
+
+/// capget view of the current task: (effective, permitted, bounding).
+pub fn capset3() -> (u64, u64, u64) {
+    with_current(|t| (caps_eff_of(t), t.cap_prm, t.cap_bnd))
+}
+
+/// capget view of another task (/proc Cap rows and CAPGET pid>0).
+pub fn pid_caps(pid: u32) -> Option<(u64, u64, u64)> {
+    let g = SCHED.lock();
+    g.as_ref()
+        .and_then(|s| {
+            s.tasks
+                .iter()
+                .find(|t| t.id == pid && t.state != State::Dead)
+        })
+        .map(|t| (caps_eff_of(t), t.cap_prm, t.cap_bnd))
+}
+
+/// capset on the current task: the new permitted set must stay inside
+/// the bounding set, and effective inside permitted — anything else is
+/// EPERM (the bounding set can only shrink via PR_CAPBSET_DROP).
+pub fn capset_self(eff: u64, prm: u64) -> i64 {
+    with_current(|t| {
+        if prm & !t.cap_bnd != 0 || eff & !prm != 0 {
+            return -1;
+        }
+        t.cap_eff = eff;
+        t.cap_prm = prm;
+        0
+    })
+}
+
+/// prctl(PR_CAPBSET_DROP): permanently drop `cap` from the bounding
+/// set — and from permitted+effective. Requires CAP_SETPCAP.
+pub fn capbset_drop(cap: u32) -> i64 {
+    if cap >= 41 {
+        return -22;
+    }
+    with_current(|t| {
+        if caps_eff_of(t) & CAP_SETPCAP == 0 {
+            return -1;
+        }
+        let m = !(1u64 << cap);
+        t.cap_bnd &= m;
+        t.cap_prm &= m;
+        t.cap_eff &= m;
+        0
+    })
+}
+
+/// May the current task signal `pid`? Linux: caller's ruid or euid must
+/// match the target's ruid or suid, else CAP_KILL is required. Unknown
+/// pid returns true — the caller's signal path reports ESRCH itself.
+pub fn signal_perm(pid: u32) -> bool {
+    let g = SCHED.lock();
+    let s = g.as_ref().unwrap();
+    let me = &s.tasks[s.cur];
+    if caps_eff_of(me) & CAP_KILL != 0 {
+        return true;
+    }
+    match s.tasks.iter().find(|t| t.id == pid) {
+        Some(t) => {
+            me.euid == t.uid
+                || me.uid == t.uid
+                || me.euid == t.suid
+                || me.uid == t.suid
+        }
+        None => true,
+    }
+}
+
 /// Saved/effective/real tuple for /proc + getres*.
 pub fn creds6() -> (u32, u32, u32, u32, u32, u32) {
     with_current(|t| (t.uid, t.euid, t.suid, t.gid, t.egid, t.sgid))
@@ -2805,6 +2932,9 @@ pub fn sys_tgkill(tgid: u32, tid: u32, sig: u64) -> i64 {
         if !same {
             return -3; // ESRCH: not a thread of that group
         }
+    }
+    if !signal_perm(tid) {
+        return -1; // EPERM
     }
     signal(tid, sig)
 }
@@ -3148,6 +3278,9 @@ pub fn rusage(pid: u32) -> Option<(u64, u64)> {
 pub fn set_nice(pid: u32, nice: i64) -> i64 {
     let pid = if pid == 0 { current_id() } else { pid };
     let n = nice.clamp(-20, 19) as i8;
+    if n < 0 && !capable(CAP_SYS_NICE) {
+        return -1; // EPERM: lowering nice below 0 needs CAP_SYS_NICE
+    }
     let mut g = SCHED.lock();
     let s = match g.as_mut() {
         Some(s) => s,
@@ -3267,6 +3400,7 @@ pub fn sys_prctl(op: u64, arg: u64) -> i64 {
                 0
             })
         }
+        24 => capbset_drop(arg as u32), // PR_CAPBSET_DROP
         _ => -22,
     }
 }
@@ -3324,7 +3458,7 @@ pub fn signal(pid: u32, sig: u64) -> i64 {
         }
         let mut any = false;
         for p in pids {
-            if signal(p, sig) == 0 {
+            if signal_perm(p) && signal(p, sig) == 0 {
                 any = true;
             }
         }
