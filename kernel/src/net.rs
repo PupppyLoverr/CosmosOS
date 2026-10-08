@@ -83,9 +83,21 @@ fn next_hop(ip: [u8; 4], timeout_ms: u64) -> Option<[u8; 6]> {
     if is_loopback(ip) {
         return Some([0; 6]); // looped at the IP layer — no next-hop
     }
+    if is_bcast(ip) {
+        return Some([0xFF; 6]); // broadcast: ff:ff:ff:ff:ff:ff, no ARP
+    }
     let me = our_ip();
     let on_net = ip[0] == me[0] && ip[1] == me[1] && ip[2] == me[2];
     arp_resolve(if on_net { ip } else { GW_IP }, timeout_ms)
+}
+
+/// Broadcast destination: 255.255.255.255 or our subnet-directed .255.
+pub fn is_bcast(ip: [u8; 4]) -> bool {
+    if ip == [255, 255, 255, 255] {
+        return true;
+    }
+    let me = our_ip();
+    ip[0] == me[0] && ip[1] == me[1] && ip[2] == me[2] && ip[3] == 255
 }
 
 fn be16(b: &[u8]) -> u16 {
@@ -191,6 +203,115 @@ fn icmp_echo_reply(src_ip: [u8; 4], req: &[u8]) {
             send_ip(mac, src_ip, 1, &rep);
         }
     }
+}
+
+/// ICMP 3/3 port-unreachable, sent when a UDP datagram hits a port nobody
+/// owns — the real response a host gives, and what a tracer probe to an
+/// unbound port on ourselves answers with. `orig_udp` is the offending
+/// UDP segment (header included); the quote rebuilds its IPv4 header since
+/// handle_frame has already stripped it (proto/ports/addresses all exact).
+fn icmp_port_unreach(sender: [u8; 4], orig_udp: &[u8]) {
+    if sender == [0, 0, 0, 0] || is_bcast(sender) || (sender[0] == 224) {
+        return; // never send errors to bcast/mcast/unspecified sources
+    }
+    let mut icmp = Vec::with_capacity(8 + 20 + 8);
+    icmp.push(3); // destination unreachable
+    icmp.push(3); // port unreachable
+    icmp.extend_from_slice(&[0u8; 2]);
+    icmp.extend_from_slice(&[0u8; 4]); // unused
+    // quote: reconstructed IPv4 header of the offending packet
+    icmp.push(0x45);
+    icmp.push(0);
+    icmp.extend_from_slice(&((20 + orig_udp.len()) as u16).to_be_bytes());
+    icmp.extend_from_slice(&[0u8; 4]);
+    icmp.push(64);
+    icmp.push(17);
+    icmp.extend_from_slice(&[0u8; 2]);
+    icmp.extend_from_slice(&sender);
+    icmp.extend_from_slice(&if is_loopback(sender) { LOOPBACK_IP } else { our_ip() });
+    icmp.extend_from_slice(&orig_udp[..orig_udp.len().min(8)]);
+    let c = csum(&icmp);
+    put16(&mut icmp[2..], c);
+    if is_loopback(sender) {
+        send_ip_src(LOOPBACK_IP, [0; 6], sender, 1, &icmp);
+    } else {
+        let mac = {
+            let c = ARP_CACHE.lock();
+            c.iter().find(|e| e.0 == sender).map(|e| e.1)
+        };
+        if let Some(mac) = mac {
+            send_ip(mac, sender, 1, &icmp);
+        }
+    }
+}
+
+/// If an ICMP error (type 11 time-exceeded or type 3 unreachable) quotes
+/// one of our tracer probes, return (probe_dport, orig_dst). The quoted
+/// original IPv4 header starts at byte 8 of the ICMP payload.
+fn icmp_probe_ports(p: &[u8]) -> Option<(u16, [u8; 4])> {
+    if p.len() < 36 || (p[0] != 11 && p[0] != 3) {
+        return None;
+    }
+    let ip = &p[8..];
+    if ip.len() < 20 || ip[0] >> 4 != 4 || ip[9] != 17 {
+        return None;
+    }
+    let ihl = ((ip[0] & 0xF) as usize) * 4;
+    if ip.len() < ihl + 8 {
+        return None;
+    }
+    let sport = be16(&ip[ihl..]);
+    let dport = be16(&ip[ihl + 2..]);
+    if sport != TRACER_SPORT {
+        return None;
+    }
+    let dst: [u8; 4] = ip[16..20].try_into().ok()?;
+    Some((dport, dst))
+}
+
+const TRACER_SPORT: u16 = 0x8342;
+
+/// Traceroute: UDP probes to `dst` port 33434+ttl with rising TTLs.
+/// Returns per-hop (ttl, Some((hop_ip, rtt_ms)) on ICMP-11, reached=true
+/// when the target itself answers ICMP 3/3). Each hop waits `per_ms`.
+pub fn net_trace(
+    dst: [u8; 4],
+    max_hops: u8,
+    per_ms: u64,
+) -> Vec<(u8, Option<([u8; 4], u64)>, bool)> {
+    let mut hops = Vec::new();
+    let Some(mac) = next_hop(dst, 1500) else {
+        return hops;
+    };
+    for ttl in 1..=max_hops.min(30) {
+        let dport = 33434u16.wrapping_add(ttl as u16);
+        let t0 = now_ms();
+        send_udp_ttl(mac, dst, TRACER_SPORT, dport, b"cosmos-trace", ttl);
+        let mut hit: Option<([u8; 4], bool)> = None;
+        while now_ms() - t0 < per_ms && hit.is_none() {
+            for (src_ip, proto, p) in pump_rx() {
+                if proto != 1 {
+                    dispatch(src_ip, proto, p); // feed real sockets mid-run
+                    continue;
+                }
+                let Some((dp, odst)) = icmp_probe_ports(&p) else {
+                    continue;
+                };
+                if dp == dport && odst == dst {
+                    hit = Some((src_ip, p[0] == 3));
+                }
+            }
+            if hit.is_none() {
+                wait_irq();
+            }
+        }
+        let reached = hit.map(|h| h.1).unwrap_or(false);
+        hops.push((ttl, hit.map(|(ip, _)| (ip, now_ms() - t0)), reached));
+        if reached {
+            break;
+        }
+    }
+    hops
 }
 
 fn send_frame(dst: [u8; 6], ethertype: u16, payload: &[u8]) -> Result<(), ()> {
@@ -408,6 +529,17 @@ fn send_ip(dst_mac: [u8; 6], dst_ip: [u8; 4], proto: u8, payload: &[u8]) {
 }
 
 fn send_ip_src(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], proto: u8, payload: &[u8]) {
+    send_ip_src_ttl(src_ip, dst_mac, dst_ip, proto, 64, payload)
+}
+
+fn send_ip_src_ttl(
+    src_ip: [u8; 4],
+    dst_mac: [u8; 6],
+    dst_ip: [u8; 4],
+    proto: u8,
+    ttl: u8,
+    payload: &[u8],
+) {
     if is_loopback(dst_ip) {
         // lo: no ethernet, no ARP — the datagram re-enters rx as-is
         LOOPBACK_Q.lock().push_back((src_ip, proto, payload.to_vec()));
@@ -421,7 +553,7 @@ fn send_ip_src(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], proto: u8, pa
     ip.extend_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
     ip.extend_from_slice(&1u16.to_be_bytes());
     ip.extend_from_slice(&[0u8; 2]);
-    ip.push(64);
+    ip.push(ttl);
     ip.push(proto);
     ip.extend_from_slice(&[0u8; 2]);
     ip.extend_from_slice(&src_ip);
@@ -434,13 +566,25 @@ fn send_ip_src(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], proto: u8, pa
 
 /// UDP send (IPv4 UDP checksum is optional — 0 means "none").
 fn send_udp(dst_mac: [u8; 6], dst_ip: [u8; 4], sport: u16, dport: u16, payload: &[u8]) {
+    send_udp_ttl(dst_mac, dst_ip, sport, dport, payload, 64)
+}
+
+fn send_udp_ttl(
+    dst_mac: [u8; 6],
+    dst_ip: [u8; 4],
+    sport: u16,
+    dport: u16,
+    payload: &[u8],
+    ttl: u8,
+) {
     let mut udp = Vec::with_capacity(8 + payload.len());
     udp.extend_from_slice(&sport.to_be_bytes());
     udp.extend_from_slice(&dport.to_be_bytes());
     udp.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
     udp.extend_from_slice(&[0u8; 2]); // checksum disabled (valid in IPv4)
     udp.extend_from_slice(payload);
-    send_ip(dst_mac, dst_ip, 17, &udp);
+    let src = if dst_ip[0] == 127 { LOOPBACK_IP } else { our_ip() };
+    send_ip_src_ttl(src, dst_mac, dst_ip, 17, ttl, &udp);
 }
 
 /// Skip a DNS name (labels or a compression pointer) starting at `i`.
@@ -937,6 +1081,9 @@ pub fn dhcp() -> Option<[u8; 4]> {
 const MAX_SOCK_Q: usize = 32;
 static SOCKS: Mutex<BTreeMap<u16, VecDeque<([u8; 4], u16, Vec<u8>)>>> =
     Mutex::new(BTreeMap::new());
+/// Port -> number of bound holders; >1 only via SO_REUSEADDR joins
+/// (udp_open_share). The port's queue dies when the count hits 0.
+static UDP_SHARES: Mutex<BTreeMap<u16, u32>> = Mutex::new(BTreeMap::new());
 
 /// Bind a local UDP port. Err(-1) if already bound.
 pub fn udp_open(lport: u16) -> Result<(), i64> {
@@ -945,14 +1092,45 @@ pub fn udp_open(lport: u16) -> Result<(), i64> {
         return Err(-1);
     }
     s.insert(lport, VecDeque::new());
+    UDP_SHARES.lock().insert(lport, 1);
     UDP_OWNERS
         .lock()
         .insert(lport, crate::task::with_current(|t| t.id));
     Ok(())
 }
 
+/// Second+ binder joining an existing UDP port under SO_REUSEADDR:
+/// incoming datagrams land in the shared queue — whichever task reads
+/// first wins, like a one-member REUSEPORT group.
+pub fn udp_open_share(lport: u16) -> Result<(), i64> {
+    let mut sh = UDP_SHARES.lock();
+    if !SOCKS.lock().contains_key(&lport) {
+        return Err(-1);
+    }
+    *sh.entry(lport).or_insert(0) += 1;
+    Ok(())
+}
+
+/// sockfd close path: decrement the share count; the queue (and port)
+/// only dies when the last binder leaves.
+pub fn udp_close_one(lport: u16) {
+    let mut sh = UDP_SHARES.lock();
+    match sh.get(&lport).copied() {
+        Some(n) if n > 1 => {
+            sh.insert(lport, n - 1);
+        }
+        _ => {
+            sh.remove(&lport);
+            drop(sh);
+            SOCKS.lock().remove(&lport);
+            UDP_OWNERS.lock().remove(&lport);
+        }
+    }
+}
+
 pub fn udp_close(lport: u16) {
     SOCKS.lock().remove(&lport);
+    UDP_SHARES.lock().remove(&lport);
     UDP_OWNERS.lock().remove(&lport);
 }
 
@@ -1020,7 +1198,11 @@ fn dispatch(src_ip: [u8; 4], proto: u8, p: Vec<u8>) -> bool {
                     }
                     true
                 }
-                None => false,
+                None => {
+                    drop(socks);
+                    icmp_port_unreach(src_ip, &p); // real host answer: ICMP 3/3
+                    false
+                }
             }
         }
         6 => {

@@ -1473,6 +1473,45 @@ pub fn getsockopt(fd: i64, level: u64, opt: u64) -> Result<u32, i64> {
     }
     Ok(u32::from_le_bytes(out))
 }
+/// setsockopt: SOL_SOCKET (1) — SO_REUSEADDR (2) relaxes the bind
+/// port-in-use rule; SO_BROADCAST (6) permits sends to bcast dsts.
+pub fn setsockopt(fd: i64, level: u64, opt: u64, val: u64) -> i64 {
+    sc4(
+        shared::SYS_SETSOCKOPT,
+        fd as u64,
+        level,
+        opt,
+        val,
+    ) as i64
+}
+/// One traceroute hop: (ttl, Some((hop_ip, rtt_ms)) when an ICMP error
+/// answered, reached=true when the target's own 3/3 arrived).
+pub fn net_trace(
+    ip: u32,
+    max_hops: u8,
+) -> alloc::vec::Vec<(u8, Option<([u8; 4], u64)>, bool)> {
+    let mut buf = [0u8; 16 * 30];
+    let n = sc4(
+        shared::SYS_NET_TRACE,
+        ip as u64,
+        max_hops as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    );
+    let mut out = alloc::vec::Vec::new();
+    if n == u64::MAX {
+        return out;
+    }
+    for e in buf[..(n as usize).min(buf.len())].chunks_exact(16) {
+        let ttl = e[0];
+        let got = e[1] & 1 != 0;
+        let reached = e[1] & 2 != 0;
+        let ip: [u8; 4] = e[4..8].try_into().unwrap_or([0; 4]);
+        let ms = u64::from_be_bytes(e[8..16].try_into().unwrap_or([0; 8]));
+        out.push((ttl, if got { Some((ip, ms)) } else { None }, reached));
+    }
+    out
+}
 
 /// fd-based TCP socket — poll/read/write/close all work on it.
 pub struct TcpFd(pub i64);

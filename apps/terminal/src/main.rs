@@ -13473,6 +13473,62 @@ impl Term {
                     None => self.fail(&alloc::format!("ping: can't resolve '{}'", s)),
                 }
             },
+            "traceroute" | "tracepath" => {
+                // traceroute [-m hops] host -- UDP probes with rising ttl;
+                // hops answer ICMP 11 (or the target's own 3/3)
+                let mut maxh = 15u8;
+                let mut target: Option<&str> = None;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-m" => {
+                            maxh = args
+                                .get(i + 1)
+                                .and_then(|x| x.parse().ok())
+                                .unwrap_or(15)
+                                .min(30);
+                            i += 2;
+                        }
+                        a => {
+                            target = Some(a);
+                            i += 1;
+                        }
+                    }
+                }
+                let Some(s) = target else {
+                    self.fail("usage: traceroute [-m hops] <host|a.b.c.d>");
+                    return;
+                };
+                match host_arg(s) {
+                    Some(ip) => {
+                        let packed = ((ip[0] as u32) << 24) | ((ip[1] as u32) << 16)
+                            | ((ip[2] as u32) << 8) | ip[3] as u32;
+                        self.emit(&alloc::format!(
+                            "traceroute to {} ({}.{}.{}.{}), {} hops max",
+                            s, ip[0], ip[1], ip[2], ip[3], maxh
+                        ));
+                        let mut ok = false;
+                        for (ttl, hop, reached) in ustd::net_trace(packed, maxh) {
+                            match hop {
+                                Some((hip, ms)) => {
+                                    ok |= reached;
+                                    self.emit(&alloc::format!(
+                                        " {:>2}  {}.{}.{}.{}  {}ms",
+                                        ttl, hip[0], hip[1], hip[2], hip[3], ms
+                                    ));
+                                }
+                                None => self.emit(&alloc::format!(" {:>2}  *", ttl)),
+                            }
+                            if reached {
+                                break;
+                            }
+                        }
+                        self.last_ok = true;
+                        let _ = ok;
+                    }
+                    None => self.fail(&alloc::format!("traceroute: can't resolve '{}'", s)),
+                }
+            },
             "ntp" => {
                 // real SNTP query (UDP/123) -- epoch -> date, vs RTC
                 let host = args.first().copied().unwrap_or("pool.ntp.org");
@@ -20196,6 +20252,7 @@ impl Term {
         "help", "ls", "cd", "pwd", "cat", "mkdir", "touch", "rm", "mv", "cp",
         "echo", "clear", "ps", "mem", "uname", "whoami", "date", "ping",
         "resolve", "httpget", "wget", "ifconfig", "dhcp", "netstat", "kill", "grep",
+        "traceroute", "tracepath",
         "uptime", "reboot", "shutdown", "exit", "history", "time",
         "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
         "set", "env", "printenv", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",

@@ -42,6 +42,8 @@ struct Sock {
     last_err: i64,                // last connect/send errno (SO_ERROR)
     owner_pid: u32,               // task that created this socket (SO_PEERCRED)
     peer_pid: u32,                // peer task's pid on unix pairs (0 = none)
+    reuse: bool,                  // SO_REUSEADDR
+    broadcast: bool,              // SO_BROADCAST (gate on bcast dst sends)
 }
 
 /// AF_UNIX named-socket registry: path -> listener state. `queue` holds
@@ -136,6 +138,8 @@ pub fn create(stream: bool, domain: u64) -> Result<String, i64> {
             last_err: 0,
             owner_pid: crate::task::current_id(),
             peer_pid: 0,
+            reuse: false,
+            broadcast: false,
         },
     );
     Ok(format!("/socket/{}", id))
@@ -156,18 +160,34 @@ pub fn bind(id: u64, port: u16, name: &[u8]) -> i64 {
         return -22;
     }
     let mut m = SOCKS.lock();
-    if m.values().any(|s| s.bound && s.lport == port) {
+    // POSIX SO_REUSEADDR: two sockets may share a port only when every
+    // existing binder AND the newcomer set it (rough Linux semantics).
+    let want_reuse = m.get(&id).map(|s| s.reuse).unwrap_or(false);
+    let shared = m.values().any(|s| s.bound && s.lport == port);
+    if shared
+        && !(want_reuse
+            && m.values()
+                .all(|s| !s.bound || s.lport != port || s.reuse))
+    {
         return -98;
     }
     let Some(s) = m.get_mut(&id) else { return -9 };
     if s.bound {
         return -22; // already bound
     }
-    if !crate::net::lport_free(port) {
-        return -98;
-    }
-    if s.kind == Kind::Udp && crate::net::udp_open(port).is_err() {
-        return -98;
+    if shared {
+        // reuse vote passed — the port is already open in the net stack;
+        // join its shared queue instead of claiming it fresh
+        if s.kind == Kind::Udp && crate::net::udp_open_share(port).is_err() {
+            return -98;
+        }
+    } else {
+        if !crate::net::lport_free(port) {
+            return -98;
+        }
+        if s.kind == Kind::Udp && crate::net::udp_open(port).is_err() {
+            return -98;
+        }
     }
     // TCP bind just records the port; the net stack claims it at
     // listen()/connect() like POSIX's deferred bind
@@ -477,6 +497,8 @@ pub fn accept(id: u64) -> Result<(String, [u8; 4], u16), i64> {
                         last_err: 0,
                         owner_pid: crate::task::current_id(),
                         peer_pid: 0,
+                        reuse: false,
+                        broadcast: false,
                     },
                 );
                 Ok((format!("/socket/{}", nid), rip, rport))
@@ -515,6 +537,8 @@ pub fn accept(id: u64) -> Result<(String, [u8; 4], u16), i64> {
                             last_err: 0,
                             owner_pid: crate::task::current_id(),
                             peer_pid: cpid,
+                            reuse: false,
+                            broadcast: false,
                         },
                     );
                     Ok((format!("/socket/{}", nid), [0; 4], 0))
@@ -587,6 +611,9 @@ pub fn try_write(path: &str, data: &[u8], nonblock: bool) -> Result<usize, i64> 
             let Some((ip, pt)) = s.peer else {
                 return Err(-89); // EDESTADDRREQ: no default destination
             };
+            if crate::net::is_bcast(ip) && !s.broadcast {
+                return Err(-13); // EACCES: SO_BROADCAST not set
+            }
             crate::net::udp_send(s.lport, ip, pt, data).map(|_| data.len())
         }
         Kind::Tcp => {
@@ -655,8 +682,13 @@ pub fn sendto(path: &str, data: &[u8], ip: u32, port: u16) -> Result<usize, i64>
         return Err(-32);
     }
     match s.kind {
-        Kind::Udp => crate::net::udp_send(s.lport, ip.to_be_bytes(), port, data)
-            .map(|_| data.len()),
+        Kind::Udp => {
+            let dst = ip.to_be_bytes();
+            if crate::net::is_bcast(dst) && !s.broadcast {
+                return Err(-13); // EACCES: SO_BROADCAST not set
+            }
+            crate::net::udp_send(s.lport, dst, port, data).map(|_| data.len())
+        }
         // addr ignored (unix-dgram uses sendto_path for a named dest)
         Kind::Tcp | Kind::Unix | Kind::UnixDgram => try_write(path, data, false),
         Kind::TcpListener | Kind::UnixListener => Err(-107),
@@ -929,7 +961,7 @@ pub fn close_obj(path: &str) {
     let Some(s) = fields(id) else { return };
     SOCKS.lock().remove(&id);
     match s.kind {
-        Kind::Udp => crate::net::udp_close(s.lport),
+        Kind::Udp => crate::net::udp_close_one(s.lport),
         Kind::Tcp => crate::net::tcp_close(s.cid),
         Kind::TcpListener => crate::net::tcp_unlisten(s.lport),
         _ => {}
@@ -1003,7 +1035,32 @@ pub fn getsockopt(id: u64, level: u64, opt: u64) -> Result<u32, i64> {
                 p => Ok(p),
             }
         }
+        2 => Ok(s.reuse as u32),      // SO_REUSEADDR
+        6 => Ok(s.broadcast as u32),  // SO_BROADCAST
         _ => Err(-92),
+    }
+}
+
+/// setsockopt(fd, level, opt, val): SOL_SOCKET (1) only. SO_REUSEADDR (2)
+/// relaxes the port-in-use check at bind; SO_BROADCAST (6) unblocks
+/// sends to 255.255.255.255 / subnet-directed broadcast.
+pub fn setsockopt(id: u64, level: u64, opt: u64, val: u64) -> i64 {
+    const SOL_SOCKET: u64 = 1;
+    if level != SOL_SOCKET {
+        return -92; // ENOPROTOOPT
+    }
+    let mut m = SOCKS.lock();
+    let Some(s) = m.get_mut(&id) else { return -9 };
+    match opt {
+        2 => {
+            s.reuse = val != 0;
+            0
+        }
+        6 => {
+            s.broadcast = val != 0;
+            0
+        }
+        _ => -92,
     }
 }
 
@@ -1041,6 +1098,8 @@ pub fn socketpair_dgram() -> Option<(String, String)> {
                 last_err: 0,
                 owner_pid: pid,
                 peer_pid: pid,
+                reuse: false,
+                broadcast: false,
             },
         );
     }

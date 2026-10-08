@@ -1131,6 +1131,45 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 Err(e) => e as u64,
             }
         }
+        shared::SYS_NET_TRACE => {
+            // (ip u32 BE, max_hops, out, cap) -> n bytes written | ERR.
+            // out gets 16-byte entries: ttl u8 | flags u8 (bit0 hop,
+            // bit1 reached) | pad u16 | hop_ip[4] | rtt u64 BE.
+            let ip = [
+                (a1 >> 24) as u8,
+                (a1 >> 16) as u8,
+                (a1 >> 8) as u8,
+                a1 as u8,
+            ];
+            let hops = net::net_trace(ip, (a2 as u8).max(1).min(30), 900);
+            let mut buf = alloc::vec::Vec::with_capacity(hops.len() * 16);
+            for (ttl, hop, reached) in hops {
+                buf.push(ttl);
+                buf.push(
+                    (hop.is_some() as u8) | ((reached as u8) << 1),
+                );
+                buf.extend_from_slice(&[0u8; 2]);
+                buf.extend_from_slice(&hop.map(|h| h.0).unwrap_or([0; 4]));
+                buf.extend_from_slice(&hop.map(|h| h.1).unwrap_or(0).to_be_bytes());
+            }
+            let n = buf.len().min(a4 as usize);
+            match copy_out(a3, &buf[..n]) {
+                Some(()) => n as u64,
+                None => ERR,
+            }
+        }
+        shared::SYS_SETSOCKOPT => {
+            // (fd, level, opt, val) -> 0 | errno
+            let id = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => crate::sockfd::parse(&f.path),
+                _ => None,
+            });
+            let Some(id) = id else {
+                ctx.rax = (-9i64) as u64;
+                return;
+            };
+            crate::sockfd::setsockopt(id, a2, a3, a4) as u64
+        }
         shared::SYS_ARP => {
             let s = net::arp_stat();
             let n = s.len().min(a2 as usize);
