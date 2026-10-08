@@ -2019,6 +2019,54 @@ fn re_sub(line: &str, pat: &str, new: &str, g: bool) -> String {
     }
 }
 
+/// Translate a BRE pattern to this engine's ERE syntax (POSIX: plain sed and
+/// plain grep are BRE, `-r`/`-E` are ERE). `\(\)`/`\+`/`\?`/`\|`/`\{\}` are
+/// operators in BRE while their bare forms are literals — the reverse of ERE.
+/// `[...]` bracket contents are passed through untouched.
+fn bre_to_ere(p: &str) -> String {
+    let b = p.as_bytes();
+    let mut out = String::with_capacity(p.len());
+    let (mut i, mut brk) = (0usize, false);
+    while i < b.len() {
+        let c = b[i];
+        if brk {
+            out.push(c as char);
+            if c == b']' {
+                brk = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'[' => {
+                brk = true;
+                out.push('[');
+                i += 1;
+            }
+            b'\\' if i + 1 < b.len() => {
+                let n = b[i + 1];
+                if matches!(n, b'(' | b')' | b'|' | b'+' | b'?' | b'{' | b'}') {
+                    out.push(n as char); // BRE operator → bare ERE form
+                } else {
+                    out.push('\\');
+                    out.push(n as char); // real escape (\. \* \< etc.)
+                }
+                i += 2;
+            }
+            b'(' | b')' | b'|' | b'+' | b'?' | b'{' | b'}' => {
+                out.push('\\'); // literal in BRE → escape for the ERE engine
+                out.push(c as char);
+                i += 1;
+            }
+            _ => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// translate a glob to a regex string for the engine: `*` → `[^/]*`,
 /// `**` → `.*`, `?` → `[^/]`, `[...]`/`[!...]` classes, and (extglob)
 /// `?(x)` `*(x)` `+(x)` `@(x)` `!(x)` groups. Escaped metachars are literal.
@@ -2888,7 +2936,15 @@ fn awk_pat_matches(
         || p.chars().any(|c| matches!(c, '<' | '>' | '%'))
     {
         // arbitrary awk condition: $1==x, $2~/re/, NR%2, NF>2, ...
-        return awk_cond(p, line, nr, fields, vars);
+        // A bare string expression ('$1" x"$1', 'length') isn't numeric —
+        // fall back to the string evaluator; truthy = non-empty and != "0".
+        return match awk_cond(p, line, nr, fields, vars) {
+            Err(e) => match awk_show(p, line, nr, fields, vars) {
+                Ok(s) => Ok(!s.is_empty() && s != "0"),
+                Err(_) => Err(e),
+            },
+            v => v,
+        };
     }
     Ok(line.contains(p))
 }
@@ -5600,6 +5656,7 @@ struct GrepOpts {
     only: bool,  // -o: print just the matching spans
     quiet: bool, // -q: status only
     ere: bool,   // -E: real regex via re_search
+    lit: bool,   // -F: literal string (plain grep is BRE)
     files: u8,   // 0 normal, 1 = -l (with matches), 2 = -L (without)
     fname: u8,   // 0 auto, 1 = -h (never prefix), 2 = -H (always prefix)
     multi: bool, // >1 file operand: auto filename prefixes
@@ -16205,7 +16262,8 @@ impl Term {
                                     b'l' => o.files = 1,
                                     b'L' => o.files = 2,
                                     b'E' => o.ere = true,    // real regex
-                                    b'F' | b'e' => {}        // already literal / -e nop
+                                    b'F' => o.lit = true,    // fixed string
+                                    b'e' => {}               // -e nop
                                     b'h' => o.fname = 1,      // never prefix
                                     b'H' => o.fname = 2,      // always prefix
                                     b's' => o.quieterr = true, // -s: no file errors
@@ -22391,12 +22449,12 @@ impl Term {
                         }
                         match k {
                             SedK::Sub(old, new, g, pf) => {
+                                // POSIX: plain s/// is BRE — real regex
+                                // (anchors, classes, \(\) groups).
                                 let r = if ere {
                                     re_sub(&cur, old, new, *g)
-                                } else if *g {
-                                    cur.replace(old.as_str(), new)
                                 } else {
-                                    cur.replacen(old.as_str(), new, 1)
+                                    re_sub(&cur, &bre_to_ere(old), new, *g)
                                 };
                                 let changed = r != cur;
                                 cur = r;
@@ -26324,8 +26382,11 @@ impl Term {
             } else if o.word {
                 hay.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                     .any(|t| t == pat)
-            } else {
+            } else if o.lit {
                 hay.contains(pat)
+            } else {
+                // plain grep is BRE (POSIX): . ^ $ [..] * \( \) are real
+                re_search(&bre_to_ere(pat), &hay).is_some()
             }
         };
         let fmt = |i: usize, l: &str, ctx: bool| -> String {
@@ -26353,11 +26414,18 @@ impl Term {
                     } else {
                         String::from(*l)
                     };
-                    if o.ere {
-                        // regex spans
+                    if o.word || o.exact {
+                        self.emit_rec(pat, o.zrec);
+                    } else if o.ere || !o.lit {
+                        // regex spans (ERE, or BRE translated for plain grep)
+                        let pp = if o.ere {
+                            String::from(pat)
+                        } else {
+                            bre_to_ere(pat)
+                        };
                         let mut rest = hay.clone();
                         let mut li = 0usize;
-                        while let Some((a, b)) = re_search(pat, &rest) {
+                        while let Some((a, b)) = re_search(&pp, &rest) {
                             self.emit_rec(&l[li + a..li + b], o.zrec);
                             if b == a {
                                 li += b + 1;
