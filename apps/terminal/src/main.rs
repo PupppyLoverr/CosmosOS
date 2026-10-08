@@ -2742,6 +2742,7 @@ fn ctags_scan(path: &str, text: &str, tags: &mut Vec<String>) {
         if t.is_empty() {
             continue;
         }
+        let mut rust_matched = false;
         // Rust: fn/struct/enum/trait/impl/type/const/static/macro_rules
         for (pfx, kind) in [
             ("fn ", 'f'),
@@ -2767,6 +2768,7 @@ fn ctags_scan(path: &str, text: &str, tags: &mut Vec<String>) {
                     .collect();
                 if !name.is_empty() {
                     tag(&name, t, kind);
+                    rust_matched = true;
                 }
                 break;
             }
@@ -2779,6 +2781,7 @@ fn ctags_scan(path: &str, text: &str, tags: &mut Vec<String>) {
                 .collect();
             if !name.is_empty() {
                 tag(&name, t, 'm');
+                rust_matched = true;
             }
         }
         // C: #define NAME, typedef/struct/enum tail names, fns at col 0
@@ -2811,6 +2814,7 @@ fn ctags_scan(path: &str, text: &str, tags: &mut Vec<String>) {
             && t.contains('(')
             && !t.starts_with('#')
             && !t.starts_with("//")
+            && !rust_matched
         {
             let pre = t.split('(').next().unwrap_or("");
             let name = pre
