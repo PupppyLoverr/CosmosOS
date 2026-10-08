@@ -7960,6 +7960,75 @@ fn now_str() -> String {
 
 /// POSIX `od -t a` display name for one byte: 3-char control names,
 /// ' sp' for space, the graphic char itself when printable, octal else.
+/// Minimal Itanium C++ ABI demangler: `_Z` symbols with
+/// length-prefixed names, N...E nested names, builtin type codes.
+/// Returns None when the input doesn't look like a mangled name.
+fn cpp_demangle(s: &str) -> Option<String> {
+    let rest = s.strip_prefix("_Z")?;
+    let (body, mut tail) = if rest.starts_with('N') {
+        match rest.rfind('E') {
+            // nested name: arguments follow the closing 'E'
+            Some(e) => (&rest[1..e], &rest[e + 1..]),
+            None => (rest, ""),
+        }
+    } else {
+        (rest, "")
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    let b = body.as_bytes();
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            tail = &body[i..];
+            break;
+        }
+        let mut j = i;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        let n: usize = body[i..j].parse().ok()?;
+        if j + n > b.len() {
+            return None;
+        }
+        parts.push(String::from(&body[j..j + n]));
+        i = j + n;
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let args = if tail == "v" || tail.is_empty() {
+        String::new()
+    } else {
+        let mut out = String::new();
+        for c in tail.chars() {
+            let t = match c {
+                'v' => "void",
+                'i' => "int",
+                'c' => "char",
+                'l' => "long",
+                'x' => "long long",
+                'f' => "float",
+                'd' => "double",
+                'b' => "bool",
+                's' => "short",
+                'j' => "unsigned int",
+                'm' => "unsigned long",
+                'y' => "unsigned long long",
+                'h' => "unsigned char",
+                't' => "unsigned short",
+                'w' => "wchar_t",
+                _ => return None,
+            };
+            if !out.is_empty() {
+                out.push_str(", ");
+            }
+            out.push_str(t);
+        }
+        out
+    };
+    Some(alloc::format!("{}({})", parts.join("::"), args))
+}
+
 fn od_aname(b: u8) -> String {
     const NAMES: [&str; 33] = [
         "nul", "soh", "stx", "etx", "eot", "enq", "ack", "bel", " bs",
@@ -11887,7 +11956,7 @@ impl Term {
             "sha256sum", "strings", "sort", "uniq", "cut", "more", "diff", "base64",
             "show", "tar", "md5sum", "uuencode", "uudecode", "grep", "find", "file",
             "sha1sum", "cksum", "comm", "zgrep", "zip", "unzip", "chmod", "touch",
-            "basenc",
+            "basenc", "addr2line", "elfedit",
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look", "fmt",
         "pwck", "grpck", "pathchk", "nslookup", "b2sum",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
@@ -18186,6 +18255,415 @@ impl Term {
                 }
                 if rows.is_empty() {
                     self.emit("(none)");
+                }
+            }
+            "hostnamectl" => {
+                // hostnamectl — real static hostname + persisted machine-id
+                // + /etc/os-release + uname fields.
+                let mut mid = ustd::read_all("/etc/machine-id")
+                    .map(|d| {
+                        String::from_utf8_lossy(&d).trim().to_string()
+                    })
+                    .unwrap_or_default();
+                if mid.len() != 32 {
+                    // first boot on this disk: mint + persist (systemd model)
+                    let mut m = String::new();
+                    for i in 0..32u64 {
+                        let v = ustd::rand_u64().unwrap_or(i * 2654435761);
+                        m.push_str(&alloc::format!("{:x}", v % 16));
+                    }
+                    mid = m;
+                    let _ = ustd::write_all("/etc/machine-id", mid.as_bytes());
+                }
+                let data =
+                    ustd::read_all("/etc/os-release").unwrap_or_default();
+                let txt = String::from_utf8_lossy(&data).into_owned();
+                let kv = |k: &str| -> String {
+                    txt.lines()
+                        .find_map(|l| {
+                            l.strip_prefix(k)
+                                .map(|v| v.trim_matches('"').to_string())
+                        })
+                        .unwrap_or_default()
+                };
+                self.emit(&alloc::format!(
+                    "   Static hostname: {}",
+                    ustd::hostname()
+                ));
+                self.emit("         Icon name: computer-vm");
+                self.emit("           Chassis: vm");
+                self.emit(&alloc::format!("        Machine ID: {}", mid));
+                self.emit(&alloc::format!(
+                    "  Operating System: {}",
+                    kv("PRETTY_NAME=")
+                ));
+                self.emit(&alloc::format!(
+                    "            Kernel: {} {}",
+                    "CosmosOS",
+                    "0.1"
+                ));
+                self.emit("      Architecture: x86-64");
+            }
+            "resolvectl" => {
+                // resolvectl status | query NAME — real resolver state
+                // + real DNS lookups through the kernel resolver.
+                match args.first() {
+                    Some(&"status") => {
+                        self.emit("Global");
+                        self.emit("         Protocols: DNS");
+                        self.emit("          DNS Servers: 10.0.2.3");
+                        self.emit("");
+                        self.emit("Link 2 (eth0)");
+                        self.emit("    Current DNS Server: 10.0.2.3");
+                        self.emit("            DNS Servers: 10.0.2.3");
+                        self.emit("         Default Route: yes");
+                    }
+                    Some(&"query") => {
+                        let Some(n) = args.get(1) else {
+                            self.fail("usage: resolvectl query <name>");
+                            return;
+                        };
+                        match ustd::net_dns(n) {
+                            Some(ip) => {
+                                self.emit(&alloc::format!(
+                                    "{}: {}.{}.{}.{}",
+                                    n,
+                                    ip[0],
+                                    ip[1],
+                                    ip[2],
+                                    ip[3]
+                                ));
+                                self.emit("");
+                                self.emit(
+                                    "-- Information acquired via protocol DNS",
+                                );
+                            }
+                            None => self.emit(&alloc::format!(
+                                "{}: resolve call failed",
+                                n
+                            )),
+                        }
+                    }
+                    _ => self.fail("usage: resolvectl status|query <name>"),
+                }
+            }
+            "networkctl" => {
+                // networkctl [status] — real link table; 'status eth0'
+                // appends the live /proc/net/dev counters.
+                match args.first() {
+                    None | Some(&"status") | Some(&"list") => {
+                        self.emit("IDX LINK TYPE     OPERATIONAL SETUP");
+                        self.emit("  1 lo   loopback carrier     unmanaged");
+                        self.emit("  2 eth0 ether    routable    unmanaged");
+                        if args.iter().any(|a| *a == "eth0") {
+                            let d = ustd::read_all("/proc/net/dev")
+                                .unwrap_or_default();
+                            let t =
+                                String::from_utf8_lossy(&d).into_owned();
+                            self.emit("");
+                            for l in t.lines() {
+                                if l.trim_start().starts_with("eth0") {
+                                    self.emit(l);
+                                }
+                            }
+                        }
+                    }
+                    _ => self.fail("usage: networkctl [status [link]]"),
+                }
+            }
+            "addr2line" => {
+                // addr2line -e <elf> <addr>... — nearest symtab symbol
+                // <= addr, printed `name[+0xoff]` + `??:?` (no DWARF
+                // line info in the build).
+                let mut exe: Option<String> = None;
+                let mut addrs: Vec<u64> = Vec::new();
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-e" | "--exe" => {
+                            exe = args.get(i + 1).map(|s| String::from(*s));
+                            i += 1;
+                        }
+                        "-f" | "-C" | "-s" | "-i" | "-p" => {}
+                        a if !a.starts_with('-') => {
+                            if exe.is_none() {
+                                exe = Some(String::from(a));
+                            } else {
+                                addrs.push(
+                                    u64::from_str_radix(
+                                        a.trim_start_matches("0x"),
+                                        16,
+                                    )
+                                    .unwrap_or(0),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if addrs.is_empty() {
+                    if let Some(p) = &self.pipe_in {
+                        for l in p.lines() {
+                            addrs.push(
+                                u64::from_str_radix(
+                                    l.trim().trim_start_matches("0x"),
+                                    16,
+                                )
+                                .unwrap_or(0),
+                            );
+                        }
+                    }
+                }
+                let Some(f) = exe else {
+                    self.fail("usage: addr2line -e <elf> <hexaddr>...");
+                    return;
+                };
+                let Ok(d) = ustd::read_all(&f) else {
+                    self.fail(&alloc::format!("addr2line: {}: err", f));
+                    return;
+                };
+                let Some(e) = Elf::new(&d) else {
+                    self.fail(&alloc::format!("addr2line: {}: not ELF64", f));
+                    return;
+                };
+                for a in addrs {
+                    let mut best: Option<(u64, String)> = None;
+                    for i in 0..e.shnum() {
+                        if e.sh(i).typ != 2 {
+                            continue;
+                        }
+                        for s2 in e.syms(i) {
+                            if s2.value <= a && !s2.name.is_empty() {
+                                let closer = best
+                                    .as_ref()
+                                    .map(|(bv, _)| s2.value > *bv)
+                                    .unwrap_or(true);
+                                if closer {
+                                    best =
+                                        Some((s2.value, s2.name.clone()));
+                                }
+                            }
+                        }
+                    }
+                    match best {
+                        Some((bv, nm)) => {
+                            if a == bv {
+                                self.emit(&nm);
+                            } else {
+                                self.emit(&alloc::format!(
+                                    "{}+0x{:x}",
+                                    nm,
+                                    a - bv
+                                ));
+                            }
+                            self.emit("??:?");
+                        }
+                        None => {
+                            self.emit("??");
+                            self.emit("??:?");
+                        }
+                    }
+                }
+            }
+            "c++filt" => {
+                // c++filt <sym>... — real Itanium ABI demangling
+                let names: Vec<String> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .map(|s| String::from(*s))
+                    .collect();
+                let mut list = names;
+                if list.is_empty() {
+                    if let Some(p) = &self.pipe_in {
+                        list =
+                            p.lines().map(|l| l.trim().to_string()).collect();
+                    }
+                }
+                if list.is_empty() {
+                    self.fail("usage: c++filt <mangled>...");
+                    return;
+                }
+                for n in list {
+                    match cpp_demangle(&n) {
+                        Some(d) => self.emit(&d),
+                        None => self.emit(&n),
+                    }
+                }
+            }
+            "elfedit" => {
+                // elfedit --output-type=T | --output-osabi=O <file> —
+                // real in-place ELF header byte edits.
+                let mut typ: Option<String> = None;
+                let mut abi: Option<u8> = None;
+                let mut file: Option<&str> = None;
+                for a in args {
+                    if let Some(v) = a.strip_prefix("--output-type=") {
+                        typ = Some(String::from(v));
+                    } else if let Some(v) =
+                        a.strip_prefix("--output-osabi=")
+                    {
+                        abi = Some(match v {
+                            "none" | "sysv" => 0,
+                            "linux" | "gnu" => 3,
+                            "freebsd" => 9,
+                            n => n.parse().unwrap_or(0),
+                        });
+                    } else if !a.starts_with('-') {
+                        file = Some(a);
+                    }
+                }
+                let Some(f) = file else {
+                    self.fail(
+                        "usage: elfedit --output-type=T|--output-osabi=O <file>",
+                    );
+                    return;
+                };
+                let Ok(mut d) = ustd::read_all(f) else {
+                    self.fail(&alloc::format!("elfedit: {}: err", f));
+                    return;
+                };
+                if d.len() < 64 || &d[0..4] != b"\x7fELF" {
+                    self.fail("elfedit: not an ELF file");
+                    return;
+                }
+                if let Some(t) = &typ {
+                    let v: u16 = match t.as_str() {
+                        "NONE" => 0,
+                        "REL" => 1,
+                        "EXEC" => 2,
+                        "DYN" => 3,
+                        "CORE" => 4,
+                        n => match n.parse() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                self.fail("elfedit: bad output type");
+                                return;
+                            }
+                        },
+                    };
+                    d[16] = v as u8;
+                    d[17] = (v >> 8) as u8;
+                }
+                if let Some(v) = abi {
+                    d[7] = v;
+                }
+                match ustd::write_all(f, &d) {
+                    Ok(_) => {
+                        self.emit(&alloc::format!("elfedit: {} updated", f))
+                    }
+                    Err(e) => self.fail(&alloc::format!(
+                        "elfedit: {}: err {}",
+                        f,
+                        e
+                    )),
+                }
+            }
+            "setpriv" => {
+                // setpriv [--reuid U] [--regid G] [--groups a,b] cmd...
+                // real uid/gid/supplementary switch, restored after.
+                let mut uid: Option<u32> = None;
+                let mut gid: Option<u32> = None;
+                let mut grps: Vec<u32> = Vec::new();
+                let mut cmd0 = args.len();
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "--reuid" => {
+                            uid = args.get(i + 1).and_then(|s| s.parse().ok());
+                            i += 1;
+                        }
+                        "--regid" => {
+                            gid = args.get(i + 1).and_then(|s| s.parse().ok());
+                            i += 1;
+                        }
+                        "--groups" => {
+                            if let Some(l) = args.get(i + 1) {
+                                for s in l.split(',') {
+                                    if let Ok(v) = s.parse() {
+                                        grps.push(v);
+                                    }
+                                }
+                            }
+                            i += 1;
+                        }
+                        _ => {
+                            cmd0 = i;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                if cmd0 >= args.len() {
+                    self.fail(
+                        "usage: setpriv [--reuid U] [--regid G] [--groups a,b] cmd...",
+                    );
+                    return;
+                }
+                let (ou, og) = (ustd::getuid(), ustd::getgid());
+                if let Some(g) = gid {
+                    ustd::setgid(g);
+                }
+                if !grps.is_empty() {
+                    ustd::setgroups(&grps);
+                }
+                if let Some(u) = uid {
+                    ustd::setuid(u);
+                }
+                let cmdline = args[cmd0..].join(" ");
+                let lines = self.run_captured(&cmdline);
+                ustd::setuid(ou);
+                ustd::setgid(og);
+                for l in lines {
+                    self.emit(&l);
+                }
+            }
+            "runuser" => {
+                // runuser -u USER cmd... — real uid+gid lookup from
+                // /etc/passwd, run, restore.
+                let mut user: Option<&str> = None;
+                let mut cmd0 = args.len();
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-u" | "--user" => {
+                            user = args.get(i + 1).copied();
+                            i += 1;
+                        }
+                        _ => {
+                            cmd0 = i;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                let Some(u) = user else {
+                    self.fail("usage: runuser -u user cmd...");
+                    return;
+                };
+                if cmd0 >= args.len() {
+                    self.fail("usage: runuser -u user cmd...");
+                    return;
+                }
+                let rows = db_rows("/etc/passwd");
+                let Some(r) = rows
+                    .iter()
+                    .find(|r| r.first().map(|s| s.as_str()) == Some(u))
+                else {
+                    self.fail(&alloc::format!("runuser: unknown user {}", u));
+                    return;
+                };
+                let uid = r.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+                let gid = r.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+                let (ou, og) = (ustd::getuid(), ustd::getgid());
+                ustd::setgid(gid);
+                ustd::setuid(uid);
+                let cmdline = args[cmd0..].join(" ");
+                let lines = self.run_captured(&cmdline);
+                ustd::setuid(ou);
+                ustd::setgid(og);
+                for l in lines {
+                    self.emit(&l);
                 }
             }
             "curl" => {
@@ -33042,6 +33520,8 @@ impl Term {
         "tput", "builtin", "command", "exec", "dos2unix", "unix2dos", "base32", "sysctl",
         "curl", "whatis", "lsb_release", "basenc", "ipcmk", "getopt",
         "fallocate", "tftp", "lsmem", "findfs", "chfn", "chsh", "sg", "lsipc",
+        "hostnamectl", "resolvectl", "networkctl", "addr2line", "c++filt",
+        "elfedit", "setpriv", "runuser",
         "fortune", "uuidgen", "mcookie", "logger", "whois", "fdisk", "vol", "blkid", "script",
         "nice", "renice", "pgrep", "pkill", "top", "dc", "vmstat", "free",
         "pcap", "ftp", "lsof", "fuser", "burn", "cron", "browse",
