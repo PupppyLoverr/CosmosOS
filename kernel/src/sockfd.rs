@@ -40,14 +40,17 @@ struct Sock {
     rd_off: bool,                 // shutdown(SHUT_RD)
     wr_off: bool,                 // shutdown(SHUT_WR)
     last_err: i64,                // last connect/send errno (SO_ERROR)
+    owner_pid: u32,               // task that created this socket (SO_PEERCRED)
+    peer_pid: u32,                // peer task's pid on unix pairs (0 = none)
 }
 
 /// AF_UNIX named-socket registry: path -> listener state. `queue` holds
-/// the server end of each completed connect ("/sockpair/{id}/1" paths).
+/// (chan path, connector pid) for each completed connect awaiting accept.
 struct UListener {
     listening: bool,
     backlog: usize,
-    queue: VecDeque<String>,
+    queue: VecDeque<(String, u32)>,
+    owner_pid: u32,
 }
 
 static NEXT: Mutex<u64> = Mutex::new(1);
@@ -131,6 +134,8 @@ pub fn create(stream: bool, domain: u64) -> Result<String, i64> {
             rd_off: false,
             wr_off: false,
             last_err: 0,
+            owner_pid: crate::task::current_id(),
+            peer_pid: 0,
         },
     );
     Ok(format!("/socket/{}", id))
@@ -220,6 +225,7 @@ fn bind_unix(id: u64, name: &[u8]) -> i64 {
             listening: false,
             backlog: 0,
             queue: VecDeque::new(),
+            owner_pid: 0,
         },
     );
     s.uname = Some(name);
@@ -313,9 +319,17 @@ fn connect_unix(id: u64, name: &[u8]) -> i64 {
             set_err(id, -2);
             return -2; // ENOENT
         }
+        // the peer of a datagram connect is the mailbox's owner
+        let peer_pid = SOCKS
+            .lock()
+            .values()
+            .find(|s| s.uname.as_deref() == Some(name))
+            .map(|s| s.owner_pid)
+            .unwrap_or(0);
         let mut m = SOCKS.lock();
         if let Some(s) = m.get_mut(&id) {
             s.peer_name = Some(String::from(name));
+            s.peer_pid = peer_pid;
             s.bound = true;
         }
         return 0;
@@ -337,11 +351,13 @@ fn connect_unix(id: u64, name: &[u8]) -> i64 {
         set_err(id, -24);
         return -24;
     };
-    l.queue.push_back(side1);
+    let lpid = l.owner_pid;
+    l.queue.push_back((side1, crate::task::current_id()));
     let mut m = SOCKS.lock();
     if let Some(s) = m.get_mut(&id) {
         s.chan = Some(side0);
         s.peer_name = Some(String::from(name));
+        s.peer_pid = lpid;
         s.bound = true;
     }
     0
@@ -410,6 +426,7 @@ pub fn listen(id: u64, backlog: usize) -> i64 {
             };
             l.listening = true;
             l.backlog = backlog.max(1);
+            l.owner_pid = s.owner_pid;
             m.get_mut(&id).unwrap().kind = Kind::UnixListener;
             return 0;
         }
@@ -458,6 +475,8 @@ pub fn accept(id: u64) -> Result<(String, [u8; 4], u16), i64> {
                         rd_off: false,
                         wr_off: false,
                         last_err: 0,
+                        owner_pid: crate::task::current_id(),
+                        peer_pid: 0,
                     },
                 );
                 Ok((format!("/socket/{}", nid), rip, rport))
@@ -471,7 +490,35 @@ pub fn accept(id: u64) -> Result<(String, [u8; 4], u16), i64> {
                 return Err(-2);
             };
             match l.queue.pop_front() {
-                Some(p) => Ok((p, [0; 4], 0)),
+                Some((p, cpid)) => {
+                    drop(names);
+                    // the accepted end is a first-class /socket object
+                    // (getsockname/sendmsg/etc work on it); its peer is
+                    // the task that connected
+                    let mut n = NEXT.lock();
+                    let nid = *n;
+                    *n += 1;
+                    SOCKS.lock().insert(
+                        nid,
+                        Sock {
+                            kind: Kind::Unix,
+                            domain: Dom::Unix,
+                            lport: 0,
+                            cid: 0,
+                            peer: None,
+                            bound: true,
+                            chan: Some(p),
+                            uname: None,
+                            peer_name: None,
+                            rd_off: false,
+                            wr_off: false,
+                            last_err: 0,
+                            owner_pid: crate::task::current_id(),
+                            peer_pid: cpid,
+                        },
+                    );
+                    Ok((format!("/socket/{}", nid), [0; 4], 0))
+                }
                 None => Err(-11),
             }
         }
@@ -896,7 +943,7 @@ pub fn close_obj(path: &str) {
         }
         let mut names = UNIX_NAMES.lock();
         if let Some(l) = names.remove(&uname) {
-            for p in l.queue {
+            for (p, _pid) in l.queue {
                 crate::sockpair::close_obj(&p);
             }
         }
@@ -948,6 +995,54 @@ pub fn getsockopt(id: u64, level: u64, opt: u64) -> Result<u32, i64> {
             }
             Ok(e as u32)
         }
+        17 => {
+            // SO_PEERCRED: pid of the task holding the other end of a
+            // unix pair (streams: connector/listener; dgram: mbox owner)
+            match s.peer_pid {
+                0 => Err(-107), // ENOTCONN
+                p => Ok(p),
+            }
+        }
         _ => Err(-92),
     }
+}
+
+/// socketpair(AF_UNIX, SOCK_DGRAM): two auto-named mailboxes, each
+/// pointing at the other — same mutual-delivery model as the stream
+/// pair, but packet boundaries are kept. Returns (pathA, pathB).
+pub fn socketpair_dgram() -> Option<(String, String)> {
+    let mut n = NEXT.lock();
+    let (a, b) = (*n, *n + 1);
+    *n += 2;
+    drop(n);
+    let (na, nb) = (format!("/tmp/udgp-{}", a), format!("/tmp/udgp-{}", b));
+    if !crate::udgram::register(&na) || !crate::udgram::register(&nb) {
+        crate::udgram::unregister(&na);
+        crate::udgram::unregister(&nb);
+        return None;
+    }
+    let pid = crate::task::current_id();
+    let mut m = SOCKS.lock();
+    for (id, mine, peer) in [(a, &na, &nb), (b, &nb, &na)] {
+        m.insert(
+            id,
+            Sock {
+                kind: Kind::UnixDgram,
+                domain: Dom::Unix,
+                lport: 0,
+                cid: 0,
+                peer: None,
+                bound: true,
+                chan: None,
+                uname: Some(mine.clone()),
+                peer_name: Some(peer.clone()),
+                rd_off: false,
+                wr_off: false,
+                last_err: 0,
+                owner_pid: pid,
+                peer_pid: pid,
+            },
+        );
+    }
+    Some((format!("/socket/{}", a), format!("/socket/{}", b)))
 }

@@ -30,11 +30,15 @@ pub fn is_up() -> bool {
 /// `/proc/net/dev` body: real rx/tx counters for the virtio-net iface.
 pub fn net_dev() -> String {
     alloc::format!(
-        "Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n  eth0:{:>8}{:>8}    0    0    0     0          0         0 {:>8}{:>8}    0    0    0     0       0          0\n",
+        "Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n  eth0:{:>8}{:>8}    0    0    0     0          0         0 {:>8}{:>8}    0    0    0     0       0          0\n    lo:{:>8}{:>8}    0    0    0     0          0         0 {:>8}{:>8}    0    0    0     0       0          0\n",
         RX_BYTES.load(Ordering::Relaxed),
         RX_PKTS.load(Ordering::Relaxed),
         TX_BYTES.load(Ordering::Relaxed),
         TX_PKTS.load(Ordering::Relaxed),
+        LO_RX_BYTES.load(Ordering::Relaxed),
+        LO_RX_PKTS.load(Ordering::Relaxed),
+        LO_TX_BYTES.load(Ordering::Relaxed),
+        LO_TX_PKTS.load(Ordering::Relaxed),
     )
 }
 
@@ -50,6 +54,21 @@ pub fn our_ip() -> [u8; 4] {
 
 static ARP_CACHE: Mutex<Vec<([u8; 4], [u8; 6])>> = Mutex::new(Vec::new());
 
+/// Loopback (`lo`): 127.0.0.0/8 and our own address deliver back into the
+/// stack instead of the wire. Queued, not dispatched inline — TX paths may
+/// run inside spin-lock scopes (TCP lock during a FIN), and inline
+/// delivery would recurse into the same locks.
+pub const LOOPBACK_IP: [u8; 4] = [127, 0, 0, 1];
+fn is_loopback(ip: [u8; 4]) -> bool {
+    ip[0] == 127 || ip == our_ip()
+}
+static LOOPBACK_Q: Mutex<VecDeque<([u8; 4], u8, Vec<u8>)>> = Mutex::new(VecDeque::new());
+// lo interface counters (/proc/net/dev row is real, like eth0's)
+static LO_RX_PKTS: AtomicU64 = AtomicU64::new(0);
+static LO_RX_BYTES: AtomicU64 = AtomicU64::new(0);
+static LO_TX_PKTS: AtomicU64 = AtomicU64::new(0);
+static LO_TX_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// Sleep until the next IRQ (timer ticks ~10ms) so waits burn no CPU and
 /// `now_ms()` advances. Syscall context runs IF=0 (interrupt gate), so we
 /// enable interrupts only for the hlt window — no locks held here, and IRQ
@@ -61,6 +80,9 @@ fn wait_irq() {
 /// Next-hop MAC for `ip`: same-subnet addresses resolve directly, anything
 /// else goes via the gateway (real routing, not ARP-for-the-world).
 fn next_hop(ip: [u8; 4], timeout_ms: u64) -> Option<[u8; 6]> {
+    if is_loopback(ip) {
+        return Some([0; 6]); // looped at the IP layer — no next-hop
+    }
     let me = our_ip();
     let on_net = ip[0] == me[0] && ip[1] == me[1] && ip[2] == me[2];
     arp_resolve(if on_net { ip } else { GW_IP }, timeout_ms)
@@ -126,7 +148,49 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
             }
         }
     }
+    // lo packets ride the same (src, proto, payload) path — delivered even
+    // when eth0 is down (loopback is its own interface)
+    let mut lq = LOOPBACK_Q.lock();
+    let n_loop = lq.len();
+    for _ in 0..n_loop {
+        if let Some(t) = lq.pop_front() {
+            LO_RX_PKTS.fetch_add(1, Ordering::Relaxed);
+            LO_RX_BYTES.fetch_add(t.2.len() as u64, Ordering::Relaxed);
+            out.push(t);
+        }
+    }
+    drop(lq);
+    // ICMP: answer echo requests like a real host — wire or loopback
+    for (src_ip, proto, p) in &out {
+        if *proto == 1 && p.len() >= 8 && p[0] == 8 {
+            icmp_echo_reply(*src_ip, p);
+        }
+    }
     out
+}
+
+/// Build an echo reply for a received request and send it — to the wire
+/// peer (mac from the ARP cache — absent = unreachable, drop) or straight
+/// back into lo when the requester is us.
+fn icmp_echo_reply(src_ip: [u8; 4], req: &[u8]) {
+    let mut rep = Vec::with_capacity(req.len());
+    rep.push(0); // echo reply
+    rep.push(0);
+    rep.extend_from_slice(&[0u8; 2]);
+    rep.extend_from_slice(&req[4..]); // id + seq + data verbatim
+    let c = csum(&rep);
+    put16(&mut rep[2..], c);
+    if is_loopback(src_ip) {
+        send_ip_src(LOOPBACK_IP, [0; 6], src_ip, 1, &rep);
+    } else {
+        let mac = {
+            let c = ARP_CACHE.lock();
+            c.iter().find(|e| e.0 == src_ip).map(|e| e.1)
+        };
+        if let Some(mac) = mac {
+            send_ip(mac, src_ip, 1, &rep);
+        }
+    }
 }
 
 fn send_frame(dst: [u8; 6], ethertype: u16, payload: &[u8]) -> Result<(), ()> {
@@ -251,6 +315,9 @@ fn handle_frame(f: &[u8]) -> Option<([u8; 4], u8, Vec<u8>)> {
 
 /// Resolve an IPv4 address to a MAC via ARP. Polls up to `ms` milliseconds.
 fn arp_resolve(ip: [u8; 4], ms: u64) -> Option<[u8; 6]> {
+    if is_loopback(ip) {
+        return Some([0; 6]); // lo has no link layer
+    }
     {
         let c = ARP_CACHE.lock();
         if let Some(e) = c.iter().find(|e| e.0 == ip) {
@@ -334,10 +401,20 @@ pub fn ping(ip: [u8; 4], timeout_ms: u64) -> Option<u64> {
 }
 
 fn send_ip(dst_mac: [u8; 6], dst_ip: [u8; 4], proto: u8, payload: &[u8]) {
-    send_ip_src(our_ip(), dst_mac, dst_ip, proto, payload);
+    // a packet to a 127/8 address originates from the loopback address —
+    // same rule as Linux's route-local delivery, so peers see 127.0.0.1
+    let src = if dst_ip[0] == 127 { LOOPBACK_IP } else { our_ip() };
+    send_ip_src(src, dst_mac, dst_ip, proto, payload);
 }
 
 fn send_ip_src(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], proto: u8, payload: &[u8]) {
+    if is_loopback(dst_ip) {
+        // lo: no ethernet, no ARP — the datagram re-enters rx as-is
+        LOOPBACK_Q.lock().push_back((src_ip, proto, payload.to_vec()));
+        LO_TX_PKTS.fetch_add(1, Ordering::Relaxed);
+        LO_TX_BYTES.fetch_add(payload.len() as u64, Ordering::Relaxed);
+        return;
+    }
     let mut ip = Vec::with_capacity(20 + payload.len());
     ip.push(0x45);
     ip.push(0);
@@ -384,6 +461,36 @@ fn dns_skip_name(m: &[u8], mut i: usize) -> Option<usize> {
 /// `resolve <hostname>`: real DNS A-record query to the slirp resolver
 /// (10.0.2.3:53) over real UDP. Returns the first A record.
 pub fn dns_query(name: &str, timeout_ms: u64) -> Option<[u8; 4]> {
+    // nsswitch order: /etc/hosts file first, then wire DNS — same as a
+    // real resolver. Lines: `a.b.c.d name [alias...]` (+ `#` comments).
+    if let Ok(h) = crate::vfs::read_all("/etc/hosts") {
+        if let Ok(text) = core::str::from_utf8(&h) {
+            for line in text.lines() {
+                let line = line.split('#').next().unwrap_or("");
+                let mut f = line.split_whitespace();
+                let Some(ip) = f.next() else { continue };
+                let mut oct = ip.split('.');
+                let mut v = [0u8; 4];
+                let mut ok = true;
+                for o in v.iter_mut() {
+                    match oct.next().and_then(|s| s.parse::<u8>().ok()) {
+                        Some(n) => *o = n,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok || oct.next().is_some() {
+                    continue;
+                }
+                if f.any(|a| a == name) {
+                    sprintln!("[net] hosts: '{}' -> {}.{}.{}.{}", name, v[0], v[1], v[2], v[3]);
+                    return Some(v);
+                }
+            }
+        }
+    }
     const DNS: [u8; 4] = [10, 0, 2, 3];
     const SPORT: u16 = 43210;
     let txid = 0xC05Au16;

@@ -1193,7 +1193,12 @@ pub fn epoll_wait(epfd: i64, out: &mut [(u32, u32)], timeout_ms: u64) -> i64 {
 /// socketpair: bidirectional connected fds (AF_UNIX SOCK_STREAM semantics).
 /// Returns (fdA, fdB); bytes written to one are read from the other.
 pub fn socketpair() -> Option<(i64, i64)> {
-    let v = sc0(shared::SYS_SOCKETPAIR);
+    socketpair_t(SOCK_STREAM)
+}
+/// socketpair_t(ty): SOCK_STREAM pair (sockpair object) or SOCK_DGRAM
+/// pair (two cross-linked AF_UNIX mailboxes).
+pub fn socketpair_t(ty: u64) -> Option<(i64, i64)> {
+    let v = sc1(shared::SYS_SOCKETPAIR, ty);
     if v == u64::MAX {
         return None;
     }

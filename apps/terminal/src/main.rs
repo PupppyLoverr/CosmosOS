@@ -16974,6 +16974,7 @@ impl Term {
                             ip[0], ip[1], ip[2], ip[3],
                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
                         ));
+                        self.emit("lo: flags=<UP,LOOPBACK,RUNNING> ip 127.0.0.1 netmask 255.0.0.0");
                     }
                     None => self.emit("no network device"),
                 }

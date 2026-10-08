@@ -609,8 +609,13 @@ pub fn dispatch(ctx: &mut CpuContext) {
         }
         shared::SYS_EPOLL_WAIT => sys_epoll_wait(ctx, a1, a2, a3, a4),
         shared::SYS_SOCKETPAIR => {
-            // () -> fdA | fdB<<32: two ends of one bidirectional socket
-            match crate::sockpair::create() {
+            // (type) -> fdA | fdB<<32: two ends of one bidirectional
+            // socket. type=SOCK_DGRAM(2) makes an AF_UNIX datagram pair.
+            match if a1 == shared::SOCK_DGRAM {
+                crate::sockfd::socketpair_dgram()
+            } else {
+                crate::sockpair::create()
+            } {
                 Some((pa, pb)) => task::with_current(|t| {
                     let sa = alloc_slot(t);
                     t.fds[sa] = Some(task::FileDesc { path: pa, pos: 0, flags: shared::O_RDWR });
