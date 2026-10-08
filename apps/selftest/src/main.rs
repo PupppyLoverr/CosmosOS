@@ -21,6 +21,10 @@ fn check(name: &str, ok: bool) {
     }
 }
 
+fn metric(name: &str, v: u64) {
+    println!("METRIC {}={}", name, v);
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
     println!("[selftest] starting");
@@ -135,19 +139,31 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         check("net-ip", ip == [10, 0, 2, 15]);
         // ping the user-net gateway (10.0.2.2) — real ARP + ICMP round trip
         let gw = 0x0A000202u32; // 10.0.2.2
-        check("ping-gw", ustd::net_ping(gw, 3000).is_some());
+        let t0 = ustd::uptime_ms();
+        let ping = ustd::net_ping(gw, 3000);
+        check("ping-gw", ping.is_some());
+        if ping.is_some() {
+            metric("ping-gw-rtt-ms", ustd::uptime_ms().saturating_sub(t0));
+        }
         // real DNS over real UDP to slirp's resolver (10.0.2.3:53)
-        check(
-            "dns-resolve",
-            ustd::net_dns("example.com").is_some(),
-        );
+        let t0 = ustd::uptime_ms();
+        let dns = ustd::net_dns("example.com");
+        check("dns-resolve", dns.is_some());
+        if dns.is_some() {
+            metric("dns-rtt-ms", ustd::uptime_ms().saturating_sub(t0));
+        }
         // real TCP/80 HTTP GET to the live internet via slirp
-        check(
-            "http-example",
-            ustd::net_http("example.com")
-                .map(|b| b.windows(5).any(|w| w == b"HTTP/"))
-                .unwrap_or(false),
-        );
+        let t0 = ustd::uptime_ms();
+        let http = ustd::net_http("example.com");
+        let http_ok = http
+            .as_ref()
+            .map(|b| b.windows(5).any(|w| w == b"HTTP/"))
+            .unwrap_or(false);
+        check("http-example", http_ok);
+        if http_ok {
+            metric("http-bytes", http.unwrap().len() as u64);
+            metric("http-total-ms", ustd::uptime_ms().saturating_sub(t0));
+        }
         // userspace UDP socket: hand-built DNS wire query through
         // bind -> sendto -> recvfrom to slirp's real resolver
         let sock_ok = (|| {

@@ -25,9 +25,13 @@ Requires: `rustup` toolchain `nightly` (`rust-src`, `llvm-tools-preview`,
 - Apps (F4–F9): Terminal, Files, Text Editor, Settings, System Monitor,
   Demo (native Rust app on the app API: shm surface + input + file persistence).
 - Real persistence: writes land on the FAT32 data disk and survive reboot.
-- Real networking: virtio-net + IPv4/ARP/ICMP/UDP/TCP — `ping`, `resolve`
-  (DNS/UDP to slirp's resolver), `httpget` (real HTTP through slirp to the
-  live internet), `ifconfig`.
+- Real networking: virtio-net + IPv4/ARP/ICMP/UDP/TCP with a real DHCP
+  client (DISCOVER→ACK configures the guest IP), `ping`, `resolve` (DNS/UDP
+  to slirp's resolver), `httpget` (real HTTP through slirp to the live
+  internet), `ifconfig`, and a userspace UDP socket API
+  (`SYS_NET_UDP_*` → `ustd::UdpSock` bind/sendto/recvfrom).
+- Damage-region compositing: the compositor redraws only the damaged rect
+  (cursor move ≈ two 16px cells, not a ~3MB full frame).
 
 ## Terminal commands
 
