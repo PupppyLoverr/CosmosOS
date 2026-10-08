@@ -7,8 +7,24 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 pub const OUR_IP: [u8; 4] = [10, 0, 2, 15];
+const GW_IP: [u8; 4] = [10, 0, 2, 2];
 
 static ARP_CACHE: Mutex<Vec<([u8; 4], [u8; 6])>> = Mutex::new(Vec::new());
+
+/// Sleep until the next IRQ (timer ticks ~10ms) so waits burn no CPU and
+/// `now_ms()` advances. Syscall context runs IF=0 (interrupt gate), so we
+/// enable interrupts only for the hlt window — no locks held here, and IRQ
+/// handlers never lock.
+fn wait_irq() {
+    unsafe { core::arch::asm!("sti; hlt; cli", options(nomem, nostack)) };
+}
+
+/// Next-hop MAC for `ip`: same-subnet addresses resolve directly, anything
+/// else goes via the gateway (real routing, not ARP-for-the-world).
+fn next_hop(ip: [u8; 4], timeout_ms: u64) -> Option<[u8; 6]> {
+    let on_net = ip[0] == OUR_IP[0] && ip[1] == OUR_IP[1] && ip[2] == OUR_IP[2];
+    arp_resolve(if on_net { ip } else { GW_IP }, timeout_ms)
+}
 
 fn be16(b: &[u8]) -> u16 {
     ((b[0] as u16) << 8) | b[1] as u16
@@ -38,7 +54,8 @@ fn now_ms() -> u64 {
 }
 
 /// Drain the device rx queue (and anything IRQ-drained) into the handlers.
-/// Net is polled, not interrupt-driven: virtio-net IRQs are not wired up.
+/// Net is polled: virtio-net IRQs are not wired; wait loops `sti;hlt` so the
+/// PIT keeps ticking and deadlines stay real.
 /// Returns (ip_proto, transport_payload) for IPv4 frames addressed to us.
 fn pump_rx() -> Vec<(u8, Vec<u8>)> {
     let mut out = Vec::new();
@@ -192,7 +209,7 @@ fn arp_resolve(ip: [u8; 4], ms: u64) -> Option<[u8; 6]> {
         if now_ms() >= deadline {
             return None;
         }
-        core::hint::spin_loop();
+        wait_irq();
     }
 }
 
@@ -203,10 +220,12 @@ pub fn ping(ip: [u8; 4], timeout_ms: u64) -> Option<u64> {
         sprintln!("[net] ping: no device");
         return None;
     }
-    let dst_mac = arp_resolve(ip, 1500)?;
+    let on_net = ip[0] == OUR_IP[0] && ip[1] == OUR_IP[1] && ip[2] == OUR_IP[2];
+    let arp_for = if on_net { ip } else { GW_IP };
+    let dst_mac = arp_resolve(arp_for, 1500)?;
     sprintln!(
         "[net] arp {}.{}.{}.{} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        ip[0], ip[1], ip[2], ip[3],
+        arp_for[0], arp_for[1], arp_for[2], arp_for[3],
         dst_mac[0], dst_mac[1], dst_mac[2], dst_mac[3], dst_mac[4], dst_mac[5]
     );
     let id = 0xC050u16;
@@ -223,7 +242,7 @@ pub fn ping(ip: [u8; 4], timeout_ms: u64) -> Option<u64> {
         if now_ms() - t0 >= timeout_ms {
             return None;
         }
-        core::hint::spin_loop();
+        wait_irq();
     }
 }
 
@@ -294,7 +313,7 @@ pub fn dns_query(name: &str, timeout_ms: u64) -> Option<[u8; 4]> {
     q.extend_from_slice(&1u16.to_be_bytes()); // A
     q.extend_from_slice(&1u16.to_be_bytes()); // IN
 
-    let mac = arp_resolve(DNS, 1500)?;
+    let mac = next_hop(DNS, 1500)?;
     send_udp(mac, DNS, SPORT, 53, &q);
     sprintln!("[net] dns query '{}' -> 10.0.2.3:53", name);
 
@@ -340,8 +359,176 @@ pub fn dns_query(name: &str, timeout_ms: u64) -> Option<[u8; 4]> {
         if now_ms() - t0 >= timeout_ms {
             return None;
         }
-        core::hint::spin_loop();
+        wait_irq();
     }
+}
+
+// ---------------------------------------------------------------------------
+// TCP — minimal real implementation: handshake, seq/ack tracking,
+// stop-and-wait retransmit, FIN teardown. Enough for HTTP over slirp.
+// ---------------------------------------------------------------------------
+
+const TCP_FIN: u8 = 0x01;
+const TCP_SYN: u8 = 0x02;
+const TCP_RST: u8 = 0x04;
+const TCP_PSH: u8 = 0x08;
+const TCP_ACK: u8 = 0x10;
+
+fn tcp_csum(src: [u8; 4], dst: [u8; 4], seg: &[u8]) -> u16 {
+    // pseudo-header: src,dst,zero,proto,len  +  segment
+    let mut ph = Vec::with_capacity(12 + seg.len());
+    ph.extend_from_slice(&src);
+    ph.extend_from_slice(&dst);
+    ph.push(0);
+    ph.push(6);
+    ph.extend_from_slice(&(seg.len() as u16).to_be_bytes());
+    ph.extend_from_slice(seg);
+    csum(&ph)
+}
+
+fn send_tcp(
+    dst_mac: [u8; 6],
+    dst_ip: [u8; 4],
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+) {
+    let mut seg = Vec::with_capacity(20 + payload.len());
+    seg.extend_from_slice(&sport.to_be_bytes());
+    seg.extend_from_slice(&dport.to_be_bytes());
+    seg.extend_from_slice(&seq.to_be_bytes());
+    seg.extend_from_slice(&ack.to_be_bytes());
+    seg.push(0x50); // data offset 5 (no options)
+    seg.push(flags);
+    seg.extend_from_slice(&65535u16.to_be_bytes()); // window
+    seg.extend_from_slice(&[0u8; 2]); // checksum
+    seg.extend_from_slice(&[0u8; 2]); // urg
+    seg.extend_from_slice(payload);
+    let c = tcp_csum(OUR_IP, dst_ip, &seg);
+    put16(&mut seg[16..], c);
+    send_ip(dst_mac, dst_ip, 6, &seg);
+}
+
+struct TcpSeg {
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: Vec<u8>,
+}
+
+fn parse_tcp(p: &[u8]) -> Option<TcpSeg> {
+    if p.len() < 20 {
+        return None;
+    }
+    let doff = ((p[12] >> 4) as usize) * 4;
+    if p.len() < doff {
+        return None;
+    }
+    Some(TcpSeg {
+        sport: be16(&p[0..]),
+        dport: be16(&p[2..]),
+        seq: u32::from_be_bytes(p[4..8].try_into().ok()?),
+        ack: u32::from_be_bytes(p[8..12].try_into().ok()?),
+        flags: p[13],
+        payload: p[doff..].to_vec(),
+    })
+}
+
+/// Blocking minimal HTTP GET: `http_get(ip, "example.com", "/")`.
+/// Returns the response bytes (header + body prefix). Real TCP through
+/// slirp to the live internet.
+pub fn http_get(dst_ip: [u8; 4], host: &str, path: &str) -> Option<Vec<u8>> {
+    const SPORT: u16 = 49200;
+    let mac = next_hop(dst_ip, 1500)?;
+    let isn = 0xC05A_0001u32;
+
+    // --- handshake: SYN -> SYN-ACK -> ACK ---
+    let deadline = now_ms() + 3000;
+    let mut rseg: Option<TcpSeg> = None;
+    let mut last_syn = 0u64;
+    while now_ms() < deadline {
+        if now_ms() - last_syn >= 1000 {
+            send_tcp(mac, dst_ip, SPORT, 80, isn, 0, TCP_SYN, &[]);
+            last_syn = now_ms();
+        }
+        for (proto, p) in pump_rx() {
+            if proto != 6 {
+                continue;
+            }
+            if let Some(s) = parse_tcp(&p) {
+                if s.dport == SPORT && s.sport == 80
+                    && s.flags & TCP_SYN != 0
+                    && s.flags & TCP_ACK != 0
+                    && s.ack == isn + 1
+                {
+                    rseg = Some(s);
+                    break;
+                }
+            }
+        }
+        if rseg.is_some() {
+            break;
+        }
+        wait_irq();
+    }
+    let rseg = rseg?;
+    let mut their_seq = rseg.seq + 1;
+    let mut my_seq = isn + 1;
+    send_tcp(mac, dst_ip, SPORT, 80, my_seq, their_seq, TCP_ACK, &[]);
+    sprintln!("[net] tcp established -> {}.{}.{}.{}:80", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
+
+    // --- send request ---
+    let req = alloc::format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path, host
+    );
+    send_tcp(mac, dst_ip, SPORT, 80, my_seq, their_seq, TCP_ACK | TCP_PSH, req.as_bytes());
+    my_seq += req.len() as u32;
+
+    // --- receive until FIN (or idle deadline), ack each segment ---
+    let mut out: Vec<u8> = Vec::new();
+    let deadline = now_ms() + 8000;
+    let mut got_fin = false;
+    while now_ms() < deadline && !got_fin {
+        let mut progressed = false;
+        for (proto, p) in pump_rx() {
+            if proto != 6 {
+                continue;
+            }
+            if let Some(s) = parse_tcp(&p) {
+                if s.dport != SPORT || s.sport != 80 {
+                    continue;
+                }
+                progressed = true;
+                if s.seq == their_seq && !s.payload.is_empty() {
+                    out.extend_from_slice(&s.payload);
+                    their_seq += s.payload.len() as u32;
+                }
+                // ack current position (dup-acks are fine)
+                send_tcp(mac, dst_ip, SPORT, 80, my_seq, their_seq, TCP_ACK, &[]);
+                if s.flags & TCP_FIN != 0 {
+                    their_seq += 1;
+                    send_tcp(mac, dst_ip, SPORT, 80, my_seq, their_seq, TCP_ACK, &[]);
+                    got_fin = true;
+                }
+                if s.flags & TCP_RST != 0 {
+                    got_fin = true;
+                }
+            }
+        }
+        if !progressed {
+            wait_irq();
+        }
+    }
+    // close politely
+    send_tcp(mac, dst_ip, SPORT, 80, my_seq, their_seq, TCP_FIN | TCP_ACK, &[]);
+    sprintln!("[net] tcp closed, {} bytes received", out.len());
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// (mac, ip) for `ifconfig`-style reporting.

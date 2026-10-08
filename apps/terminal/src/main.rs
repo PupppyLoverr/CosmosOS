@@ -115,7 +115,7 @@ impl Term {
             "help" => {
                 for l in [
                     "commands: help ls cd pwd cat mkdir touch rm mv cp echo",
-                    "          clear ps mem uname whoami date ping resolve ifconfig",
+                    "          clear ps mem uname whoami date ping resolve httpget ifconfig",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -280,6 +280,18 @@ impl Term {
                     None => self.push_line(&alloc::format!("resolve: {}: no answer", host)),
                 },
                 None => self.push_line("usage: resolve <hostname>  (real DNS over UDP/53)"),
+            },
+            "httpget" => match args.first() {
+                Some(host) => match ustd::net_http(host) {
+                    Some(body) => {
+                        let s = String::from_utf8_lossy(&body);
+                        for l in s.lines().take(12) {
+                            self.push_line(l);
+                        }
+                    }
+                    None => self.push_line(&alloc::format!("httpget: {}: failed", host)),
+                },
+                None => self.push_line("usage: httpget <host>  (real TCP/80 GET /)"),
             },
             "ifconfig" => match ustd::net_info() {
                 Some((mac, ip)) => {

@@ -25,10 +25,15 @@ Requires: `rustup` toolchain `nightly` (`rust-src`, `llvm-tools-preview`,
 - Apps (F4–F9): Terminal, Files, Text Editor, Settings, System Monitor,
   Demo (native Rust app on the app API: shm surface + input + file persistence).
 - Real persistence: writes land on the FAT32 data disk and survive reboot.
+- Real networking: virtio-net + IPv4/ARP/ICMP/UDP/TCP — `ping`, `resolve`
+  (DNS/UDP to slirp's resolver), `httpget` (real HTTP through slirp to the
+  live internet), `ifconfig`.
 
 ## Terminal commands
 
-`help ls cd pwd cat mkdir touch rm mv cp echo clear ps mem uname reboot shutdown`
+`help ls cd pwd cat mkdir touch rm mv cp echo clear ps mem uname date`
+`ping <ip> resolve <host> httpget <host> ifconfig`
+`reboot shutdown exit`
 
 ## Layout
 
@@ -71,8 +76,9 @@ are read with `ptr::read_unaligned` (no alignment guarantees on the wire).
 - Idle RAM at fresh desktop: ~53 MiB used of 1009 MiB (frame allocator).
   With 4–5 windows open: ~105–155 MiB. Well under the 1 GiB target.
 - Boot image: ~10.6 MiB; data image holds the FAT32 payload.
-- Selftest: `DONE ok=33 fail=0` — 33 checks across memory, fs, IPC,
-  shm, spawn/waitpid, fb, datetime.
+- Selftest: `DONE ok=39 fail=0` — 39 checks across memory, fs, IPC,
+  shm, spawn/waitpid, fb, datetime, syscall-boundary negatives, and
+  live networking (ARP+ICMP ping, DNS over UDP, TCP/HTTP to the internet).
 
 ## Rules in this codebase
 
@@ -84,3 +90,7 @@ are read with `ptr::read_unaligned` (no alignment guarantees on the wire).
   via `enable_and_hlt`, never `hlt` with IF=0.
 - Port owner `0` (`SYS_IPC_OWNER`) means "owner died" — winserver reaps
   dead windows on its 1 Hz tick.
+- The syscall gate runs IF=0 (interrupt gate): kernel-side wait loops must
+  `sti;hlt;cli` (see `net::wait_irq`) or `now_ms()` stays frozen and
+  deadlines never fire. Same reason IRQ handlers must not lock anything a
+  lock-holder across an `sti` window could hold.

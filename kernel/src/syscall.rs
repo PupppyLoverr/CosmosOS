@@ -173,6 +173,26 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
+        shared::SYS_NET_HTTP => {
+            let Some(host) = copy_str(a1, a2.min(253)) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let Some(ip) = net::dns_query(&host, 3000) else {
+                ctx.rax = ERR;
+                return;
+            };
+            match net::http_get(ip, &host, "/") {
+                Some(body) => {
+                    let n = body.len().min(a4 as usize);
+                    match copy_out(a3, &body[..n]) {
+                        Some(_) => n as u64,
+                        None => ERR,
+                    }
+                }
+                None => ERR,
+            }
+        }
         shared::SYS_NET_INFO => match net::info() {
             Some((mac, ip)) => {
                 let mut b = [0u8; 10];
