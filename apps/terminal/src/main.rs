@@ -119,6 +119,12 @@ impl Term {
         if input.is_empty() {
             return;
         }
+        if let Some(rest) = input.strip_prefix("time ") {
+            let t0 = ustd::uptime_ms();
+            self.run(rest);
+            self.push_line(&alloc::format!("  {} ms", ustd::uptime_ms() - t0));
+            return;
+        }
         self.hist.push(String::from(input));
         self.hi = self.hist.len();
         let mut it = input.split_whitespace();
@@ -130,7 +136,8 @@ impl Term {
                     "commands: help ls cd pwd cat mkdir touch rm mv cp echo",
                     "          clear ps mem uname whoami date ping resolve httpget ifconfig dhcp",
                     "          netstat kill <pid> grep <pat> <file> (or -r <dir>) uptime",
-                    "          hex <file> wc <file> du <path>",
+                    "          hex <file> wc <file> du <path> history time <cmd>",
+                    "          head/tail [-n N] <file> sort <file>",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -393,6 +400,45 @@ impl Term {
                 }
                 None => self.push_line("usage: du <path>  (recursive bytes)"),
             },
+            "history" => {
+                for i in 0..self.hist.len() {
+                    let line = alloc::format!("  {:>3}  {}", i + 1, self.hist[i]);
+                    self.push_line(&line);
+                }
+            }
+            "head" | "tail" | "sort" => match args.iter().position(|a| !a.starts_with('-')) {
+                Some(pi) => {
+                    let p = args[pi];
+                    let n: usize = args
+                        .iter()
+                        .position(|a| a == &"-n")
+                        .and_then(|i| args.get(i + 1))
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(10);
+                    match ustd::read_all(p) {
+                        Ok(d) => {
+                            let s = String::from_utf8_lossy(&d);
+                            let mut ls: Vec<&str> = s.lines().collect();
+                            if cmd == "sort" {
+                                ls.sort();
+                                for l in ls {
+                                    self.push_line(l);
+                                }
+                            } else if cmd == "head" {
+                                for l in ls.iter().take(n) {
+                                    self.push_line(l);
+                                }
+                            } else {
+                                for l in ls.iter().skip(ls.len().saturating_sub(n)) {
+                                    self.push_line(l);
+                                }
+                            }
+                        }
+                        Err(e) => self.push_line(&alloc::format!("{}: {}: err {}", cmd, p, e)),
+                    }
+                }
+                None => self.push_line(&alloc::format!("usage: {} [-n N] <file>", cmd)),
+            },
             "netstat" => {
                 for l in ustd::net_stat().lines() {
                     self.push_line(l);
@@ -519,7 +565,8 @@ impl Term {
             "help", "ls", "cd", "pwd", "cat", "mkdir", "touch", "rm", "mv", "cp",
             "echo", "clear", "ps", "mem", "uname", "whoami", "date", "ping",
             "resolve", "httpget", "ifconfig", "dhcp", "netstat", "kill", "grep",
-            "uptime", "reboot", "shutdown", "exit",
+            "uptime", "reboot", "shutdown", "exit", "history", "time",
+            "head", "tail", "sort",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
