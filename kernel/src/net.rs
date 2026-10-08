@@ -73,7 +73,9 @@ static LO_TX_BYTES: AtomicU64 = AtomicU64::new(0);
 /// `now_ms()` advances. Syscall context runs IF=0 (interrupt gate), so we
 /// enable interrupts only for the hlt window — no locks held here, and IRQ
 /// handlers never lock.
-fn wait_irq() {
+/// Halt until the next IRQ (PIT/virtio) with interrupts enabled, then
+/// re-mask — the kernel's sleep primitive inside syscalls.
+pub(crate) fn wait_irq() {
     unsafe { core::arch::asm!("sti; hlt; cli", options(nomem, nostack)) };
 }
 
@@ -176,6 +178,29 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
     for (src_ip, proto, p) in &out {
         if *proto == 1 && p.len() >= 8 && p[0] == 8 {
             icmp_echo_reply(*src_ip, p);
+        }
+    }
+    // TCP keepalive: any conn opted in via SO_KEEPALIVE that hasn't heard
+    // from its peer in 15s gets a bare ACK probe (seq = snd_una-1 — the
+    // classic keepalive segment real stacks send).
+    {
+        let probes: Vec<([u8; 6], [u8; 4], u16, u16, u32, u32, u16)> = {
+            let mut t = TCP_SOCKS.lock();
+            let mut v = Vec::new();
+            for k in t.values_mut() {
+                if k.ka
+                    && k.state == TcpState::Open
+                    && now_ms().saturating_sub(k.ka_rx) > 15_000
+                {
+                    k.ka_rx = now_ms(); // one probe per idle window
+                    v.push((k.mac, k.rip, k.lport, k.rport,
+                        k.snd_una.wrapping_sub(1), k.rcv_nxt, k.cid));
+                }
+            }
+            v
+        };
+        for (mac, rip, lp, rp, seq, ack, _cid) in probes {
+            send_tcp(mac, rip, lp, rp, seq, ack, TCP_ACK, &[]);
         }
     }
     out
@@ -1134,6 +1159,12 @@ pub fn udp_close(lport: u16) {
     UDP_OWNERS.lock().remove(&lport);
 }
 
+/// MSG_PEEK for UDP sockets: copy the front datagram's (src_ip, sport,
+/// payload) WITHOUT popping it.
+pub fn udp_peek(lport: u16) -> Option<([u8; 4], u16, Vec<u8>)> {
+    SOCKS.lock().get(&lport).and_then(|q| q.front().cloned())
+}
+
 /// Send a datagram from `lport` to `dst_ip:dst_port` (real ARP next-hop).
 pub fn udp_send(lport: u16, dst_ip: [u8; 4], dport: u16, payload: &[u8]) -> Result<(), i64> {
     if !SOCKS.lock().contains_key(&lport) {
@@ -1262,6 +1293,8 @@ pub struct TcpSock {
     q: VecDeque<Vec<u8>>, // in-order payload chunks
     owner: u32,           // task id that opened/accepted it (0 = kernel side)
     wr_off: bool,         // shutdown(SHUT_WR): FIN sent, no more sends
+    ka: bool,             // SO_KEEPALIVE: probe the peer after 15s idle
+    ka_rx: u64,           // last rx (or probe) timestamp — keepalive clock
 }
 
 static TCP_SOCKS: Mutex<BTreeMap<u16, TcpSock>> = Mutex::new(BTreeMap::new());
@@ -1277,6 +1310,7 @@ static ACCEPTED: Mutex<BTreeMap<u16, VecDeque<(u16, [u8; 4], u16)>>> =
 static NEXT_CID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x8000);
 
 fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
+    k.ka_rx = now_ms(); // any segment from the peer resets the idle clock
     match k.state {
         TcpState::SynRecv => {
             if s.flags & TCP_RST != 0 {
@@ -1353,6 +1387,8 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
             cid: lport,
             owner: crate::task::with_current(|t| t.id),
             wr_off: false,
+            ka: false,
+            ka_rx: now_ms(),
         },
     );
     let deadline = now_ms() + timeout_ms;
@@ -1431,6 +1467,8 @@ fn accept_syn(s: &TcpSeg, src_ip: [u8; 4]) {
             q: VecDeque::new(),
             owner: 0,
             wr_off: false,
+            ka: false,
+            ka_rx: now_ms(),
         },
     );
     send_tcp(mac, src_ip, s.dport, s.sport, isn, s.seq + 1, TCP_SYN | TCP_ACK, &[]);
@@ -1623,6 +1661,24 @@ pub fn tcp_shutdown_wr(cid: u16) {
     k.wr_off = true;
     send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_FIN | TCP_ACK, &[]);
     k.snd_nxt = k.snd_nxt.wrapping_add(1); // FIN consumes one sequence number
+}
+
+/// MSG_PEEK: copy up to `cap` bytes of the front chunk WITHOUT consuming
+/// it — the next read returns the same data.
+pub fn tcp_peek_some(cid: u16, cap: usize) -> Option<Vec<u8>> {
+    let t = TCP_SOCKS.lock();
+    let k = t.get(&cid)?;
+    let front = k.q.front()?;
+    let n = front.len().min(cap);
+    Some(front[..n].to_vec())
+}
+
+/// Set SO_KEEPALIVE on a conn — probes start counting from now.
+pub fn tcp_set_keepalive(cid: u16, on: bool) {
+    if let Some(k) = TCP_SOCKS.lock().get_mut(&cid) {
+        k.ka = on;
+        k.ka_rx = now_ms();
+    }
 }
 
 /// Nonblocking partial read: at most `cap` bytes of the front queued chunk;

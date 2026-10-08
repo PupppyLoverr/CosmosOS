@@ -44,6 +44,9 @@ struct Sock {
     peer_pid: u32,                // peer task's pid on unix pairs (0 = none)
     reuse: bool,                  // SO_REUSEADDR
     broadcast: bool,              // SO_BROADCAST (gate on bcast dst sends)
+    rcvtimeo: u64,                // SO_RCVTIMEO: max recv block, ms (0 = inf)
+    keepalive: bool,              // SO_KEEPALIVE (TCP: real wire probes)
+    wait_expired: bool,           // recv hit rcvtimeo — surface EAGAIN, no reblock
 }
 
 /// AF_UNIX named-socket registry: path -> listener state. `queue` holds
@@ -140,6 +143,9 @@ pub fn create(stream: bool, domain: u64) -> Result<String, i64> {
             peer_pid: 0,
             reuse: false,
             broadcast: false,
+            rcvtimeo: 0,
+            keepalive: false,
+            wait_expired: false,
         },
     );
     Ok(format!("/socket/{}", id))
@@ -499,6 +505,9 @@ pub fn accept(id: u64) -> Result<(String, [u8; 4], u16), i64> {
                         peer_pid: 0,
                         reuse: false,
                         broadcast: false,
+                        rcvtimeo: 0,
+                        keepalive: false,
+                        wait_expired: false,
                     },
                 );
                 Ok((format!("/socket/{}", nid), rip, rport))
@@ -539,6 +548,9 @@ pub fn accept(id: u64) -> Result<(String, [u8; 4], u16), i64> {
                             peer_pid: cpid,
                             reuse: false,
                             broadcast: false,
+                            rcvtimeo: 0,
+                            keepalive: false,
+                            wait_expired: false,
                         },
                     );
                     Ok((format!("/socket/{}", nid), [0; 4], 0))
@@ -554,6 +566,48 @@ pub fn accept(id: u64) -> Result<(String, [u8; 4], u16), i64> {
 /// of the queued stream; unix delegates to its sockpair side; listener
 /// fds have no stream (-11). rd_off (SHUT_RD) reads as EOF.
 pub fn try_read(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
+    read_wait(path, buf, false)
+}
+
+/// Try one read; when SO_RCVTIMEO is set, an empty read blocks inside this
+/// call until the deadline — on expiry `wait_expired` marks the socket so
+/// the syscall layer returns EAGAIN instead of reblocking forever.
+fn read_wait(path: &str, buf: &mut [u8], peek: bool) -> Result<usize, i64> {
+    let id = parse(path).ok_or(-3i64)?;
+    let timeo = fields(id).map(|s| s.rcvtimeo).unwrap_or(0);
+    match try_read_once(path, buf, peek) {
+        Err(-11) if timeo > 0 => {
+            let deadline = crate::timer::uptime_ms() + timeo;
+            loop {
+                crate::net::wait_irq();
+                match try_read_once(path, buf, peek) {
+                    Err(-11) if crate::timer::uptime_ms() < deadline => continue,
+                    Err(-11) => {
+                        if let Some(s) = SOCKS.lock().get_mut(&id) {
+                            s.wait_expired = true;
+                        }
+                        return Err(-11);
+                    }
+                    r => return r,
+                }
+            }
+        }
+        r => r,
+    }
+}
+
+/// Was the last recv the SO_RCVTIMEO expiry (report EAGAIN, don't reblock)?
+/// Reads-and-clears the flag.
+pub fn wait_expired(path: &str) -> bool {
+    let Some(id) = parse(path) else { return false };
+    let mut m = SOCKS.lock();
+    let Some(s) = m.get_mut(&id) else { return false };
+    let e = s.wait_expired;
+    s.wait_expired = false;
+    e
+}
+
+fn try_read_once(path: &str, buf: &mut [u8], peek: bool) -> Result<usize, i64> {
     let id = parse(path).ok_or(-3i64)?;
     crate::net::pump_once(); // surface any packets that arrived since
     let s = fields(id).ok_or(-9i64)?;
@@ -565,7 +619,12 @@ pub fn try_read(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
             if s.lport == 0 {
                 return Err(-89); // EDESTADDRREQ: unbound
             }
-            match crate::net::udp_recv(s.lport, 0) {
+            let d = if peek {
+                crate::net::udp_peek(s.lport)
+            } else {
+                crate::net::udp_recv(s.lport, 0)
+            };
+            match d {
                 Some((_ip, _pt, d)) => {
                     let n = d.len().min(buf.len());
                     buf[..n].copy_from_slice(&d[..n]);
@@ -577,20 +636,39 @@ pub fn try_read(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
         Kind::Tcp => match crate::net::tcp_read_ready(s.cid) {
             None => Ok(0), // peer finished and queue drained: EOF
             Some(false) => Err(-11),
-            Some(true) => match crate::net::tcp_recv_some(s.cid, buf.len()) {
-                Some(d) => {
-                    buf[..d.len()].copy_from_slice(&d);
-                    Ok(d.len())
+            Some(true) => {
+                let d = if peek {
+                    crate::net::tcp_peek_some(s.cid, buf.len())
+                } else {
+                    crate::net::tcp_recv_some(s.cid, buf.len())
+                };
+                match d {
+                    Some(d) => {
+                        buf[..d.len()].copy_from_slice(&d);
+                        Ok(d.len())
+                    }
+                    None => Err(-11),
                 }
-                None => Err(-11),
-            },
+            }
         },
         Kind::Unix => match &s.chan {
-            Some(c) => crate::sockpair::try_read(c, buf),
+            Some(c) => {
+                if peek {
+                    crate::sockpair::peek_read(c, buf)
+                } else {
+                    crate::sockpair::try_read(c, buf)
+                }
+            }
             None => Err(-107), // ENOTCONN
         },
         Kind::UnixDgram => match &s.uname {
-            Some(u) => crate::udgram::recv(u, buf).map(|(n, _)| n),
+            Some(u) => {
+                if peek {
+                    crate::udgram::peek(u, buf).map(|(n, _)| n)
+                } else {
+                    crate::udgram::recv(u, buf).map(|(n, _)| n)
+                }
+            }
             None => Err(-22), // EINVAL: recvfrom on an unbound mailbox
         },
         Kind::TcpListener | Kind::UnixListener => Err(-11),
@@ -732,7 +810,13 @@ pub fn recvfrom_path(id: u64, buf: &mut [u8]) -> Result<(usize, String), i64> {
 
 /// recvfrom(fd, buf): like read() but the sender's (ip, port) comes back —
 /// only meaningful for UDP; streams behave as read() with a zeroed src.
-pub fn recvfrom(path: &str, buf: &mut [u8]) -> Result<(usize, [u8; 4], u16), i64> {
+/// `peek` = MSG_PEEK: the datagram/stream front is copied but not consumed.
+/// SO_RCVTIMEO bounds the wait on all paths (read_wait / udp_recv budget).
+pub fn recvfrom(
+    path: &str,
+    buf: &mut [u8],
+    peek: bool,
+) -> Result<(usize, [u8; 4], u16), i64> {
     let id = parse(path).ok_or(-3i64)?;
     crate::net::pump_once();
     let s = fields(id).ok_or(-9i64)?;
@@ -741,16 +825,31 @@ pub fn recvfrom(path: &str, buf: &mut [u8]) -> Result<(usize, [u8; 4], u16), i64
             if s.lport == 0 {
                 return Err(-89);
             }
-            match crate::net::udp_recv(s.lport, 0) {
+            let d = if peek {
+                crate::net::udp_peek(s.lport)
+            } else {
+                crate::net::udp_recv(s.lport, s.rcvtimeo)
+            };
+            match d {
                 Some((ip, pt, d)) => {
                     let n = d.len().min(buf.len());
                     buf[..n].copy_from_slice(&d[..n]);
                     Ok((n, ip, pt))
                 }
-                None => Err(-11),
+                None => {
+                    // udp_recv consumed the whole timeout budget — EAGAIN
+                    // goes to userspace, no reblock (peek stays retryable:
+                    // POSIX's own callers poll anyway)
+                    if !peek && s.rcvtimeo > 0 {
+                        if let Some(s) = SOCKS.lock().get_mut(&id) {
+                            s.wait_expired = true;
+                        }
+                    }
+                    Err(-11)
+                }
             }
         }
-        _ => try_read(path, buf).map(|n| (n, [0; 4], 0)),
+        _ => read_wait(path, buf, peek).map(|n| (n, [0; 4], 0)),
     }
 }
 
@@ -1037,6 +1136,8 @@ pub fn getsockopt(id: u64, level: u64, opt: u64) -> Result<u32, i64> {
         }
         2 => Ok(s.reuse as u32),      // SO_REUSEADDR
         6 => Ok(s.broadcast as u32),  // SO_BROADCAST
+        9 => Ok(s.keepalive as u32),  // SO_KEEPALIVE
+        20 => Ok(s.rcvtimeo as u32),  // SO_RCVTIMEO (ms)
         _ => Err(-92),
     }
 }
@@ -1058,6 +1159,22 @@ pub fn setsockopt(id: u64, level: u64, opt: u64, val: u64) -> i64 {
         }
         6 => {
             s.broadcast = val != 0;
+            0
+        }
+        9 => {
+            // SO_KEEPALIVE: on TCP conns this fires real bare-ACK probes
+            // after 15s of peer silence (net.rs pump scan)
+            s.keepalive = val != 0;
+            let cid = s.cid;
+            let is_tcp = s.kind == Kind::Tcp;
+            drop(m);
+            if is_tcp && cid != 0 {
+                crate::net::tcp_set_keepalive(cid, val != 0);
+            }
+            0
+        }
+        20 => {
+            s.rcvtimeo = val.min(600_000); // SO_RCVTIMEO, ms
             0
         }
         _ => -92,
@@ -1100,6 +1217,9 @@ pub fn socketpair_dgram() -> Option<(String, String)> {
                 peer_pid: pid,
                 reuse: false,
                 broadcast: false,
+                rcvtimeo: 0,
+                keepalive: false,
+                wait_expired: false,
             },
         );
     }

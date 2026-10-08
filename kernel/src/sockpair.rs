@@ -110,6 +110,33 @@ pub fn try_read(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
     Ok(n)
 }
 
+/// MSG_PEEK: copy the front bytes WITHOUT draining — same error contract
+/// as try_read (Ok(0) EOF, Err(-11) would block).
+pub fn peek_read(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
+    let Some((id, side)) = parse(path) else {
+        return Err(-2);
+    };
+    let g = SP.lock();
+    let Some(s) = g.get(&id) else {
+        return Err(-2);
+    };
+    let my_rd = if side == 0 { s.rd_a } else { s.rd_b };
+    if my_rd {
+        return Ok(0);
+    }
+    let inbox = if side == 0 { &s.b2a } else { &s.a2b };
+    if inbox.is_empty() {
+        let peer_open = if side == 0 { s.open_b } else { s.open_a };
+        let peer_wr = if side == 0 { s.wr_b } else { s.wr_a };
+        return if peer_open && !peer_wr { Err(-11) } else { Ok(0) };
+    }
+    let n = inbox.len().min(buf.len());
+    for (i, b) in inbox.iter().take(n).enumerate() {
+        buf[i] = *b;
+    }
+    Ok(n)
+}
+
 /// Err(-32) = EPIPE (peer closed); Err(-11) = buffer full.
 pub fn try_write(path: &str, buf: &[u8]) -> Result<usize, i64> {
     let Some((id, side)) = parse(path) else {

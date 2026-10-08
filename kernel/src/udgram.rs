@@ -79,6 +79,23 @@ pub fn recv(name: &str, buf: &mut [u8]) -> Result<(usize, String), i64> {
     }
 }
 
+/// MSG_PEEK: copy the front datagram + sender WITHOUT popping it.
+/// Err(-11) empty queue, Err(-2) mailbox gone — same contract as recv.
+pub fn peek(name: &str, buf: &mut [u8]) -> Result<(usize, String), i64> {
+    let g = BOXES.lock();
+    let Some(b) = g.get(name) else {
+        return Err(-2);
+    };
+    match b.packets.front() {
+        Some((d, s)) => {
+            let n = d.len().min(buf.len());
+            buf[..n].copy_from_slice(&d[..n]);
+            Ok((n, s.clone()))
+        }
+        None => Err(-11),
+    }
+}
+
 /// Poll/epoll readiness: a queued packet (or a gone mailbox — let the
 /// read surface the error instead of blocking forever).
 pub fn ready(name: &str) -> bool {
