@@ -571,7 +571,8 @@ pub fn kill_pid(pid: u32) -> bool {
     let Some(idx) = s.tasks.iter().position(|t| t.id == pid && t.state != State::Dead) else {
         return false;
     };
-    if s.tasks[idx].id == 0 || !s.tasks[idx].is_user {
+    // init (pid 1) and winserver are vital; refuse to kill them.
+    if s.tasks[idx].id == 1 || s.tasks[idx].name == "cosmos-winserver" || !s.tasks[idx].is_user {
         return false;
     }
     let was_cur = idx == s.cur;

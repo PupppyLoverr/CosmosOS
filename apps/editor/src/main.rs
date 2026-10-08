@@ -233,6 +233,8 @@ impl Editor {
                     self.dirty_ui = true;
                     return;
                 }
+                x if x == KeyCode::Ctrl as u32 || x == KeyCode::Shift as u32
+                    || x == KeyCode::Alt as u32 || x == KeyCode::Super as u32 => {}
                 _ => self.sel = None, // any other key collapses the selection
             }
         }
