@@ -1840,15 +1840,27 @@ pub fn eventfd2(initval: u64, flags: u64) -> i64 {
 /// mount: only fstype "tmpfs" exists — a real in-RAM fs over `target`
 /// (an existing dir). `source` is ignored like Linux tmpfs.
 pub fn mount(source: &str, target: &str, fstype: &str) -> i64 {
-    let args: [u64; 6] = [
+    mount_flags(source, target, fstype, 0)
+}
+
+/// mount with flags: MS_RDONLY(1), MS_REMOUNT(32).
+pub fn mount_flags(source: &str, target: &str, fstype: &str, flags: u64) -> i64 {
+    let args: [u64; 8] = [
         source.as_ptr() as u64,
         source.len() as u64,
         target.as_ptr() as u64,
         target.len() as u64,
         fstype.as_ptr() as u64,
         fstype.len() as u64,
+        flags,
+        0,
     ];
     sc1(shared::SYS_MOUNT, args.as_ptr() as u64) as i64
+}
+
+/// chroot(dir): jail this task's path resolution under `dir`.
+pub fn chroot(dir: &str) -> i64 {
+    sc2(218, dir.as_ptr() as u64, dir.len() as u64) as i64
 }
 
 /// umount: unmount target — EBUSY(-16) with open fds/cwd under it.

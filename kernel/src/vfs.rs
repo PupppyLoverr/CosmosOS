@@ -79,11 +79,21 @@ fn dos_dt_to_unix(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8) -> u64 {
     (days.max(0) as u64) * 86400 + h as u64 * 3600 + mi as u64 * 60 + s as u64
 }
 
-/// Join `cwd` + `path`, resolve `.`/`..`, return canonical absolute path.
+/// Join `cwd` + `path`, resolve `.`/`..`, return canonical absolute
+/// (physical) path. When the calling task is chrooted (`t.root != "/"`),
+/// absolute paths resolve under the jail root and `..` can't pop above
+/// it — cwd/root are always stored as physical paths.
 pub fn normalize(cwd: &str, path: &str) -> String {
+    let root = task::with_current(|t| t.root.clone());
+    let root_depth = root.split('/').filter(|c| !c.is_empty()).count();
     let mut out: Vec<&str> = Vec::new();
     let joined: String = if path.starts_with('/') {
-        String::from(path)
+        // virtual absolute -> physical under the jail root
+        if root == "/" {
+            String::from(path)
+        } else {
+            alloc::format!("{}{}", root.trim_end_matches('/'), path)
+        }
     } else {
         alloc::format!("{}/{}", cwd.trim_end_matches('/'), path)
     };
@@ -91,7 +101,9 @@ pub fn normalize(cwd: &str, path: &str) -> String {
         match comp {
             "" | "." => {}
             ".." => {
-                out.pop();
+                if out.len() > root_depth {
+                    out.pop();
+                }
             }
             c => out.push(c),
         }

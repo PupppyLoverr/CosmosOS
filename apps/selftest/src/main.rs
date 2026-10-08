@@ -3965,6 +3965,44 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::remove("/tfs-r");
         ok
     });
+    check("tmpfs-ro", {
+        // MS_RDONLY: mounting ro makes every write EROFS, reads still work;
+        // MS_REMOUNT toggles it back rw.
+        let _ = ustd::mkdir("/tfs-ro");
+        let ok = ustd::mount_flags("none", "/tfs-ro", "tmpfs", 1) == 0
+            && ustd::write_all("/tfs-ro/f", b"x") == Err(-30i64)
+            && ustd::mount_flags("none", "/tfs-ro", "tmpfs", 32) == 0 // remount rw
+            && ustd::write_all("/tfs-ro/f", b"x").is_ok()
+            && ustd::umount("/tfs-ro") == 0;
+        let _ = ustd::remove("/tfs-ro");
+        ok
+    });
+    check("chroot-jail", {
+        // a jailed child sees /jail as / and can't escape via ".."
+        let _ = ustd::mkdir("/jail");
+        let ok = ustd::write_all("/jail/x", b"J").is_ok();
+        let pid = ustd::fork();
+        if pid == 0 {
+            if ustd::chroot("/jail") != 0 {
+                ustd::exit(11);
+            }
+            let seen = ustd::read_all("/x").map(|d| d == b"J").unwrap_or(false);
+            ustd::chdir("/.."); // .. at the jail root must not escape
+            let esc = ustd::read_all("/x").map(|d| d == b"J").unwrap_or(false);
+            let leak = ustd::stat("/etc/rc.conf").is_ok(); // outside jail
+            ustd::exit(if seen && esc && !leak { 0 } else { 12 });
+        }
+        let st = ustd::waitpid(pid as u32, 10_000);
+        ok && st == Ok(0)
+    });
+    check("tmp-tmpfs", {
+        // init mounted a real tmpfs on /tmp at boot
+        ustd::read_all("/proc/mounts")
+            .map(|d| String::from_utf8_lossy(&d).contains("tmpfs /tmp tmpfs"))
+            .unwrap_or(false)
+            && ustd::write_all("/tmp/st", b"t").is_ok()
+            && ustd::read_all("/tmp/st").map(|d| d == b"t").unwrap_or(false)
+    });
     check("gettimeofday", {
         let (s, u) = ustd::gettimeofday();
         s > 1_700_000_000 && u < 1_000_000

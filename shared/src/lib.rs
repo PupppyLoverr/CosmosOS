@@ -241,7 +241,12 @@ pub const SYS_UTIMENSAT: u64 = 213;       // (dirfd,path,plen,times_ptr[4u64]|0,
 pub const SYS_PIPE2: u64 = 214;           // (flags: O_NONBLOCK|O_CLOEXEC) -> rfd|wfd<<32
 pub const SYS_EVENTFD2: u64 = 215;        // (initval, flags: SEM|NONBLOCK|CLOEXEC) -> fd
 pub const SYS_MOUNT: u64 = 216;           // (&[u64;6]{sptr,slen,tptr,tlen,fptr,flen})
-pub const SYS_UMOUNT: u64 = 217;          // (target_ptr, len) -> 0|err
+pub const SYS_UMOUNT: u64 = 217;
+/// chroot(dir): jail the task's path resolution under `dir` (root field).
+pub const SYS_CHROOT: u64 = 218;
+/// mount() flags
+pub const MS_RDONLY: u64 = 1;
+pub const MS_REMOUNT: u64 = 32;          // (target_ptr, len) -> 0|err
 pub const O_CLOEXEC: u64 = 0x10000;       // per-desc flag: close on successful exec
 pub const F_GETFD: u64 = 1;               // fcntl: get descriptor flags
 pub const F_SETFD: u64 = 2;               // fcntl: set descriptor flags (FD_CLOEXEC)

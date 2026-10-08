@@ -865,6 +865,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
         }
         shared::SYS_MOUNT => sys_mount(a1),
         shared::SYS_UMOUNT => sys_umount(a1, a2),
+        shared::SYS_CHROOT => sys_chroot(a1, a2),
         shared::SYS_GETTIMEOFDAY => {
             let sec = vfs::now_unix();
             let usec = (task::ticks() % 100) * 10_000; // 10ms tick granularity
@@ -3368,11 +3369,12 @@ fn sys_symlink_impl(target: &str, link: &str) -> u64 {
 }
 
 /// statfs record out: {type=0x4d44 FAT, bsize=cluster, blocks, bfree}.
-/// SYS_MOUNT(&[u64;6]{sptr,slen,tptr,tlen,fptr,flen}): mount a filesystem.
-/// Only "tmpfs" exists — a real in-RAM fs over the target dir. The source
-/// string is ignored like Linux does for tmpfs.
+/// SYS_MOUNT(&[u64;8]{sptr,slen,tptr,tlen,fptr,flen,flags,unused}):
+/// mount a filesystem. Only "tmpfs" exists — a real in-RAM fs over the
+/// target dir; source is ignored like Linux tmpfs. Flags: MS_RDONLY(1),
+/// MS_REMOUNT(32) — remount flips ro on the existing mount.
 fn sys_mount(argp: u64) -> u64 {
-    let Some(a) = copy_in(argp, 48) else { return ERR };
+    let Some(a) = copy_in(argp, 64) else { return ERR };
     let rd = |i: usize| u64::from_le_bytes(a[i * 8..i * 8 + 8].try_into().unwrap());
     let (Some(tgt), Some(fst)) = (copy_str(rd(2) as u64, rd(3) as u64), copy_str(rd(4) as u64, rd(5) as u64))
     else {
@@ -3381,15 +3383,42 @@ fn sys_mount(argp: u64) -> u64 {
     if fst.trim_matches('\0') != "tmpfs" {
         return (-19i64) as u64; // ENODEV: unknown fstype
     }
+    let flags = rd(6);
     let cwd = task::with_current(|t| t.cwd.clone());
     let t = vfs::normalize(&cwd, tgt.trim_matches('\0'));
+    let ro = flags & shared::MS_RDONLY != 0;
+    if flags & shared::MS_REMOUNT != 0 {
+        return crate::tmpfs::remount(&t, ro)
+            .map(|_| 0)
+            .unwrap_or_else(|e| e as u64);
+    }
     // target must be an existing directory on whatever fs it lands on
     match vfs::stat_path(&t) {
         Ok(s) if s.is_dir != 0 => {}
         Ok(_) => return (-20i64) as u64, // ENOTDIR
         Err(e) => return e as u64,
     }
-    crate::tmpfs::mount(&t).map(|_| 0).unwrap_or_else(|e| e as u64)
+    crate::tmpfs::mount(&t, ro)
+        .map(|_| 0)
+        .unwrap_or_else(|e| e as u64)
+}
+
+/// SYS_CHROOT(path): jail the task under `path` — must be a directory.
+/// Absolute paths resolve under it via vfs::normalize; `..` can't escape.
+fn sys_chroot(pptr: u64, plen: u64) -> u64 {
+    let Some(p) = copy_str(pptr, plen) else { return ERR };
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let full = vfs::normalize(&cwd, p.trim_matches('\0'));
+    match vfs::stat_path(&full) {
+        Ok(s) if s.is_dir != 0 => {
+            task::with_current(|t| {
+                t.root = full;
+                0u64
+            })
+        }
+        Ok(_) => (-20i64) as u64, // ENOTDIR
+        Err(e) => e as u64,
+    }
 }
 
 /// SYS_UMOUNT(target): EBUSY on open fds/cwd/nested mounts under it.

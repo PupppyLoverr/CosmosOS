@@ -24,7 +24,8 @@ pub struct Node {
 }
 
 static NODES: Mutex<BTreeMap<String, Node>> = Mutex::new(BTreeMap::new());
-static MOUNTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// (mount path, read-only) — longest-prefix-first on insert.
+static MOUNTS: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
 /// Lock-free "anything mounted?" flag — lets `handles` short-circuit
 /// without taking MOUNTS, which matters on the page-fault read path.
 static ANY: AtomicUsize = AtomicUsize::new(0);
@@ -43,8 +44,13 @@ fn under(m: &str, path: &str) -> bool {
     path == m || (path.len() > m.len() && path.starts_with(m) && path.as_bytes()[m.len()] == b'/')
 }
 
-fn mounted(g: &Vec<String>, path: &str) -> bool {
-    g.iter().any(|m| under(m, path))
+fn mounted(g: &Vec<(String, bool)>, path: &str) -> bool {
+    g.iter().any(|m| under(&m.0, path))
+}
+
+/// Is `path` under a READ-ONLY mount? EROFS gate for all mutators.
+fn ro_of(g: &Vec<(String, bool)>, path: &str) -> bool {
+    g.iter().any(|m| m.1 && under(&m.0, path))
 }
 
 /// Is `path` at or under a tmpfs mount point?
@@ -55,9 +61,21 @@ pub fn handles(path: &str) -> bool {
     mounted(&MOUNTS.lock(), path)
 }
 
-/// Registered mount points (for /proc/mounts).
-pub fn mounts() -> Vec<String> {
+/// Registered mount points with ro flag (for /proc/mounts).
+pub fn mounts() -> Vec<(String, bool)> {
     MOUNTS.lock().clone()
+}
+
+/// MS_REMOUNT: update the existing mount's ro flag. EINVAL if not mounted.
+pub fn remount(target: &str, ro: bool) -> Result<(), i64> {
+    let mut mg = MOUNTS.lock();
+    match mg.iter_mut().find(|m| m.0 == target) {
+        Some(m) => {
+            m.1 = ro;
+            Ok(())
+        }
+        None => Err(-22),
+    }
 }
 
 fn parent_of(path: &str) -> Option<String> {
@@ -124,12 +142,12 @@ fn write_pages(n: &mut Node, off: u64, buf: &[u8]) {
 /// Mount a fresh tmpfs at `target` (already normalized, verified to be an
 /// existing directory by the caller). EBUSY(-16) if already a mount,
 /// EINVAL(-22) for "/".
-pub fn mount(target: &str) -> Result<(), i64> {
+pub fn mount(target: &str, ro: bool) -> Result<(), i64> {
     if target == "/" {
         return Err(-22);
     }
     let mut mg = MOUNTS.lock();
-    if mg.iter().any(|m| m == target) {
+    if mg.iter().any(|m| m.0 == target) {
         return Err(-16);
     }
     let mut ng = NODES.lock();
@@ -144,8 +162,8 @@ pub fn mount(target: &str) -> Result<(), i64> {
             children: Vec::new(),
         },
     );
-    mg.push(String::from(target));
-    mg.sort_by(|a, b| b.len().cmp(&a.len())); // longest prefix wins
+    mg.push((String::from(target), ro));
+    mg.sort_by(|a, b| b.0.len().cmp(&a.0.len())); // longest prefix wins
     ANY.store(mg.len(), Ordering::Relaxed);
     Ok(())
 }
@@ -154,12 +172,12 @@ pub fn mount(target: &str) -> Result<(), i64> {
 /// nested tmpfs mount lives inside it. Drops every node under the prefix.
 pub fn umount(target: &str) -> Result<(), i64> {
     let mut mg = MOUNTS.lock();
-    let Some(i) = mg.iter().position(|m| m == target) else {
+    let Some(i) = mg.iter().position(|m| m.0 == target) else {
         return Err(-22); // EINVAL: not a mount
     };
     // busy: a nested mount, or an open fd / cwd below it
     let under = alloc::format!("{}/", target);
-    if mg.iter().any(|m| m.starts_with(&under)) {
+    if mg.iter().any(|m| m.0.starts_with(&under)) {
         return Err(-16);
     }
     if crate::task::fd_path_prefix_in_use(&under) || crate::task::cwd_under(&under) {
@@ -174,6 +192,12 @@ pub fn umount(target: &str) -> Result<(), i64> {
 
 /// open(2) semantics for a tmpfs path. Returns ((), append_pos).
 pub fn open(path: &str, flags: u64) -> Result<u64, i64> {
+    let wants_write = flags
+        & (shared::O_WRONLY | shared::O_RDWR | shared::O_CREATE | shared::O_TRUNC | shared::O_APPEND)
+        != 0;
+    if wants_write && ro_of(&MOUNTS.lock(), path) {
+        return Err(-30); // EROFS
+    }
     let mut ng = NODES.lock();
     match ng.get(path) {
         Some(n) if n.is_dir => return Err(-4), // EISDIR
@@ -277,6 +301,9 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, i64> {
 /// Write `buf` at `off` (caller handles O_APPEND by passing off=len).
 /// ENOSPC past QUOTA.
 pub fn write_range(path: &str, off: u64, buf: &[u8]) -> Result<usize, i64> {
+    if ro_of(&MOUNTS.lock(), path) {
+        return Err(-30);
+    }
     let mut ng = NODES.lock();
     if !ng.contains_key(path) {
         return Err(-2);
@@ -296,6 +323,9 @@ pub fn write_range(path: &str, off: u64, buf: &[u8]) -> Result<usize, i64> {
 }
 
 pub fn truncate(path: &str, len: u64) -> Result<(), i64> {
+    if ro_of(&MOUNTS.lock(), path) {
+        return Err(-30);
+    }
     let mut ng = NODES.lock();
     let Some(n) = ng.get_mut(path) else { return Err(-2) };
     if n.is_dir {
@@ -322,6 +352,9 @@ pub fn stat(path: &str) -> Option<(u64, bool, u64, u8)> {
 }
 
 pub fn mkdir(path: &str) -> Result<(), i64> {
+    if ro_of(&MOUNTS.lock(), path) {
+        return Err(-30);
+    }
     let mut ng = NODES.lock();
     if ng.contains_key(path) {
         return Err(-17);
@@ -350,6 +383,9 @@ pub fn mkdir(path: &str) -> Result<(), i64> {
 
 /// unlink/rmdir: files drop on unlink; dirs only when empty (-39 ENOTEMPTY).
 pub fn remove(path: &str) -> Result<(), i64> {
+    if ro_of(&MOUNTS.lock(), path) {
+        return Err(-30);
+    }
     let mut ng = NODES.lock();
     let Some(n) = ng.get(path) else { return Err(-2) };
     if n.is_dir && !n.children.is_empty() {
@@ -367,6 +403,12 @@ pub fn remove(path: &str) -> Result<(), i64> {
 
 /// Same-mount rename (dirs or files); cross-mount is EXDEV(-18).
 pub fn rename(from: &str, to: &str) -> Result<(), i64> {
+    {
+        let mg = MOUNTS.lock();
+        if ro_of(&mg, from) || ro_of(&mg, to) {
+            return Err(-30);
+        }
+    }
     let mut ng = NODES.lock();
     let par_to = parent_of(to).unwrap_or_else(|| String::from("/"));
     {
@@ -423,6 +465,9 @@ pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
 }
 
 pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
+    if ro_of(&MOUNTS.lock(), path) {
+        return Err(-30);
+    }
     let mut ng = NODES.lock();
     let Some(n) = ng.get_mut(path) else { return Err(-2) };
     n.mtime = secs;
@@ -430,6 +475,9 @@ pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
 }
 
 pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
+    if ro_of(&MOUNTS.lock(), path) {
+        return Err(-30);
+    }
     let mut ng = NODES.lock();
     let Some(n) = ng.get_mut(path) else { return Err(-2) };
     n.attr = attr;

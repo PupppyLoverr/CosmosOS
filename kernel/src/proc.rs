@@ -284,8 +284,12 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/version" => alloc::format!("CosmosOS 0.1 rust-kernel x86_64\n"),
         "/proc/mounts" => {
             let mut s = String::from("virtio-blk / fat32 rw 0 0\nproc /proc proc ro 0 0\ndevfs /dev devfs ro 0 0\n");
-            for m in crate::tmpfs::mounts() {
-                s.push_str(&alloc::format!("tmpfs {} tmpfs rw 0 0\n", m));
+            for (m, ro) in crate::tmpfs::mounts() {
+                s.push_str(&alloc::format!(
+                    "tmpfs {} tmpfs {} 0 0\n",
+                    m,
+                    if ro { "ro" } else { "rw" }
+                ));
             }
             s
         }

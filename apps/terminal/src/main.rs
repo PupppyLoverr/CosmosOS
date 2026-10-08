@@ -12863,24 +12863,48 @@ impl Term {
                         Err(e) => self.fail(&alloc::format!("mount: err {}", e)),
                     }
                 } else {
-                    // mount -t <type> <src> <target>
+                    // mount [-t type] [-o ro,rw,remount] <src> <dir>
                     let a: Vec<&str> = args.iter().map(|s| *s).collect();
-                    if a.len() == 4 && a[0] == "-t" {
-                        match ustd::mount(a[2], a[3], a[1]) {
-                            0 => self.emit(&alloc::format!("{} on {}", a[1], a[3])),
-                            e => self.fail(&alloc::format!("mount: err {}", e)),
+                    let mut typ = "tmpfs";
+                    let mut flags: u64 = 0;
+                    let mut pos = 0usize;
+                    while pos < a.len() {
+                        match a[pos] {
+                            "-t" if pos + 1 < a.len() => {
+                                typ = a[pos + 1];
+                                pos += 2;
+                            }
+                            "-o" if pos + 1 < a.len() => {
+                                for o in a[pos + 1].split(',') {
+                                    match o {
+                                        "ro" => flags |= 1,
+                                        "rw" => flags &= !1,
+                                        "remount" => flags |= 32,
+                                        _ => {}
+                                    }
+                                }
+                                pos += 2;
+                            }
+                            _ => break,
                         }
-                    } else if a.len() == 2 {
-                        // mount <src> <dir>: guess tmpfs
-                        match ustd::mount(a[0], a[1], "tmpfs") {
-                            0 => self.emit(&alloc::format!("tmpfs on {}", a[1])),
+                    }
+                    if a.len() - pos == 2 {
+                        match ustd::mount_flags(a[pos], a[pos + 1], typ, flags) {
+                            0 => self.emit(&alloc::format!("{} on {}", typ, a[pos + 1])),
                             e => self.fail(&alloc::format!("mount: err {}", e)),
                         }
                     } else {
-                        self.fail("usage: mount [-t tmpfs <src>] <dir>");
+                        self.fail("usage: mount [-t type] [-o opts] <src> <dir>");
                     }
                 }
             }
+            "chroot" => match args.first() {
+                Some(d) => match ustd::chroot(d) {
+                    0 => self.emit(&alloc::format!("root is now {}", d)),
+                    e => self.fail(&alloc::format!("chroot: {}: err {}", d, e)),
+                },
+                None => self.fail("usage: chroot <dir>"),
+            },
             "umount" => match args.first() {
                 Some(p) => match ustd::umount(p) {
                     0 => self.emit(&alloc::format!("unmounted {}", p)),
@@ -20534,7 +20558,7 @@ impl Term {
         "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
         "alias", "unalias", "type", "hostname", "id", "printf", "dd", "split",
         "source", "comm", "join", "paste", "expand", "unexpand", "at", "file",
-        "test", "[", "rand", "mount", "umount", "rmdir",
+        "test", "[", "rand", "mount", "umount", "chroot", "rmdir",
         "export", "unset", "man",
         "lspci", "lscpu", "factor", "shuf", "cksum",
         "eval", "break", "continue", "return",
