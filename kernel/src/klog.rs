@@ -48,6 +48,13 @@ pub fn append_byte(b: u8) {
     }
 }
 
+/// Empty the ring (`dmesg -c` reads then clears).
+pub fn clear() {
+    let mut r = RING.lock();
+    r.head = 0;
+    r.len = 0;
+}
+
 /// Copy up to `out.len()` tail bytes of the log into `out`; returns the
 /// number written.
 pub fn read_tail(out: &mut [u8]) -> usize {

@@ -171,6 +171,14 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
             return Err(-2);
         }
         fs.create_file(&full).map_err(err_to_i64)?;
+        // POSIX umask: FAT has no mode bits; the one meaningful mapping is
+        // owner-write masked out -> the readonly attribute. Other bits are
+        // ignored (fat32 has nothing to map them onto).
+        let um = task::with_current(|t| t.umask);
+        if um & 0o200 != 0 {
+            let cur = fs.stat(&full).map(|s| s.attr).unwrap_or(0);
+            let _ = fs.set_meta(&full, None, Some(cur | 0x01));
+        }
     }
     if exists && flags & O_TRUNC != 0 && !is_dev && !is_proc {
         fs.write_file(&full, &[]).map_err(err_to_i64)?;

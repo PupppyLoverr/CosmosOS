@@ -84,6 +84,8 @@ pub const SYS_ARP_DEL: u64 = 84;           // (ip as u32 BE) -> 1 deleted | 0 ab
 pub const SYS_UTIME: u64 = 85;             // (path_ptr,len,secs) -> 0 | ERR  set file mtime
 pub const SYS_SETATTR: u64 = 86;           // (path_ptr,len,attr) -> 0 | ERR  set FAT attr bits
 pub const SYS_RTC_SET: u64 = 87;           // (unix_secs) -> 0            set wall clock (RTC + base)
+pub const SYS_UMASK: u64 = 88;             // (mask|U64MAX=query) -> old   per-task file-create mask
+pub const SYS_KLOG_CLEAR: u64 = 89;        // () -> 0                      clear the kernel log ring
 pub const SYS_ERR: u64 = u64::MAX;
 
 // open flags

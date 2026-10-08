@@ -365,6 +365,17 @@ pub fn dispatch(ctx: &mut CpuContext) {
             crate::timer::set_unix(a1);
             0
         }
+        shared::SYS_UMASK => task::with_current(|t| {
+            let old = t.umask as u64;
+            if a1 != u64::MAX {
+                t.umask = (a1 as u32) & 0o777;
+            }
+            old
+        }),
+        shared::SYS_KLOG_CLEAR => {
+            crate::klog::clear();
+            0
+        }
         shared::SYS_ARP => {
             let s = net::arp_stat();
             let n = s.len().min(a2 as usize);

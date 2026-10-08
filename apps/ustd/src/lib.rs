@@ -558,6 +558,17 @@ pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
 pub fn set_time(secs: u64) {
     sc1(shared::SYS_RTC_SET, secs);
 }
+
+/// Set (mask != u64::MAX) and/or query the per-task file-creation umask;
+/// returns the previous mask.
+pub fn umask(mask: u64) -> u64 {
+    sc1(shared::SYS_UMASK, mask)
+}
+
+/// Clear the kernel log ring (`dmesg -c`).
+pub fn klog_clear() {
+    sc0(shared::SYS_KLOG_CLEAR);
+}
 pub fn mkdir(path: &str) -> Result<(), i64> {
     let r = sc2(shared::SYS_MKDIR, path.as_ptr() as u64, path.len() as u64);
     if is_err(r) {

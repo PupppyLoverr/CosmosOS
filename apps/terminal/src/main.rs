@@ -573,30 +573,41 @@ fn block_depth(stmts: &[String]) -> i32 {
 }
 
 /// Shell word-splitting: whitespace separates, '...' and "..." group (and are
-/// stripped). Returns (word, was_quoted) per token -- quoted words are exempt
-/// from glob expansion, like a real shell.
-fn tokenize(s: &str) -> Vec<(String, bool)> {
+/// stripped). Returns (word, was_quoted, first_quoted_pos) per token --
+/// quoted words are exempt from glob expansion, like a real shell.
+/// first_quoted_pos is the stripped-index of the first char that came from
+/// inside quotes (usize::MAX when nothing was quoted): the shell uses it to
+/// tell `a='x'` (assignment) from `'a=b'` (literal command word).
+fn tokenize(s: &str) -> Vec<(String, bool, usize)> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let (mut sq, mut dq) = (false, false);
     let mut quoted = false;
+    let mut qpos = usize::MAX;
     let mut any = false;
     for c in s.chars() {
         match c {
             '\'' if !dq => {
+                if !sq && qpos == usize::MAX {
+                    qpos = cur.len();
+                }
                 sq = !sq;
                 quoted = true;
                 any = true;
             }
             '"' if !sq => {
+                if !dq && qpos == usize::MAX {
+                    qpos = cur.len();
+                }
                 dq = !dq;
                 quoted = true;
                 any = true;
             }
             c if c.is_whitespace() && !sq && !dq => {
                 if any {
-                    out.push((core::mem::take(&mut cur), quoted));
+                    out.push((core::mem::take(&mut cur), quoted, qpos));
                     quoted = false;
+                    qpos = usize::MAX;
                     any = false;
                 }
             }
@@ -607,7 +618,7 @@ fn tokenize(s: &str) -> Vec<(String, bool)> {
         }
     }
     if any {
-        out.push((cur, quoted));
+        out.push((cur, quoted, qpos));
     }
     out
 }
@@ -996,6 +1007,26 @@ fn human_size(n: u64) -> String {
 }
 
 /// Shell-style wildcard match: `*` (any run) and `?` (single char).
+/// `name=` / `name+=` / `name[..]=` / `name=(` / `name+=(` — the start of
+/// an assignment token (quoted tokens were already excluded by the caller).
+fn is_assign_head(w: &str) -> bool {
+    let b = w.as_bytes();
+    if b.is_empty() || !(b[0].is_ascii_alphabetic() || b[0] == b'_') {
+        return false;
+    }
+    let mut i = 0;
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+        i += 1;
+    }
+    if b.get(i) == Some(&b'[') {
+        match w[i..].find(']') {
+            Some(close) => i += close + 1,
+            None => return false,
+        }
+    }
+    b.get(i) == Some(&b'=') || (b.get(i) == Some(&b'+') && b.get(i + 1) == Some(&b'='))
+}
+
 fn wild_match(pat: &str, s: &str) -> bool {
     let (p, s) = (pat.as_bytes(), s.as_bytes());
     let (mut pi, mut si) = (0usize, 0usize);
@@ -1293,21 +1324,7 @@ fn awk_stmts(
                 out.push(line.clone());
                 continue;
             }
-            let mut parts = Vec::new();
-            let mut dep = 0i32;
-            let mut last = 0;
-            for (i, c) in e.char_indices() {
-                match c {
-                    '(' => dep += 1,
-                    ')' => dep -= 1,
-                    ',' if dep == 0 => {
-                        parts.push(&e[last..i]);
-                        last = i + 1;
-                    }
-                    _ => {}
-                }
-            }
-            parts.push(&e[last..]);
+            let parts = awk_argsplit(e);
             let vals: Result<Vec<String>, String> = parts
                 .iter()
                 .map(|p| awk_show(p.trim(), line, nr, fields, vars))
@@ -1356,7 +1373,83 @@ fn awk_show(
             });
         }
     }
+    if e.starts_with("substr(") {
+        return awk_strexp(e, line, nr, fields, vars);
+    }
     Ok(alloc::format!("{}", awk_num(e, line, nr, fields, vars)?))
+}
+
+/// split `a,b,c` on depth-0 commas (paren- and quote-aware).
+fn awk_argsplit(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut dep, mut q, mut last) = (0i32, 0u8, 0usize);
+    for (i, c) in s.char_indices() {
+        match c {
+            _ if q != 0 && c as u8 == q => q = 0,
+            '\'' | '"' if q == 0 => q = c as u8,
+            '(' if q == 0 => dep += 1,
+            ')' if q == 0 => dep -= 1,
+            ',' if q == 0 && dep == 0 => {
+                out.push(&s[last..i]);
+                last = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[last..]);
+    out
+}
+
+/// string-valued sub-expression: "lit", $N/$0/$NF, substr(), else number-as-str.
+fn awk_strexp(
+    e: &str,
+    line: &str,
+    nr: usize,
+    fields: &[String],
+    vars: &alloc::collections::BTreeMap<String, i64>,
+) -> Result<String, String> {
+    let e = e.trim();
+    if e.starts_with('"') && e.ends_with('"') && e.len() >= 2 {
+        return Ok(String::from(&e[1..e.len() - 1]));
+    }
+    if let Some(r) = e.strip_prefix('$') {
+        let r = r.trim();
+        let idx = if r == "NF" {
+            Some(fields.len())
+        } else {
+            r.parse::<usize>().ok()
+        };
+        if let Some(i) = idx {
+            return Ok(if i == 0 {
+                String::from(line)
+            } else {
+                fields.get(i - 1).cloned().unwrap_or_default()
+            });
+        }
+    }
+    if e.starts_with("substr(") && e.ends_with(')') {
+        let args = awk_argsplit(&e[7..e.len() - 1]);
+        if args.len() < 2 {
+            return Err(String::from("awk: substr needs >= 2 args"));
+        }
+        let st = awk_strexp(args[0], line, nr, fields, vars)?;
+        let start = awk_num(args[1], line, nr, fields, vars)?.max(1);
+        let len = args
+            .get(2)
+            .map(|a| awk_num(a, line, nr, fields, vars))
+            .transpose()?;
+        let chars: Vec<char> = st.chars().collect();
+        let i = ((start - 1) as usize).min(chars.len());
+        let tail = &chars[i..];
+        return Ok(match len {
+            Some(l) => tail.iter().take(l.max(0) as usize).collect(),
+            None => tail.iter().collect(),
+        });
+    }
+    Ok(alloc::format!(
+        "{}",
+        awk_num(e, line, nr, fields, vars)?
+    ))
 }
 
 /// numeric expression: terms `+ -` then `* / %`, parens, $N/$NF, NF, NR, vars.
@@ -1434,11 +1527,82 @@ fn awk_num(
             *p += 1;
         }
         let t = core::str::from_utf8(&b[s..*p]).unwrap_or("");
-        if t == "NR" {
+        if t == "NR" || t == "FNR" {
             return Ok(nr as i64);
         }
         if t == "NF" {
             return Ok(fields.len() as i64);
+        }
+        if t == "length" {
+            // `length` bare = length($0); `length(...)` below
+            ws(b, p);
+            if *p >= b.len() || b[*p] != b'(' {
+                return Ok(line.chars().count() as i64);
+            }
+        }
+        if matches!(t, "length" | "index" | "substr") {
+            ws(b, p);
+            if b.get(*p) == Some(&b'(') {
+                let open = *p;
+                let (mut d, mut i, mut q) = (0usize, open, 0u8);
+                while i < b.len() {
+                    match b[i] {
+                        c if q != 0 && c == q => q = 0,
+                        b'\'' | b'"' if q == 0 => q = b[i],
+                        b'(' if q == 0 => d += 1,
+                        b')' if q == 0 => {
+                            d -= 1;
+                            if d == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if i >= b.len() {
+                    return Err(String::from("awk: unclosed ("));
+                }
+                let argstr = core::str::from_utf8(&b[open + 1..i]).unwrap_or("");
+                *p = i + 1;
+                let args = awk_argsplit(argstr);
+                return match t {
+                    "length" => Ok(args
+                        .first()
+                        .map(|a| {
+                            awk_strexp(a, line, nr, fields, vars)
+                                .map(|x| x.chars().count() as i64)
+                        })
+                        .unwrap_or(Ok(line.chars().count() as i64))?),
+                    "index" => {
+                        if args.len() < 2 {
+                            return Err(String::from("awk: index needs 2 args"));
+                        }
+                        let hay = awk_strexp(args[0], line, nr, fields, vars)?;
+                        let ndl = awk_strexp(args[1], line, nr, fields, vars)?;
+                        Ok(match hay.find(&ndl) {
+                            Some(bi) => hay[..bi].chars().count() as i64 + 1,
+                            None => 0,
+                        })
+                    }
+                    _ => {
+                        // substr in numeric context: leading-digit prefix
+                        let v = awk_strexp(
+                            &alloc::format!("substr({})", argstr),
+                            line,
+                            nr,
+                            fields,
+                            vars,
+                        )?;
+                        let t: String = v
+                            .trim()
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '+')
+                            .collect();
+                        Ok(t.parse().unwrap_or(0))
+                    }
+                };
+            }
         }
         if let Ok(v) = t.parse::<i64>() {
             return Ok(v);
@@ -2416,6 +2580,9 @@ struct Term {
     err_buf: Vec<String>,                              // stderr lines collected while err_file set
     out_err: bool,                                     // 1>&2: stdout routed to the stderr stream
     select_in: Option<(String, Vec<String>, Vec<String>)>, // select: (var, words, body)
+    comps: alloc::collections::BTreeMap<String, String>,   // `complete -W` wordlists per command
+    in_pc: bool,                                     // PROMPT_COMMAND recursion guard
+    ulimit_n: u64,                                   // `ulimit -n` advisory (0 = default 1024)
 }
 
 impl Term {
@@ -2841,8 +3008,28 @@ impl Term {
     /// ${V/p/r} ${V//p/r} ${V:off[:len]} and the special params ${1} ${#}
     /// ${@} ${*} ${?} ${!} {$$}. Returns None (error in sub_err) on failure.
     fn param_expand(&mut self, inner: &str) -> Option<String> {
-        // ${#V}: value length in characters
         if let Some(rest) = inner.strip_prefix('#') {
+            // ${#A[@]} / ${#A[*]}: number of ASSIGNED elements in A
+            // (sparse arrays count only set slots, like bash)
+            if rest.ends_with("[@]") || rest.ends_with("[*]") {
+                let an = &rest[..rest.len() - 3];
+                if !an.is_empty()
+                    && an.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                {
+                    let n = self
+                        .lookup_var(&alloc::format!("{}_COUNT", an))
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    let c = (0..n)
+                        .filter(|i| {
+                            self.lookup_var(&alloc::format!("{}_{}", an, i))
+                                .is_some()
+                        })
+                        .count();
+                    return Some(alloc::format!("{}", c));
+                }
+            }
+            // ${#V}: value length in characters
             if !rest.is_empty()
                 && rest.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
             {
@@ -2901,7 +3088,34 @@ impl Term {
             1 // single special char: # @ * ? ! $ etc.
         };
         let name = &inner[..name_end];
-        let op = &inner[name_end..];
+        let mut op = &inner[name_end..];
+        // array subscript ${A[expr]} / ${A[@]} / ${A[*]}: elements live in
+        // vars A_0..A_{COUNT-1} (the mapfile/read -a convention); the
+        // subscript is an arithmetic expression (@/* join every element).
+        let mut sub_val: Option<Option<String>> = None;
+        if let Some(rb) = op.strip_prefix('[') {
+            if let Some(cb) = rb.find(']') {
+                let sub = &rb[..cb];
+                op = &rb[cb + 1..];
+                if sub == "@" || sub == "*" {
+                    let n = self
+                        .lookup_var(&alloc::format!("{}_COUNT", name))
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let parts: Vec<String> = (0..n)
+                        .filter_map(|i| {
+                            self.lookup_var(&alloc::format!("{}_{}", name, i))
+                        })
+                        .collect();
+                    sub_val = Some(Some(parts.join(" ")));
+                } else {
+                    let idx = expr_eval(&self.arith_vars(sub)).unwrap_or(0).max(0);
+                    sub_val = Some(
+                        self.lookup_var(&alloc::format!("{}_{}", name, idx)),
+                    );
+                }
+            }
+        }
         // resolve the base value (empty string for unset-but-allowed ops)
         let val_of = |t: &mut Term, n: &str| -> Option<String> {
             match n {
@@ -2923,7 +3137,10 @@ impl Term {
                 _ => t.lookup_var(n),
             }
         };
-        let val = val_of(self, name);
+        let val = match sub_val {
+            Some(v) => v,
+            None => val_of(self, name),
+        };
         if op.is_empty() {
             return val.or_else(|| {
                 if self.nounset && self.sub_err.is_some() {
@@ -2934,7 +3151,6 @@ impl Term {
             });
         }
         // operator dispatch
-        let ob = op.as_bytes();
         let word_expand = |t: &mut Term, w: &str| -> String {
             let sub = t.expand_subst(w);
             t.expand_vars(&sub)
@@ -3172,6 +3388,94 @@ impl Term {
         true
     }
 
+    /// Perform one assignment token: `name=v`, `name+=v` (string append),
+    /// `name[i]=v` / `name[i]+=v` (array element), `name=(w..)` /
+    /// `name+=(w..)` (array literal). Elements live in `name_0..` plus
+    /// `name_COUNT` — the mapfile/read -a convention.
+    fn do_assign(&mut self, w: &str) -> bool {
+        let b = w.as_bytes();
+        let mut i = 0;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        let name = &w[..i];
+        let mut sub: Option<String> = None;
+        if i < b.len() && b[i] == b'[' {
+            match w[i..].find(']') {
+                Some(close) => {
+                    sub = Some(String::from(&w[i + 1..i + close]));
+                    i += close + 1;
+                }
+                None => {
+                    self.fail("bad subscript: missing ']'");
+                    return false;
+                }
+            }
+        }
+        let append = b.get(i) == Some(&b'+');
+        let eq = i + append as usize;
+        if b.get(eq) != Some(&b'=') {
+            return false;
+        }
+        let val = &w[eq + 1..];
+        let ckey = alloc::format!("{}_COUNT", name);
+        if let Some(inner) = val
+            .strip_prefix('(')
+            .and_then(|v| v.strip_suffix(')'))
+        {
+            // array literal: elements split on whitespace (quotes were
+            // already consumed by the tokenizer)
+            let start = if append {
+                self.lookup_var(&ckey)
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0)
+            } else {
+                let old = self
+                    .lookup_var(&ckey)
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let newn = inner.split_whitespace().count();
+                for k in newn..old {
+                    self.vars.remove(&alloc::format!("{}_{}", name, k));
+                }
+                0
+            };
+            for (k, word) in inner.split_whitespace().enumerate() {
+                if !self.assign(&alloc::format!("{}_{}", name, start + k), String::from(word)) {
+                    return false;
+                }
+            }
+            let n = start + inner.split_whitespace().count();
+            return self.assign(&ckey, alloc::format!("{}", n));
+        }
+        if let Some(sub) = sub {
+            let idx = expr_eval(&self.arith_vars(&sub)).unwrap_or(0).max(0) as usize;
+            let key = alloc::format!("{}_{}", name, idx);
+            let nv = if append {
+                alloc::format!("{}{}", self.vars.get(&key).cloned().unwrap_or_default(), val)
+            } else {
+                String::from(val)
+            };
+            if !self.assign(&key, nv) {
+                return false;
+            }
+            let cur = self
+                .lookup_var(&ckey)
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            if idx + 1 > cur {
+                let _ = self.assign(&ckey, alloc::format!("{}", idx + 1));
+            }
+            return true;
+        }
+        let nv = if append {
+            alloc::format!("{}{}", self.vars.get(name).cloned().unwrap_or_default(), val)
+        } else {
+            String::from(val)
+        };
+        self.assign(name, nv)
+    }
+
     /// `test`/`[` evaluator: unary file/string tests and three-token
     /// comparisons. Returns the boolean; `last_ok` mirrors it.
     fn eval_test(&mut self, a: &[&str]) -> bool {
@@ -3308,9 +3612,10 @@ impl Term {
     /// `!*`, `!:N` and `<event>:N` pick words from it. Single quotes suppress
     /// expansion; `!` that starts no designator (e.g. `!=`, trailing `!`)
     /// stays literal. Err on a valid-looking spec with no matching event.
-    fn hist_expand(&self, input: &str) -> Result<String, String> {
+    fn hist_expand(&self, input: &str) -> Result<(String, bool), String> {
         let b = input.as_bytes();
         let mut out = String::with_capacity(input.len() + 16);
+        let mut print_only = false; // `!x:p` echoes the expansion, doesn't run it
         let mut sq = false;
         let mut cbd = 0i32; // ${...} depth — `!` inside (${!V} indirect) is literal
         let mut i = 0;
@@ -3333,7 +3638,8 @@ impl Term {
                     i += 1;
                 }
                 b'!' if !sq && cbd == 0 => match self.bang_designator(&b[i + 1..])? {
-                    Some((text, eaten)) => {
+                    Some((text, eaten, p)) => {
+                        print_only |= p;
                         out.push_str(&text);
                         i += 1 + eaten;
                     }
@@ -3348,13 +3654,13 @@ impl Term {
                 }
             }
         }
-        Ok(out)
+        Ok((out, print_only))
     }
 
-    /// Parse one `!` designator at the start of `rest`. Returns the expansion
-    /// text plus how many bytes of `rest` it consumed, or None when `!` is
-    /// literal text. Err = a spec was present but no event matched.
-    fn bang_designator(&self, rest: &[u8]) -> Result<Option<(String, usize)>, String> {
+    /// Parse one `!` designator at the start of `rest`. Returns (expansion,
+    /// bytes consumed, print_only), or None when `!` is literal text.
+    /// Err = a spec was present but no event matched.
+    fn bang_designator(&self, rest: &[u8]) -> Result<Option<(String, usize, bool)>, String> {
         if rest.is_empty() {
             return Ok(None);
         }
@@ -3423,42 +3729,96 @@ impl Term {
             _ => return Ok(None),
         };
         let line = entry.ok_or_else(|| String::from("bash: !: event not found"))?;
-        // optional word designator: `:` + N|^|$|* or bare ^ $ * after the event
+        // word designators (^ $ * :N) and modifiers (:s/o/n/ :h :t :r :p)
+        // chain after the event; each consumes bytes and rewrites `sel`.
         let words: Vec<&str> = line.split_whitespace().collect();
-        let mut from = off;
-        let mut spec = rest.get(from).copied();
-        if spec == Some(b':') {
-            from += 1;
-            spec = rest.get(from).copied();
-        }
-        match spec {
-            Some(b'^') => Ok(Some((
-                words.get(1).map(|s| String::from(*s)).unwrap_or_default(),
-                from + 1,
-            ))),
-            Some(b'$') => Ok(Some((
-                words.last().map(|s| String::from(*s)).unwrap_or_default(),
-                from + 1,
-            ))),
-            Some(b'*') => Ok(Some((
-                words.get(1..).map(|w| w.join(" ")).unwrap_or_default(),
-                from + 1,
-            ))),
-            Some(c) if c.is_ascii_digit() => {
-                let mut j = from;
-                while j < rest.len() && rest[j].is_ascii_digit() {
-                    j += 1;
+        let mut cur = off;
+        let mut sel = line.clone();
+        let mut print_only = false;
+        loop {
+            let c = match rest.get(cur).copied() {
+                Some(c) => c,
+                None => break,
+            };
+            match c {
+                b':' => match rest.get(cur + 1).copied().unwrap_or(0) {
+                    b's' => {
+                        // :s/old/new/ — first occurrence in the expansion
+                        let Some(&d) = rest.get(cur + 2) else { break };
+                        let seg = &rest[cur + 3..];
+                        let mut it = seg.split(|&x| x == d);
+                        let old =
+                            String::from_utf8_lossy(it.next().unwrap_or(b"")).into_owned();
+                        let new =
+                            String::from_utf8_lossy(it.next().unwrap_or(b"")).into_owned();
+                        // ':' 's' <d> old <d> new [<d>] — tolerate a missing
+                        // trailing delimiter (end of line)
+                        let used = (3 + old.len() + 1 + new.len() + 1).min(rest.len() - cur);
+                        cur += used;
+                        if !old.is_empty() {
+                            sel = sel.replacen(&old, &new, 1);
+                        }
+                    }
+                    b'h' => {
+                        if let Some(i) = sel.rfind('/') {
+                            sel = if i == 0 {
+                                String::from("/")
+                            } else {
+                                String::from(&sel[..i])
+                            };
+                        }
+                        cur += 2;
+                    }
+                    b't' => {
+                        if let Some(i) = sel.rfind('/') {
+                            sel = String::from(&sel[i + 1..]);
+                        }
+                        cur += 2;
+                    }
+                    b'r' => {
+                        if let Some(i) = sel.rfind('.') {
+                            if i > 0 {
+                                sel.truncate(i);
+                            }
+                        }
+                        cur += 2;
+                    }
+                    b'p' => {
+                        print_only = true;
+                        cur += 2;
+                    }
+                    c2 if c2.is_ascii_digit() => {
+                        let mut j = cur + 1;
+                        while j < rest.len() && rest[j].is_ascii_digit() {
+                            j += 1;
+                        }
+                        let n: usize = String::from_utf8_lossy(&rest[cur + 1..j])
+                            .parse()
+                            .unwrap_or(usize::MAX);
+                        sel = words
+                            .get(n)
+                            .map(|s| String::from(*s))
+                            .unwrap_or_default();
+                        cur = j;
+                    }
+                    _ => break,
+                },
+                b'^' => {
+                    sel = words.get(1).map(|s| String::from(*s)).unwrap_or_default();
+                    cur += 1;
                 }
-                let n: usize = String::from_utf8_lossy(&rest[from..j])
-                    .parse()
-                    .unwrap_or(usize::MAX);
-                Ok(Some((
-                    words.get(n).map(|s| String::from(*s)).unwrap_or_default(),
-                    j,
-                )))
+                b'$' => {
+                    sel = words.last().map(|s| String::from(*s)).unwrap_or_default();
+                    cur += 1;
+                }
+                b'*' => {
+                    sel = words.get(1..).map(|w| w.join(" ")).unwrap_or_default();
+                    cur += 1;
+                }
+                _ => break,
             }
-            _ => Ok(Some((line, off))),
         }
+        Ok(Some((sel, cur, print_only)))
     }
 
     /// Replace the command word with its alias (repeat up to 8 hops so
@@ -3612,7 +3972,75 @@ impl Term {
         if self.read_modal.is_some() {
             return String::new();
         }
+        // PS1 escape expansion (bash subset): \u \h \H \w \W \$ \d \t \T
+        // \n \s \\ — everything else (incl. \[ \] non-printing markers)
+        // passes through literally.
+        if let Some(ps1) = self.vars.get("PS1").cloned() {
+            let d = ustd::datetime();
+            let cwd = ustd::getcwd();
+            const WDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+            const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            let dow = ((cal_days(d.year, d.month, d.day) + 4) % 7) as usize;
+            let mut out = String::new();
+            let mut it = ps1.chars().peekable();
+            let mut skip = false; // inside \[ \] — non-printing, drop
+            while let Some(c) = it.next() {
+                if skip {
+                    if c == ']' { skip = false; }
+                    continue;
+                }
+                if c != '\\' {
+                    out.push(c);
+                    continue;
+                }
+                match it.next() {
+                    Some('u') => out.push_str("cosmos"),
+                    Some('h') | Some('H') => out.push_str(&self.host),
+                    Some('w') => out.push_str(&cwd),
+                    Some('W') => out.push_str(
+                        cwd.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("/"),
+                    ),
+                    Some('$') => out.push('#'), // uid 0
+                    Some('d') => out.push_str(&alloc::format!(
+                        "{} {} {:02}", WDAY[dow], MON[(d.month - 1) as usize], d.day
+                    )),
+                    Some('t') | Some('T') => out.push_str(&alloc::format!(
+                        "{:02}:{:02}:{:02}", d.hour, d.minute, d.second
+                    )),
+                    Some('n') => out.push('\n'),
+                    Some('s') => out.push_str("sh"),
+                    Some('\\') => out.push('\\'),
+                    Some('[') => skip = true,
+                    Some(o) => {
+                        out.push('\\');
+                        out.push(o);
+                    }
+                    None => out.push('\\'),
+                }
+            }
+            return out;
+        }
         alloc::format!("{} $ ", ustd::getcwd())
+    }
+
+    /// PROMPT_COMMAND (bash): run the var's value as a command before each
+    /// interactive prompt — i.e. right after a submitted line finishes.
+    fn run_prompt_cmd(&mut self) {
+        if self.in_pc || self.read_modal.is_some() || self.select_in.is_some() {
+            return;
+        }
+        let Some(pc) = self.vars.get("PROMPT_COMMAND").cloned() else {
+            return;
+        };
+        if pc.trim().is_empty() {
+            return;
+        }
+        self.in_pc = true;
+        let was_ok = self.last_ok; // don't let the hook poison $?
+        self.run(&pc);
+        self.last_ok = was_ok;
+        self.in_pc = false;
     }
 
     /// One `select` iteration: record REPLY, map a 1..N choice to the word
@@ -4103,7 +4531,7 @@ impl Term {
                                 return;
                             }
                             let mut ws = Vec::new();
-                            for (w, q) in tokenize(&vard) {
+                            for (w, q, _qp) in tokenize(&vard) {
                                 if !q && (w.contains('*') || w.contains('?')) && !self.noglob {
                                     ws.extend(self.glob_expand(&w));
                                 } else {
@@ -4177,7 +4605,7 @@ impl Term {
                             return;
                         }
                         let mut words: Vec<String> = Vec::new();
-                        for (w, q) in tokenize(&vard) {
+                        for (w, q, _qp) in tokenize(&vard) {
                             if !q && (w.contains('*') || w.contains('?')) && !self.noglob {
                                 words.extend(self.glob_expand(&w));
                             } else {
@@ -4426,7 +4854,15 @@ impl Term {
         // is echoed and recorded, not the `!` form itself.
         if top && input.contains('!') {
             match self.hist_expand(input) {
-                Ok(expanded) if expanded != input => {
+                Ok((expanded, true)) => {
+                    // `!x:p` — echo the expanded text, record the line, run nothing
+                    self.emit(&expanded);
+                    self.hist.push(String::from(input));
+                    self.hi = self.hist.len();
+                    self.save_hist();
+                    return;
+                }
+                Ok((expanded, _)) if expanded != input => {
                     self.push_line(&alloc::format!("$ {}", expanded));
                     // like bash: `!!`/`!n` records the expansion, not the `!` line
                     self.hist.push(expanded.clone());
@@ -4744,7 +5180,7 @@ impl Term {
             .get("HOME")
             .cloned()
             .unwrap_or_else(|| String::from("/"));
-        let toks: Vec<(String, bool)> = tokenize(input)
+        let toks: Vec<(String, bool, usize)> = tokenize(input)
             .iter()
             .flat_map(|t| {
                 if t.1 {
@@ -4752,7 +5188,7 @@ impl Term {
                 } else {
                     brace_expand(&t.0)
                         .into_iter()
-                        .map(|w| (tilde_expand(&w, &home), false))
+                        .map(|w| (tilde_expand(&w, &home), false, usize::MAX))
                         .collect()
                 }
             })
@@ -4798,42 +5234,61 @@ impl Term {
         // name=value statements (real sh): `x=1 y=2` sets vars; a leading run
         // `x=1 cmd ...` sets them then runs the remainder. Quoted values keep
         // their spaces; the remainder is reconstructed quote-safely.
+        // Array forms: `a[i]=v`, `a=(w..)`, `a+=(w..)` — a paren group whose
+        // spaces were tokenized consumes tokens until one ends with ')'.
         {
             let mut ai = 0usize;
             while ai < toks.len() {
-                let (w, q) = &toks[ai];
-                if *q {
+                let (w, _q, qp) = &toks[ai];
+                // assignment iff name[= or name+=[ or name[[..]=] appears
+                // before the first quoted char: `a='x'` assigns,
+                // `'a=b'` is a literal command word.
+                let eq = w.find('=').map(|i| i as usize);
+                let ok = is_assign_head(w)
+                    && match (eq, *qp) {
+                        (Some(e), qpos) => e < qpos,
+                        _ => false,
+                    };
+                if !ok {
                     break;
                 }
-                match w.find('=') {
-                    Some(eq) if eq > 0 => {
-                        let name = &w[..eq];
-                        let first = name.chars().next().unwrap_or(' ');
-                        if !(first.is_ascii_alphabetic() || first == '_')
-                            || !name
-                                .chars()
-                                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                        {
-                            break;
+                ai += 1;
+                if let Some(p) = w.find("=(").or_else(|| w.find("+=(")) {
+                    if !w[p + 1..].contains(')') {
+                        while ai < toks.len() && !toks[ai].0.ends_with(')') {
+                            ai += 1;
                         }
-                        ai += 1;
+                        if ai < toks.len() {
+                            ai += 1;
+                        }
                     }
-                    _ => break,
                 }
             }
             if ai > 0 {
-                let mut ro_hit = false;
-                for (w, _) in &toks[..ai] {
-                    let eq = w.find('=').unwrap();
-                    let (n, v) = (&w[..eq], &w[eq + 1..]);
-                    if self.ro_vars.contains(n) {
-                        self.fail(&alloc::format!("{}: readonly variable", n));
-                        ro_hit = true;
-                        continue;
+                let mut bad = false;
+                let mut gi = 0usize;
+                while gi < ai {
+                    let mut text = toks[gi].0.clone();
+                    let mut gj = gi + 1;
+                    if let Some(p) = text.find("=(").or_else(|| text.find("+=(")) {
+                        if !text[p + 1..].contains(')') {
+                            while gj < ai {
+                                text.push(' ');
+                                text.push_str(&toks[gj].0);
+                                let done = toks[gj].0.ends_with(')');
+                                gj += 1;
+                                if done {
+                                    break;
+                                }
+                            }
+                        }
                     }
-                    self.vars.insert(String::from(n), String::from(v));
+                    if !self.do_assign(&text) {
+                        bad = true;
+                    }
+                    gi = gj;
                 }
-                if ro_hit {
+                if bad {
                     return;
                 }
                 let rest: Vec<String> = toks[ai..]
@@ -4953,6 +5408,7 @@ impl Term {
                 let mut by_time = false;
                 let mut rev = false;
                 let mut rec = false;
+                let mut classify = false;
                 let mut i = 0usize;
                 while i < args.len() && args[i].starts_with('-') && args[i].len() > 1 {
                     for c in args[i][1..].chars() {
@@ -4962,6 +5418,7 @@ impl Term {
                             't' => by_time = true,
                             'r' => rev = true,
                             'R' => rec = true,
+                            'F' => classify = true,
                             'l' | '1' => {}
                             _ => {
                                 self.fail(&alloc::format!("ls: bad flag -{}", c));
@@ -5514,12 +5971,14 @@ impl Term {
                 let mut ro = cmd == "readonly";
                 let mut prt = false;
                 let mut fns = false;
+                let mut arr = false;
                 let mut names: Vec<&str> = Vec::new();
                 for a in args.iter().copied() {
                     match a {
                         "-r" => ro = true,
                         "-p" => prt = true,
                         "-f" => fns = true,
+                        "-a" => arr = true,
                         _ => names.push(a),
                     }
                 }
@@ -5548,6 +6007,25 @@ impl Term {
                     }
                 }
                 for a in names {
+                    if arr {
+                        // declare -a NAME | NAME=(w..) | NAME[i]=v
+                        let w = String::from(a);
+                        if a.contains('=') || a.contains('(') {
+                            if !self.do_assign(&w) {
+                                return;
+                            }
+                        } else if self
+                            .vars
+                            .get(&alloc::format!("{}_COUNT", a))
+                            .is_none()
+                        {
+                            let _ = self.assign(
+                                &alloc::format!("{}_COUNT", a),
+                                String::from("0"),
+                            );
+                        }
+                        continue;
+                    }
                     if let Some(eq) = a.find('=') {
                         let (n, v) = a.split_at(eq);
                         if !n.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
@@ -5643,7 +6121,8 @@ impl Term {
                 }
             }
             "env" => {
-                // env [-i] [cmd...]: -i runs the command with cleared vars
+                // env [-i] [NAME=v ...] [cmd...]: -i clears vars first,
+                // NAME=v assigns for the duration of the command only
                 if args.first() == Some(&"-i") {
                     let rest: Vec<&str> = args[1..].to_vec();
                     if rest.is_empty() {
@@ -5652,6 +6131,50 @@ impl Term {
                     let saved = core::mem::take(&mut self.vars);
                     self.run(&rest.join(" "));
                     self.vars = saved;
+                    return;
+                }
+                // env X=y cmd — scoped vars for the command run
+                let mut ai = 0usize;
+                while ai < args.len() {
+                    let a = args[ai];
+                    match a.find('=') {
+                        Some(eq) if eq > 0
+                            && a[..eq]
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            && a.chars()
+                                .next()
+                                .map(|c| c.is_ascii_alphabetic() || c == '_')
+                                .unwrap_or(false) =>
+                        {
+                            ai += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                if ai > 0 && ai < args.len() {
+                    let saved: Vec<(String, Option<String>)> = args[..ai]
+                        .iter()
+                        .map(|a| {
+                            let eq = a.find('=').unwrap();
+                            (String::from(&a[..eq]), self.vars.get(&a[..eq]).cloned())
+                        })
+                        .collect();
+                    for a in &args[..ai] {
+                        let eq = a.find('=').unwrap();
+                        let _ = self.assign(&a[..eq], String::from(&a[eq + 1..]));
+                    }
+                    self.run(&args[ai..].join(" "));
+                    for (n, old) in saved {
+                        match old {
+                            Some(v) => {
+                                self.vars.insert(n, v);
+                            }
+                            None => {
+                                self.vars.remove(&n);
+                            }
+                        }
+                    }
                     return;
                 }
                 for i in 0..self.vars.len() {
@@ -8529,8 +9052,27 @@ impl Term {
             }
             "date" => {
                 let d = ustd::datetime();
+                const WDAY: [&str; 7] =
+                    ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+                const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+                let dow = ((cal_days(d.year, d.month, d.day) + 4) % 7) as usize;
                 match args.first() {
-                    // date +FORMAT: %Y %m %d %H %M %S %T %F %%
+                    // -R/--rfc-2822: Tue, 06 Oct 2026 02:09:00 +0000
+                    Some(&"-R") | Some(&"--rfc-2822") => {
+                        self.emit(&alloc::format!(
+                            "{}, {:02} {} {:04} {:02}:{:02}:{:02} +0000",
+                            WDAY[dow], d.day, MON[(d.month - 1) as usize],
+                            d.year, d.hour, d.minute, d.second
+                        ));
+                    }
+                    // -I/--iso-8601: 2026-10-06
+                    Some(&"-I") | Some(&"--iso-8601") => {
+                        self.emit(&alloc::format!(
+                            "{:04}-{:02}-{:02}", d.year, d.month, d.day
+                        ));
+                    }
+                    // date +FORMAT: %Y %m %d %H %M %S %T %F %a %A %b %B %e %s %z %Z %%
                     Some(f) if f.starts_with('+') => {
                         let f = &f[1..];
                         let mut out = String::new();
@@ -8554,6 +9096,32 @@ impl Term {
                                 Some('F') => out.push_str(&alloc::format!(
                                     "{:04}-{:02}-{:02}", d.year, d.month, d.day
                                 )),
+                                Some('a') => out.push_str(WDAY[dow]),
+                                Some('A') => out.push_str(match WDAY[dow] {
+                                    "Sun" => "Sunday",
+                                    "Mon" => "Monday",
+                                    "Tue" => "Tuesday",
+                                    "Wed" => "Wednesday",
+                                    "Thu" => "Thursday",
+                                    "Fri" => "Friday",
+                                    _ => "Saturday",
+                                }),
+                                Some('b') | Some('h') => out.push_str(MON[(d.month - 1) as usize]),
+                                Some('B') => out.push_str(match MON[(d.month - 1) as usize] {
+                                    "Jan" => "January", "Feb" => "February",
+                                    "Mar" => "March", "Apr" => "April",
+                                    "May" => "May", "Jun" => "June",
+                                    "Jul" => "July", "Aug" => "August",
+                                    "Sep" => "September", "Oct" => "October",
+                                    "Nov" => "November", _ => "December",
+                                }),
+                                Some('e') => out.push_str(&alloc::format!("{:>2}", d.day)),
+                                Some('s') => out.push_str(&alloc::format!(
+                                    "{}", cal_days(d.year, d.month, d.day) * 86400
+                                        + d.hour as u64 * 3600 + d.minute as u64 * 60 + d.second as u64
+                                )),
+                                Some('z') => out.push_str("+0000"),
+                                Some('Z') => out.push_str("UTC"),
                                 Some('%') => out.push('%'),
                                 Some(o) => {
                                     out.push('%');
@@ -9650,6 +10218,32 @@ impl Term {
                                     }
                                 };
                                 ls.sort_by_key(|l| field(l));
+                            } else if args.iter().any(|a| a == &"-h") {
+                                // -h: human sizes — leading number times the
+                                // K/M/G/B suffix multiplier (1024-based)
+                                let hum = |l: &&str| -> i64 {
+                                    let t = l.trim_start();
+                                    let neg = t.starts_with('-');
+                                    let t2 = &t[neg as usize..];
+                                    let nd: String = t2
+                                        .chars()
+                                        .take_while(|c| {
+                                            c.is_ascii_digit() || *c == '.'
+                                        })
+                                        .collect();
+                                    let base: f64 = nd.parse().unwrap_or(0.0);
+                                    let suf = t2.chars().nth(nd.len()).unwrap_or(' ');
+                                    let mult: f64 = match suf {
+                                        'K' | 'k' => 1024.0,
+                                        'M' | 'm' => 1024.0 * 1024.0,
+                                        'G' | 'g' => 1024.0 * 1024.0 * 1024.0,
+                                        'T' | 't' => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+                                        _ => 1.0,
+                                    };
+                                    let v = base * mult;
+                                    (if neg { -v } else { v }) as i64
+                                };
+                                ls.sort_by_key(hum);
                             } else if args.iter().any(|a| a == &"-n") {
                                 ls.sort_by_key(num);
                             } else {
@@ -10261,15 +10855,292 @@ impl Term {
                 }
             }
             "dmesg" => {
-                // last 40 lines of the kernel log ring buffer
+                // last 40 lines of the kernel log ring buffer; -c clears it
                 let s = ustd::klog();
                 let ls: Vec<&str> = s.lines().collect();
                 for l in ls.iter().skip(ls.len().saturating_sub(40)) {
                     self.emit(l);
                 }
+                if args.iter().any(|a| *a == "-c") {
+                    ustd::klog_clear();
+                }
+            }
+            "ulimit" => {
+                // ulimit [-a] [-n|-s|-u|-t|-f|-v|-m [N]] — report real limits;
+                // unbounded kernel resources report unlimited. -n N sets an
+                // advisory value stored on the shell.
+                let a_mode = args.first() == Some(&"-a") || args.first() == Some(&"-H");
+                let flag = args.first().copied().unwrap_or("-n");
+                let openlim = if self.ulimit_n > 0 { alloc::format!("{}", self.ulimit_n) } else { String::from("unlimited") };
+                if a_mode {
+                    for (k, v) in [
+                        ("-t cpu time", "unlimited"),
+                        ("-f file size", "unlimited"),
+                        ("-d data size", "unlimited"),
+                        ("-s stack size", "256"),      // USER_STACK_PAGES=64
+                        ("-m rss", "unlimited"),
+                        ("-u processes", "unlimited"),
+                        ("-n open files", openlim.as_str()),
+                        ("-v addr space", "unlimited"),
+                    ] {
+                        self.emit(&alloc::format!("{}  {}", k, v));
+                    }
+                    return;
+                }
+                match flag {
+                    "-n" => {
+                        match args.get(1) {
+                            Some(v) => match v.parse::<u64>() {
+                                Ok(n) => {
+                                    self.ulimit_n = n;
+                                }
+                                _ => self.fail("ulimit: bad value"),
+                            },
+                            None => self.emit(&openlim),
+                        }
+                    }
+                    "-s" => self.emit("256"),
+                    "-t" | "-f" | "-d" | "-m" | "-u" | "-v" => self.emit("unlimited"),
+                    _ => self.fail("usage: ulimit [-a] [-n [N]] [-s|-u|-t|-f|-v|-m]"),
+                }
+            }
+            "complete" => {
+                // complete -W "w.." cmd | complete -r cmd | complete (list)
+                let wi = args.iter().position(|a| *a == "-W");
+                match args.first() {
+                    Some(&"-r") => {
+                        if let Some(c) = args.get(1) {
+                            self.comps.remove(*c);
+                        }
+                    }
+                    _ if wi.is_some() => {
+                        let wi = wi.unwrap();
+                        match (args.get(wi + 1), args.get(wi + 2)) {
+                            (Some(words), Some(c)) => {
+                                self.comps
+                                    .insert(String::from(*c), String::from(*words));
+                            }
+                            _ => self.fail("usage: complete -W \"words\" cmd"),
+                        }
+                    }
+                    _ => {
+                        for (c, w) in self.comps.clone() {
+                            self.emit(&alloc::format!("complete -W '{}' {}", w, c));
+                        }
+                    }
+                }
+            }
+            "compgen" => {
+                // compgen -W "w.." [prefix] | -c (builtin names) | -A function
+                if let Some(wi) = args.iter().position(|a| *a == "-W") {
+                    let words = args.get(wi + 1).copied().unwrap_or("");
+                    let pfx = args
+                        .iter()
+                        .skip(wi + 2)
+                        .find(|a| !a.starts_with('-'))
+                        .copied()
+                        .unwrap_or("");
+                    for w in words.split_whitespace() {
+                        if w.starts_with(pfx) {
+                            self.emit(w);
+                        }
+                    }
+                } else if args.iter().any(|a| *a == "-A" || *a == "-c") {
+                    let pfx = args.last().copied().unwrap_or("");
+                    if args.iter().any(|a| *a == "-c") {
+                        for c in Self::BUILTINS {
+                            if c.starts_with(pfx) {
+                                self.emit(c);
+                            }
+                        }
+                    } else {
+                        // -A function
+                        for (n, _) in self.funcs.clone() {
+                            if n.starts_with(pfx) {
+                                self.emit(&n);
+                            }
+                        }
+                    }
+                }
+            }
+            "hexdump" => {
+                // hexdump -C <file>: canonical 8-hex-digit offsets, two groups
+                // of 8 bytes, |ascii| gutter. Reads the file or stdin.
+                let canon = args.iter().any(|a| *a == "-C" || *a == "-v" || *a == "-cv");
+                let path = args.iter().find(|a| !a.starts_with('-'));
+                let data = match path {
+                    Some(p) => match ustd::read_all(p) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            self.fail(&alloc::format!("hexdump: {}: err {}", p, e));
+                            return;
+                        }
+                    },
+                    None => self
+                        .pipe_in
+                        .clone()
+                        .map(|s| s.into_bytes())
+                        .unwrap_or_default(),
+                };
+                let _ = canon; // -C is the only supported layout
+                let mut off = 0usize;
+                for chunk in data.chunks(16) {
+                    let mut hx = String::new();
+                    for (i, b) in chunk.iter().enumerate() {
+                        if i == 8 {
+                            hx.push(' ');
+                        }
+                        hx.push_str(&alloc::format!(" {:02x}", b));
+                    }
+                    // pad short final line: 16 bytes -> 16*3+1 chars of hex
+                    while hx.len() < 49 {
+                        hx.push(' ');
+                    }
+                    let asc: String = chunk
+                        .iter()
+                        .map(|b| {
+                            if (0x20..0x7f).contains(b) {
+                                *b as char
+                            } else {
+                                '.'
+                            }
+                        })
+                        .collect();
+                    self.emit(&alloc::format!("{:08x} {}  |{}|", off, hx, asc));
+                    off += chunk.len();
+                }
+            }
+            "umask" => {
+                // umask [-S] [octal]: query/change the per-task create mask.
+                // FAT maps masked owner-write to the readonly attr on create.
+                match args.first() {
+                    Some(&"-S") => {
+                        let m = ustd::umask(u64::MAX);
+                        let sym = |mask_digit: u64| -> String {
+                            let granted = !mask_digit & 7;
+                            alloc::format!(
+                                "{}{}{}",
+                                if granted & 4 != 0 { "r" } else { "-" },
+                                if granted & 2 != 0 { "w" } else { "-" },
+                                if granted & 1 != 0 { "x" } else { "-" },
+                            )
+                        };
+                        self.emit(&alloc::format!(
+                            "u={},g={},o={}",
+                            sym((m >> 6) & 7),
+                            sym((m >> 3) & 7),
+                            sym(m & 7)
+                        ));
+                    }
+                    Some(a) => match u64::from_str_radix(a, 8) {
+                        Ok(n) if n <= 0o777 => {
+                            ustd::umask(n);
+                        }
+                        _ => self.fail(&alloc::format!("umask: '{}' bad mask", a)),
+                    },
+                    None => self.emit(&alloc::format!("{:04o}", ustd::umask(u64::MAX))),
+                }
+            }
+            "chmod" => {
+                // chmod [-R] MODE path... — FAT has no rwx mode; the one real
+                // mapping is the owner-write bit <-> readonly attr. Modes that
+                // leave some 'w' set clear RO; modes with all 'w' masked set it.
+                let rec = args.iter().any(|a| *a == "-R" || *a == "--recursive");
+                let pos: Vec<&str> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .copied()
+                    .collect();
+                let (Some(modes), paths) = (pos.first(), &pos[1.min(pos.len())..]) else {
+                    self.fail("usage: chmod [-R] MODE path...");
+                    return;
+                };
+                // resolve MODE to a target readonly state
+                let ro: Option<bool> = if modes.bytes().all(|c| c.is_ascii_digit()) {
+                    u64::from_str_radix(modes, 8)
+                        .ok()
+                        .map(|m| m & 0o222 == 0)
+                } else {
+                    // symbolic [ugoa]*[+-=][rwxX]+ — only 'w' matters on FAT
+                    let mut ro = None;
+                    let mut ok = true;
+                    for clause in modes.split(',') {
+                        let b = clause.as_bytes();
+                        let mut i = 0;
+                        while i < b.len() && matches!(b[i], b'u' | b'g' | b'o' | b'a') {
+                            i += 1;
+                        }
+                        if i >= b.len() {
+                            ok = false;
+                            break;
+                        }
+                        let op = b[i];
+                        let letters = &clause[i + 1..];
+                        match op {
+                            b'-' => {
+                                if letters.contains('w') {
+                                    ro = Some(true);
+                                }
+                            }
+                            b'+' => {
+                                if letters.contains('w') {
+                                    ro = Some(false);
+                                }
+                            }
+                            b'=' => ro = Some(!letters.contains('w')),
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        self.fail(&alloc::format!("chmod: bad mode '{}'", modes));
+                        return;
+                    }
+                    ro
+                };
+                let Some(ro) = ro else {
+                    // mode never touched 'w' (e.g. chmod +x): nothing maps
+                    self.last_ok = true;
+                    return;
+                };
+                if paths.is_empty() {
+                    self.fail("usage: chmod [-R] MODE path...");
+                    return;
+                }
+                let mut targets: Vec<String> = Vec::new();
+                for p in paths {
+                    if rec && ustd::stat(*p).map(|s| s.is_dir != 0).unwrap_or(false) {
+                        targets.push(String::from(*p));
+                        for m in self.find_collect(p, "*", None, usize::MAX, None) {
+                            targets.push(m.trim_end_matches('/').to_string());
+                        }
+                    } else {
+                        targets.push(String::from(*p));
+                    }
+                }
+                for t in &targets {
+                    match ustd::stat(t) {
+                        Ok(st) => {
+                            let na = if ro { st.attr | 0x01 } else { st.attr & !0x01 };
+                            if let Err(e) = ustd::setattr(t, na as u8) {
+                                self.fail(&alloc::format!("chmod: {}: err {}", t, e));
+                            }
+                        }
+                        Err(e) => self.fail(&alloc::format!("chmod: {}: err {}", t, e)),
+                    }
+                }
             }
             "kill" => {
+                // kill -l lists signal names; otherwise
                 // kill [-9|-15|-18|-19|-KILL|-TERM|-STOP|-CONT] <pid|%n>
+                if args.first() == Some(&"-l") {
+                    self.emit(
+                        " 1) HUP   2) INT   3) QUIT  9) KILL 15) TERM 18) CONT 19) STOP",
+                    );
+                    return;
+                }
                 let mut sig: u64 = 15;
                 let mut ti = 0usize;
                 while let Some(a) = args.get(ti) {
@@ -10341,15 +11212,42 @@ impl Term {
                 }
                 None => self.fail("usage: killall <name-substr>"),
             },
-            "basename" => match args.first() {
-                Some(p) => {
-                    let t = p.trim_end_matches('/');
-                    self.emit(t.rsplit('/').next().unwrap_or("/"));
+            "basename" => {
+                // basename [-s SUF] name... — strip dir prefix, then the
+                // suffix (a literal string, not a glob)
+                let si = args.iter().position(|a| *a == "-s");
+                let suf = si.and_then(|i| args.get(i + 1)).copied().unwrap_or("");
+                let skip = si.map(|i| alloc::vec![i, i + 1]).unwrap_or_default();
+                // -a: every positional is a name (multiple names are also the
+                // default when more than two non-flag args appear)
+                let pos: Vec<&&str> = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, a)| !a.starts_with('-') && !skip.contains(i))
+                    .map(|(_, a)| a)
+                    .collect();
+                if pos.is_empty() {
+                    self.fail("usage: basename [-s SUF] name...");
+                    return;
                 }
-                None => self.fail("usage: basename <path>"),
-            },
-            "dirname" => match args.first() {
-                Some(p) => {
+                for p in pos.iter() {
+                    let t = p.trim_end_matches('/');
+                    let mut b = t.rsplit('/').next().unwrap_or("/");
+                    if !suf.is_empty() && b.len() > suf.len() && b.ends_with(suf) {
+                        b = &b[..b.len() - suf.len()];
+                    }
+                    self.emit(b);
+                }
+            }
+            "dirname" => {
+                // dirname name... — directory portion of each path
+                let pos: Vec<&&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).collect();
+                if pos.is_empty() {
+                    self.fail("usage: dirname <path>...");
+                    return;
+                }
+                for p in pos {
                     let t = p.trim_end_matches('/');
                     match t.rfind('/') {
                         None => self.emit("."),
@@ -10357,8 +11255,7 @@ impl Term {
                         Some(i) => self.emit(&t[..i]),
                     }
                 }
-                None => self.fail("usage: dirname <path>"),
-            },
+            }
             "strings" => match args.first() {
                 Some(p) => match ustd::read_all(p) {
                     Ok(d) => {
@@ -10389,9 +11286,20 @@ impl Term {
                 let mut want_dir: Option<bool> = None;
                 let mut maxd = usize::MAX;
                 let mut newer: Option<u64> = None;
+                let mut pathpat: Option<String> = None;
+                let mut want_empty = false;
+                let mut del = false;
                 let mut skip: Vec<usize> = Vec::new();
                 for (i, a) in args.iter().enumerate() {
                     match *a {
+                        "-path" => {
+                            if let Some(v) = args.get(i + 1) {
+                                pathpat = Some(String::from(*v));
+                                skip.push(i + 1);
+                            }
+                        }
+                        "-empty" => want_empty = true,
+                        "-delete" => del = true,
                         "-name" => {
                             if let Some(v) = args.get(i + 1) {
                                 pat = v;
@@ -10474,7 +11382,44 @@ impl Term {
                                 }
                             }
                         } else {
-                            self.find_run(dir, pat, want_dir, maxd, newer);
+                            let mut ms = self.find_collect(dir, pat, want_dir, maxd, newer);
+                            // -path PAT: match the full path, not the basename
+                            if let Some(pp) = &pathpat {
+                                ms.retain(|m| wild_match(pp, m.trim_end_matches('/')));
+                            }
+                            // -empty: zero-size file or directory with no entries
+                            if want_empty {
+                                ms.retain(|m| {
+                                    let t = m.trim_end_matches('/');
+                                    match ustd::stat(t) {
+                                        Ok(st) if st.is_dir != 0 => ustd::readdir(t)
+                                            .map(|e| {
+                                                e.iter().all(|x| {
+                                                    let n = core::str::from_utf8(
+                                                        &x.name[..x.name_len as usize],
+                                                    )
+                                                    .unwrap_or("");
+                                                    n == "." || n == ".."
+                                                })
+                                            })
+                                            .unwrap_or(false),
+                                        Ok(st) => st.size == 0,
+                                        Err(_) => false,
+                                    }
+                                });
+                            }
+                            for m in &ms {
+                                let t = m.trim_end_matches('/');
+                                if del {
+                                    // -delete removes matches (dirs only when
+                                    // empty — the kernel enforces that)
+                                    if let Err(e) = ustd::remove(t) {
+                                        self.fail(&alloc::format!("find: -delete {}: err {}", t, e));
+                                    }
+                                } else {
+                                    self.emit(m);
+                                }
+                            }
                         }
                     }
                     Ok(_) => {
@@ -11178,25 +12123,70 @@ impl Term {
                     }
                 }
             }
-            "stat" => match args.first() {
-                Some(p) => match ustd::stat(p) {
-                    Ok(st) => {
-                        let (y, mo, d, h, mi, se) = epoch_to_dt(st.mtime);
-                        self.emit(&alloc::format!("  {}: {} B {}", p, st.size, if st.is_dir != 0 { "(dir)" } else { "" }));
-                        self.emit(&alloc::format!(
-                            "  mtime {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, mo, d, h, mi, se
-                        ));
-                        self.emit(&alloc::format!(
-                            "  attr {}{} (0x{:02x})",
-                            if st.attr & 0x01 != 0 { "readonly " } else { "" },
-                            if st.attr & 0x02 != 0 { "hidden" } else { "" },
-                            st.attr
-                        ));
+            "stat" => {
+                // stat [-c FMT] path... — FMT: %n name %s size %F type
+                // %a attr-octal %y mtime-iso %% literal
+                let ci = args.iter().position(|a| *a == "-c");
+                let fmt = ci.and_then(|i| args.get(i + 1)).copied();
+                let pos: Vec<&&str> = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, a)| {
+                        !a.starts_with('-') && Some(*i) != ci.map(|x| x + 1)
+                    })
+                    .map(|(_, a)| a)
+                    .collect();
+                if pos.is_empty() {
+                    self.fail("usage: stat [-c FMT] <path>...");
+                    return;
+                }
+                for p in pos {
+                    match ustd::stat(p) {
+                        Ok(st) => {
+                            let (y, mo, d, h, mi, se) = epoch_to_dt(st.mtime);
+                            if let Some(f) = fmt {
+                                let mut out = String::new();
+                                let mut it = f.chars().peekable();
+                                while let Some(c) = it.next() {
+                                    if c != '%' {
+                                        out.push(c);
+                                        continue;
+                                    }
+                                    match it.next() {
+                                        Some('n') => out.push_str(p),
+                                        Some('s') => out.push_str(&alloc::format!("{}", st.size)),
+                                        Some('F') => out.push_str(if st.is_dir != 0 { "directory" } else { "regular file" }),
+                                        Some('a') => out.push_str(&alloc::format!("{:o}", st.attr)),
+                                        Some('y') => out.push_str(&alloc::format!(
+                                            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} +0000",
+                                            y, mo, d, h, mi, se
+                                        )),
+                                        Some('%') => out.push('%'),
+                                        Some(o) => {
+                                            out.push('%');
+                                            out.push(o);
+                                        }
+                                        None => out.push('%'),
+                                    }
+                                }
+                                self.emit(&out);
+                            } else {
+                                self.emit(&alloc::format!("  {}: {} B {}", p, st.size, if st.is_dir != 0 { "(dir)" } else { "" }));
+                                self.emit(&alloc::format!(
+                                    "  mtime {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, mo, d, h, mi, se
+                                ));
+                                self.emit(&alloc::format!(
+                                    "  attr {}{} (0x{:02x})",
+                                    if st.attr & 0x01 != 0 { "readonly " } else { "" },
+                                    if st.attr & 0x02 != 0 { "hidden" } else { "" },
+                                    st.attr
+                                ));
+                            }
+                        }
+                        Err(e) => self.fail(&alloc::format!("stat: {}: err {}", p, e)),
                     }
-                    Err(e) => self.fail(&alloc::format!("stat: {}: err {}", p, e)),
-                },
-                None => self.fail("usage: stat <path>"),
-            },
+                }
+            }
             "dhcp" => match ustd::net_dhcp() {
                 Some(ip) => self.emit(&alloc::format!(
                     "dhcp: lease {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]
@@ -11214,6 +12204,16 @@ impl Term {
                 None => self.emit("no network device"),
             },
             "jobs" => {
+                // jobs [-l] [-p]: -p prints just the live job pids
+                if args.first() == Some(&"-p") {
+                    let live: alloc::vec::Vec<u32> = ustd::proclist(64).iter().map(|p| p.pid).collect();
+                    for (pid, _) in self.jobs.clone() {
+                        if live.contains(&pid) {
+                            self.emit(&alloc::format!("{}", pid));
+                        }
+                    }
+                    return;
+                }
                 // list tracked jobs; + marks the most recent, dead ones reap out
                 let live: alloc::vec::Vec<u32> = ustd::proclist(64).iter().map(|p| p.pid).collect();
                 let mut keep: Vec<(u32, String)> = Vec::new();
@@ -11668,6 +12668,26 @@ impl Term {
                             out.push(String::from(l));
                         }
                     }
+                } else if spec.as_bytes().len() >= 5 && spec.as_bytes()[0] == b'y' {
+                    // y/src/dst/ transliteration (like tr SET1 SET2)
+                    let b = spec.as_bytes();
+                    let d = b[1] as char;
+                    let parts: Vec<&str> = spec[2..].split(d).collect();
+                    if parts.len() >= 2 {
+                        let (src, dst) = (parts[0], parts[1]);
+                        for l in s.lines() {
+                            let r: String = l
+                                .chars()
+                                .map(|c| match src.find(c) {
+                                    Some(i) => dst.chars().nth(i).unwrap_or(c),
+                                    None => c,
+                                })
+                                .collect();
+                            out.push(r);
+                        }
+                    } else {
+                        bad = true;
+                    }
                 } else {
                     // s/// substitution
                     let b = spec.as_bytes();
@@ -11744,12 +12764,21 @@ impl Term {
                 let mut repl: Option<String> = None;
                 let mut trace = false;
                 let mut nul = false;
+                let mut delim: Option<char> = None;
                 let mut ci = 0usize;
                 while ci < args.len() {
                     match args[ci] {
                         "-n" => {
                             nbatch = args.get(ci + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
                             ci += 2;
+                        }
+                        "-d" => {
+                            delim = args.get(ci + 1).and_then(|s| s.chars().next());
+                            ci += 2;
+                        }
+                        a if a.starts_with("-d") && a.len() > 2 => {
+                            delim = a[2..].chars().next();
+                            ci += 1;
                         }
                         "-I" => {
                             repl = args.get(ci + 1).map(|s| String::from(*s));
@@ -11773,7 +12802,9 @@ impl Term {
                 }
                 let base = rest.join(" ");
                 if let Some(s) = self.pipe_in.clone() {
-                    let items: Vec<&str> = if nul {
+                    let items: Vec<&str> = if let Some(d) = delim {
+                        s.split(d).collect()
+                    } else if nul {
                         s.split('\0').collect()
                     } else {
                         // real xargs splits items on blanks+newlines by default
@@ -11900,9 +12931,14 @@ impl Term {
                 let mut timeout_ms: u64 = 0;
                 let mut silent = false;
                 let mut raw = false;
+                let mut arr_name: Option<String> = None;
                 let mut ai = 0usize;
                 while ai < args.len() {
                     match args[ai] {
+                        "-a" => {
+                            arr_name = args.get(ai + 1).map(|s| String::from(*s));
+                            ai += 2;
+                        }
                         "-p" => {
                             prompt = args.get(ai + 1).unwrap_or(&"");
                             ai += 2;
@@ -11947,8 +12983,8 @@ impl Term {
                 if !prompt.is_empty() {
                     self.emit(prompt);
                 }
-                match rargs.first() {
-                    Some(_) => match self.pipe_in.clone() {
+                match rargs.first().is_some() || arr_name.is_some() {
+                    true => match self.pipe_in.clone() {
                         Some(s) => {
                             let mut it = s.splitn(2, delim);
                             let mut line = it.next().unwrap_or("");
@@ -11960,6 +12996,19 @@ impl Term {
                             let _ = raw;
                             // fields split on whitespace; the last var gets
                             // the remainder (bash `read a b c` semantics)
+                            if let Some(an) = &arr_name {
+                                let ck = alloc::format!("{}_COUNT", an);
+                                let mut n = 0usize;
+                                for wd in line.split_whitespace() {
+                                    let _ = self.assign(
+                                        &alloc::format!("{}_{}", an, n),
+                                        String::from(wd),
+                                    );
+                                    n += 1;
+                                }
+                                let _ = self.assign(&ck, alloc::format!("{}", n));
+                                return;
+                            }
                             let mut words = line.split_whitespace();
                             for (i, v) in rargs.iter().enumerate() {
                                 let val = if i + 1 == rargs.len() {
@@ -11977,7 +13026,12 @@ impl Term {
                             // interactive top-level only: capture the next
                             // line the user types (script bodies have no tty)
                             if self.run_depth == 1 && self.script_depth == 0 {
-                                let names = rargs.join(" ");
+                                // -a encodes the array name as \x01NAME in the
+                                // modal slot; finish_read splits into ARR_0..
+                                let names = match &arr_name {
+                                    Some(an) => alloc::format!("\x01{}", an),
+                                    None => rargs.join(" "),
+                                };
                                 let deadline = if timeout_ms > 0 {
                                     ustd::uptime_ms() + timeout_ms
                                 } else {
@@ -11990,7 +13044,7 @@ impl Term {
                             }
                         }
                     },
-                    None => self.fail("usage: <cmd> | read VAR"),
+                    false => self.fail("usage: <cmd> | read [-a ARR] VAR"),
                 }
             }
             "wait" => match args.first().map(|a| *a) {
@@ -12065,9 +13119,24 @@ impl Term {
                 None => self.fail("usage: unalias <name>"),
             },
             "type" => {
-                // type [-a] <name>: -a lists every match (alias, function,
-                // builtin, /bin) instead of stopping at the first
+                // type [-a] [-p] <name>: -a lists every match (alias, function,
+                // builtin, /bin) instead of stopping at the first; -p prints
+                // the resolved path/name only
                 let all = args.iter().any(|a| *a == "-a");
+                if args.iter().any(|a| *a == "-p") {
+                    let name = args.iter().find(|a| !a.starts_with('-'));
+                    match name {
+                        Some(n) => {
+                            if Self::BUILTINS.contains(n) || self.funcs.iter().any(|(f, _)| f == n) {
+                                self.emit(n);
+                            } else if ustd::stat(&alloc::format!("/bin/{}", n)).is_ok() {
+                                self.emit(&alloc::format!("/bin/{}", n));
+                            }
+                        }
+                        None => self.fail("usage: type -p <cmd>"),
+                    }
+                    return;
+                }
                 let name = args.iter().find(|a| !a.starts_with('-'));
                 match name {
                     Some(name) => {
@@ -12128,8 +13197,24 @@ impl Term {
             },
             "id" => self.emit("uid=0(cosmos) gid=0(cosmos)"),
             "printf" => {
-                // printf 'fmt' [args]: %s %d %i %x %% + \n \t \\ escapes;
-                // the format re-cycles when args outnumber conversions
+                // printf [-v VAR] 'fmt' [args]: %s %d %i %x %o %c %b %% +
+                // \n \t \\ escapes; the format re-cycles when args
+                // outnumber conversions. -v stores the result in VAR.
+                let mut vname: Option<&str> = None;
+                let args: &[&str] = if args.first() == Some(&"-v") {
+                    match args.get(1) {
+                        Some(v) => {
+                            vname = Some(*v);
+                            &args[2.min(args.len())..]
+                        }
+                        None => {
+                            self.fail("usage: printf -v VAR 'fmt' [args..]");
+                            return;
+                        }
+                    }
+                } else {
+                    &args[..]
+                };
                 match args.first() {
                     Some(fmt) => {
                         let rest = &args[1.min(args.len())..];
@@ -12174,6 +13259,43 @@ impl Term {
                                                     .and_then(|s| s.parse().ok())
                                                     .unwrap_or(0);
                                                 line.push_str(&alloc::format!("{:x}", v));
+                                                ri += 1;
+                                            }
+                                            b'o' => {
+                                                let v: i64 = rest
+                                                    .get(ri)
+                                                    .and_then(|s| s.parse().ok())
+                                                    .unwrap_or(0);
+                                                line.push_str(&alloc::format!("{:o}", v));
+                                                ri += 1;
+                                            }
+                                            b'c' => {
+                                                let a = rest.get(ri).copied().unwrap_or("");
+                                                if let Some(c0) = a.chars().next() {
+                                                    line.push(c0);
+                                                }
+                                                ri += 1;
+                                            }
+                                            b'b' => {
+                                                // %b: %s with \ escapes
+                                                let a = rest.get(ri).copied().unwrap_or("");
+                                                let mut esc = false;
+                                                for c in a.chars() {
+                                                    if esc {
+                                                        line.push(match c {
+                                                            'n' => '\n',
+                                                            't' => '\t',
+                                                            '0' => '\0',
+                                                            '\\' => '\\',
+                                                            o => o,
+                                                        });
+                                                        esc = false;
+                                                    } else if c == '\\' {
+                                                        esc = true;
+                                                    } else {
+                                                        line.push(c);
+                                                    }
+                                                }
                                                 ri += 1;
                                             }
                                             c => {
@@ -12561,6 +13683,7 @@ impl Term {
                     let prompt = self.prompt_str();
                     self.emit(&alloc::format!("{}{}", prompt, line));
                     self.run(&line);
+                    self.run_prompt_cmd();
                 }
                 x if x == KeyCode::Escape as u32 => {
                     self.rs = None;
@@ -12935,6 +14058,7 @@ impl Term {
             } else {
                 self.emit(&alloc::format!("{}{}", prompt, line));
                 self.run(&line);
+                self.run_prompt_cmd();
             }
         } else if k.key == KeyCode::Escape as u32 && self.read_modal.is_some() {
             self.read_modal = None;
@@ -13018,6 +14142,7 @@ impl Term {
         "sync", "hwclock", "pwdx", "pidstat", "lsblk", "getconf", "lshw", "nohup",
         "install", "jot", "ipcalc", "tsort", "fdupes", "rename", "updatedb",
         "locate", "mapfile", "readarray", "cpio", "rsync",
+        "umask", "chmod", "ulimit", "complete", "compgen", "hexdump",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -13270,6 +14395,46 @@ impl Term {
                 }
             }
         } else {
+            // a `complete -W` spec on the command word completes args from
+            // its wordlist instead of paths
+            let cmd = head[..word_start].trim();
+            if let Some(spec) = self.comps.get(cmd).cloned() {
+                for w in spec.split_whitespace() {
+                    if w.starts_with(word) {
+                        cands.push(String::from(w));
+                    }
+                }
+                if !cands.is_empty() {
+                    // fall through to the shared lcp/insert logic
+                    let mut lcp = cands[0].clone();
+                    for c in &cands[1..] {
+                        let mut i = 0;
+                        for (a, b) in lcp.bytes().zip(c.bytes()) {
+                            if a != b {
+                                break;
+                            }
+                            i += 1;
+                        }
+                        lcp.truncate(i);
+                    }
+                    if lcp.len() > word.len() {
+                        let add = String::from(&lcp[word.len()..]);
+                        for (i, ch) in add.chars().enumerate() {
+                            self.cur.insert(self.cx + i, ch);
+                        }
+                        self.cx += add.len();
+                    } else if cands.len() > 1 {
+                        for c in &cands {
+                            self.emit(&alloc::format!("  {}", c));
+                        }
+                    } else {
+                        self.cur.insert(self.cx, ' ');
+                        self.cx += 1;
+                    }
+                    self.dirty_all = true;
+                    return;
+                }
+            }
             // path position -- split dir/prefix, readdir, keep trailing / on dirs
             let (dir, prefix) = match word.rfind('/') {
                 Some(i) => (&word[..i + 1], &word[i + 1..]),
@@ -14260,6 +15425,9 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         err_buf: Vec::new(),
         out_err: false,
         select_in: None,
+        comps: alloc::collections::BTreeMap::new(),
+        in_pc: false,
+        ulimit_n: 0,
         start_ms: ustd::uptime_ms(),
     };
     // push the persisted name into the kernel so uname -n / /proc agree
