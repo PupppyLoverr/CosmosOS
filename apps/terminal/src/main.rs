@@ -5168,6 +5168,8 @@ struct GrepOpts {
     quiet: bool, // -q: status only
     ere: bool,   // -E: real regex via re_search
     files: u8,   // 0 normal, 1 = -l (with matches), 2 = -L (without)
+    fname: u8,   // 0 auto, 1 = -h (never prefix), 2 = -H (always prefix)
+    multi: bool, // >1 file operand: auto filename prefixes
     before: usize,
     after: usize,
     maxm: usize,
@@ -8907,6 +8909,26 @@ impl Term {
                 // recurses directories with `path:` headers, -l forces the long
                 // one-per-line form (the default layout already). Multiple dir
                 // args get a `path:` header each.
+                // -B/--ignore-backups: skip *~ entries; -I PAT/--ignore=PAT:
+                // glob patterns to exclude from directory listings
+                let mut hide_bak = false;
+                let mut ignores: Vec<String> = Vec::new();
+                let mut args2: Vec<&str> = Vec::new();
+                let mut it = args.iter().peekable();
+                while let Some(a) = it.next() {
+                    if *a == "-B" || *a == "--ignore-backups" {
+                        hide_bak = true;
+                    } else if let Some(v) = a.strip_prefix("--ignore=") {
+                        ignores.push(String::from(v));
+                    } else if *a == "-I" {
+                        if let Some(v) = it.next() {
+                            ignores.push(String::from(*v));
+                        }
+                    } else {
+                        args2.push(*a);
+                    }
+                }
+                let args = &args2[..];
                 let mut show_all = false;
                 let mut by_size = false;
                 let mut by_time = false;
@@ -8977,6 +8999,21 @@ impl Term {
                             let mut ents = ents;
                             if !show_all {
                                 ents.retain(|e| e.name[0] != b'.');
+                            }
+                            if hide_bak {
+                                ents.retain(|e| {
+                                    e.name_len == 0
+                                        || e.name[e.name_len as usize - 1] != b'~'
+                                });
+                            }
+                            if !ignores.is_empty() {
+                                ents.retain(|e| {
+                                    let n = core::str::from_utf8(
+                                        &e.name[..e.name_len as usize],
+                                    )
+                                    .unwrap_or("");
+                                    !ignores.iter().any(|p| wild_match(p, n))
+                                });
                             }
                             if by_size {
                                 ents.sort_by(|a, b| {
@@ -10011,11 +10048,12 @@ impl Term {
                 None => self.fail("usage: which <cmd>"),
             },
             "cat" => {
-                // cat [-nbETsA] <files...>: -n numbers all lines, -b numbers
+                // cat [-nbETsAve] <files...>: -n numbers all lines, -b numbers
                 // non-blank, -E shows $ at EOL, -T shows tabs as ^I,
-                // -s squeezes blank runs, -A = -ET
-                let (mut num, mut numnb, mut eol, mut tabs, mut sqz) =
-                    (false, false, false, false, false);
+                // -s squeezes blank runs, -A = -ET, -v shows other control
+                // chars as ^X / ^? / M-x; -e = -vE, -t = -vT
+                let (mut num, mut numnb, mut eol, mut tabs, mut sqz, mut vis) =
+                    (false, false, false, false, false, false);
                 let mut files: Vec<&str> = Vec::new();
                 for a in args.iter().copied() {
                     if a.starts_with('-') && a.len() > 1 {
@@ -10026,6 +10064,15 @@ impl Term {
                                 'E' => eol = true,
                                 'T' => tabs = true,
                                 's' => sqz = true,
+                                'v' => vis = true,
+                                'e' => {
+                                    vis = true;
+                                    eol = true;
+                                }
+                                't' => {
+                                    vis = true;
+                                    tabs = true;
+                                }
                                 'A' => {
                                     eol = true;
                                     tabs = true;
@@ -10049,8 +10096,31 @@ impl Term {
                         }
                         blank = l.is_empty();
                         let mut o = String::from(l);
-                        if tabs {
-                            o = o.replace('\t', "^I");
+                        if vis || tabs {
+                            let mut v = String::new();
+                            for c in o.chars() {
+                                match c {
+                                    '\t' if tabs => v.push_str("^I"),
+                                    '\t' => v.push('\t'),
+                                    c if (c as u32) < 32 => {
+                                        v.push('^');
+                                        v.push((b'@' + c as u8) as char);
+                                    }
+                                    '\u{7f}' => v.push_str("^?"),
+                                    c if (c as u32) >= 128 => {
+                                        v.push_str("M-");
+                                        let lo = c as u32 - 128;
+                                        if lo < 32 {
+                                            v.push('^');
+                                            v.push((b'@' + lo as u8) as char);
+                                        } else {
+                                            v.push(char::from_u32(lo).unwrap_or('?'));
+                                        }
+                                    }
+                                    c => v.push(c),
+                                }
+                            }
+                            o = v;
                         }
                         if eol {
                             o.push('$');
@@ -14500,6 +14570,8 @@ impl Term {
                                     b'L' => o.files = 2,
                                     b'E' => o.ere = true,    // real regex
                                     b'F' | b'e' => {}        // already literal / -e nop
+                                    b'h' => o.fname = 1,      // never prefix
+                                    b'H' => o.fname = 2,      // always prefix
                                     _ => {}
                                 }
                             }
@@ -14573,7 +14645,9 @@ impl Term {
                 };
                 match (pat, files.first().copied()) {
                     (Some(p), Some(_)) => {
-                        // every positional after the pattern is a file/dir operand
+                        // every positional after the pattern is a file/dir
+                        // operand; >1 gets automatic filename prefixes
+                        o.multi = files.len() > 1;
                         let mut hits = 0usize;
                         for path in files {
                             hits += self.grep_run(&p, path, &o);
@@ -17012,7 +17086,7 @@ impl Term {
                 for p in paths {
                     if rec && ustd::stat(*p).map(|s| s.is_dir != 0).unwrap_or(false) {
                         targets.push(String::from(*p));
-                        for m in self.find_collect(p, "*", None, usize::MAX, None) {
+                        for m in self.find_collect(p, "*", None, usize::MAX, None, false) {
                             targets.push(m.trim_end_matches('/').to_string());
                         }
                     } else {
@@ -17257,6 +17331,9 @@ impl Term {
                     alloc::collections::BTreeSet::new();
                 for g in &groups {
                     let mut pat: &str = bare_pat.unwrap_or("*");
+                    let mut pat_ci = false;
+                    let mut path_ci = false;
+                    let mut mind = 0usize;
                     let mut want_dir: Option<bool> = None;
                     let mut want_link = false;
                     let mut repat: Option<String> = None;
@@ -17286,6 +17363,24 @@ impl Term {
                             "-name" => {
                                 if let Some(v) = g.get(i + 1) {
                                     pat = v;
+                                    pat_ci = false;
+                                }
+                            }
+                            "-iname" => {
+                                if let Some(v) = g.get(i + 1) {
+                                    pat = v;
+                                    pat_ci = true;
+                                }
+                            }
+                            "-ipath" => {
+                                if let Some(v) = g.get(i + 1) {
+                                    pathpat = Some(String::from(*v));
+                                    path_ci = true;
+                                }
+                            }
+                            "-mindepth" => {
+                                if let Some(v) = g.get(i + 1) {
+                                    mind = v.parse().unwrap_or(0);
                                 }
                             }
                             "-type" => {
@@ -17348,10 +17443,35 @@ impl Term {
                     }
                     if dir_is_dir {
                         let mut ms =
-                            self.find_collect(dir, pat, want_dir, maxd, newer);
+                            self.find_collect(dir, pat, want_dir, maxd, newer, pat_ci);
                         // -path PAT: match the full path, not the basename
+                        // (-ipath is its case-insensitive form)
                         if let Some(pp) = &pathpat {
-                            ms.retain(|m| wild_match(pp, m.trim_end_matches('/')));
+                            if path_ci {
+                                let pl = pp.to_lowercase();
+                                ms.retain(|m| {
+                                    wild_match(&pl, &m.trim_end_matches('/').to_lowercase())
+                                });
+                            } else {
+                                ms.retain(|m| wild_match(pp, m.trim_end_matches('/')));
+                            }
+                        }
+                        // -mindepth N: only entries at least N levels below
+                        // dir — depth = slash count minus the root's own
+                        if mind > 0 {
+                            let base = dir
+                                .trim_end_matches('/')
+                                .bytes()
+                                .filter(|b| *b == b'/')
+                                .count();
+                            ms.retain(|m| {
+                                m.trim_end_matches('/')
+                                    .bytes()
+                                    .filter(|b| *b == b'/')
+                                    .count()
+                                    .saturating_sub(base)
+                                    >= mind
+                            });
                         }
                         // -regex PAT: full-path match through the regex engine
                         if let Some(rp) = &repat {
@@ -22642,7 +22762,16 @@ impl Term {
             Ok(d) => {
                 let s = String::from_utf8_lossy(&d).into_owned();
                 let lines: Vec<&str> = s.lines().collect();
-                let hits = self.grep_lines(pat, &lines, path, o);
+                // GNU prefixing: recursive or multi-file search shows the
+                // path; -h suppresses it, -H forces it
+                let prefix = if o.fname == 1 {
+                    ""
+                } else if o.fname == 2 || o.rec || o.multi {
+                    path
+                } else {
+                    ""
+                };
+                let hits = self.grep_lines(pat, &lines, prefix, o);
                 if o.files == 1 && hits > 0 {
                     self.emit(path);
                 } else if o.files == 2 && hits == 0 {
@@ -22689,7 +22818,7 @@ impl Term {
     /// `want_dir` filters by entry type; `maxd` bounds descent depth.
     /// Iterative directory walk: paths matching (pat, want_dir, maxd).
     /// Returns display strings (dirs carry a trailing '/').
-    fn find_collect(&mut self, dir: &str, pat: &str, want_dir: Option<bool>, maxd: usize, newer: Option<u64>) -> Vec<String> {
+    fn find_collect(&mut self, dir: &str, pat: &str, want_dir: Option<bool>, maxd: usize, newer: Option<u64>, ci: bool) -> Vec<String> {
         let mut out = Vec::new();
         let mut stack = alloc::vec::Vec::new();
         stack.push((String::from(dir), 0usize));
@@ -22705,7 +22834,12 @@ impl Term {
                             name
                         );
                         let is_dir = e.is_dir != 0;
-                        if wild_match(pat, name)
+                        let name_hit = if ci {
+                            wild_match(&pat.to_lowercase(), &name.to_lowercase())
+                        } else {
+                            wild_match(pat, name)
+                        };
+                        if name_hit
                             && want_dir.map(|w| is_dir == w).unwrap_or(true)
                             && newer.map(|r| e.mtime > r).unwrap_or(true)
                         {
@@ -22772,7 +22906,7 @@ impl Term {
     }
 
     fn find_run(&mut self, dir: &str, pat: &str, want_dir: Option<bool>, maxd: usize, newer: Option<u64>) {
-        for p in self.find_collect(dir, pat, want_dir, maxd, newer) {
+        for p in self.find_collect(dir, pat, want_dir, maxd, newer, false) {
             self.emit(&p);
         }
     }
