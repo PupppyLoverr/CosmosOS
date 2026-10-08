@@ -214,6 +214,130 @@ fn wild_match(pat: &str, s: &str) -> bool {
     pi == p.len()
 }
 
+/// Classic unified-hunk diff on two line slices: trims the common
+/// prefix/suffix, runs LCS on the differing middle, emits `n a/m/d` blocks
+/// in the style of traditional diff output. Bounded: caps each side at
+/// 1024 lines so the O(m*n) LCS table stays under ~4 MiB.
+fn diff_lines(a: &[String], b: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    // trim shared prefix / suffix
+    let mut lo = 0usize;
+    let (mut ahi, mut bhi) = (a.len(), b.len());
+    while lo < ahi && lo < bhi && a[lo] == b[lo] {
+        lo += 1;
+    }
+    while ahi > lo && bhi > lo && a[ahi - 1] == b[bhi - 1] {
+        ahi -= 1;
+        bhi -= 1;
+    }
+    let (am, bm) = (&a[lo..ahi], &b[lo..bhi]);
+    let (m, n) = (am.len(), bm.len());
+    if m == 0 && n == 0 {
+        return out;
+    }
+    // LCS length table (m+1 x n+1)
+    let mut t = alloc::vec![0u32; (m + 1) * (n + 1)];
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            t[i * (n + 1) + j] = if am[i] == bm[j] {
+                t[(i + 1) * (n + 1) + j + 1] + 1
+            } else {
+                t[(i + 1) * (n + 1) + j].max(t[i * (n + 1) + j + 1])
+            };
+        }
+    }
+    // backtrack: flat op list — 0=eq(skip),1=del,2=add — then group
+    // consecutive non-eq ops into one hunk
+    #[derive(Clone, Copy)]
+    enum Op {
+        Eq,
+        Del(usize),
+        Add(usize),
+    }
+    let mut ops: Vec<Op> = Vec::with_capacity(m + n);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < m && j < n {
+        if am[i] == bm[j] {
+            ops.push(Op::Eq);
+            i += 1;
+            j += 1;
+        } else if t[(i + 1) * (n + 1) + j] >= t[i * (n + 1) + j + 1] {
+            ops.push(Op::Del(i));
+            i += 1;
+        } else {
+            ops.push(Op::Add(j));
+            j += 1;
+        }
+    }
+    while i < m {
+        ops.push(Op::Del(i));
+        i += 1;
+    }
+    while j < n {
+        ops.push(Op::Add(j));
+        j += 1;
+    }
+    let mut k = 0usize;
+    let (mut a_cur, mut b_cur) = (0usize, 0usize);
+    while k < ops.len() {
+        if matches!(ops[k], Op::Eq) {
+            a_cur += 1;
+            b_cur += 1;
+            k += 1;
+            continue;
+        }
+        // hunk: run of Del/Add ops
+        let (mut dels, mut adds) = (Vec::new(), Vec::new());
+        let (a0, b0) = (a_cur, b_cur);
+        while k < ops.len() {
+            match ops[k] {
+                Op::Del(di) => {
+                    dels.push(di);
+                    a_cur += 1;
+                }
+                Op::Add(ai) => {
+                    adds.push(ai);
+                    b_cur += 1;
+                }
+                Op::Eq => break,
+            }
+            k += 1;
+        }
+        let (a1, b1) = (a_cur, b_cur);
+        if dels.is_empty() {
+            out.push(alloc::format!("{}a{}", a0 + lo, rng(b0 + lo, b1 + lo)));
+            for &x in &adds {
+                out.push(alloc::format!("> {}", bm[x]));
+            }
+        } else if adds.is_empty() {
+            out.push(alloc::format!("{}d{}", rng(a0 + lo, a1 + lo), b0 + lo));
+            for &x in &dels {
+                out.push(alloc::format!("< {}", am[x]));
+            }
+        } else {
+            out.push(alloc::format!("{}c{}", rng(a0 + lo, a1 + lo), rng(b0 + lo, b1 + lo)));
+            for &x in &dels {
+                out.push(alloc::format!("< {}", am[x]));
+            }
+            out.push(String::from("---"));
+            for &x in &adds {
+                out.push(alloc::format!("> {}", bm[x]));
+            }
+        }
+    }
+    out
+}
+
+/// Traditional-diff line-range notation: `N` or `N,M` (1-based inclusive).
+fn rng(lo0: usize, hi0: usize) -> String {
+    // input is 0-based [lo,hi)
+    if hi0 <= lo0 + 1 {
+        alloc::format!("{}", lo0 + 1)
+    } else {
+        alloc::format!("{},{}", lo0 + 1, hi0)
+    }
+}
+
 struct Term {
     win: Window,
     c: Canvas,
@@ -234,6 +358,10 @@ struct Term {
     httpd: Option<ustd::TcpListener>,                  // `httpd <port>` server mode
     nc: Option<ustd::TcpSock>,                         // `nc <ip> <port>` raw session
     last_ok: bool,                                     // success of the last statement (for && / ||)
+    sel: Option<((usize, usize), (usize, usize))>,     // scrollback selection (line,col)->(line,col)
+    sel_drag: bool,                                    // left button currently held
+    pq: String,                                        // pager search query
+    pg_input: bool,                                    // pager `/` input active
 }
 
 impl Term {
@@ -319,9 +447,36 @@ impl Term {
         out
     }
 
-    /// Lines per `more` page (whole visible area).
+    /// Lines per `more` page. The scrollback region is rows_vis-1 (prompt
+    /// row) and the --More-- status row eats another: h/16 - 3 so a full
+    /// page fits without clipping its first line.
     fn page_lines(&self) -> usize {
-        ((self.c.h as usize / CH as usize) - 2).max(4)
+        ((self.c.h as usize / CH as usize) - 3).max(4)
+    }
+
+    /// First line after `top` matching self.pq, wrapping (less-style).
+    fn pager_next(&self, all: &[String], top: usize) -> Option<usize> {
+        if self.pq.is_empty() {
+            return None;
+        }
+        for off in 1..=all.len() {
+            let i = (top + off) % all.len();
+            if all[i].contains(&self.pq) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Replace the last scrollback line with the `/query` input display.
+    fn edit_search_line(&mut self) {
+        if let Some(last) = self.lines.last_mut() {
+            if last.starts_with('/') || last.starts_with("--More--") {
+                *last = alloc::format!("/{}", self.pq);
+                return;
+            }
+        }
+        self.push_line(&alloc::format!("/{}", self.pq));
     }
 
     /// Paint one page of `all` starting at `top`.
@@ -396,6 +551,23 @@ impl Term {
         let region = rows_vis.saturating_sub(total_cur_lines);
         let end = self.lines.len().saturating_sub(self.view.min(self.lines.len()));
         let start = end.saturating_sub(region);
+        // selection highlight under the text (normalized line range)
+        if let Some((a, b)) = self.sel {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            for li in lo.0..=hi.0 {
+                if li < start || li >= end {
+                    continue;
+                }
+                let l = &self.lines[li];
+                let c0 = if li == lo.0 { lo.1.min(l.len()) } else { 0 };
+                let c1 = if li == hi.0 { hi.1.min(l.len()) } else { l.len() };
+                if c1 <= c0 {
+                    continue;
+                }
+                let row = li - start;
+                self.c.fill(8 + c0 as i32 * CW, 8 + row as i32 * CH, (c1 - c0) as i32 * CW, CH, draw::EDGE);
+            }
+        }
         let mut y = 8i32;
         for line in &self.lines[start..end] {
             if y + CH > self.c.h as i32 - 4 {
@@ -505,7 +677,9 @@ impl Term {
                     "          httpd <port>  arp  dmesg  nc <ip> <port>  true  false",
                     "          fserve <port> <file>  fget <ip> <port> <out>  shot [path]",
                     "          find <dir> [pat]  killall <name>  basename/dirname  strings",
-                    "          ops: a ; b   a && b   a || b",
+                    "          diff <a> <b>  stat <path>  sort -n/-r/-u  wc -l/-w/-c",
+                    "          ops: a ; b   a && b   a || b   drag-select copies to clipboard",
+                    "          more: Space/b page, / search, n next",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -1177,9 +1351,34 @@ impl Term {
                                     w += 1;
                                 }
                             }
-                            self.emit(&alloc::format!("  {} lines {} words {} bytes", l, w, s.len()));
+                            let (fl, fw, fc) = (
+                                args.iter().any(|a| a == &"-l"),
+                                args.iter().any(|a| a == &"-w"),
+                                args.iter().any(|a| a == &"-c"),
+                            );
+                            match (fl, fw, fc) {
+                                (true, false, false) => self.emit(&alloc::format!("{}", l)),
+                                (false, true, false) => self.emit(&alloc::format!("{}", w)),
+                                (false, false, true) => self.emit(&alloc::format!("{}", s.len())),
+                                _ => self.emit(&alloc::format!("  {} lines {} words {} bytes", l, w, s.len())),
+                            }
                         } else if cmd == "sort" {
-                            ls.sort();
+                            if args.iter().any(|a| a == &"-n") {
+                                // numeric: compare leading signed-integer fields (0 if none)
+                                let num = |l: &&str| -> i64 {
+                                    let t = l.trim_start();
+                                    let neg = t.starts_with('-');
+                                    let digits: String = t.chars()
+                                        .skip(neg as usize)
+                                        .take_while(|c| c.is_ascii_digit())
+                                        .collect();
+                                    let v: i64 = digits.parse().unwrap_or(0);
+                                    if neg { -v } else { v }
+                                };
+                                ls.sort_by_key(num);
+                            } else {
+                                ls.sort();
+                            }
                             if args.iter().any(|a| a == &"-u") {
                                 ls.dedup();
                             }
@@ -1303,6 +1502,38 @@ impl Term {
                     Err(e) => self.fail(&alloc::format!("find: {}: err {}", dir, e)),
                 }
             }
+            "diff" => match (args.first(), args.get(1)) {
+                (Some(pa), Some(pb)) => match (ustd::read_all(pa), ustd::read_all(pb)) {
+                    (Ok(da), Ok(db)) => {
+                        let sa = String::from_utf8_lossy(&da).into_owned();
+                        let sb = String::from_utf8_lossy(&db).into_owned();
+                        let la: Vec<String> = sa.lines().take(1024).map(String::from).collect();
+                        let lb: Vec<String> = sb.lines().take(1024).map(String::from).collect();
+                        let out = diff_lines(&la, &lb);
+                        if out.is_empty() {
+                            self.emit("(identical)");
+                        }
+                        for l in out {
+                            self.emit(&l);
+                        }
+                    }
+                    (Err(e), _) | (_, Err(e)) => self.fail(&alloc::format!("diff: err {}", e)),
+                },
+                _ => self.fail("usage: diff <fileA> <fileB>"),
+            },
+            "stat" => match args.first() {
+                Some(p) => match ustd::stat(p) {
+                    Ok(st) => {
+                        let (y, mo, d, h, mi, se) = epoch_to_dt(st.mtime);
+                        self.emit(&alloc::format!("  {}: {} B {}", p, st.size, if st.is_dir != 0 { "(dir)" } else { "" }));
+                        self.emit(&alloc::format!(
+                            "  mtime {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, mo, d, h, mi, se
+                        ));
+                    }
+                    Err(e) => self.fail(&alloc::format!("stat: {}: err {}", p, e)),
+                },
+                None => self.fail("usage: stat <path>"),
+            },
             "dhcp" => match ustd::net_dhcp() {
                 Some(ip) => self.emit(&alloc::format!(
                     "dhcp: lease {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]
@@ -1343,9 +1574,58 @@ impl Term {
         if k.down == 0 {
             return;
         }
-        // pager mode: Space/PgDn next page, b/PgUp back, q/Esc/Enter quits
+        // pager mode: Space/PgDn next page, b/PgUp back, q/Esc/Enter quits;
+        // `/` searches (Enter runs, Esc cancels input), n repeats
         if self.pager.is_some() {
+            if self.pg_input {
+                match k.key as u32 {
+                    x if x == KeyCode::Enter as u32 => {
+                        self.pg_input = false;
+                        let (all, top) = self.pager.take().unwrap();
+                        match self.pager_next(&all, top) {
+                            Some(i) => self.page(i, all),
+                            None => {
+                                self.push_line("(not found)");
+                                self.pager = Some((all, top));
+                            }
+                        }
+                    }
+                    x if x == KeyCode::Escape as u32 => {
+                        self.pg_input = false;
+                        self.pq.clear();
+                        self.push_line("(search cancelled)");
+                    }
+                    x if x == KeyCode::Backspace as u32 => {
+                        self.pq.pop();
+                        self.edit_search_line();
+                    }
+                    x if x == KeyCode::Char as u32 && k.chr != 0 => {
+                        self.pq.push(k.chr as char);
+                        self.edit_search_line();
+                    }
+                    _ => {}
+                }
+                self.dirty_all = true;
+                return;
+            }
             match k.key as u32 {
+                x if x == KeyCode::Char as u32 && k.chr == b'/' => {
+                    self.pg_input = true;
+                    self.pq.clear();
+                    self.edit_search_line();
+                }
+                x if x == KeyCode::Char as u32 && k.chr == b'n' => {
+                    if !self.pq.is_empty() {
+                        let (all, top) = self.pager.take().unwrap();
+                        match self.pager_next(&all, top) {
+                            Some(i) => self.page(i, all),
+                            None => {
+                                self.push_line("(not found)");
+                                self.pager = Some((all, top));
+                            }
+                        }
+                    }
+                }
                 x if x == KeyCode::Char as u32 && (k.chr == b' ' || k.chr == b'q' || k.chr == b'Q' || k.chr == b'b') => {
                     if k.chr == b' ' {
                         let (all, top) = self.pager.take().unwrap();
@@ -1528,7 +1808,7 @@ impl Term {
             "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
             "set", "env", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
             "dmesg", "arp", "httpd", "ntp", "nc", "fserve", "fget", "true", "false",
-            "shot", "find", "killall", "basename", "dirname", "strings",
+            "shot", "find", "killall", "basename", "dirname", "strings", "diff", "stat",
         ];
         // word being completed = text after the last space before the caret
         let head = &self.cur[..self.cx];
@@ -1760,6 +2040,10 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         vars: alloc::collections::BTreeMap::new(),
         prev_cwd: String::new(),
         pager: None,
+        sel: None,
+        sel_drag: false,
+        pq: String::new(),
+        pg_input: false,
     };
     t.load_hist();
     t.push_line("CosmosOS terminal - type 'help'");
@@ -1781,6 +2065,52 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 } else if p.wheel < 0 {
                     t.view = t.view.saturating_sub(3 * (-p.wheel) as usize);
                     t.dirty_all = true;
+                }
+                // left-drag selects scrollback text; release copies it to
+                // the kernel clipboard (X11 PRIMARY semantics)
+                if p.buttons & 1 != 0 && !t.lines.is_empty() {
+                    let rows_vis = (t.c.h as usize / CH as usize).saturating_sub(1);
+                    let prompt = t.prompt_str();
+                    let total_cur = (prompt.len() + t.cur.len()) / COLS + 1;
+                    let region = rows_vis.saturating_sub(total_cur);
+                    let end = t.lines.len().saturating_sub(t.view.min(t.lines.len()));
+                    let start = end.saturating_sub(region);
+                    let row = ((p.y - 8) / CH).clamp(0, region.max(1) as i32 - 1) as usize;
+                    let li = (start + row).min(end.saturating_sub(1));
+                    let col = (((p.x - 8) / CW).max(0) as usize)
+                        .min(t.lines.get(li).map(|l| l.len()).unwrap_or(0));
+                    if !t.sel_drag {
+                        t.sel = Some(((li, col), (li, col)));
+                        t.sel_drag = true;
+                    } else if let Some((a, _)) = t.sel {
+                        t.sel = Some((a, (li, col)));
+                    }
+                    t.dirty_all = true;
+                } else if t.sel_drag {
+                    t.sel_drag = false;
+                    if let Some((a, b)) = t.sel.take() {
+                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                        let mut txt = String::new();
+                        for li in lo.0..=hi.0 {
+                            if li >= t.lines.len() {
+                                break;
+                            }
+                            let l = &t.lines[li];
+                            let c0 = if li == lo.0 { lo.1.min(l.len()) } else { 0 };
+                            let c1 = if li == hi.0 { hi.1.min(l.len()) } else { l.len() };
+                            if c1 > c0 {
+                                txt.push_str(&l[c0..c1]);
+                            }
+                            if li < hi.0 {
+                                txt.push('\n');
+                            }
+                        }
+                        if !txt.is_empty() {
+                            ustd::clip_set(txt.as_bytes());
+                            t.push_line(&alloc::format!("(copied {} B)", txt.len()));
+                            t.dirty_all = true;
+                        }
+                    }
                 }
             }
             Some((EV_CLOSE, _)) => return 0,
