@@ -8485,7 +8485,7 @@ impl Term {
             "sha256sum", "strings", "sort", "uniq", "cut", "more", "diff", "base64",
             "show", "tar", "md5sum", "uuencode", "uudecode", "grep", "find", "file",
             "sha1sum", "cksum", "comm", "zgrep", "zip", "unzip", "chmod", "touch",
-            "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl",
+            "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
             "egrep", "fgrep", "sdiff", "diff3", "merge", "compress",
             "uncompress", "sum", "sha224sum", "namei", "ts", "pr",
@@ -18346,8 +18346,52 @@ impl Term {
                     self.fail("xargs: no input (pipe lines in)");
                 }
             }
-            "nl" | "rev" | "fmt" => {
-                // nl numbers lines; rev reverses chars; fmt rewraps to -w cols
+            "look" => {
+                // look [-f] prefix [file]: print lines beginning with prefix
+                // (binary-search tool in real systems; a prefix scan here).
+                // -f folds case. No file → piped stdin.
+                let ci = args.iter().any(|a| a == &"-f");
+                let pos: Vec<&str> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .copied()
+                    .collect();
+                match pos.first() {
+                    Some(pfx) => {
+                        let body = match pos.get(1) {
+                            Some(f) => match ustd::read_all(f) {
+                                Ok(d) => Some(String::from_utf8_lossy(&d).into_owned()),
+                                Err(e) => {
+                                    self.fail(&alloc::format!("look: {}: err {}", f, e));
+                                    None
+                                }
+                            },
+                            None => self.pipe_in.clone(),
+                        };
+                        if let Some(s) = body {
+                            let needle = if ci {
+                                pfx.to_ascii_lowercase()
+                            } else {
+                                String::from(*pfx)
+                            };
+                            for l in s.lines() {
+                                let hay = if ci {
+                                    l.to_ascii_lowercase()
+                                } else {
+                                    String::from(l)
+                                };
+                                if hay.starts_with(&needle) {
+                                    self.emit(l);
+                                }
+                            }
+                        }
+                    }
+                    None => self.fail("usage: look [-f] <prefix> [file]"),
+                }
+            }
+            "rev" | "fmt" => {
+                // rev reverses chars; fmt rewraps to -w cols
+                // (nl lives in its own arm — it has -b style parsing)
                 let wi = args.iter().position(|a| a == &"-w");
                 let width: usize = wi
                     .and_then(|i| args.get(i + 1))
@@ -18371,11 +18415,6 @@ impl Term {
                 };
                 if let Some(s) = content {
                     match cmd {
-                        "nl" => {
-                            for (i, l) in s.lines().enumerate() {
-                                self.emit(&alloc::format!("  {:>4}  {}", i + 1, l));
-                            }
-                        }
                         "rev" => {
                             for l in s.lines() {
                                 self.emit(&l.chars().rev().collect::<String>());
@@ -21136,7 +21175,7 @@ impl Term {
         "getent", "host", "usleep", "fc", "times",
         "readonly", "expr", "tty", "link", "unlink", "pstree", "lsattr", "chattr",
         "sync", "hwclock", "pwdx", "pidstat", "lsblk", "getconf", "lshw", "nohup",
-        "install", "jot", "ipcalc", "tsort", "fdupes", "rename", "updatedb", "nl",
+        "install", "jot", "ipcalc", "tsort", "fdupes", "rename", "updatedb", "nl", "look",
         "locate", "mapfile", "readarray", "cpio", "rsync",
         "umask", "chmod", "ulimit", "complete", "compgen", "hexdump",
             "ln", "shopt", "hash", "enable", "stty", "readlink",
@@ -21562,19 +21601,20 @@ impl Term {
     /// row when several files are given. Byte counts use raw file bytes
     /// (not the lossy-decoded text). No files → counts stdin (pipe).
     fn wc_run(&mut self, args: &[&str]) {
-        let (fl, fw, fc, fm) = (
-            args.iter().any(|a| a == &"-l"),
-            args.iter().any(|a| a == &"-w"),
-            args.iter().any(|a| a == &"-c"),
-            args.iter().any(|a| a == &"-L"),
-        );
+        // combined short flags work: -lmc == -l -m -c
+        let has = |ch: char| {
+            args.iter()
+                .any(|a| a.starts_with('-') && a.len() > 1 && a[1..].contains(ch))
+        };
+        let (fl, fw, fc, fm, fchars) =
+            (has('l'), has('w'), has('c'), has('L'), has('m'));
         let files: Vec<&str> = args
             .iter()
             .filter(|a| !a.starts_with('-'))
             .copied()
             .collect();
-        // (lines, words, bytes, max line length)
-        let counts = |raw: &[u8], s: &str| -> (usize, usize, usize, usize) {
+        // (lines, words, bytes, max line length, chars)
+        let counts = |raw: &[u8], s: &str| -> (usize, usize, usize, usize, usize) {
             let (mut l, mut w) = (0usize, 0usize);
             let mut in_w = false;
             for ch in s.chars() {
@@ -21589,15 +21629,15 @@ impl Term {
                 }
             }
             let m = s.lines().map(|ln| ln.chars().count()).max().unwrap_or(0);
-            (l, w, raw.len(), m)
+            (l, w, raw.len(), m, s.chars().count())
         };
-        let show = |t: &mut Term, c: (usize, usize, usize, usize), name: &str| {
+        let show = |t: &mut Term, c: (usize, usize, usize, usize, usize), name: &str| {
             let tag = if name.is_empty() {
                 String::new()
             } else {
                 alloc::format!(" {}", name)
             };
-            if !fl && !fw && !fc && !fm {
+            if !fl && !fw && !fc && !fm && !fchars {
                 t.emit(&alloc::format!("  {} {} {}{}", c.0, c.1, c.2, tag));
                 return;
             }
@@ -21613,6 +21653,9 @@ impl Term {
             }
             if fm {
                 cols.push(c.3);
+            }
+            if fchars {
+                cols.push(c.4);
             }
             t.emit(&alloc::format!(
                 "{}{}",
@@ -21632,7 +21675,7 @@ impl Term {
             return;
         }
         let multi = files.len() > 1;
-        let mut tot = (0usize, 0usize, 0usize, 0usize);
+        let mut tot = (0usize, 0usize, 0usize, 0usize, 0usize);
         for f in &files {
             match ustd::read_all(f) {
                 Ok(d) => {
@@ -21642,6 +21685,7 @@ impl Term {
                     tot.1 += c.1;
                     tot.2 += c.2;
                     tot.3 = tot.3.max(c.3);
+                    tot.4 += c.4;
                     show(self, c, if multi { f } else { "" });
                 }
                 Err(e) => self.fail(&alloc::format!("wc: {}: err {}", f, e)),
