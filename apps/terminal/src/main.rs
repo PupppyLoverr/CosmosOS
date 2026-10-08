@@ -11783,22 +11783,39 @@ impl Term {
                 // -b takes a separate or attached value; everything else
                 // non-flag is the file
                 let mut style = "t";
+                let mut sep = "\t";
+                let mut startn = 1usize;
+                let mut numw = 6usize;
                 let mut file: Option<&str> = None;
                 let mut skip_b_val = false;
+                let mut valflag: Option<&str> = None;
                 for a in &args {
-                    if skip_b_val {
-                        style = a;
-                        skip_b_val = false;
+                    if let Some(fl) = valflag {
+                        match fl {
+                            "-b" => style = a,
+                            "-s" => sep = a,
+                            "-v" => startn = a.parse().unwrap_or(1),
+                            "-w" => numw = a.parse().unwrap_or(6),
+                            _ => {}
+                        }
+                        valflag = None;
                         continue;
                     }
-                    if a == &"-b" {
-                        skip_b_val = true;
+                    if a == &"-b" || a == &"-s" || a == &"-v" || a == &"-w" {
+                        valflag = Some(a);
                     } else if a.starts_with("-b") && a.len() > 2 {
                         style = &a[2..];
+                    } else if let Some(v) = a.strip_prefix("-s") {
+                        if !v.is_empty() { sep = v; }
+                    } else if let Some(v) = a.strip_prefix("-v") {
+                        startn = v.parse().unwrap_or(1);
+                    } else if let Some(v) = a.strip_prefix("-w") {
+                        numw = v.parse().unwrap_or(6);
                     } else if !a.starts_with('-') && file.is_none() {
                         file = Some(*a);
                     }
                 }
+                let _ = skip_b_val;
                 let body = match file {
                     Some(f) => match ustd::read_all(f) {
                         Ok(d) => String::from_utf8_lossy(&d).to_string(),
@@ -11816,7 +11833,7 @@ impl Term {
                         }
                     }
                 };
-                let mut ln = 0usize;
+                let mut ln = startn;
                 for line in body.split('\n') {
                     let number = match style {
                         "a" => true,
@@ -11824,8 +11841,14 @@ impl Term {
                         _ => !line.is_empty(),
                     };
                     if number {
+                        self.emit(&alloc::format!(
+                            "{:>w$}{}{}",
+                            ln,
+                            sep,
+                            line,
+                            w = numw
+                        ));
                         ln += 1;
-                        self.emit(&alloc::format!("{:>6}\t{}", ln, line));
                     } else {
                         self.emit(line);
                     }
@@ -12543,15 +12566,17 @@ impl Term {
                 }
             }
             "fold" => {
-                // fold [-w N] -- wrap lines at column N (default 80)
+                // fold [-s] [-w N] -- wrap lines at column N (default 80);
+                // -s breaks at the last blank within the width when possible
                 let (mut w, mut file) = (80usize, None);
+                let spaces = args.iter().any(|a| *a == "-s");
                 let mut it = args.iter().peekable();
                 while let Some(a) = it.next() {
                     if *a == "-w" {
                         w = it.next().and_then(|x| x.parse().ok()).unwrap_or(80);
                     } else if let Some(v) = a.strip_prefix("-w") {
                         w = v.parse().unwrap_or(80);
-                    } else {
+                    } else if !a.starts_with('-') {
                         file = Some(*a);
                     }
                 }
@@ -12567,10 +12592,116 @@ impl Term {
                         while !rest.is_char_boundary(cut) {
                             cut -= 1;
                         }
+                        // -s: prefer the last blank inside the window
+                        if spaces {
+                            if let Some(p) = rest[..cut].rfind(|c: char| c.is_whitespace()) {
+                                if p > 0 {
+                                    cut = p + 1; // keep the blank at line end
+                                }
+                            }
+                        }
                         self.emit(&rest[..cut]);
                         rest = &rest[cut..];
                     }
                     self.emit(rest);
+                }
+            }
+            "expand" | "unexpand" => {
+                // expand [-t N]: tabs -> spaces at stops of N (default 8).
+                // unexpand [-a] [-t N]: runs of blanks -> tabs; leading runs
+                // always, -a also interior runs that reach a tab stop.
+                let exp = cmd == "expand";
+                let all = !exp && args.iter().any(|a| *a == "-a");
+                let mut stop = 8usize;
+                let mut file: Option<&str> = None;
+                let mut it = args.iter().peekable();
+                while let Some(a) = it.next() {
+                    if *a == "-t" {
+                        stop = it.next().and_then(|v| v.parse().ok()).unwrap_or(8);
+                    } else if let Some(v) = a.strip_prefix("-t") {
+                        stop = v.parse().unwrap_or(8);
+                    } else if !a.starts_with('-') && file.is_none() {
+                        file = Some(*a);
+                    }
+                }
+                let stop = stop.max(1);
+                let data = match file {
+                    Some(p) => match ustd::read_all(p) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            self.fail(&alloc::format!("{}: {}: err {}", cmd, p, e));
+                            return;
+                        }
+                    },
+                    None => self
+                        .pipe_in
+                        .clone()
+                        .unwrap_or_default()
+                        .into_bytes(),
+                };
+                let s = String::from_utf8_lossy(&data);
+                for l in s.lines() {
+                    if exp {
+                        let mut out = String::new();
+                        let mut col = 0usize;
+                        for ch in l.chars() {
+                            if ch == '\t' {
+                                let n = stop - col % stop;
+                                for _ in 0..n {
+                                    out.push(' ');
+                                }
+                                col += n;
+                            } else {
+                                out.push(ch);
+                                col += 1;
+                            }
+                        }
+                        self.emit(&out);
+                    } else {
+                        // Column model: walk blank runs, re-emit the same
+                        // span using '\t' for every whole stop it covers —
+                        // leading runs always, interior runs only under -a.
+                        let cs: Vec<char> = l.chars().collect();
+                        let mut out = String::new();
+                        let mut col = 0usize;
+                        let mut i = 0usize;
+                        while i < cs.len() {
+                            if cs[i] == ' ' || cs[i] == '\t' {
+                                let mut j = i;
+                                while j < cs.len()
+                                    && (cs[j] == ' ' || cs[j] == '\t')
+                                {
+                                    j += 1;
+                                }
+                                let mut end = col;
+                                for k in i..j {
+                                    end = if cs[k] == '\t' {
+                                        (end / stop + 1) * stop
+                                    } else {
+                                        end + 1
+                                    };
+                                }
+                                let lead_ok = all || col == 0;
+                                while col < end {
+                                    let nxt = (col / stop + 1) * stop;
+                                    if lead_ok && nxt <= end && nxt - col >= 2
+                                    {
+                                        out.push('\t');
+                                        col = nxt;
+                                    } else {
+                                        out.push(' ');
+                                        col += 1;
+                                    }
+                                }
+                                i = j;
+                            } else {
+                                out.push(cs[i]);
+                                col += 1;
+                                i += 1;
+                            }
+                        }
+                        self.emit(&out);
+                    }
                 }
             }
             "column" => {
@@ -14376,24 +14507,75 @@ impl Term {
                         _ => {}
                     }
                 }
+                // -f FILE: each non-empty line is a pattern, OR'd. Read it,
+                // escape every literal char, join with '|', and force the
+                // ERE matcher so the alternation is real (not a literal '|').
+                let mut fpat: Option<String> = None;
+                let mut fpos: Option<usize> = None;
+                for (i, a) in args.iter().enumerate() {
+                    if *a == "-f" {
+                        fpos = Some(i + 1);
+                    } else if let Some(v) = a.strip_prefix("-f") {
+                        if !v.is_empty() {
+                            fpos = Some(i);
+                        }
+                    }
+                }
+                if let Some(i) = fpos {
+                    let path = args.get(i).copied();
+                    if let Some(path) = path {
+                        skip.push(i);
+                        if let Ok(d) = ustd::read_all(path) {
+                            let txt = String::from_utf8_lossy(&d);
+                            let mut pats: Vec<String> = Vec::new();
+                            for pl in txt.lines() {
+                                if pl.is_empty() {
+                                    continue;
+                                }
+                                let mut e = String::new();
+                                for c in pl.chars() {
+                                    if ".[](){}^$*+?|\\".contains(c) {
+                                        e.push('\\');
+                                    }
+                                    e.push(c);
+                                }
+                                pats.push(e);
+                            }
+                            if !pats.is_empty() {
+                                o.ere = true;
+                                fpat = Some(pats.join("|"));
+                            }
+                        }
+                    }
+                }
                 let pos: Vec<&str> = args
                     .iter()
                     .enumerate()
                     .filter(|(i, a)| !a.starts_with('-') && !skip.contains(i))
                     .map(|(_, a)| *a)
                     .collect();
-                let pat = pos.first().map(|p| {
-                    if o.ci {
-                        p.to_ascii_lowercase()
-                    } else {
-                        String::from(*p)
-                    }
-                });
-                match (pat, pos.get(1).copied()) {
+                // with -f every positional is a file; otherwise pos[0] is
+                // the pattern and the rest are files
+                let fmode = fpat.is_some();
+                let (pat, files): (Option<String>, &[&str]) = if fmode {
+                    (fpat, &pos[..])
+                } else {
+                    (
+                        pos.first().map(|p| {
+                            if o.ci {
+                                p.to_ascii_lowercase()
+                            } else {
+                                String::from(*p)
+                            }
+                        }),
+                        if pos.len() > 1 { &pos[1..] } else { &[][..] },
+                    )
+                };
+                match (pat, files.first().copied()) {
                     (Some(p), Some(_)) => {
                         // every positional after the pattern is a file/dir operand
                         let mut hits = 0usize;
-                        for path in &pos[1..] {
+                        for path in files {
                             hits += self.grep_run(&p, path, &o);
                         }
                         if o.quiet {
@@ -15825,7 +16007,19 @@ impl Term {
                         }
                     }
                     "uniq" => {
-                        let content = match args.iter().find(|a| !a.starts_with('-')) {
+                        // file arg = first non-flag that isn't a -f/-w value
+                        let mut skip_next = false;
+                        let content = match args.iter().find(|a| {
+                            if skip_next {
+                                skip_next = false;
+                                return false;
+                            }
+                            if **a == "-f" || **a == "-w" {
+                                skip_next = true;
+                                return false;
+                            }
+                            !a.starts_with('-')
+                        }) {
                             Some(p) => match ustd::read_all(p) {
                                 Ok(d) => Some(String::from_utf8_lossy(&d).into_owned()),
                                 Err(e) => {
@@ -15836,27 +16030,63 @@ impl Term {
                             None => self.pipe_in.clone(),
                         };
                         if let Some(s) = content {
-                            // uniq [-cdui]: -c counts, -d only dup runs,
-                            // -u only singleton runs, -i case-insensitive
+                            // uniq [-cdui] [-f N] [-w N]: -c counts,
+                            // -d only dup runs, -u only singleton runs,
+                            // -i case-insensitive; -f skips N leading
+                            // whitespace-separated fields when comparing,
+                            // -w compares only the first N characters
                             let count = args.iter().any(|a| a == &"-c");
                             let only_dup = args.iter().any(|a| a == &"-d");
                             let only_uniq = args.iter().any(|a| a == &"-u");
                             let ci = args.iter().any(|a| a == &"-i");
-                            // group consecutive runs (respecting -i)
-                            let mut runs: Vec<(&str, usize)> = Vec::new();
-                            for l in s.lines() {
-                                let eq = match runs.last() {
-                                    Some((p, _)) if ci => p.eq_ignore_ascii_case(l),
-                                    Some((p, _)) => *p == l,
-                                    None => false,
-                                };
-                                if eq {
-                                    runs.last_mut().unwrap().1 += 1;
-                                } else {
-                                    runs.push((l, 1));
+                            let mut skipf = 0usize;
+                            let mut width = usize::MAX;
+                            let mut vit = args.iter().peekable();
+                            while let Some(a) = vit.next() {
+                                if *a == "-f" {
+                                    skipf = vit
+                                        .next()
+                                        .and_then(|v| v.parse().ok())
+                                        .unwrap_or(0);
+                                } else if let Some(v) = a.strip_prefix("-f") {
+                                    skipf = v.parse().unwrap_or(0);
+                                } else if *a == "-w" {
+                                    width = vit
+                                        .next()
+                                        .and_then(|v| v.parse().ok())
+                                        .unwrap_or(usize::MAX);
+                                } else if let Some(v) = a.strip_prefix("-w") {
+                                    width = v.parse().unwrap_or(usize::MAX);
                                 }
                             }
-                            for (p, n) in runs {
+                            let key = |l: &str| -> String {
+                                // skip -f fields (field = blanks + non-blanks)
+                                let mut rest = l;
+                                for _ in 0..skipf {
+                                    rest = rest.trim_start();
+                                    let adv = rest
+                                        .find(|c: char| c.is_whitespace())
+                                        .map(|p| p)
+                                        .unwrap_or(rest.len());
+                                    rest = &rest[adv..];
+                                }
+                                let mut k: String =
+                                    rest.chars().take(width).collect();
+                                if ci {
+                                    k = k.to_ascii_lowercase();
+                                }
+                                k
+                            };
+                            // group consecutive runs on the compare key
+                            let mut runs: Vec<(&str, usize, String)> = Vec::new();
+                            for l in s.lines() {
+                                let k = key(l);
+                                match runs.last_mut() {
+                                    Some((_, n, pk)) if *pk == k => *n += 1,
+                                    _ => runs.push((l, 1, k)),
+                                }
+                            }
+                            for (p, n, _) in runs {
                                 if only_dup && n < 2 {
                                     continue;
                                 }
@@ -16067,7 +16297,26 @@ impl Term {
                                     .and_then(|i| args.get(i + 1))
                                     .copied()
                             });
+                        // -c/-b char/byte range spec, same syntax as -f
+                        let cspec: Option<&str> = args
+                            .iter()
+                            .find_map(|a| {
+                                if *a == "-c" || *a == "-b" {
+                                    None
+                                } else {
+                                    a.strip_prefix("-c")
+                                        .or_else(|| a.strip_prefix("-b"))
+                                        .filter(|s| !s.is_empty())
+                                }
+                            })
+                            .or_else(|| {
+                                args.iter()
+                                    .position(|a| a == &"-c" || a == &"-b")
+                                    .and_then(|i| args.get(i + 1))
+                                    .copied()
+                            });
                         let fields: Vec<(usize, usize)> = fspec
+                            .or(cspec)
                             .map(|s| {
                                 s.split(',')
                                     .filter_map(|x| {
@@ -16093,7 +16342,9 @@ impl Term {
                             .unwrap_or_default();
                         let complement = args.iter().any(|a| *a == "--complement");
                         let src = args.iter().enumerate().find(|(i, a)| {
-                            !a.starts_with('-') && *i > 0 && args[i - 1] != "-d" && args[i - 1] != "-f"
+                            !a.starts_with('-') && *i > 0
+                                && args[i - 1] != "-d" && args[i - 1] != "-f"
+                                && args[i - 1] != "-c" && args[i - 1] != "-b"
                         }).map(|(_, a)| *a);
                         let content = match src {
                             Some(p) => match ustd::read_all(p) {
@@ -16106,6 +16357,23 @@ impl Term {
                             None => self.pipe_in.clone(),
                         };
                         match (content, fields.is_empty()) {
+                            (Some(s), false) if cspec.is_some() => {
+                                // char positions over the line, ranges OR'd
+                                for l in s.lines() {
+                                    let cs: Vec<char> = l.chars().collect();
+                                    let mut out = String::new();
+                                    for (idx, ch) in cs.iter().enumerate() {
+                                        let pos = idx + 1;
+                                        let hit = fields.iter().any(|(lo, hi)| {
+                                            pos >= *lo && pos <= *hi
+                                        });
+                                        if hit != complement {
+                                            out.push(*ch);
+                                        }
+                                    }
+                                    self.emit(&out);
+                                }
+                            }
                             (Some(s), false) => {
                                 let dstr = alloc::format!("{}", delim);
                                 for l in s.lines() {
@@ -16122,8 +16390,8 @@ impl Term {
                                     self.emit(&got.join(&dstr));
                                 }
                             }
-                            (Some(_), true) => self.fail("cut: need -f N[,M..]"),
-                            (None, _) => self.fail("usage: cut -d X -f N[,M..] <file>"),
+                            (Some(_), true) => self.fail("cut: need -f|-c N[,M..]"),
+                            (None, _) => self.fail("usage: cut -d X -f|-c N[,M..] <file>"),
                         }
                     }
                     "tee" => {
@@ -19704,33 +19972,76 @@ impl Term {
                                 .collect();
                             match cmd {
                                 "comm" => {
+                                    // comm [-1|-2|-3] f1 f2 — -N suppresses
+                                    // column N (1=a-only, 2=b-only, 3=both).
+                                    // Remaining columns keep their GNU tab
+                                    // indentation.
+                                    let (mut s1, mut s2, mut s3) =
+                                        (false, false, false);
+                                    for a in args.iter() {
+                                        if a.starts_with('-')
+                                            && a[1..]
+                                                .bytes()
+                                                .all(|c| matches!(c, b'1'..=b'3'))
+                                            && a.len() > 1
+                                        {
+                                            for c in a[1..].bytes() {
+                                                match c {
+                                                    b'1' => s1 = true,
+                                                    b'2' => s2 = true,
+                                                    _ => s3 = true,
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // leading tabs = count of unsuppressed
+                                    // columns before this one
+                                    let mut b = |col: usize, line: &str| {
+                                        let (sup, tabs) = match col {
+                                            1 => (s1, 0usize),
+                                            2 => (s2, !s1 as usize),
+                                            _ => (
+                                                s3,
+                                                !s1 as usize + !s2 as usize,
+                                            ),
+                                        };
+                                        if !sup {
+                                            let mut s = String::new();
+                                            for _ in 0..tabs {
+                                                s.push('\t');
+                                            }
+                                            s.push_str(line);
+                                            self.emit(&s);
+                                        }
+                                    };
                                     let (mut i, mut j) = (0usize, 0usize);
                                     while i < la.len() && j < lb.len() {
                                         match la[i].cmp(&lb[j]) {
                                             core::cmp::Ordering::Less => {
                                                 let l = la[i].clone();
-                                                self.emit(&l);
+                                                b(1, &l);
                                                 i += 1;
                                             }
                                             core::cmp::Ordering::Greater => {
-                                                let l = alloc::format!("\t{}", lb[j]);
-                                                self.emit(&l);
+                                                let l = lb[j].clone();
+                                                b(2, &l);
                                                 j += 1;
                                             }
                                             core::cmp::Ordering::Equal => {
-                                                let l = alloc::format!("\t\t{}", la[i]);
-                                                self.emit(&l);
+                                                let l = la[i].clone();
+                                                b(3, &l);
                                                 i += 1;
                                                 j += 1;
                                             }
                                         }
                                     }
                                     for l in &la[i..] {
-                                        self.emit(l);
+                                        let l = l.clone();
+                                        b(1, &l);
                                     }
                                     for l in &lb[j..] {
-                                        let l = alloc::format!("\t{}", l);
-                                        self.emit(&l);
+                                        let l = l.clone();
+                                        b(2, &l);
                                     }
                                 }
                                 "join" => {
