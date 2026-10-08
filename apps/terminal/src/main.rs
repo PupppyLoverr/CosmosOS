@@ -5,7 +5,7 @@
 
 extern crate alloc;
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use shared::*;
 use ustd::draw::{self, Canvas};
@@ -524,6 +524,53 @@ fn wild_match(pat: &str, s: &str) -> bool {
 /// prefix/suffix, runs LCS on the differing middle, emits `n a/m/d` blocks
 /// in the style of traditional diff output. Bounded: caps each side at
 /// 1024 lines so the O(m*n) LCS table stays under ~4 MiB.
+#[derive(Clone, Copy)]
+enum DiffOp {
+    Eq,
+    Del(usize),
+    Add(usize),
+}
+
+/// LCS edit script over two line slices: flat op list of Eq/Del(a_i)/Add(b_j).
+fn diff_ops(am: &[String], bm: &[String]) -> Vec<DiffOp> {
+    let (m, n) = (am.len(), bm.len());
+    let mut t = alloc::vec![0u32; (m + 1) * (n + 1)];
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            t[i * (n + 1) + j] = if am[i] == bm[j] {
+                t[(i + 1) * (n + 1) + j + 1] + 1
+            } else {
+                t[(i + 1) * (n + 1) + j].max(t[i * (n + 1) + j + 1])
+            };
+        }
+    }
+    let mut ops: Vec<DiffOp> = Vec::with_capacity(m + n);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < m && j < n {
+        if am[i] == bm[j] {
+            ops.push(DiffOp::Eq);
+            i += 1;
+            j += 1;
+        } else if t[(i + 1) * (n + 1) + j] >= t[i * (n + 1) + j + 1] {
+            ops.push(DiffOp::Del(i));
+            i += 1;
+        } else {
+            ops.push(DiffOp::Add(j));
+            j += 1;
+        }
+    }
+    while i < m {
+        ops.push(DiffOp::Del(i));
+        i += 1;
+    }
+    while j < n {
+        ops.push(DiffOp::Add(j));
+        j += 1;
+    }
+    ops
+}
+
+/// Classic ed-style diff output (`n a/m/d` + `<> ` lines).
 fn diff_lines(a: &[String], b: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     // trim shared prefix / suffix
@@ -537,56 +584,14 @@ fn diff_lines(a: &[String], b: &[String]) -> Vec<String> {
         bhi -= 1;
     }
     let (am, bm) = (&a[lo..ahi], &b[lo..bhi]);
-    let (m, n) = (am.len(), bm.len());
-    if m == 0 && n == 0 {
+    if am.is_empty() && bm.is_empty() {
         return out;
     }
-    // LCS length table (m+1 x n+1)
-    let mut t = alloc::vec![0u32; (m + 1) * (n + 1)];
-    for i in (0..m).rev() {
-        for j in (0..n).rev() {
-            t[i * (n + 1) + j] = if am[i] == bm[j] {
-                t[(i + 1) * (n + 1) + j + 1] + 1
-            } else {
-                t[(i + 1) * (n + 1) + j].max(t[i * (n + 1) + j + 1])
-            };
-        }
-    }
-    // backtrack: flat op list -- 0=eq(skip),1=del,2=add -- then group
-    // consecutive non-eq ops into one hunk
-    #[derive(Clone, Copy)]
-    enum Op {
-        Eq,
-        Del(usize),
-        Add(usize),
-    }
-    let mut ops: Vec<Op> = Vec::with_capacity(m + n);
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < m && j < n {
-        if am[i] == bm[j] {
-            ops.push(Op::Eq);
-            i += 1;
-            j += 1;
-        } else if t[(i + 1) * (n + 1) + j] >= t[i * (n + 1) + j + 1] {
-            ops.push(Op::Del(i));
-            i += 1;
-        } else {
-            ops.push(Op::Add(j));
-            j += 1;
-        }
-    }
-    while i < m {
-        ops.push(Op::Del(i));
-        i += 1;
-    }
-    while j < n {
-        ops.push(Op::Add(j));
-        j += 1;
-    }
+    let ops = diff_ops(am, bm);
     let mut k = 0usize;
     let (mut a_cur, mut b_cur) = (0usize, 0usize);
     while k < ops.len() {
-        if matches!(ops[k], Op::Eq) {
+        if matches!(ops[k], DiffOp::Eq) {
             a_cur += 1;
             b_cur += 1;
             k += 1;
@@ -597,15 +602,15 @@ fn diff_lines(a: &[String], b: &[String]) -> Vec<String> {
         let (a0, b0) = (a_cur, b_cur);
         while k < ops.len() {
             match ops[k] {
-                Op::Del(di) => {
+                DiffOp::Del(di) => {
                     dels.push(di);
                     a_cur += 1;
                 }
-                Op::Add(ai) => {
+                DiffOp::Add(ai) => {
                     adds.push(ai);
                     b_cur += 1;
                 }
-                Op::Eq => break,
+                DiffOp::Eq => break,
             }
             k += 1;
         }
@@ -634,6 +639,370 @@ fn diff_lines(a: &[String], b: &[String]) -> Vec<String> {
     out
 }
 
+/// Parse `@@ -a[,b] +c[,d] @@` -> (a_start, b_start) (1-based).
+fn parse_hunk(h: &str) -> Option<(usize, usize)> {
+    let inner = h.trim().strip_prefix("@@")?;
+    let mut it = inner.split_whitespace();
+    let a = it.next()?.strip_prefix('-')?;
+    let b = it.next()?.strip_prefix('+')?;
+    let pa = |s: &str| s.split(',').next()?.parse::<usize>().ok();
+    Some((pa(a)?, pa(b)?))
+}
+
+/// mini-awk: `awk [-F c] 'prog' [file]`. prog = optional `BEGIN{..}` /
+/// `END{..}` plus `pattern { stmts }` rules. pattern: /substr/, NR==n,
+/// NR<n, NR>n, NR%n==m, or empty (all lines). stmts: `print e,..` or
+/// `var=expr` / `var+=expr`; exprs support + - * / % on fields/vars/numbers.
+fn awk_eval(prog: &str, input: &str, fs: Option<char>) -> Result<Vec<String>, String> {
+    // split program into rules: [BEGIN{..}] [pat]{ .. } [END{..}]
+    let mut rules: Vec<(String, String)> = Vec::new();
+    let mut rest = prog.trim();
+    let mut begin = String::new();
+    let mut end = String::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(r) = rest.strip_prefix("BEGIN") {
+            let p = r.find('{').ok_or("awk: BEGIN needs {..}")?;
+            let q = match_brace(&r[p..]).ok_or("awk: unclosed {}")? + p;
+            begin = String::from(&r[p + 1..q]);
+            rest = &r[q + 1..];
+            continue;
+        }
+        if let Some(r) = rest.strip_prefix("END") {
+            let p = r.find('{').ok_or("awk: END needs {..}")?;
+            let q = match_brace(&r[p..]).ok_or("awk: unclosed {}")? + p;
+            end = String::from(&r[p + 1..q]);
+            rest = &r[q + 1..];
+            continue;
+        }
+        match rest.find('{') {
+            // pattern-only rule: `pat` alone means `pat { print $0 }`
+            None => {
+                rules.push((String::from(rest.trim()), String::from("print")));
+                rest = "";
+            }
+            Some(p) => {
+                let pat = rest[..p].trim();
+                let q = match_brace(&rest[p..]).ok_or("awk: unclosed {}")? + p;
+                rules.push((String::from(pat), String::from(&rest[p + 1..q])));
+                rest = &rest[q + 1..];
+            }
+        }
+    }
+    let mut vars: alloc::collections::BTreeMap<String, i64> = Default::default();
+    let mut out: Vec<String> = Vec::new();
+    awk_stmts(&begin, &String::from(input), 0, &[], &mut vars, &mut out)?;
+    for (ln, line) in input.lines().enumerate() {
+        let fields: Vec<String> = match fs {
+            Some(c) => line.split(c).map(String::from).collect(),
+            None => line.split_whitespace().map(String::from).collect(),
+        };
+        for (pat, body) in &rules {
+            if awk_pat_matches(pat, ln + 1, line)? {
+                awk_stmts(body, &String::from(line), ln + 1, &fields, &mut vars, &mut out)?;
+            }
+        }
+    }
+    awk_stmts(&end, &String::new(), input.lines().count(), &[], &mut vars, &mut out)?;
+    Ok(out)
+}
+
+/// index of the `}` matching the `{` at s[0] (nesting-aware, quote-aware).
+fn match_brace(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'{') {
+        return None;
+    }
+    let (mut d, mut i, mut q) = (0usize, 0usize, 0u8);
+    while i < b.len() {
+        match b[i] {
+            c if q != 0 && c == q => q = 0,
+            b'\'' | b'"' if q == 0 => q = b[i],
+            b'{' if q == 0 => d += 1,
+            b'}' if q == 0 => {
+                d -= 1;
+                if d == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn awk_pat_matches(pat: &str, nr: usize, line: &str) -> Result<bool, String> {
+    let p = pat.trim();
+    if p.is_empty() {
+        return Ok(true);
+    }
+    if p.starts_with('/') && p.ends_with('/') && p.len() >= 2 {
+        return Ok(line.contains(&p[1..p.len() - 1]));
+    }
+    if let Some(r) = p.strip_prefix("NR") {
+        let r = r.trim();
+        for op in ["==", "!=", ">=", "<=", ">", "<"] {
+            if let Some(n) = r.strip_prefix(op) {
+                let v: i64 = n.trim().parse().map_err(|_| "awk: bad NR cond")?;
+                let a = nr as i64;
+                return Ok(match op {
+                    "==" => a == v,
+                    "!=" => a != v,
+                    ">=" => a >= v,
+                    "<=" => a <= v,
+                    ">" => a > v,
+                    _ => a < v,
+                });
+            }
+        }
+        if let Some(n) = r.strip_prefix('%') {
+            // NR%n==m
+            let mut it = n.split("==");
+            let m: i64 = it.next().and_then(|x| x.trim().parse().ok()).ok_or("awk: bad NR%")?;
+            let v: i64 = it.next().and_then(|x| x.trim().parse().ok()).ok_or("awk: bad NR%")?;
+            return Ok(nr as i64 % m == v);
+        }
+        return Err(String::from("awk: bad NR condition"));
+    }
+    Ok(line.contains(p))
+}
+
+/// run `;`-separated awk stmts: `print expr,..` / `var=expr` / `var+=expr`.
+fn awk_stmts(
+    body: &str,
+    line: &String,
+    nr: usize,
+    fields: &[String],
+    vars: &mut alloc::collections::BTreeMap<String, i64>,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    for st in body.split(';') {
+        let st = st.trim();
+        if st.is_empty() {
+            continue;
+        }
+        if let Some(e) = st.strip_prefix("print") {
+            let e = e.trim();
+            if e.is_empty() {
+                out.push(line.clone());
+                continue;
+            }
+            let mut parts = Vec::new();
+            let mut dep = 0i32;
+            let mut last = 0;
+            for (i, c) in e.char_indices() {
+                match c {
+                    '(' => dep += 1,
+                    ')' => dep -= 1,
+                    ',' if dep == 0 => {
+                        parts.push(&e[last..i]);
+                        last = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            parts.push(&e[last..]);
+            let vals: Result<Vec<String>, String> = parts
+                .iter()
+                .map(|p| awk_show(p.trim(), line, nr, fields, vars))
+                .collect();
+            out.push(vals?.join(" "));
+        } else if let Some(p) = st.find("+=") {
+            let name = st[..p].trim();
+            let rhs = st[p + 2..].trim();
+            let v = awk_num(rhs, line, nr, fields, vars)?;
+            *vars.entry(String::from(name)).or_insert(0) += v;
+        } else if let Some(p) = st.find('=') {
+            let name = st[..p].trim();
+            let rhs = st[p + 1..].trim();
+            vars.insert(String::from(name), awk_num(rhs, line, nr, fields, vars)?);
+        } else {
+            return Err(alloc::format!("awk: unknown stmt '{}'", st));
+        }
+    }
+    Ok(())
+}
+
+/// awk value display: string literal or numeric expr result.
+fn awk_show(
+    e: &str,
+    line: &str,
+    nr: usize,
+    fields: &[String],
+    vars: &alloc::collections::BTreeMap<String, i64>,
+) -> Result<String, String> {
+    if e.starts_with('"') && e.ends_with('"') && e.len() >= 2 {
+        return Ok(String::from(&e[1..e.len() - 1]));
+    }
+    // bare $N / $NF / $0 prints the raw field text (awk semantics)
+    if let Some(r) = e.strip_prefix('$') {
+        let r = r.trim();
+        let idx = if r == "NF" {
+            Some(fields.len())
+        } else {
+            r.parse::<usize>().ok()
+        };
+        if let Some(i) = idx {
+            return Ok(if i == 0 {
+                String::from(line)
+            } else {
+                fields.get(i - 1).cloned().unwrap_or_default()
+            });
+        }
+    }
+    Ok(alloc::format!("{}", awk_num(e, line, nr, fields, vars)?))
+}
+
+/// numeric expression: terms `+ -` then `* / %`, parens, $N/$NF, NF, NR, vars.
+fn awk_num(
+    e: &str,
+    line: &str,
+    nr: usize,
+    fields: &[String],
+    vars: &alloc::collections::BTreeMap<String, i64>,
+) -> Result<i64, String> {
+    let b = e.as_bytes();
+    let mut pos = 0usize;
+    fn ws(b: &[u8], p: &mut usize) {
+        while *p < b.len() && b[*p].is_ascii_whitespace() {
+            *p += 1;
+        }
+    }
+    fn atom(
+        b: &[u8],
+        p: &mut usize,
+        line: &str,
+        nr: usize,
+        fields: &[String],
+        vars: &alloc::collections::BTreeMap<String, i64>,
+    ) -> Result<i64, String> {
+        ws(b, p);
+        if *p >= b.len() {
+            return Err(String::from("awk: empty expr"));
+        }
+        if b[*p] == b'(' {
+            *p += 1;
+            let v = expr(b, p, line, nr, fields, vars)?;
+            ws(b, p);
+            if *p >= b.len() || b[*p] != b')' {
+                return Err(String::from("awk: missing ')'"));
+            }
+            *p += 1;
+            return Ok(v);
+        }
+        if b[*p] == b'-' {
+            *p += 1;
+            return Ok(-atom(b, p, line, nr, fields, vars)?);
+        }
+        if b[*p] == b'$' {
+            *p += 1;
+            ws(b, p);
+            let s = *p;
+            while *p < b.len() && b[*p].is_ascii_alphanumeric() {
+                *p += 1;
+            }
+            let t = &b[s..*p];
+            let idx = if t == b"NF" {
+                fields.len()
+            } else {
+                core::str::from_utf8(t)
+                    .ok()
+                    .and_then(|x| x.parse::<usize>().ok())
+                    .ok_or("awk: bad $ref")?
+            };
+            let f = if idx == 0 {
+                line.to_string()
+            } else {
+                fields.get(idx - 1).cloned().unwrap_or_default()
+            };
+            // awk field->number: leading numeric prefix (sign + digits), else 0
+            let t: String = f
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '+')
+                .collect();
+            return Ok(t.parse().unwrap_or(0));
+        }
+        let s = *p;
+        while *p < b.len() && (b[*p].is_ascii_alphanumeric() || b[*p] == b'_') {
+            *p += 1;
+        }
+        let t = core::str::from_utf8(&b[s..*p]).unwrap_or("");
+        if t == "NR" {
+            return Ok(nr as i64);
+        }
+        if t == "NF" {
+            return Ok(fields.len() as i64);
+        }
+        if let Ok(v) = t.parse::<i64>() {
+            return Ok(v);
+        }
+        if t.is_empty() {
+            return Err(String::from("awk: empty term"));
+        }
+        Ok(*vars.get(t).unwrap_or(&0))
+    }
+    fn term(
+        b: &[u8],
+        p: &mut usize,
+        line: &str,
+        nr: usize,
+        fields: &[String],
+        vars: &alloc::collections::BTreeMap<String, i64>,
+    ) -> Result<i64, String> {
+        let mut v = atom(b, p, line, nr, fields, vars)?;
+        loop {
+            ws(b, p);
+            let op = match b.get(*p) {
+                Some(b'*') => b'*',
+                Some(b'/') => b'/',
+                Some(b'%') => b'%',
+                _ => break,
+            };
+            *p += 1;
+            let r = atom(b, p, line, nr, fields, vars)?;
+            v = match op {
+                b'*' => v * r,
+                b'/' => v.checked_div(r).ok_or("awk: div by 0")?,
+                _ => v.checked_rem(r).ok_or("awk: mod by 0")?,
+            };
+        }
+        Ok(v)
+    }
+    fn expr(
+        b: &[u8],
+        p: &mut usize,
+        line: &str,
+        nr: usize,
+        fields: &[String],
+        vars: &alloc::collections::BTreeMap<String, i64>,
+    ) -> Result<i64, String> {
+        let mut v = term(b, p, line, nr, fields, vars)?;
+        loop {
+            ws(b, p);
+            let op = match b.get(*p) {
+                Some(b'+') => b'+',
+                Some(b'-') => b'-',
+                _ => break,
+            };
+            *p += 1;
+            let r = term(b, p, line, nr, fields, vars)?;
+            v = if op == b'+' { v + r } else { v - r };
+        }
+        Ok(v)
+    }
+    let v = expr(b, &mut pos, line, nr, fields, vars)?;
+    ws(b, &mut pos);
+    if pos < b.len() {
+        return Err(alloc::format!("awk: trailing '{}'", &e[pos..]));
+    }
+    Ok(v)
+}
+
 /// Traditional-diff line-range notation: `N` or `N,M` (1-based inclusive).
 fn rng(lo0: usize, hi0: usize) -> String {
     // input is 0-based [lo,hi)
@@ -642,6 +1011,96 @@ fn rng(lo0: usize, hi0: usize) -> String {
     } else {
         alloc::format!("{},{}", lo0 + 1, hi0)
     }
+}
+
+/// Unified-context diff (`diff -u`): `@@ -s,c +s,c @@` hunks with `ctx`
+/// context lines; change runs <=2*ctx apart merge into one hunk.
+fn diff_unified(a: &[String], b: &[String], ctx: usize) -> Vec<String> {
+    let mut lo = 0usize;
+    let (mut ahi, mut bhi) = (a.len(), b.len());
+    while lo < ahi && lo < bhi && a[lo] == b[lo] {
+        lo += 1;
+    }
+    while ahi > lo && bhi > lo && a[ahi - 1] == b[bhi - 1] {
+        ahi -= 1;
+        bhi -= 1;
+    }
+    let ops = diff_ops(&a[lo..ahi], &b[lo..bhi]);
+    let mut out: Vec<String> = Vec::new();
+    let mut k = 0usize;
+    let (mut ai, mut bi) = (lo, lo); // absolute 0-based line indices
+    while k < ops.len() {
+        // eq run before the next change
+        let mut eqs = 0usize;
+        while let Some(DiffOp::Eq) = ops.get(k) {
+            k += 1;
+            eqs += 1;
+        }
+        if k == ops.len() {
+            break;
+        }
+        // hunk: leading context = min(ctx, eqs)
+        let lead = eqs.min(ctx);
+        let hs_a = ai + eqs - lead;
+        let hs_b = bi + eqs - lead;
+        let mut lines: Vec<String> = Vec::new();
+        // emit the last `lead` eq lines as leading context
+        for t in 0..lead {
+            lines.push(alloc::format!(" {}", a[ai + eqs - lead + t]));
+        }
+        ai += eqs;
+        bi += eqs;
+        // consume change ops, merging following eq runs <=2*ctx
+        loop {
+            while k < ops.len() {
+                match ops[k] {
+                    DiffOp::Del(d) => {
+                        lines.push(alloc::format!("-{}", a[lo + d]));
+                        ai += 1;
+                        k += 1;
+                    }
+                    DiffOp::Add(x) => {
+                        lines.push(alloc::format!("+{}", b[lo + x]));
+                        bi += 1;
+                        k += 1;
+                    }
+                    DiffOp::Eq => break,
+                }
+            }
+            // peek at the eq run after the change run
+            let mut q = k;
+            let mut run = 0usize;
+            while let Some(DiffOp::Eq) = ops.get(q) {
+                q += 1;
+                run += 1;
+            }
+            let tail = run.min(ctx);
+            if q == ops.len() || run > 2 * ctx {
+                // hunk ends: emit only `tail` context eqs
+                for _ in 0..tail {
+                    lines.push(alloc::format!(" {}", a[ai]));
+                    ai += 1;
+                    bi += 1;
+                    k += 1;
+                }
+                break;
+            }
+            // short eq run: keep it and merge with the next change run
+            for _ in 0..run {
+                lines.push(alloc::format!(" {}", a[ai]));
+                ai += 1;
+                bi += 1;
+                k += 1;
+            }
+        }
+        let alen = lines.iter().filter(|l| !l.starts_with('+')).count();
+        let blen = lines.iter().filter(|l| !l.starts_with('-')).count();
+        let a_start = if alen == 0 { hs_a } else { hs_a + 1 };
+        let b_start = if blen == 0 { hs_b } else { hs_b + 1 };
+        out.push(alloc::format!("@@ -{},{} +{},{} @@", a_start, alen, b_start, blen));
+        out.extend(lines);
+    }
+    out
 }
 
 /// Parse a note name (`A4`, `C#5`, `Eb3`, `R` = rest) or a raw frequency
@@ -871,6 +1330,99 @@ fn tar_octal(buf: &mut [u8], off: usize, w: usize, v: u64) {
     buf[off + n] = 0;
 }
 
+/// mkdir -p: create each missing component of `path` (absolute or relative).
+fn mkdir_p(path: &str) -> Result<(), i64> {
+    let mut cur = String::new();
+    if path.starts_with('/') {
+        cur.push('/');
+    }
+    for c in path.split('/').filter(|c| !c.is_empty()) {
+        if !cur.is_empty() && !cur.ends_with('/') {
+            cur.push('/');
+        }
+        cur.push_str(c);
+        match ustd::mkdir(&cur) {
+            Ok(()) | Err(_) => {} // exists-or-created both fine
+        }
+    }
+    Ok(())
+}
+
+/// Append `path` (file or directory) to a ustar archive; recurses into dirs
+/// emitting typeflag-'5' directory entries. `name` in the archive keeps the
+/// path given (stripped of a leading '/').
+fn tar_add(arc: &mut Vec<u8>, path: &str) -> usize {
+    let st = match ustd::stat(path) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let name = path.trim_start_matches('/');
+    if st.is_dir != 0 {
+        // dir entry
+        let mut h = [0u8; 512];
+        let dn = alloc::format!("{}/", name.trim_end_matches('/'));
+        let nb = dn.as_bytes();
+        let nn = nb.len().min(100);
+        h[..nn].copy_from_slice(&nb[..nn]);
+        tar_octal(&mut h, 100, 8, 0o755);
+        tar_octal(&mut h, 136, 12, st.mtime);
+        for i in 148..156 {
+            h[i] = b' ';
+        }
+        h[156] = b'5';
+        h[257..263].copy_from_slice(b"ustar\0");
+        h[263] = b'0';
+        h[264] = b'0';
+        let sum: u64 = h.iter().map(|b| *b as u64).sum();
+        tar_octal(&mut h, 148, 8, sum);
+        h[155] = b' ';
+        arc.extend_from_slice(&h);
+        let mut n = 1usize;
+        if let Ok(ents) = ustd::readdir(path) {
+            for e in ents {
+                let en = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("");
+                if en == "." || en == ".." || en.is_empty() {
+                    continue;
+                }
+                let c = tar_add(arc, &alloc::format!("{}/{}", path, en));
+                if c == 0 {
+                    return 0;
+                }
+                n += c;
+            }
+        }
+        return n;
+    }
+    let d = match ustd::read_all(path) {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+    let mut h = [0u8; 512];
+    let nb = name.as_bytes();
+    let nn = nb.len().min(100);
+    h[..nn].copy_from_slice(&nb[..nn]);
+    tar_octal(&mut h, 100, 8, 0o644); // mode
+    tar_octal(&mut h, 108, 8, 0); // uid
+    tar_octal(&mut h, 116, 8, 0); // gid
+    tar_octal(&mut h, 124, 12, d.len() as u64); // size
+    tar_octal(&mut h, 136, 12, st.mtime); // mtime
+    for i in 148..156 {
+        h[i] = b' ';
+    }
+    h[156] = b'0'; // regular file
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263] = b'0';
+    h[264] = b'0';
+    let sum: u64 = h.iter().map(|b| *b as u64).sum();
+    tar_octal(&mut h, 148, 8, sum);
+    h[155] = b' ';
+    arc.extend_from_slice(&h);
+    arc.extend_from_slice(&d);
+    let pad = (512 - d.len() % 512) % 512;
+    arc.resize(arc.len() + pad, 0);
+    1
+}
+
 /// Options for one grep pass (file or stdin).
 #[derive(Clone, Copy, Default)]
 struct GrepOpts {
@@ -1012,6 +1564,141 @@ impl Term {
     fn fail(&mut self, s: &str) {
         self.last_ok = false;
         self.emit(s);
+    }
+
+    /// Apply a unified diff to files in cwd: `---`/`+++` headers pick the
+    /// target, each `@@ -s,c +s,c @@` hunk is located by matching its
+    /// context+removed lines (searched ±64 lines around the expected spot,
+    /// tracking cumulative offset like real patch).
+    fn run_patch(&mut self, text: &str) {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut i = 0usize;
+        let mut any = false;
+        while i < lines.len() {
+            // --- a/name / --- name
+            if !lines[i].starts_with("--- ") {
+                i += 1;
+                continue;
+            }
+            let mut target = String::new();
+            // GNU patch prefers the '---' (old) name; fall back to '+++'
+            let mut name = |l: &str| -> String {
+                let n = l[4..].trim().split_whitespace().next().unwrap_or("");
+                let n = n.strip_prefix("a/").or_else(|| n.strip_prefix("b/")).unwrap_or(n);
+                String::from(n)
+            };
+            if let Some(p) = lines.get(i + 1) {
+                if p.starts_with("+++ ") {
+                    let old_name = name(lines[i]);
+                    let new_name = name(p);
+                    target = if ustd::stat(&old_name).is_ok() || new_name.is_empty() {
+                        old_name
+                    } else {
+                        new_name
+                    };
+                    i += 2;
+                } else {
+                    i += 1;
+                    continue;
+                }
+            }
+            // gather this file's hunks
+            let mut hunks: Vec<(usize, Vec<String>, Vec<String>)> = Vec::new();
+            while i < lines.len() && !lines[i].starts_with("--- ") {
+                if !lines[i].starts_with("@@") {
+                    i += 1;
+                    continue;
+                }
+                let hdr = lines[i];
+                i += 1;
+                // @@ -a,b +c,d @@
+                let (a_start, _b_start) = match parse_hunk(hdr) {
+                    Some(x) => x,
+                    None => {
+                        self.fail(&alloc::format!("patch: bad hunk header '{}'", hdr));
+                        return;
+                    }
+                };
+                let (mut old, mut new) = (Vec::new(), Vec::new());
+                while i < lines.len() {
+                    let l = lines[i];
+                    if let Some(r) = l.strip_prefix(' ') {
+                        old.push(String::from(r));
+                        new.push(String::from(r));
+                    } else if let Some(r) = l.strip_prefix('-') {
+                        old.push(String::from(r));
+                    } else if let Some(r) = l.strip_prefix('+') {
+                        new.push(String::from(r));
+                    } else if l.starts_with('\\') {
+                        // "\ No newline at end of file" — ignore
+                    } else {
+                        break;
+                    }
+                    i += 1;
+                }
+                hunks.push((a_start, old, new));
+            }
+            if target.is_empty() || hunks.is_empty() {
+                continue;
+            }
+            let data = match ustd::read_all(&target) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.fail(&alloc::format!("patch: {}: err {}", target, e));
+                    continue;
+                }
+            };
+            let src: Vec<String> = String::from_utf8_lossy(&data)
+                .lines()
+                .map(String::from)
+                .collect();
+            let mut cur = src.clone();
+            let mut off = 0i64;
+            let mut ok = true;
+            for (hno, (a_start, old, new)) in hunks.iter().enumerate() {
+                // expected 0-based position + cumulative offset; search ±64
+                let want = (*a_start as i64 + off - 1).max(0) as usize;
+                let mut at = None;
+                'scan: for d in 0..64usize {
+                    for cand in [want.saturating_add(d), want.saturating_sub(d)] {
+                        if cand + old.len() <= cur.len()
+                            && (0..old.len()).all(|x| cur[cand + x] == old[x])
+                        {
+                            at = Some(cand);
+                            break 'scan;
+                        }
+                    }
+                }
+                match at {
+                    Some(pos) => {
+                        cur.splice(pos..pos + old.len(), new.iter().cloned());
+                        off = pos as i64 + old.len() as i64 - (*a_start as i64 - 1 + old.len() as i64);
+                        self.emit(&alloc::format!(
+                            "patching {}: hunk #{} ok at line {}",
+                            target, hno + 1, pos + 1
+                        ));
+                    }
+                    None => {
+                        self.fail(&alloc::format!(
+                            "patch: {}: hunk #{} FAILED at {}",
+                            target, hno + 1, a_start
+                        ));
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                let joined = cur.join("\n") + "\n";
+                match ustd::write_all(&target, joined.as_bytes()) {
+                    Ok(()) => any = true,
+                    Err(e) => self.fail(&alloc::format!("patch: {}: err {}", target, e)),
+                }
+            }
+        }
+        if !any {
+            self.fail("patch: no hunks applied");
+        }
     }
 
     /// Run `cmd` with output captured; returns the captured lines.
@@ -2056,8 +2743,10 @@ impl Term {
                     "          sh <file> args -> $0 $1..$N $#   !<prefix> reruns match",
                     "          more: Space/b page, / search, n next",
                     "          beep [hz ms]  play <file> (NOTE|HZ,DUR per line, R=rest)",
-                    "          unzip (STORE+DEFLATE)  gunzip [-c] f.gz  zcat  /proc/*",
+                    "          zip (deflate)/unzip/zipinfo  gzip [-c]  gunzip  zcat  /proc/*",
                     "          sh: case W in p|p) .. ;; esac   cmd <<EOF heredoc",
+                    "          diff -u <a> <b>  patch <file.diff>  awk [-F c] 'prog' [file]",
+                    "          tar cf|tf|tv|xf (dirs recurse, xf honors paths)",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ];
@@ -2749,8 +3438,8 @@ impl Term {
                 self.emit(&line);
             }
             "zip" => {
-                // real ZIP container, STORE (uncompressed) entries with real
-                // CRC32s -- extractable by any standard unzip / Explorer
+                // real ZIP container: entries deflate (method 8) when that
+                // wins, else STORE — extractable by any standard unzip.
                 let Some(zname) = args.first() else {
                     self.fail("usage: zip <out.zip> <file>...");
                     return;
@@ -2769,29 +3458,35 @@ impl Term {
                     };
                     let name = f.trim_start_matches('/');
                     let crc = crc32(&data);
+                    let def = ustd::deflate::deflate(&data);
+                    let (body, method) = if def.len() < data.len() {
+                        (def, 8u16)
+                    } else {
+                        (data.clone(), 0u16)
+                    };
                     let lhoff = out.len() as u32;
                     out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
                     out.extend_from_slice(&20u16.to_le_bytes()); // version needed
                     out.extend_from_slice(&0u16.to_le_bytes());  // flags
-                    out.extend_from_slice(&0u16.to_le_bytes());  // method: STORE
+                    out.extend_from_slice(&method.to_le_bytes());
                     out.extend_from_slice(&mt.to_le_bytes());
                     out.extend_from_slice(&md.to_le_bytes());
                     out.extend_from_slice(&crc.to_le_bytes());
-                    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
                     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
                     out.extend_from_slice(&(name.len() as u16).to_le_bytes());
                     out.extend_from_slice(&0u16.to_le_bytes()); // extra len
                     out.extend_from_slice(name.as_bytes());
-                    out.extend_from_slice(&data);
+                    out.extend_from_slice(&body);
                     central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
                     central.extend_from_slice(&20u16.to_le_bytes()); // made by
                     central.extend_from_slice(&20u16.to_le_bytes()); // need
                     central.extend_from_slice(&0u16.to_le_bytes());
-                    central.extend_from_slice(&0u16.to_le_bytes());
+                    central.extend_from_slice(&method.to_le_bytes());
                     central.extend_from_slice(&mt.to_le_bytes());
                     central.extend_from_slice(&md.to_le_bytes());
                     central.extend_from_slice(&crc.to_le_bytes());
-                    central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                    central.extend_from_slice(&(body.len() as u32).to_le_bytes());
                     central.extend_from_slice(&(data.len() as u32).to_le_bytes());
                     central.extend_from_slice(&(name.len() as u16).to_le_bytes());
                     central.extend_from_slice(&0u16.to_le_bytes()); // extra
@@ -2802,7 +3497,11 @@ impl Term {
                     central.extend_from_slice(&lhoff.to_le_bytes());
                     central.extend_from_slice(name.as_bytes());
                     n += 1;
-                    self.emit(&alloc::format!("  add: {}", name));
+                    self.emit(&alloc::format!(
+                        "  add: {} ({} -> {} B{})",
+                        name, data.len(), body.len(),
+                        if method == 8 { ", deflate" } else { ", stored" }
+                    ));
                 }
                 if n == 0 {
                     self.fail("zip: no files added");
@@ -2889,6 +3588,19 @@ impl Term {
                         .get(off + 46..off + 46 + nlen)
                         .map(|b| String::from_utf8_lossy(b).into_owned())
                         .unwrap_or_default();
+                    // sanitize member path: no leading '/', no '.'/'..' parts
+                    let is_dir_ent = name.ends_with('/');
+                    let name: String = name
+                        .split('/')
+                        .filter(|c| !c.is_empty() && *c != "." && *c != "..")
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    if name.is_empty() {
+                        count += 1;
+                        n -= 1;
+                        off += 46 + nlen + elen + clen;
+                        continue;
+                    }
                     if list_only {
                         self.emit(&alloc::format!("{:>8}  {}", usize_, name));
                     } else {
@@ -2924,11 +3636,12 @@ impl Term {
                                 self.fail(&alloc::format!("unzip: {}: size mismatch", name));
                             } else {
                                 let outp = if dest.is_empty() {
-                                    alloc::format!("/{}", name)
+                                    // no -d: extract relative to the CWD
+                                    name.clone()
                                 } else {
                                     alloc::format!("{}/{}", dest.trim_end_matches('/'), name)
                                 };
-                                if name.ends_with('/') {
+                                if is_dir_ent {
                                     let _ = ustd::mkdir(&outp);
                                 } else {
                                     mkdir_parents(&outp);
@@ -2950,6 +3663,37 @@ impl Term {
                 }
                 if count == 0 {
                     self.fail("unzip: empty or corrupt central directory");
+                }
+            }
+            "gzip" => {
+                // gzip [-c] file — real DEFLATE compression, writes file.gz
+                // (or stdout with -c). Source is kept.
+                let to_stdout = args.first().map(|a| *a == "-c").unwrap_or(false);
+                let path = args.iter().find(|a| !a.starts_with('-')).copied();
+                let Some(p) = path else {
+                    self.fail("usage: gzip [-c] <file>");
+                    return;
+                };
+                match ustd::read_all(p) {
+                    Ok(d) => {
+                        let gz = ustd::deflate::gzip_data(&d);
+                        if to_stdout {
+                            for l in String::from_utf8_lossy(&gz).lines() {
+                                self.emit(l);
+                            }
+                        } else {
+                            let outp = alloc::format!("{}.gz", p);
+                            match ustd::write_all(&outp, &gz) {
+                                Ok(()) => self.emit(&alloc::format!(
+                                    "{} -> {} ({} -> {} B, saved {}%)",
+                                    p, outp, d.len(), gz.len(),
+                                    100usize.saturating_sub(gz.len() * 100 / d.len().max(1))
+                                )),
+                                Err(e) => self.fail(&alloc::format!("gzip: {}: err {}", outp, e)),
+                            }
+                        }
+                    }
+                    Err(e) => self.fail(&alloc::format!("gzip: {}: err {}", p, e)),
                 }
             }
             "gunzip" | "zcat" => {
@@ -3957,53 +4701,40 @@ impl Term {
                         }
                     }
                     "tar" => {
-                        // minimal ustar: tar cf out.tar f.. | tar tf a.tar | tar xf a.tar
+                        // ustar: tar cf out.tar <file|dir>.. | tar tf|tv a.tar | tar xf a.tar [members..]
+                        // cf walks dirs recursively emitting '5' dir entries;
+                        // xf honors member paths (mkdir -p parents, '..' dropped).
                         let sub = args.first().copied().unwrap_or("");
-                        match sub {
+                        let op = if sub.contains('c') {
+                            "cf"
+                        } else if sub.contains('x') {
+                            "xf"
+                        } else if sub.contains('t') {
+                            if sub.contains('v') { "tv" } else { "tf" }
+                        } else {
+                            ""
+                        };
+                        match op {
                             "cf" => match (args.get(1), args.get(2)) {
                                 (Some(out), Some(_)) => {
                                     let mut arc: Vec<u8> = Vec::new();
                                     let mut ok = true;
+                                    let mut nmem = 0usize;
                                     for f in &args[2..] {
-                                        let (d, st) = match (ustd::read_all(f), ustd::stat(f)) {
-                                            (Ok(d), Ok(st)) => (d, st),
-                                            _ => {
-                                                self.fail(&alloc::format!("tar: {}: unreadable", f));
-                                                ok = false;
-                                                break;
-                                            }
-                                        };
-                                        let mut h = [0u8; 512];
-                                        let name = f.rsplit('/').next().unwrap_or(f);
-                                        let nb = name.as_bytes();
-                                        let nn = nb.len().min(100);
-                                        h[..nn].copy_from_slice(&nb[..nn]);
-                                        tar_octal(&mut h, 100, 8, 0o644); // mode
-                                        tar_octal(&mut h, 108, 8, 0); // uid
-                                        tar_octal(&mut h, 116, 8, 0); // gid
-                                        tar_octal(&mut h, 124, 12, d.len() as u64); // size
-                                        tar_octal(&mut h, 136, 12, st.mtime); // mtime
-                                        for i in 148..156 {
-                                            h[i] = b' ';
+                                        let c = tar_add(&mut arc, f.trim_end_matches('/'));
+                                        if c == 0 {
+                                            self.fail(&alloc::format!("tar: {}: unreadable", f));
+                                            ok = false;
+                                            break;
                                         }
-                                        h[156] = b'0'; // regular file
-                                        h[257..263].copy_from_slice(b"ustar\0");
-                                        h[263] = b'0';
-                                        h[264] = b'0';
-                                        let sum: u64 = h.iter().map(|b| *b as u64).sum();
-                                        tar_octal(&mut h, 148, 8, sum);
-                                        h[155] = b' ';
-                                        arc.extend_from_slice(&h);
-                                        arc.extend_from_slice(&d);
-                                        let pad = (512 - d.len() % 512) % 512;
-                                        arc.resize(arc.len() + pad, 0);
+                                        nmem += c;
                                     }
                                     if ok {
                                         arc.resize(arc.len() + 1024, 0);
                                         match ustd::write_all(out, &arc) {
                                             Ok(()) => self.emit(&alloc::format!(
                                                 "tar: {} -> {} ({} B)",
-                                                args.len() - 2,
+                                                nmem,
                                                 out,
                                                 arc.len()
                                             )),
@@ -4012,11 +4743,16 @@ impl Term {
                                         }
                                     }
                                 }
-                                _ => self.fail("usage: tar cf out.tar <file...>"),
+                                _ => self.fail("usage: tar cf out.tar <file|dir...>"),
                             },
-                            "tf" | "xf" => match args.get(1) {
+                            "tf" | "tv" | "xf" => match args.get(1) {
                                 Some(path) => match ustd::read_all(path) {
                                     Ok(d) => {
+                                        // optional member filter: tar xf a.tar m1 m2
+                                        let filter: Vec<&str> = args[2..]
+                                            .iter()
+                                            .map(|s| s.trim_start_matches('/'))
+                                            .collect();
                                         let mut off = 0usize;
                                         let mut nfiles = 0usize;
                                         loop {
@@ -4035,35 +4771,80 @@ impl Term {
                                                 8,
                                             )
                                             .unwrap_or(0);
+                                            let is_dir = h[156] == b'5';
                                             off += 512;
-                                            if sub == "tf" {
-                                                self.emit(name);
-                                            } else {
-                                                let data = &d[off..off + size as usize];
-                                                let base = name.rsplit('/').next().unwrap_or(name);
-                                                match ustd::write_all(base, data) {
-                                                    Ok(()) => self.emit(&alloc::format!(
-                                                        "x {} ({} B)",
-                                                        base, size
-                                                    )),
-                                                    Err(e) => self.fail(&alloc::format!(
-                                                        "tar: {}: err {}",
-                                                        base, e
-                                                    )),
+                                            let want = filter.is_empty()
+                                                || filter.iter().any(|f| name == *f
+                                                    || name.starts_with(&alloc::format!("{}/", f)));
+                                            if want {
+                                                if op == "tf" {
+                                                    self.emit(name);
+                                                } else if op == "tv" {
+                                                    let mtime = u64::from_str_radix(
+                                                        core::str::from_utf8(&h[136..148])
+                                                            .unwrap_or("")
+                                                            .trim_matches(|c| c == '\0' || c == ' '),
+                                                        8,
+                                                    )
+                                                    .unwrap_or(0);
+                                                    let (y, mo, dd, hh, mm, _s) = epoch_to_dt(mtime);
+                                                    self.emit(&alloc::format!(
+                                                        "{}{:>9} {:04}-{:02}-{:02} {:02}:{:02}  {}",
+                                                        if is_dir { "d" } else { "-" },
+                                                        size, y, mo, dd, hh, mm, name
+                                                    ));
+                                                } else {
+                                                    // xf: honor member path (drop .. / leading /)
+                                                    let mut parts: Vec<&str> = name
+                                                        .split('/')
+                                                        .filter(|c| !c.is_empty() && *c != "." && *c != "..")
+                                                        .collect();
+                                                    if is_dir {
+                                                        parts.pop();
+                                                    }
+                                                    let rel = parts.join("/");
+                                                    if rel.is_empty() {
+                                                        nfiles += 1;
+                                                        off += ((size as usize) + 511) / 512 * 512;
+                                                        continue;
+                                                    }
+                                                    if is_dir {
+                                                        let _ = mkdir_p(&rel);
+                                                        self.emit(&alloc::format!("x {}/", rel));
+                                                    } else {
+                                                        if let Some((dpar, _)) = rel.rsplit_once('/') {
+                                                            let _ = mkdir_p(dpar);
+                                                        }
+                                                        let data = &d[off..off + size as usize];
+                                                        match ustd::write_all(&rel, data) {
+                                                            Ok(()) => self.emit(&alloc::format!(
+                                                                "x {} ({} B)",
+                                                                rel, size
+                                                            )),
+                                                            Err(e) => self.fail(&alloc::format!(
+                                                                "tar: {}: err {}",
+                                                                rel, e
+                                                            )),
+                                                        }
+                                                    }
                                                 }
+                                                nfiles += 1;
                                             }
-                                            nfiles += 1;
                                             off += ((size as usize) + 511) / 512 * 512;
                                         }
                                         if nfiles == 0 {
-                                            self.fail("tar: empty or invalid archive");
+                                            self.fail(if filter.is_empty() {
+                                                "tar: empty or invalid archive"
+                                            } else {
+                                                "tar: no matching members"
+                                            });
                                         }
                                     }
                                     Err(e) => self.fail(&alloc::format!("tar: {}: err {}", path, e)),
                                 },
-                                None => self.fail(&alloc::format!("usage: tar {} <a.tar>", sub)),
+                                None => self.fail(&alloc::format!("usage: tar {} <a.tar> [members..]", sub)),
                             },
-                            _ => self.fail("usage: tar cf|tf|xf ..."),
+                            _ => self.fail("usage: tar cf|tf|tv|xf ..."),
                         }
                     }
                     "uniq" => {
@@ -4250,6 +5031,47 @@ impl Term {
                     _ => {}
                 }
             }
+            "awk" => {
+                // awk [-F c] 'prog' [file] — input = file arg or stdin
+                let (mut fs, mut rest) = (None, args.as_slice());
+                if let Some(f) = rest.first().and_then(|a| a.strip_prefix("-F")) {
+                    fs = f.chars().next();
+                    rest = &rest[1..];
+                }
+                let (prog, file) = match rest {
+                    [p] => (Some(*p), None),
+                    [p, f, ..] => (Some(*p), Some(*f)),
+                    _ => (None, None),
+                };
+                let Some(prog) = prog else {
+                    self.fail("usage: awk [-F c] 'prog' [file]");
+                    return;
+                };
+                let input = match file {
+                    Some(f) => match ustd::read_all(f) {
+                        Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                        Err(e) => {
+                            self.fail(&alloc::format!("awk: {}: err {}", f, e));
+                            return;
+                        }
+                    },
+                    None => match self.pipe_in.clone() {
+                        Some(s) => s,
+                        None => {
+                            self.fail("awk: no input (file arg or pipe)");
+                            return;
+                        }
+                    },
+                };
+                match awk_eval(prog, &input, fs) {
+                    Ok(lines) => {
+                        for l in lines {
+                            self.emit(&l);
+                        }
+                    }
+                    Err(e) => self.fail(&e),
+                }
+            }
             "netstat" => {
                 for l in ustd::net_stat().lines() {
                     self.emit(l);
@@ -4384,25 +5206,59 @@ impl Term {
                     Err(e) => self.fail(&alloc::format!("find: {}: err {}", dir, e)),
                 }
             }
-            "diff" => match (args.first(), args.get(1)) {
-                (Some(pa), Some(pb)) => match (ustd::read_all(pa), ustd::read_all(pb)) {
-                    (Ok(da), Ok(db)) => {
-                        let sa = String::from_utf8_lossy(&da).into_owned();
-                        let sb = String::from_utf8_lossy(&db).into_owned();
-                        let la: Vec<String> = sa.lines().take(1024).map(String::from).collect();
-                        let lb: Vec<String> = sb.lines().take(1024).map(String::from).collect();
-                        let out = diff_lines(&la, &lb);
-                        if out.is_empty() {
-                            self.emit("(identical)");
+            "diff" => {
+                // diff [-u] a b — ed-style by default, unified with -u
+                let unified = args.iter().any(|a| *a == "-u");
+                let paths: Vec<&&str> = args.iter().filter(|a| !a.starts_with('-')).collect();
+                match (paths.first(), paths.get(1)) {
+                    (Some(pa), Some(pb)) => match (ustd::read_all(pa), ustd::read_all(pb)) {
+                        (Ok(da), Ok(db)) => {
+                            let sa = String::from_utf8_lossy(&da).into_owned();
+                            let sb = String::from_utf8_lossy(&db).into_owned();
+                            let la: Vec<String> = sa.lines().take(1024).map(String::from).collect();
+                            let lb: Vec<String> = sb.lines().take(1024).map(String::from).collect();
+                            let out = if unified {
+                                diff_unified(&la, &lb, 3)
+                            } else {
+                                diff_lines(&la, &lb)
+                            };
+                            if out.is_empty() {
+                                self.emit("(identical)");
+                            }
+                            if unified && !out.is_empty() {
+                                self.emit(&alloc::format!("--- {}", pa));
+                                self.emit(&alloc::format!("+++ {}", pb));
+                            }
+                            for l in out {
+                                self.emit(&l);
+                            }
                         }
-                        for l in out {
-                            self.emit(&l);
+                        (Err(e), _) | (_, Err(e)) => {
+                            self.fail(&alloc::format!("diff: err {}", e))
                         }
-                    }
-                    (Err(e), _) | (_, Err(e)) => self.fail(&alloc::format!("diff: err {}", e)),
-                },
-                _ => self.fail("usage: diff <fileA> <fileB>"),
-            },
+                    },
+                    _ => self.fail("usage: diff [-u] <fileA> <fileB>"),
+                }
+            }
+            "patch" => {
+                // patch [file.diff] — apply a unified diff (from `diff -u`).
+                // Reads the diff file given, or stdin (pipe heredoc) when none.
+                let text = match args.first() {
+                    Some(p) => match ustd::read_all(p) {
+                        Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                        Err(e) => {
+                            self.fail(&alloc::format!("patch: {}: err {}", p, e));
+                            return;
+                        }
+                    },
+                    None => self.pipe_in.clone().unwrap_or_default(),
+                };
+                if text.is_empty() {
+                    self.fail("usage: patch <file.diff>   (or pipe a unified diff)");
+                    return;
+                }
+                self.run_patch(&text);
+            }
             "stat" => match args.first() {
                 Some(p) => match ustd::stat(p) {
                     Ok(st) => {
@@ -5612,8 +6468,8 @@ impl Term {
         "eval", "break", "continue", "return",
         "for", "while", "until", "if", "do", "done", "then", "else", "elif", "fi",
         "tac", "fold", "column", "truncate", "mktemp", "clip", "pushd", "popd",
-        "dirs", "zip", "unzip", "zipinfo", "beep", "play", "gunzip", "zcat",
-        "case", "esac",
+        "dirs", "zip", "unzip", "zipinfo", "beep", "play", "gzip", "gunzip", "zcat",
+        "patch", "awk", "case", "esac",
     ];
 
     /// Tab-complete: command names before the first space, paths after.

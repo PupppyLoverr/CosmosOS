@@ -14,6 +14,7 @@ use linked_list_allocator::LockedHeap;
 
 pub mod draw;
 pub mod img;
+pub mod deflate;
 pub mod inflate;
 // FONT16 moved to `shared` so the kernel can render its panic screen.
 pub mod font16 {
