@@ -27,6 +27,7 @@ struct Files {
     new_name: String,
     editing: bool,
     rename_from: Option<String>, // F2 rename: full path of the entry being renamed
+    menu: Option<(i32, i32, usize)>, // right-click menu: (x, y, entry index)
     dirty: bool,
 }
 
@@ -43,6 +44,46 @@ impl Files {
 
     fn entry_name(e: &shared::DirEntry) -> String {
         String::from_utf8_lossy(&e.name[..e.name_len as usize]).into_owned()
+    }
+
+    /// Full path of entry `i` under the current directory.
+    fn path_of(&self, i: usize) -> String {
+        alloc::format!(
+            "{}{}{}",
+            self.cwd,
+            if self.cwd.ends_with('/') { "" } else { "/" },
+            Self::entry_name(&self.ents[i])
+        )
+    }
+
+    /// Rename prompt armed on the selected entry (F2 / context menu).
+    fn start_rename(&mut self) {
+        if self.sel >= 0 && (self.sel as usize) < self.ents.len() {
+            let name = Self::entry_name(&self.ents[self.sel as usize]);
+            self.rename_from = Some(self.path_of(self.sel as usize));
+            self.editing = true;
+            self.new_name = name.clone();
+            self.status = alloc::format!("rename {}", name);
+        } else {
+            self.status = String::from("nothing selected");
+        }
+    }
+
+    /// Delete the selected entry (Del / toolbar / context menu).
+    fn delete_sel(&mut self) {
+        if self.sel >= 0 && (self.sel as usize) < self.ents.len() {
+            let name = Self::entry_name(&self.ents[self.sel as usize]);
+            let path = self.path_of(self.sel as usize);
+            match ustd::remove(&path) {
+                Ok(_) => {
+                    self.status = alloc::format!("deleted {}", name);
+                    self.reload();
+                }
+                Err(e) => self.status = alloc::format!("delete failed: {}", e),
+            }
+        } else {
+            self.status = String::from("nothing selected");
+        }
     }
 
     fn row_rect(&self, i: i32) -> (i32, i32, i32) {
@@ -101,10 +142,52 @@ impl Files {
         // status
         c.fill(0, c.h as i32 - 22, c.w as i32, 22, draw::EDGE);
         c.text(10, c.h as i32 - 19, &self.status, draw::DIM, None);
+        // right-click context menu
+        if let Some((mx, my, _)) = self.menu {
+            const MENU_W: i32 = 110;
+            const ITEMS: [&str; 3] = ["open", "rename", "delete"];
+            c.fill(mx, my, MENU_W, 22 * ITEMS.len() as i32, draw::PANEL);
+            c.border(mx, my, MENU_W, 22 * ITEMS.len() as i32, draw::EDGE);
+            for (i, it) in ITEMS.iter().enumerate() {
+                c.text(mx + 10, my + 6 + i as i32 * 22, it, draw::TEXT, None);
+            }
+        }
         self.win.present_all();
     }
 
     fn click(&mut self, x: i32, y: i32, buttons: u8) {
+        // an open context menu consumes the next click (item or dismiss)
+        if let Some((mx, my, mi)) = self.menu.take() {
+            const MENU_W: i32 = 110;
+            const MENU_H: i32 = 22 * 3;
+            if x >= mx && x < mx + MENU_W && y >= my && y < my + MENU_H {
+                self.sel = mi as i32;
+                match (y - my) / 22 {
+                    0 => self.open_selected(),
+                    1 => self.start_rename(),
+                    _ => self.delete_sel(),
+                }
+            }
+            self.dirty = true;
+            return;
+        }
+        // right-click on a row: select it + open the context menu
+        if buttons & 2 != 0 {
+            if y >= 40 {
+                let row = (y - 40 + self.scroll) / ROW_H;
+                let idx = row - if self.cwd != "/" { 1 } else { 0 };
+                if idx >= 0 && (idx as usize) < self.ents.len() {
+                    const MENU_W: i32 = 110;
+                    const MENU_H: i32 = 22 * 3;
+                    let mx = x.min(self.c.w as i32 - MENU_W - 2).max(0);
+                    let my = y.min(self.c.h as i32 - MENU_H - 24).max(34);
+                    self.menu = Some((mx, my, idx as usize));
+                    self.sel = idx as i32;
+                    self.dirty = true;
+                }
+            }
+            return;
+        }
         if buttons & 1 == 0 {
             return;
         }
@@ -118,20 +201,7 @@ impl Files {
                 self.new_name.clear();
                 self.status = String::from("type folder name, Enter to create");
             } else if x >= w - bw - 8 {
-                // delete selected
-                if self.sel >= 0 && (self.sel as usize) < self.ents.len() {
-                    let name = Self::entry_name(&self.ents[self.sel as usize]);
-                    let path = alloc::format!("{}{}{}", self.cwd, if self.cwd.ends_with('/') { "" } else { "/" }, name);
-                    match ustd::remove(&path) {
-                        Ok(_) => {
-                            self.status = alloc::format!("deleted {}", name);
-                            self.reload();
-                        }
-                        Err(e) => self.status = alloc::format!("delete failed: {}", e),
-                    }
-                } else {
-                    self.status = String::from("nothing selected");
-                }
+                self.delete_sel();
             }
             self.dirty = true;
             return;
@@ -246,32 +316,8 @@ impl Files {
                     self.open_selected();
                 }
             }
-            x if x == KeyCode::Delete as u32 => {
-                if self.sel >= 0 && (self.sel as usize) < self.ents.len() {
-                    let name = Self::entry_name(&self.ents[self.sel as usize]);
-                    let path = alloc::format!("{}{}{}", self.cwd, if self.cwd.ends_with('/') { "" } else { "/" }, name);
-                    match ustd::remove(&path) {
-                        Ok(_) => {
-                            self.status = alloc::format!("deleted {}", name);
-                            self.reload();
-                        }
-                        Err(e) => self.status = alloc::format!("delete failed: {}", e),
-                    }
-                } else {
-                    self.status = String::from("nothing selected");
-                }
-            }
-            x if x == KeyCode::F2 as u32 => {
-                if self.sel >= 0 && (self.sel as usize) < self.ents.len() {
-                    let name = Self::entry_name(&self.ents[self.sel as usize]);
-                    self.rename_from = Some(alloc::format!("{}{}{}", self.cwd, if self.cwd.ends_with('/') { "" } else { "/" }, name));
-                    self.editing = true;
-                    self.new_name = name.clone();
-                    self.status = alloc::format!("rename {}", name);
-                } else {
-                    self.status = String::from("nothing selected");
-                }
-            }
+            x if x == KeyCode::Delete as u32 => self.delete_sel(),
+            x if x == KeyCode::F2 as u32 => self.start_rename(),
             x if x == KeyCode::Backspace as u32 => {
                 if self.cwd != "/" {
                     let mut parts: Vec<&str> = self.cwd.split('/').filter(|s| !s.is_empty()).collect();
@@ -313,6 +359,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         new_name: String::new(),
         editing: false,
         rename_from: None,
+        menu: None,
         dirty: true,
     };
     f.reload();

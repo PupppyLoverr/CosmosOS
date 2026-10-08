@@ -31,9 +31,79 @@ struct Editor {
     status: String,
     drag_anchor: Option<usize>, // byte idx where the mouse press started
     ldown: bool,
+    undo: Vec<(usize, String, String)>, // (pos, deleted, inserted) inverse ops
+    redo: Vec<(usize, String, String)>,
+    ins_tail: Option<usize>,            // running typed-insert run start (coalescing)
 }
 
 impl Editor {
+    /// Record an edit's inverse for Ctrl-Z: the op deleted `del` and
+    /// inserted `ins` at byte `pos`. Any new edit clears the redo stack.
+    fn rec(&mut self, pos: usize, del: String, ins: String) {
+        if self.undo.len() >= 200 {
+            self.undo.remove(0);
+        }
+        self.undo.push((pos, del, ins));
+        self.redo.clear();
+    }
+
+    /// Typed-char inserts coalesce into the top undo op when contiguous.
+    fn rec_ins(&mut self, pos: usize, s: &str) {
+        if self.ins_tail == Some(pos) {
+            if let Some(last) = self.undo.last_mut() {
+                last.2.push_str(s);
+                self.ins_tail = Some(pos + s.len());
+                return;
+            }
+        }
+        self.rec(pos, String::new(), String::from(s));
+        self.ins_tail = Some(pos + s.len());
+    }
+
+    fn do_undo(&mut self) {
+        match self.undo.pop() {
+            Some((pos, del, ins)) => {
+                self.text
+                    .replace_range(pos..pos + ins.len(), "");
+                if !del.is_empty() {
+                    self.text.insert_str(pos, &del);
+                }
+                self.cx = pos + del.len();
+                self.redo.push((pos, del, ins));
+                self.sel = None;
+                self.ins_tail = None;
+                self.dirty_text = true;
+                self.dirty_ui = true;
+            }
+            None => {
+                self.status = String::from("nothing to undo");
+                self.dirty_ui = true;
+            }
+        }
+    }
+
+    fn do_redo(&mut self) {
+        match self.redo.pop() {
+            Some((pos, del, ins)) => {
+                self.text
+                    .replace_range(pos..pos + del.len(), "");
+                if !ins.is_empty() {
+                    self.text.insert_str(pos, &ins);
+                }
+                self.cx = pos + ins.len();
+                self.undo.push((pos, del, ins));
+                self.sel = None;
+                self.ins_tail = None;
+                self.dirty_text = true;
+                self.dirty_ui = true;
+            }
+            None => {
+                self.status = String::from("nothing to redo");
+                self.dirty_ui = true;
+            }
+        }
+    }
+
     fn lines(&self) -> Vec<&str> {
         self.text.split('\n').collect()
     }
@@ -160,6 +230,9 @@ impl Editor {
                 self.cx = 0;
                 self.sel = None;
                 self.scroll = 0;
+                self.undo.clear();
+                self.redo.clear();
+                self.ins_tail = None;
                 self.dirty_text = false;
                 self.status = alloc::format!("opened {} ({}B)", path, d.len());
                 self.refresh_title();
@@ -371,9 +444,12 @@ impl Editor {
                         ustd::clip_set(&self.text.as_bytes()[s0..s1]);
                         self.status = alloc::format!("{}d {}B", if k.chr == b'c' || k.chr == b'C' { "copie" } else { "cut" }, s1 - s0);
                         if k.chr == b'x' || k.chr == b'X' {
+                            let del = String::from(&self.text[s0..s1]);
                             self.text.replace_range(s0..s1, "");
                             self.cx = s0;
                             self.sel = None;
+                            self.rec(s0, del, String::new());
+                            self.ins_tail = None;
                             self.dirty_text = true;
                         }
                     }
@@ -382,15 +458,24 @@ impl Editor {
                     let d = ustd::clip_get();
                     if !d.is_empty() {
                         let s = String::from_utf8_lossy(&d).into_owned();
-                        if let Some((s0, s1)) = self.sel.take() {
+                        let (pos, del) = if let Some((s0, s1)) = self.sel.take() {
+                            let d = String::from(&self.text[s0..s1]);
                             self.text.replace_range(s0..s1, "");
                             self.cx = s0;
-                        }
+                            (s0, d)
+                        } else {
+                            (self.cx, String::new())
+                        };
                         self.text.insert_str(self.cx, &s);
                         self.cx += s.len();
+                        self.rec(pos, del, s);
+                        self.ins_tail = None;
                         self.dirty_text = true;
                     }
                 }
+                b'z' if k.mods & 2 != 0 => self.do_redo(), // Ctrl-Shift-Z
+                b'z' => self.do_undo(),
+                b'y' => self.do_redo(),
                 _ => {}
             }
             self.dirty_ui = true;
@@ -400,9 +485,12 @@ impl Editor {
         if let Some((s0, s1)) = self.sel {
             match k.key as u32 {
                 x if x == KeyCode::Backspace as u32 || x == KeyCode::Delete as u32 => {
+                    let del = String::from(&self.text[s0..s1]);
                     self.text.replace_range(s0..s1, "");
                     self.cx = s0;
                     self.sel = None;
+                    self.rec(s0, del, String::new());
+                    self.ins_tail = None;
                     self.dirty_text = true;
                     self.dirty_ui = true;
                     return;
@@ -414,25 +502,33 @@ impl Editor {
         }
         match k.key as u32 {
             x if x == KeyCode::Char as u32 => {
-                self.text.insert(self.cx, k.chr as char);
+                let c = String::from(k.chr as char);
+                self.text.insert_str(self.cx, &c);
+                self.rec_ins(self.cx, &c);
                 self.cx += 1;
                 self.dirty_text = true;
             }
             x if x == KeyCode::Enter as u32 => {
                 self.text.insert(self.cx, '\n');
+                self.rec(self.cx, String::new(), String::from("\n"));
+                self.ins_tail = None; // newline breaks the typed-run coalescing
                 self.cx += 1;
                 self.dirty_text = true;
             }
             x if x == KeyCode::Backspace as u32 => {
                 if self.cx > 0 {
                     self.cx -= 1;
-                    self.text.remove(self.cx);
+                    let del = String::from(self.text.remove(self.cx));
+                    self.rec(self.cx, del, String::new());
+                    self.ins_tail = None;
                     self.dirty_text = true;
                 }
             }
             x if x == KeyCode::Delete as u32 => {
                 if self.cx < self.text.len() {
-                    self.text.remove(self.cx);
+                    let del = String::from(self.text.remove(self.cx));
+                    self.rec(self.cx, del, String::new());
+                    self.ins_tail = None;
                     self.dirty_text = true;
                 }
             }
@@ -511,6 +607,9 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
         dirty_text: false,
         dirty_ui: true,
         status: String::from("ready"),
+        undo: Vec::new(),
+        redo: Vec::new(),
+        ins_tail: None,
         drag_anchor: None,
         ldown: false,
     };

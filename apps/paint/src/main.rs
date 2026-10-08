@@ -15,12 +15,19 @@ use ustd::println;
 
 const TOOL_H: i32 = 26;
 
+/// Ink palette — 8 swatches selectable with keys 1-8 or a toolbar click.
+const PALETTE: [u32; 8] = [
+    0xFFF2F2F2, 0xFFB8B8B8, 0xFF6E6E6E, 0xFF2E2E2E,
+    0xFFE0382F, 0xFFF2A127, 0xFF3FA34D, 0xFF3A6FD8,
+];
+
 struct Paint {
     win: Window,
     c: Canvas,
     last: Option<(i32, i32)>, // last stroke point while the button is down
     brush: i32,               // half-size of the square brush
     eraser: bool,
+    color: usize,             // index into PALETTE
     status: String,
     dirty: bool,
 }
@@ -28,7 +35,11 @@ struct Paint {
 impl Paint {
     /// One stamp of the brush (filled square in canvas space).
     fn stamp(&mut self, x: i32, y: i32) {
-        let col = if self.eraser { draw::BLACK } else { draw::TEXT };
+        let col = if self.eraser {
+            draw::BLACK
+        } else {
+            PALETTE[self.color]
+        };
         let r = self.brush;
         self.c.fill(x - r, y - r, r * 2 + 1, r * 2 + 1, col);
     }
@@ -89,7 +100,7 @@ impl Paint {
             8,
             5,
             &alloc::format!(
-                "brush {} {}{}  b brush  e eraser  [/] size  c clear  s save",
+                "brush {} {}{}  b brush  e eraser  [/] size  1-8 color  c clear  s save",
                 self.brush,
                 if self.eraser { "eraser" } else { "draw" },
                 if self.status.is_empty() {
@@ -101,6 +112,15 @@ impl Paint {
             draw::DIM,
             None,
         );
+        // palette swatches at the right edge of the toolbar
+        let sw = 14i32;
+        let gap = 3i32;
+        let x0 = self.c.w as i32 - PALETTE.len() as i32 * (sw + gap) - 6;
+        for (i, col) in PALETTE.iter().enumerate() {
+            let x = x0 + i as i32 * (sw + gap);
+            self.c.fill(x, 5, sw, sw, *col);
+            self.c.border(x - 1, 4, sw + 2, sw + 2, if i == self.color { draw::TEXT } else { draw::EDGE });
+        }
         self.win.present_all();
     }
 }
@@ -123,6 +143,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         last: None,
         brush: 2,
         eraser: false,
+        color: 0,
         status: String::new(),
         dirty: true,
     };
@@ -156,6 +177,11 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                             p.dirty = true;
                         }
                         b's' => p.save(),
+                        c if (b'1'..=b'8').contains(&c) => {
+                            p.color = (c - b'1') as usize;
+                            p.eraser = false;
+                            p.dirty = true;
+                        }
                         _ => {}
                     }
                 }
@@ -174,6 +200,21 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                         p.last = None;
                     }
                 } else {
+                    // toolbar click on a swatch selects the color
+                    if pt.buttons & 1 != 0 {
+                        let sw = 14i32;
+                        let gap = 3i32;
+                        let x0 = p.c.w as i32 - PALETTE.len() as i32 * (sw + gap) - 6;
+                        let i = (pt.x - x0) / (sw + gap);
+                        if (0..PALETTE.len() as i32).contains(&i)
+                            && pt.x >= x0 + i * (sw + gap)
+                            && pt.x < x0 + i * (sw + gap) + sw
+                        {
+                            p.color = i as usize;
+                            p.eraser = false;
+                            p.dirty = true;
+                        }
+                    }
                     p.last = None;
                 }
             }

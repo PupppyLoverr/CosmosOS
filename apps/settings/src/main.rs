@@ -137,6 +137,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             Row { key: "wallpaper", label: "Wallpaper tone", options: &["dark", "darker", "graphite"], cur: 0 },
             Row { key: "cursor_speed", label: "Cursor speed", options: &["slow", "normal", "fast"], cur: 1 },
             Row { key: "clock_seconds", label: "Taskbar clock", options: &["hh:mm", "hh:mm:ss"], cur: 1 },
+            Row { key: "screensaver", label: "Screensaver idle", options: &["30s", "90s", "5min", "off"], cur: 1 },
         ],
         sel: -1,
         status: String::from("changes apply to /etc/cosmos.conf"),
