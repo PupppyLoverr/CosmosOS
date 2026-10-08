@@ -100,7 +100,11 @@ pub fn acquire(path: &str) {
 }
 
 /// Per-desc release: the last master desc destroys the pair outright
-/// (POSIX: slave then gets EIO, not EOF).
+/// (POSIX: slave then gets EIO, not EOF). Destruction also queues a
+/// hangup — SIGHUP goes to the session that had this pty as its
+/// controlling terminal, delivered by drain_hups on the next syscall
+/// (release can run under SCHED during task teardown, so signaling
+/// here could self-deadlock).
 pub fn release(path: &str) {
     let Some(id) = id_of(path) else { return };
     let mut g = PTS.lock();
@@ -115,6 +119,22 @@ pub fn release(path: &str) {
     });
     if destroy.unwrap_or(false) {
         g.remove(&id);
+        HUP_PENDING.lock().push(id);
+    }
+}
+
+static HUP_PENDING: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Deliver queued terminal hangups: SIGHUP to every live task holding
+/// the destroyed pty as its controlling terminal. Called at the top of
+/// syscall dispatch where the scheduler lock is not held.
+pub fn drain_hups() {
+    let ids: Vec<u64> = {
+        let mut g = HUP_PENDING.lock();
+        core::mem::take(&mut *g)
+    };
+    for id in ids {
+        crate::task::signal_ctty(id, 1);
     }
 }
 

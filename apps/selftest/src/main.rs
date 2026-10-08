@@ -3673,6 +3673,125 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let past = ustd::clock_nanosleep(t0); // already past -> immediate 0
         r == 0 && past == 0 && ustd::uptime_ms() - t0 >= 50
     });
+    // --- batch 69: shared-mm races, thread slot reclaim, ctty hangup ---
+    check("thread-slot-reuse", {
+        // each dead thread's stack slot must be reclaimed — spawning more
+        // threads than the arena's 191 slots only works if death frees them
+        extern "C" fn nul(_: u64) -> i64 {
+            0
+        }
+        let mut n = 0;
+        let mut ok = true;
+        for _ in 0..200 {
+            match ustd::thread_spawn(nul, 0) {
+                Ok(tid) => {
+                    n += 1;
+                    let _ = ustd::waitpid(tid, 4000);
+                }
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        ok && n == 200
+    });
+    check("mm-reserve", {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static B: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn mm(_: u64) -> i64 {
+            let p = ustd::mmap(8192).map(|x| x as u64).unwrap_or(0);
+            B.store(p, Ordering::SeqCst);
+            0
+        }
+        B.store(0, Ordering::SeqCst);
+        match ustd::thread_spawn(mm, 0) {
+            Ok(tid) => {
+                let mine = ustd::mmap(8192).map(|x| x as u64).unwrap_or(0);
+                let _ = ustd::waitpid(tid, 3000);
+                let theirs = B.load(Ordering::SeqCst);
+                // anon mmap ranges must be disjoint across threads of one mm
+                mine != 0 && theirs != 0 && mine != theirs
+            }
+            Err(_) => false,
+        }
+    });
+    check("mprotect-peer", {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static P: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn mp(_: u64) -> i64 {
+            let base = P.load(Ordering::SeqCst);
+            if base == 0 {
+                return 1;
+            }
+            if ustd::mprotect(base as *mut u8, 4096, 1) {
+                0
+            } else {
+                2
+            }
+        }
+        match ustd::mmap(4096) {
+            Some(p) => {
+                P.store(p as u64, Ordering::SeqCst);
+                match ustd::thread_spawn(mp, 0) {
+                    Ok(tid) => {
+                        let code = ustd::waitpid(tid, 3000).unwrap_or(-1);
+                        // OUR task's maps must show the peer's mprotect
+                        let maps = ustd::read_all("/proc/self/maps").unwrap_or_default();
+                        let s = String::from_utf8_lossy(&maps);
+                        let needle = alloc::format!("{:08x}", p as u64);
+                        code == 0
+                            && s.lines().any(|l| l.starts_with(needle.as_str()) && l.contains("r--p"))
+                    }
+                    Err(_) => false,
+                }
+            }
+            None => false,
+        }
+    });
+    check("ptmx-sighup", {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static GOT_HUP: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn hup(_: u64) {
+            GOT_HUP.store(1, Ordering::SeqCst);
+        }
+        GOT_HUP.store(0, Ordering::SeqCst);
+        let mfd = ustd::openpt();
+        if mfd < 0 {
+            false
+        } else {
+            let sname = ustd::ptsname(mfd).unwrap_or_default();
+            match ustd::fork() {
+                0 => {
+                    // drop the inherited master fd — only the parent may
+                    // hold it, or the pair outlives the parent's close
+                    ustd::close(mfd);
+                    ustd::setsid();
+                    // session leader's first tty open -> controlling tty
+                    let f = ustd::open(&sname, ustd::O_RDWR).unwrap_or(-1);
+                    if f < 0 {
+                        ustd::exit(11);
+                    }
+                    ustd::signal(1, hup);
+                    loop {
+                        ustd::sleep_ms(50);
+                        if GOT_HUP.load(Ordering::SeqCst) == 1 {
+                            ustd::exit(77);
+                        }
+                    }
+                }
+                p if p > 0 => {
+                    ustd::sleep_ms(400); // let the child acquire the ctty
+                    ustd::close(mfd); // master death -> SIGHUP to the session
+                    ustd::waitpid(p as u32, 9000).unwrap_or(-1) == 77
+                }
+                _ => {
+                    ustd::close(mfd);
+                    false
+                }
+            }
+        }
+    });
     check("gettimeofday", {
         let (s, u) = ustd::gettimeofday();
         s > 1_700_000_000 && u < 1_000_000

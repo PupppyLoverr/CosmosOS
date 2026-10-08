@@ -221,6 +221,7 @@ pub const AT_REMOVEDIR: u64 = 0x200;
 pub const AT_EMPTY_PATH: u64 = 0x1000;
 pub const O_EXCL: u64 = 128;
 pub const O_PATH: u64 = 256;
+pub const O_NOCTTY: u64 = 512; // don't acquire the tty as controlling
 pub const SYS_SECCOMP: u64 = 198;       // (mode, allow_ptr, len32B) -> 0|err  1=strict 2=bitmap
 pub const SYS_SET_ROBUST_LIST: u64 = 199;// (head_va) -> 0  node={next, futex_va}
 pub const SYS_STATFS: u64 = 200;        // (path,len,&mut Statfs{type,bsize,blocks,bfree}) -> 0|err

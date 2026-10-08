@@ -120,6 +120,9 @@ pub fn dispatch(ctx: &mut CpuContext) {
         t.cur_syscall = nr;
         t.sc_args = [a1, a2, a3, a4, a5];
     });
+    // pending pty hangups: master closes queue them (pty::release may run
+    // under SCHED during task teardown) — dispatch is a lock-free spot.
+    crate::pty::drain_hups();
     // seccomp enforcement: strict kills with SIGKILL on anything outside
     // the POSIX strict allowlist (read/write/exit/sigreturn/exit_group);
     // filter mode returns ENOSYS on any nr outside the installed bitmap.
@@ -2050,12 +2053,15 @@ fn sys_mmap(size: u64, flags: u64, addr: u64) -> u64 {
         }
     }
     // (real anon mmap — see SYS_MUNMAP/SYS_MPROTECT for the full lifecycle)
+    let pp = task::with_current(|t| t.pml4.map(|p| p.start_address().as_u64()));
+    let Some(pp) = pp else { return 0 };
+    // reserve across ALL peers of the mm — two threads can't collide
+    let base = if fixed { addr } else { task::mm_reserve(pp, pages) };
+    if base == 0 {
+        return 0;
+    }
     task::with_current(|t| {
         let Some(pml4) = t.pml4 else { return 0 };
-        let base = if fixed { addr } else { t.mmap_next };
-        if base == 0 {
-            return 0;
-        }
         let mut scratch = Vec::new();
         for i in 0..pages {
             if elf::map_user_page(pml4, base + i * 0x1000, &mut scratch).is_none() {
@@ -2069,9 +2075,6 @@ fn sys_mmap(size: u64, flags: u64, addr: u64) -> u64 {
             perm: 1 | 2,
             name: alloc::string::String::from("[anon]"),
         });
-        if !fixed {
-            t.mmap_next += pages * 0x1000 + 0x1000; // guard page
-        }
         base
     })
 }
@@ -2111,15 +2114,17 @@ fn sys_mmap_file(fd: u64, size: u64, offset: u64) -> u64 {
     if st.is_dir != 0 {
         return 0;
     }
+    let pages = size.div_ceil(0x1000);
+    let pp = task::with_current(|t| t.pml4.map(|p| p.start_address().as_u64()));
+    let Some(pp) = pp else { return 0 };
+    let base = task::mm_reserve(pp, pages);
+    if base == 0 {
+        return 0;
+    }
     task::with_current(|t| {
         if t.pml4.is_none() {
             return 0;
         }
-        let base = t.mmap_next;
-        if base == 0 {
-            return 0;
-        }
-        let pages = size.div_ceil(0x1000);
         t.mem_bytes += pages * 0x1000;
         t.maps.push(task::MapEnt {
             start: base,
@@ -2134,7 +2139,6 @@ fn sys_mmap_file(fd: u64, size: u64, offset: u64) -> u64 {
             off: offset,
             perm: 1 | 2,
         });
-        t.mmap_next += pages * 0x1000 + 0x1000; // guard page
         base
     })
 }
@@ -2259,8 +2263,8 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     let w = prot & shared::PROT_WRITE != 0;
     let x = prot & shared::PROT_EXEC != 0;
     let end = addr.saturating_add(len.div_ceil(0x1000) * 0x1000);
-    task::with_current(|t| {
-        let Some(pml4) = t.pml4 else { return ERR };
+    let changed = task::with_current(|t| {
+        let Some(pml4) = t.pml4 else { return 0 };
         let mut a = addr;
         let mut changed = 0u64;
         while a < end {
@@ -2276,18 +2280,26 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
             }
             a += 0x1000;
         }
-        if changed == 0 {
-            return ERR;
-        }
-        for m in t.maps.iter_mut() {
-            if m.end <= addr || m.start >= end {
-                continue;
+        changed
+    });
+    if changed == 0 {
+        return ERR;
+    }
+    // perm bookkeeping propagates to every thread of the mm — peers
+    // share the page tables, so their maps must agree
+    let pp = task::with_current(|t| t.pml4.map(|p| p.start_address().as_u64()));
+    if let Some(pp) = pp {
+        task::for_mm_peers(pp, |o| {
+            for m in o.maps.iter_mut() {
+                if m.end <= addr || m.start >= end {
+                    continue;
+                }
+                m.perm = (prot & 7) as u8;
             }
-            m.perm = (prot & 7) as u8;
-        }
-        unsafe { x86_64::instructions::tlb::flush_all() };
-        0
-    })
+        });
+    }
+    unsafe { x86_64::instructions::tlb::flush_all() };
+    0
 }
 
 fn sys_debug(ptr: u64, len: u64) -> u64 {
@@ -2302,7 +2314,23 @@ fn sys_debug(ptr: u64, len: u64) -> u64 {
 fn sys_open(pptr: u64, plen: u64, flags: u64) -> u64 {
     let Some(path) = copy_str(pptr, plen) else { return ERR };
     match vfs::open(&path, flags) {
-        Ok(fd) => fd as u64,
+        Ok(fd) => {
+            // POSIX ctty acquisition: a session leader with no controlling
+            // terminal takes the tty it just opened (unless O_NOCTTY).
+            if flags & shared::O_NOCTTY == 0 {
+                if let Some(id) = path
+                    .strip_prefix("/dev/pts/")
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    task::with_current(|t| {
+                        if t.sid == t.id && t.ctty == 0 {
+                            t.ctty = id;
+                        }
+                    });
+                }
+            }
+            fd as u64
+        }
         Err(e) => e as u64,
     }
 }

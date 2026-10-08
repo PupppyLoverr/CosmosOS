@@ -121,6 +121,7 @@ pub struct Task {
     pub alarm_at: u64,          // SIGALRM deadline (ms ticks; 0 = disarmed)
     pub pgid: u32,              // process-group id (kill(-pgid) targets it)
     pub sid: u32,               // session id (setsid detaches)
+    pub ctty: u64,              // controlling tty: /dev/pts/{id} index (0 = none)
     pub pdeathsig: u8,          // PR_SET_PDEATHSIG: signal on parent's death
     pub stop_notified: bool,    // this stop already reported to waitpid
     pub stop_sig: u8,           // signal that stopped it (for WUNTRACED)
@@ -298,6 +299,7 @@ pub fn init() {
         alarm_at: 0,
         pgid: 0,
         sid: 0,
+        ctty: 0,
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
@@ -788,6 +790,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         // POSIX: the child lands in the parent's process group + session
         pgid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.pgid).unwrap_or(0),
         sid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.sid).unwrap_or(0),
+        ctty: s.tasks.iter().find(|t| t.id == parent).map(|t| t.ctty).unwrap_or(0),
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
@@ -888,6 +891,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         alarm_at: 0,
         pgid: 0,
         sid: 0,
+        ctty: 0,
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
@@ -1064,6 +1068,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64) -> Option<u32> {
         alarm_at: 0,
         pgid: s.tasks[s.cur].pgid,
         sid: s.tasks[s.cur].sid,
+        ctty: s.tasks[s.cur].ctty,
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
@@ -1632,6 +1637,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         alarm_at: 0,
         pgid: cur.pgid,
         sid: cur.sid,
+        ctty: cur.ctty,
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
@@ -1835,6 +1841,61 @@ pub fn for_mm_peers(pml4_phys: u64, f: impl Fn(&mut Task)) {
     }
 }
 
+/// Reserve `pages` in the mm shared by every task on `pml4_phys` —
+/// base = the highest peer's mmap_next, then every peer's cursor is
+/// advanced past base + guard. Two threads of one mm can never hand
+/// out the same anonymous range. Returns the reserved base VA.
+pub fn mm_reserve(pml4_phys: u64, pages: u64) -> u64 {
+    let mut g = SCHED.lock();
+    let Some(s) = g.as_mut() else {
+        return 0;
+    };
+    let mut base = 0u64;
+    for t in s.tasks.iter() {
+        if t.state != State::Dead
+            && t.pml4.map(|p| p.start_address().as_u64()) == Some(pml4_phys)
+            && t.mmap_next > base
+        {
+            base = t.mmap_next;
+        }
+    }
+    if base == 0 {
+        return 0;
+    }
+    let end = base + pages * 0x1000 + 0x1000; // guard page
+    for t in s.tasks.iter_mut() {
+        if t.pml4.map(|p| p.start_address().as_u64()) == Some(pml4_phys) {
+            t.mmap_next = t.mmap_next.max(end);
+        }
+    }
+    base
+}
+
+/// SIGHUP-style broadcast: mark `sig` pending on every live userspace
+/// task whose controlling terminal is pty id `ctty` (hangup broadcast
+/// when a ptmx master dies). Single SCHED pass — safe to call from any
+/// context that does not already hold the scheduler lock.
+pub fn signal_ctty(ctty: u64, sig: u64) -> u64 {
+    let mut g = SCHED.lock();
+    let Some(s) = g.as_mut() else {
+        return 0;
+    };
+    let mut n = 0u64;
+    for t in s.tasks.iter_mut() {
+        if t.ctty == ctty
+            && t.is_user
+            && t.state != State::Dead
+            && t.id != 1
+            && t.name != "cosmos-winserver"
+        {
+            t.sigpending |= 1 << sig;
+            wake_for_signal(t, sig as usize);
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Does ANY live task still hold an fd on `path`? Object fds (pipes,
 /// sockets, event objects) are refcounted by live references — a thread
 /// inherits a dup'd table, so teardown must skip objects another task
@@ -1953,6 +2014,29 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
             }
         }
         t.robust_list = 0;
+    }
+    // thread teardown: while mm peers still run on this pml4, unmap the
+    // dead task's stack region — clone_user's slot scan can reuse it and
+    // its frames go back to the allocator (free_frame is COW-refcounted,
+    // so a frame also RO-mapped in a fork sibling is only released).
+    if t.is_user && t.stack_min != 0 {
+        if let Some(pml4) = t.pml4 {
+            let pp = pml4.start_address().as_u64();
+            let peers = s.tasks.iter().any(|o| {
+                o.state != State::Dead
+                    && o.pml4.map(|p| p.start_address().as_u64()) == Some(pp)
+            });
+            if peers {
+                let mut page = t.stack_min;
+                while page < t.stack_max {
+                    if let Some(pa) = crate::elf::translate(pml4, page) {
+                        crate::elf::unmap_user_page(pml4, page);
+                        crate::mem::free_frame(pa & !0xFFF);
+                    }
+                    page += 0x1000;
+                }
+            }
+        }
     }
     // wake any waiters (only live ones); u32::MAX = wait(-1) any-child
     for o in s.tasks.iter_mut() {
@@ -2551,6 +2635,7 @@ pub fn sys_setsid() -> i64 {
         }
         t.sid = t.id;
         t.pgid = t.id;
+        t.ctty = 0; // a fresh session has no controlling terminal yet
         0
     })
 }
