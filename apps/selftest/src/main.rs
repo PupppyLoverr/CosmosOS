@@ -5077,6 +5077,45 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
     );
 
 >>>>>>> d53d265f005d84f431076196fe8f1c7c6a0f399e
+    // --- performance baseline: real durations (tick = 10ms resolution) ---
+    {
+        // 4 MiB through write_all (virtio-blk -> FAT32)
+        let block = alloc::vec![0xA5u8; 64 * 1024];
+        let t0 = uptime_ms();
+        for i in 0..64u64 {
+            let p = alloc::format!("/test/perf{}", i);
+            let _ = write_all(&p, &block);
+        }
+        metric("fs-write-4mib", uptime_ms() - t0);
+        let t1 = uptime_ms();
+        let mut total = 0usize;
+        for i in 0..64u64 {
+            let p = alloc::format!("/test/perf{}", i);
+            total += read_all(&p).map(|d| d.len()).unwrap_or(0);
+        }
+        metric("fs-read-4mib", uptime_ms() - t1);
+        let _ = total;
+        for i in 0..64u64 {
+            let _ = remove(&alloc::format!("/test/perf{}", i));
+        }
+    }
+    // task spawn + exit + reap round trip
+    {
+        let t0 = uptime_ms();
+        if let Ok(pid) = spawn("/bin/cosmos-selftest-child", "") {
+            let _ = waitpid(pid, 10_000);
+            metric("spawn-waitpid", uptime_ms() - t0);
+        }
+    }
+    // syscall overhead: 1000 cheap syscalls
+    {
+        let t0 = uptime_ms();
+        for _ in 0..1000 {
+            let _ = uptime_ms();
+        }
+        metric("syscall-1000", uptime_ms() - t0);
+    }
+
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

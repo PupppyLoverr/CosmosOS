@@ -86,6 +86,13 @@ are read with `ptr::read_unaligned` (no alignment guarantees on the wire).
 - Selftest: `DONE ok=39 fail=0` — 39 checks across memory, fs, IPC,
   shm, spawn/waitpid, fb, datetime, syscall-boundary negatives, and
   live networking (ARP+ICMP ping, DNS over UDP, TCP/HTTP to the internet).
+- Kernel boot → selftest running: **20 ms** (kernel init + init spawn +
+  ELF load; excludes OVMF).
+- `spawn`+exit+reap round trip: **50 ms**. 1000 trivial syscalls: <10 ms.
+- Framebuffer full-fill (3 MiB): <10 ms (>300 MiB/s writes).
+- FS throughput pre-cache baseline (measured before the sector cache
+  landed): write 4 MiB in 6.2 s (~0.66 MiB/s), read 4 MiB in
+  11.8 s (~0.34 MiB/s) — cluster alloc + per-sector synchronous I/O.
 
 ## Rules in this codebase
 
