@@ -256,14 +256,19 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
                 let t = task::total_cpu_ticks();
                 (t * 10_000, 0, 0)
             } else {
-                let g = CG.lock();
-                let c = g.get(&gid)?;
-                let ticks: u64 = c
-                    .members
+                // Snapshot under CG, drop the guard, then touch SCHED —
+                // kill_at holds SCHED and takes CG, so CG must never be
+                // held across a SCHED-locking call.
+                let (ms, nrt, thrt) = {
+                    let g = CG.lock();
+                    let c = g.get(&gid)?;
+                    (c.members.clone(), c.throttled_windows, c.throttled_ticks * 10_000)
+                };
+                let ticks: u64 = ms
                     .iter()
                     .map(|&p| task::cpu_ticks_of(p).unwrap_or(0))
                     .sum();
-                (ticks * 10_000, c.throttled_windows, c.throttled_ticks * 10_000)
+                (ticks * 10_000, nrt, thrt)
             };
             alloc::format!(
                 "usage_usec {}\nnr_periods {}\nnr_throttled {}\nthrottled_usec {}\n",
