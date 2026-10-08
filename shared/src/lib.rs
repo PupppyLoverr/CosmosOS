@@ -277,6 +277,23 @@ pub const SYS_PIDFD_GETFD: u64 = 229;
 pub const SYS_SYSLOG: u64 = 230;
 /// timerfd_gettime(fd, &mut [u64;2]{init_ms,interval_ms})
 pub const SYS_TFD_GET: u64 = 231;
+/// getuid/geteuid/getgid/getegid() -> u32 id
+pub const SYS_GETUID: u64 = 233;
+pub const SYS_GETEUID: u64 = 234;
+pub const SYS_GETGID: u64 = 235;
+pub const SYS_GETEGID: u64 = 236;
+/// setuid(uid) / setgid(gid): root sets real+eff; non-root may only
+/// switch euid back to its real id (EPERM otherwise)
+pub const SYS_SETUID: u64 = 237;
+pub const SYS_SETGID: u64 = 238;
+/// chown(path_ptr,len,uid,gid; u64::MAX=unchanged) — EPERM on FAT
+/// (vfat has no owners) and for non-root
+pub const SYS_CHOWN: u64 = 239;
+/// fchown(fd,uid,gid)
+pub const SYS_FCHOWN: u64 = 240;
+/// chmod(path_ptr,len,mode): tmpfs stores real mode bits; FAT maps
+/// owner-w onto the readonly attr (vfat-style), root only
+pub const SYS_CHMOD: u64 = 241;
 /// MS_MOVE: move a mount point instead of creating one
 pub const MS_MOVE: u64 = 0x2000;
 /// CLONE_NEWUTS: unshare the UTS namespace (hostname)
@@ -318,6 +335,8 @@ pub struct Statx {
     pub mtime: u64,
     pub ctime: u64,
     pub btime: u64,
+    pub uid: u32,
+    pub gid: u32,
 }          // (target_ptr, len) -> 0|err
 pub const O_CLOEXEC: u64 = 0x10000;       // per-desc flag: close on successful exec
 pub const F_GETFD: u64 = 1;               // fcntl: get descriptor flags

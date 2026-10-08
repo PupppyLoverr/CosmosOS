@@ -1966,6 +1966,49 @@ pub fn timerfd_gettime(fd: u64) -> Option<(u64, u64)> {
     if r < 0 { None } else { Some((b[0], b[1])) }
 }
 
+/// uid helpers: getuid/geteuid/getgid/getegid.
+pub fn getuid() -> u32 {
+    sc0(shared::SYS_GETUID) as u32
+}
+pub fn geteuid() -> u32 {
+    sc0(shared::SYS_GETEUID) as u32
+}
+pub fn getgid() -> u32 {
+    sc0(shared::SYS_GETGID) as u32
+}
+pub fn getegid() -> u32 {
+    sc0(shared::SYS_GETEGID) as u32
+}
+/// setuid(uid): root drops to it; non-root may only restore real uid.
+pub fn setuid(u: u32) -> i64 {
+    sc1(shared::SYS_SETUID, u as u64) as i64
+}
+pub fn setgid(g: u32) -> i64 {
+    sc1(shared::SYS_SETGID, g as u64) as i64
+}
+/// chown(path, uid, gid); u32::MAX keeps a field. EPERM on FAT/non-root.
+pub fn chown(path: &str, uid: u32, gid: u32) -> i64 {
+    sc4(
+        shared::SYS_CHOWN,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        uid as u64,
+        gid as u64,
+    ) as i64
+}
+pub fn fchown(fd: i64, uid: u32, gid: u32) -> i64 {
+    sc3(shared::SYS_FCHOWN, fd as u64, uid as u64, gid as u64) as i64
+}
+/// chmod(path, mode): real perm bits on tmpfs, ro-attr map on FAT.
+pub fn chmod(path: &str, mode: u32) -> i64 {
+    sc3(
+        shared::SYS_CHMOD,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        mode as u64,
+    ) as i64
+}
+
 /// reboot_cmd(cmd): RB_RESTART 0x1234567 / RB_HALT 0xcdef0123 /
 /// RB_POWER_OFF 0x4321fedc — never returns on success; EINVAL(-22) on
 /// a bad magic/cmd. The bare reboot() above is restart semantics.

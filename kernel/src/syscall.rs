@@ -870,6 +870,15 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_PIDFD_GETFD => sys_pidfd_getfd(a1, a2, a3),
         shared::SYS_SYSLOG => sys_syslog(a1, a2, a3),
         shared::SYS_TFD_GET => sys_tfd_gettime(a1, a2),
+        shared::SYS_GETUID => task::creds().0 as u64,
+        shared::SYS_GETGID => task::creds().1 as u64,
+        shared::SYS_GETEUID => task::creds().2 as u64,
+        shared::SYS_GETEGID => task::creds().3 as u64,
+        shared::SYS_SETUID => sys_setid(a1, false),
+        shared::SYS_SETGID => sys_setid(a1, true),
+        shared::SYS_CHOWN => sys_chown(a1, a2, a3, a4),
+        shared::SYS_FCHOWN => sys_fchown(a1, a2, a3),
+        shared::SYS_CHMOD => sys_chmod(a1, a2, a3),
         shared::SYS_CHROOT => sys_chroot(a1, a2),
         shared::SYS_GETTIMEOFDAY => {
             let sec = vfs::now_unix();
@@ -3740,6 +3749,91 @@ fn sys_reboot_call(m1: u64, m2: u64, cmd: u64) -> u64 {
     }
 }
 
+/// SYS_SETUID/SYS_SETGID: root swaps both ids to `v`; a non-root task may
+/// only restore its effective id to its real one — EPERM otherwise.
+fn sys_setid(v: u64, group: bool) -> u64 {
+    let u = v as u32;
+    task::with_current(|t| {
+        if t.euid == 0 {
+            if group {
+                t.gid = u;
+                t.egid = u;
+            } else {
+                t.uid = u;
+                t.euid = u;
+            }
+            0
+        } else if group && u == t.gid {
+            t.egid = u;
+            0
+        } else if !group && u == t.uid {
+            t.euid = u;
+            0
+        } else {
+            (-1i64) as u64 // EPERM
+        }
+    })
+}
+
+/// SYS_CHOWN(path_ptr, len, uid, gid; u64::MAX keeps a field): real
+/// ownership on tmpfs; EPERM on FAT (vfat has no owners) and for
+/// non-root callers anywhere.
+fn sys_chown(pptr: u64, plen: u64, uid: u64, gid: u64) -> u64 {
+    let Some(path) = copy_str(pptr, plen) else { return ERR };
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let full = vfs::normalize(&cwd, path.trim_matches('\0'));
+    if crate::tmpfs::handles(&full) {
+        return crate::tmpfs::chown(&full, uid as u32, gid as u32)
+            .map(|_| 0)
+            .unwrap_or_else(|e| e as u64);
+    }
+    let (eu, _) = task::cred();
+    if eu != 0 {
+        return (-1i64) as u64; // EPERM — non-root, any filesystem
+    }
+    (-1i64) as u64 // EPERM — vfat has no owners
+}
+
+/// SYS_FCHOWN(fd, uid, gid): same policy, fd's stored path resolves it.
+fn sys_fchown(fd: u64, uid: u64, gid: u64) -> u64 {
+    let path = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) => f.path.clone(),
+        _ => String::new(),
+    });
+    if path.is_empty() {
+        return (-9i64) as u64;
+    }
+    if crate::tmpfs::handles(&path) {
+        return crate::tmpfs::chown(&path, uid as u32, gid as u32)
+            .map(|_| 0)
+            .unwrap_or_else(|e| e as u64);
+    }
+    (-1i64) as u64
+}
+
+/// SYS_CHMOD(path_ptr, len, mode): tmpfs stores real perm bits (owner or
+/// root only); FAT maps the owner-write bit onto the readonly attr,
+/// root only, matching vfat's chmod.
+fn sys_chmod(pptr: u64, plen: u64, mode: u64) -> u64 {
+    let Some(path) = copy_str(pptr, plen) else { return ERR };
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let full = vfs::normalize(&cwd, path.trim_matches('\0'));
+    if crate::tmpfs::handles(&full) {
+        return crate::tmpfs::chmod(&full, mode as u16)
+            .map(|_| 0)
+            .unwrap_or_else(|e| e as u64);
+    }
+    let (eu, _) = task::cred();
+    if eu != 0 {
+        return (-1i64) as u64;
+    }
+    // FAT: owner-write masked -> readonly attr; other bits unmapped
+    let ro = mode & 0o222 == 0;
+    let cur = vfs::stat_path(&full).map(|s| s.attr).unwrap_or(0) as u8;
+    let attr = if ro { cur | 0x01 } else { cur & !0x01 };
+    vfs::setattr(&full, attr).map(|_| 0).unwrap_or_else(|e| e as u64)
+}
+
 /// SYS_SETNS(fd): the fd must be an ns-object fd — an open
 /// /proc/<pid>/ns/{mntns,uts} whose stored path is /nsfd/{n} pinning a
 /// MountNs or UtsNs object. EINVAL on a non-ns fd.
@@ -3822,7 +3916,19 @@ fn sys_statx(argp: u64) -> u64 {
         blksize: 512,
         attr: st.attr as u64,
         nlink: 1,
-        mode: if st.is_dir != 0 { 0o40755 } else { 0o100644 },
+        mode: {
+            // tmpfs nodes carry real perm bits; FAT/pseudo keep the
+            // uniform 0755/0644 vfat-style answer.
+            let (ou, _og, om) = crate::tmpfs::owner(&path);
+            let _ = ou;
+            if om != 0 {
+                (if st.is_dir != 0 { 0o40000 } else { 0o100000 }) | om as u32
+            } else if st.is_dir != 0 {
+                0o40755
+            } else {
+                0o100644
+            }
+        },
         _pad: 0,
         ino: h,
         size: st.size,
@@ -3830,6 +3936,8 @@ fn sys_statx(argp: u64) -> u64 {
         mtime: st.mtime,
         ctime: vfs::btime(&path),
         btime: vfs::btime(&path),
+        uid: crate::tmpfs::owner(&path).0,
+        gid: crate::tmpfs::owner(&path).1,
     };
     let bytes = unsafe {
         core::slice::from_raw_parts(

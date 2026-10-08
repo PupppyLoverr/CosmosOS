@@ -50,7 +50,11 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
     // Best-effort: keep going if the mount fails.
     let _ = ustd::mkdirat(ustd::AT_FDCWD, "/tmp");
     match ustd::mount("tmpfs", "/tmp", "tmpfs") {
-        0 => println!("[init] tmpfs on /tmp"),
+        0 => {
+            println!("[init] tmpfs on /tmp");
+            // real /tmp semantics: world-writable + sticky
+            let _ = ustd::chmod("/tmp", 0o1777);
+        }
         e => println!("[init] tmpfs on /tmp failed: {}", e),
     }
 
