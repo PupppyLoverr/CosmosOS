@@ -262,6 +262,14 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
             None => ERR,
         },
+        shared::SYS_NET_STAT => {
+            let s = net::sockstat();
+            let n = s.len().min(a2 as usize);
+            match copy_out(a1, &s.as_bytes()[..n]) {
+                Some(()) => n as u64,
+                None => ERR,
+            }
+        }
         shared::SYS_CLIP_GET => {
             let c = CLIPBOARD.lock();
             let n = c.len().min(a2 as usize);

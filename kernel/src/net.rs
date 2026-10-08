@@ -4,6 +4,7 @@
 use crate::sprintln;
 use crate::virtio_net::{self, NET};
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
 
@@ -513,6 +514,24 @@ pub fn http_get(dst_ip: [u8; 4], host: &str, path: &str) -> Option<Vec<u8>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
+/// `netstat`-style dump of the socket tables.
+pub fn sockstat() -> String {
+    let mut s = String::new();
+    for (p, q) in SOCKS.lock().iter() {
+        s.push_str(&alloc::format!("udp  :{} ({} queued)\n", p, q.len()));
+    }
+    for (p, k) in TCP_SOCKS.lock().iter() {
+        s.push_str(&alloc::format!(
+            "tcp  :{} -> {}.{}.{}.{}:{} {:?}\n",
+            p, k.rip[0], k.rip[1], k.rip[2], k.rip[3], k.rport, k.state
+        ));
+    }
+    if s.is_empty() {
+        s.push_str("no sockets open\n");
+    }
+    s
+}
+
 /// (mac, ip) for `ifconfig`-style reporting.
 pub fn info() -> Option<([u8; 6], [u8; 4])> {
     NET.lock().as_ref().map(|n| (n.mac, our_ip()))
@@ -757,7 +776,7 @@ fn dispatch(src_ip: [u8; 4], proto: u8, p: Vec<u8>) -> bool {
 // and userspace (SYS_NET_TCP_*) share it.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum TcpState {
     SynSent,
     Open,

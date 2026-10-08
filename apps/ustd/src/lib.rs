@@ -231,6 +231,17 @@ impl Drop for TcpSock {
     }
 }
 
+/// `netstat` dump of the kernel socket tables.
+pub fn net_stat() -> String {
+    let mut buf = alloc::vec![0u8; 4096];
+    let n = sc2(shared::SYS_NET_STAT, buf.as_mut_ptr() as u64, buf.len() as u64);
+    if n == shared::SYS_ERR {
+        return String::new();
+    }
+    buf.truncate(n as usize);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// Kernel clipboard (survives app exit — real cross-app copy/paste).
 pub fn clip_set(data: &[u8]) {
     sc2(shared::SYS_CLIP_SET, data.as_ptr() as u64, data.len() as u64);

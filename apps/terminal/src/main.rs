@@ -129,6 +129,7 @@ impl Term {
                 for l in [
                     "commands: help ls cd pwd cat mkdir touch rm mv cp echo",
                     "          clear ps mem uname whoami date ping resolve httpget ifconfig dhcp",
+                    "          netstat kill <pid> kill",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -305,6 +306,18 @@ impl Term {
                     None => self.push_line(&alloc::format!("httpget: {}: failed", host)),
                 },
                 None => self.push_line("usage: httpget <host>  (real TCP/80 GET /)"),
+            },
+            "netstat" => {
+                for l in ustd::net_stat().lines() {
+                    self.push_line(l);
+                }
+            }
+            "kill" => match args.first() {
+                Some(p) => match p.parse::<u32>() {
+                    Ok(pid) if ustd::kill(pid) => self.push_line(&alloc::format!("killed {}", pid)),
+                    _ => self.push_line("kill: no such pid"),
+                },
+                None => self.push_line("usage: kill <pid>"),
             },
             "dhcp" => match ustd::net_dhcp() {
                 Some(ip) => self.push_line(&alloc::format!(
