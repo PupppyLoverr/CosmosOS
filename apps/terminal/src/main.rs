@@ -37,6 +37,27 @@ fn cal_days(y: u16, m: u8, d: u8) -> u64 {
     n + d as u64 - 1
 }
 
+/// Split a statement at its first top-level `;`, `&&` or `||`
+/// (returns (before, op, after)). Single `|` (pipe) does not match.
+fn stmt_split(s: &str) -> Option<(&str, u8, &str)> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b';' => return Some((&s[..i], b';', &s[i + 1..])),
+            b'&' if i + 1 < b.len() && b[i + 1] == b'&' => {
+                return Some((&s[..i], b'&', &s[i + 2..]));
+            }
+            b'|' if i + 1 < b.len() && b[i + 1] == b'|' => {
+                return Some((&s[..i], b'|', &s[i + 2..]));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Unix epoch seconds -> (y, m, d, h, min, s) UTC.
 fn epoch_to_dt(secs: u64) -> (u16, u8, u8, u8, u8, u8) {
     let mut d = secs / 86400;
@@ -178,6 +199,7 @@ struct Term {
     prev_cwd: String,                                  // for `cd -`
     pager: Option<(Vec<String>, usize)>,               // (all lines, page top) for `more`
     httpd: Option<ustd::TcpListener>,                  // `httpd <port>` server mode
+    last_ok: bool,                                     // success of the last statement (for && / ||)
 }
 
 impl Term {
@@ -217,6 +239,13 @@ impl Term {
         } else {
             self.push_line(s);
         }
+    }
+
+    /// Emit an error line and mark the current statement failed (for
+    /// `&&`/`||` statement chaining).
+    fn fail(&mut self, s: &str) {
+        self.last_ok = false;
+        self.emit(s);
     }
 
     /// Run `cmd` with output captured; returns the captured lines.
@@ -279,7 +308,7 @@ impl Term {
         let ents = match ustd::readdir(path) {
             Ok(e) => e,
             Err(e) => {
-                self.emit(&alloc::format!("{}[err {}]", prefix, e));
+                self.fail(&alloc::format!("{}[err {}]", prefix, e));
                 return;
             }
         };
@@ -354,6 +383,19 @@ impl Term {
         if input.is_empty() {
             return;
         }
+        // statement operators: `a; b` (always), `a && b` (on ok), `a || b` (on fail)
+        if let Some((l, op, r)) = stmt_split(input) {
+            self.last_ok = true;
+            self.run(l);
+            let ok = self.last_ok;
+            match op {
+                b';' => self.run(r),
+                b'&' if ok => self.run(r),
+                b'|' if !ok => self.run(r),
+                _ => {}
+            }
+            return;
+        }
         if let Some(rest) = input.strip_prefix("time ") {
             let t0 = ustd::uptime_ms();
             self.run(rest);
@@ -380,7 +422,7 @@ impl Term {
             }
             let fname = rest.split_whitespace().next().unwrap_or("");
             if fname.is_empty() {
-                self.emit("usage: <cmd> > file  (or >> to append)");
+                self.fail("usage: <cmd> > file  (or >> to append)");
                 return;
             }
             let out = self.run_captured(left);
@@ -396,7 +438,7 @@ impl Term {
                 ustd::write_all(fname, body.as_bytes())
             };
             if let Err(e) = r {
-                self.emit(&alloc::format!("{}: err {}", fname, e));
+                self.fail(&alloc::format!("{}: err {}", fname, e));
             }
             return;
         }
@@ -419,6 +461,8 @@ impl Term {
                     "          head/tail [-n N] <file> sort <file>",
                     "          a | b   cmd > file   cmd >> file   watch [-n s] cmd",
                     "          df  (volume usage)  more  cal  tree  seq  sleep  sh  calc  ntp",
+                    "          httpd <port>  arp  dmesg  true  false",
+                    "          ops: a ; b   a && b   a || b",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ] {
@@ -443,7 +487,7 @@ impl Term {
                             self.emit(&line);
                         }
                     }
-                    Err(e) => self.emit(&alloc::format!("ls: {}: err {}", dir, e)),
+                    Err(e) => self.fail(&alloc::format!("ls: {}: err {}", dir, e)),
                 }
             }
             "cd" => {
@@ -460,10 +504,12 @@ impl Term {
                 if ustd::chdir(&dest) {
                     self.prev_cwd = cur;
                 } else {
-                    self.emit(&alloc::format!("cd: {}: no such dir", dest));
+                    self.fail(&alloc::format!("cd: {}: no such dir", dest));
                 }
             }
             "pwd" => self.emit(&ustd::getcwd()),
+            "true" => {}
+            "false" => self.last_ok = false,
             "set" => {
                 // set NAME=value | set   (list) | set -u NAME (unset)
                 if args.is_empty() {
@@ -480,7 +526,7 @@ impl Term {
                     let (n, v) = args[0].split_at(eq);
                     self.vars.insert(String::from(n), String::from(&v[1..]));
                 } else {
-                    self.emit("usage: set NAME=value | set -u NAME");
+                    self.fail("usage: set NAME=value | set -u NAME");
                 }
             }
             "env" => {
@@ -495,10 +541,10 @@ impl Term {
                     let p = alloc::format!("/bin/{}", c);
                     match ustd::stat(&p) {
                         Ok(_) => self.emit(&p),
-                        Err(_) => self.emit(&alloc::format!("which: {} not found", c)),
+                        Err(_) => self.fail(&alloc::format!("which: {} not found", c)),
                     }
                 }
-                None => self.emit("usage: which <cmd>"),
+                None => self.fail("usage: which <cmd>"),
             },
             "cat" => match args.first() {
                 Some(p) => match ustd::read_all(p) {
@@ -508,7 +554,7 @@ impl Term {
                             self.emit(l);
                         }
                     }
-                    Err(e) => self.emit(&alloc::format!("cat: {}: err {}", p, e)),
+                    Err(e) => self.fail(&alloc::format!("cat: {}: err {}", p, e)),
                 },
                 None => match self.pipe_in.clone() {
                     Some(s) => {
@@ -516,7 +562,7 @@ impl Term {
                             self.emit(l);
                         }
                     }
-                    None => self.emit("usage: cat <file>"),
+                    None => self.fail("usage: cat <file>"),
                 },
             },
             "mkdir" => {
@@ -542,19 +588,19 @@ impl Term {
                     }
                     Some(p) => {
                         if let Err(e) = ustd::mkdir(p) {
-                            self.emit(&alloc::format!("mkdir: err {}", e));
+                            self.fail(&alloc::format!("mkdir: err {}", e));
                         }
                     }
-                    None => self.emit("usage: mkdir [-p] <dir>"),
+                    None => self.fail("usage: mkdir [-p] <dir>"),
                 }
             },
             "touch" => match args.first() {
                 Some(p) => {
                     if let Err(e) = ustd::write_all(p, b"") {
-                        self.emit(&alloc::format!("touch: err {}", e));
+                        self.fail(&alloc::format!("touch: err {}", e));
                     }
                 }
-                None => self.emit("usage: touch <file>"),
+                None => self.fail("usage: touch <file>"),
             },
             "rm" => {
                 let (rec, target) = if args.first() == Some(&"-r") {
@@ -566,30 +612,30 @@ impl Term {
                     Some(p) => {
                         let r = if rec { self.rm_tree(p) } else { ustd::remove(p) };
                         if let Err(e) = r {
-                            self.emit(&alloc::format!("rm: {}: err {}", p, e));
+                            self.fail(&alloc::format!("rm: {}: err {}", p, e));
                         }
                     }
-                    None => self.emit("usage: rm [-r] <path>"),
+                    None => self.fail("usage: rm [-r] <path>"),
                 }
             }
             "mv" => {
                 if args.len() < 2 {
-                    self.emit("usage: mv <from> <to>");
+                    self.fail("usage: mv <from> <to>");
                 } else if let Err(e) = ustd::rename(args[0], args[1]) {
-                    self.emit(&alloc::format!("mv: err {}", e));
+                    self.fail(&alloc::format!("mv: err {}", e));
                 }
             }
             "cp" => {
                 if args.len() < 2 {
-                    self.emit("usage: cp <from> <to>");
+                    self.fail("usage: cp <from> <to>");
                 } else {
                     match ustd::read_all(args[0]) {
                         Ok(d) => {
                             if let Err(e) = ustd::write_all(args[1], &d) {
-                                self.emit(&alloc::format!("cp: err {}", e));
+                                self.fail(&alloc::format!("cp: err {}", e));
                             }
                         }
-                        Err(e) => self.emit(&alloc::format!("cp: {}: err {}", args[0], e)),
+                        Err(e) => self.fail(&alloc::format!("cp: {}: err {}", args[0], e)),
                     }
                 }
             }
@@ -602,7 +648,7 @@ impl Term {
                     let mut d = String::from(text.trim());
                     d.push('\n');
                     if let Err(e) = ustd::write_all(path, d.as_bytes()) {
-                        self.emit(&alloc::format!("echo: err {}", e));
+                        self.fail(&alloc::format!("echo: err {}", e));
                     }
                 } else {
                     self.emit(&joined);
@@ -652,7 +698,7 @@ impl Term {
             }
             "sleep" => match args.first().and_then(|s| s.parse::<u64>().ok()) {
                 Some(ms) => ustd::sleep_ms(ms),
-                None => self.emit("usage: sleep <ms>"),
+                None => self.fail("usage: sleep <ms>"),
             },
             "seq" => {
                 // seq END | seq START END | seq START STEP END
@@ -690,9 +736,9 @@ impl Term {
                             self.run(line);
                         }
                     }
-                    Err(e) => self.emit(&alloc::format!("sh: {}: err {}", p, e)),
+                    Err(e) => self.fail(&alloc::format!("sh: {}: err {}", p, e)),
                 },
-                None => self.emit("usage: sh <file>"),
+                None => self.fail("usage: sh <file>"),
             },
             "cal" => {
                 // cal [month [year]] — real Gregorian calendar
@@ -700,7 +746,7 @@ impl Term {
                 let mo = args.first().and_then(|s| s.parse::<u32>().ok()).map(|m| m as u8).unwrap_or(now.month);
                 let yr = args.get(1).and_then(|s| s.parse::<u32>().ok()).map(|y| y as u16).unwrap_or(now.year);
                 if !(1..=12).contains(&mo) {
-                    self.emit("cal: month must be 1-12");
+                    self.fail("cal: month must be 1-12");
                 } else {
                     for l in cal_render(mo, yr) { self.emit(&l); }
                 }
@@ -727,9 +773,9 @@ impl Term {
                             )),
                         }
                     }
-                    None => self.emit(&alloc::format!("ping: bad ip '{}'", s)),
+                    None => self.fail(&alloc::format!("ping: bad ip '{}'", s)),
                 },
-                None => self.emit("usage: ping <a.b.c.d>  (try 10.0.2.2)"),
+                None => self.fail("usage: ping <a.b.c.d>  (try 10.0.2.2)"),
             },
             "ntp" => {
                 // real SNTP query (UDP/123) — epoch -> date, vs RTC
@@ -774,7 +820,7 @@ impl Term {
                             )),
                         }
                     }
-                    None => self.emit(&alloc::format!("ntp: {}: DNS failed", host)),
+                    None => self.fail(&alloc::format!("ntp: {}: DNS failed", host)),
                 }
             }
             "resolve" => match args.first() {
@@ -783,9 +829,9 @@ impl Term {
                         "{} -> {}.{}.{}.{}",
                         host, ip[0], ip[1], ip[2], ip[3]
                     )),
-                    None => self.emit(&alloc::format!("resolve: {}: no answer", host)),
+                    None => self.fail(&alloc::format!("resolve: {}: no answer", host)),
                 },
-                None => self.emit("usage: resolve <hostname>  (real DNS over UDP/53)"),
+                None => self.fail("usage: resolve <hostname>  (real DNS over UDP/53)"),
             },
             "httpget" => match args.first() {
                 Some(host) => match ustd::net_http(host) {
@@ -799,7 +845,7 @@ impl Term {
                                         body.len(),
                                         f
                                     )),
-                                    Err(e) => self.emit(&alloc::format!("httpget: {}: err {}", f, e)),
+                                    Err(e) => self.fail(&alloc::format!("httpget: {}: err {}", f, e)),
                                 }
                                 out = true;
                             }
@@ -811,9 +857,9 @@ impl Term {
                             }
                         }
                     }
-                    None => self.emit(&alloc::format!("httpget: {}: failed", host)),
+                    None => self.fail(&alloc::format!("httpget: {}: failed", host)),
                 },
-                None => self.emit("usage: httpget <host> [-o file]  (real TCP/80 GET /)"),
+                None => self.fail("usage: httpget <host> [-o file]  (real TCP/80 GET /)"),
             },
             "grep" => {
                 // grep <pat> <file> | grep -r <pat> <dir>
@@ -832,9 +878,9 @@ impl Term {
                                 }
                             }
                         }
-                        None => self.emit("usage: grep <pat> <file> | grep -r <pat> <dir>"),
+                        None => self.fail("usage: grep <pat> <file> | grep -r <pat> <dir>"),
                     },
-                    _ => self.emit("usage: grep <pat> <file> | grep -r <pat> <dir>"),
+                    _ => self.fail("usage: grep <pat> <file> | grep -r <pat> <dir>"),
                 }
             }
             "hex" => match args.first() {
@@ -858,16 +904,16 @@ impl Term {
                             self.emit(&alloc::format!("  ... ({} bytes total)", d.len()));
                         }
                     }
-                    Err(e) => self.emit(&alloc::format!("hex: {}: err {}", p, e)),
+                    Err(e) => self.fail(&alloc::format!("hex: {}: err {}", p, e)),
                 },
-                None => self.emit("usage: hex <file>  (first 1KiB)"),
+                None => self.fail("usage: hex <file>  (first 1KiB)"),
             },
             "du" => match args.first() {
                 Some(p) => {
                     let n = self.du_tree(p, 0);
                     self.emit(&alloc::format!("  {} B total", n));
                 }
-                None => self.emit("usage: du <path>  (recursive bytes)"),
+                None => self.fail("usage: du <path>  (recursive bytes)"),
             },
             "df" => match ustd::df() {
                 Some((total, free)) => {
@@ -882,7 +928,7 @@ impl Term {
                     Some(p) => match ustd::read_all(p) {
                         Ok(d) => Some(String::from_utf8_lossy(&d).into_owned()),
                         Err(e) => {
-                            self.emit(&alloc::format!("more: {}: err {}", p, e));
+                            self.fail(&alloc::format!("more: {}: err {}", p, e));
                             None
                         }
                     },
@@ -892,7 +938,7 @@ impl Term {
                     let ls: Vec<String> = s.lines().map(String::from).collect();
                     self.page(0, ls);
                 } else if args.is_empty() && self.pipe_in.is_none() {
-                    self.emit("usage: more <file>   (Space/PgDn next, b back, q quit)");
+                    self.fail("usage: more <file>   (Space/PgDn next, b back, q quit)");
                 }
             }
             "httpd" => match args.first().and_then(|s| s.parse::<u16>().ok()) {
@@ -904,9 +950,9 @@ impl Term {
                             port
                         ));
                     }
-                    None => self.emit(&alloc::format!("httpd: :{} already in use", port)),
+                    None => self.fail(&alloc::format!("httpd: :{} already in use", port)),
                 },
-                None => self.emit("usage: httpd <port>  (serves a status page, Esc stops)"),
+                None => self.fail("usage: httpd <port>  (serves a status page, Esc stops)"),
             },
             "watch" => {
                 // watch [-n secs] <cmd...>: re-run every N secs until Esc/Enter
@@ -921,7 +967,7 @@ impl Term {
                     i = 2;
                 }
                 if args.len() <= i {
-                    self.emit("usage: watch [-n secs] <cmd...>  (Esc/Enter exits)");
+                    self.fail("usage: watch [-n secs] <cmd...>  (Esc/Enter exits)");
                 } else {
                     self.watch = Some((args[i..].join(" "), ms, 0));
                     self.emit(&alloc::format!("watching every {}ms — Esc/Enter to stop", ms));
@@ -945,7 +991,7 @@ impl Term {
                     Some(p) => match ustd::read_all(p) {
                         Ok(d) => Some(String::from_utf8_lossy(&d).into_owned()),
                         Err(e) => {
-                            self.emit(&alloc::format!("{}: {}: err {}", cmd, p, e));
+                            self.fail(&alloc::format!("{}: {}: err {}", cmd, p, e));
                             None
                         }
                     },
@@ -990,7 +1036,7 @@ impl Term {
                             }
                         }
                     }
-                    None => self.emit(&alloc::format!("usage: {} [-n N] <file>", cmd)),
+                    None => self.fail(&alloc::format!("usage: {} [-n N] <file>", cmd)),
                 }
             }
             "netstat" => {
@@ -1014,15 +1060,15 @@ impl Term {
             "kill" => match args.first() {
                 Some(p) => match p.parse::<u32>() {
                     Ok(pid) if ustd::kill(pid) => self.emit(&alloc::format!("killed {}", pid)),
-                    _ => self.emit("kill: no such pid"),
+                    _ => self.fail("kill: no such pid"),
                 },
-                None => self.emit("usage: kill <pid>"),
+                None => self.fail("usage: kill <pid>"),
             },
             "dhcp" => match ustd::net_dhcp() {
                 Some(ip) => self.emit(&alloc::format!(
                     "dhcp: lease {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]
                 )),
-                None => self.emit("dhcp: no response (net down or no server)"),
+                None => self.fail("dhcp: no response (net down or no server)"),
             },
             "ifconfig" => match ustd::net_info() {
                 Some((mac, ip)) => {
@@ -1045,10 +1091,10 @@ impl Term {
                         Ok(pid) => {
                             self.emit(&alloc::format!("spawned {} (pid {})", cmd, pid));
                         }
-                        Err(_) => self.emit(&alloc::format!("{}: spawn failed", cmd)),
+                        Err(_) => self.fail(&alloc::format!("{}: spawn failed", cmd)),
                     }
                 } else {
-                    self.emit(&alloc::format!("{}: unknown command", cmd));
+                    self.fail(&alloc::format!("{}: unknown command", cmd));
                 }
             }
         }
@@ -1315,7 +1361,7 @@ impl Term {
             Err(_) => match ustd::stat(path) {
                 Ok(st) => st.size,
                 Err(_) => {
-                    self.emit(&alloc::format!("du: {}: not found", path));
+                    self.fail(&alloc::format!("du: {}: not found", path));
                     0
                 }
             },
@@ -1351,7 +1397,7 @@ impl Term {
                     }
                 }
             }
-            Err(e) => self.emit(&alloc::format!("grep: {}: err {}", path, e)),
+            Err(e) => self.fail(&alloc::format!("grep: {}: err {}", path, e)),
         }
     }
 
@@ -1408,6 +1454,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         pipe_in: None,
         watch: None,
         httpd: None,
+        last_ok: true,
         vars: alloc::collections::BTreeMap::new(),
         prev_cwd: String::new(),
         pager: None,
