@@ -5580,6 +5580,7 @@ struct Term {
     top_prev: Vec<(u32, u64)>,  // (pid, cpu_ticks) snapshot for %CPU deltas                      // `tail -f`: (path, next byte offset)
     tailf_last: u64,                                   // last poll ms
     yesing: Option<String>,                            // `yes`: repeated line (mode)
+    shufr: Option<Vec<String>>,                        // `shuf -r` (no -n): random pick stream
     at_q: Vec<(u64, String)>,                          // `at`: (fire_ms, cmd) deferred commands
     cron_q: Vec<(u64, u64, String)>,                   // `cron`: (period_ms, next_fire_ms, cmd)
     yank: String,                                       // readline kill-ring (Ctrl-K/U/W -> Ctrl-Y)
@@ -6771,6 +6772,14 @@ impl Term {
                 "-d" => ustd::stat(a[1]).map(|s| s.is_dir != 0).unwrap_or(false),
                 "-r" | "-w" | "-x" => ustd::stat(a[1]).is_ok(), // single permissive fs
                 "-L" | "-h" => ustd::readlink(a[1]).is_some(), // symlink
+                // -O/-G: file owner is my euid / belongs to my egid — real
+                // creds vs statx uid/gid (tmpfs nodes carry both; FAT = 0/0)
+                "-O" => ustd::statx(a[1])
+                    .map(|s| s.uid == ustd::geteuid())
+                    .unwrap_or(false),
+                "-G" => ustd::statx(a[1])
+                    .map(|s| s.gid == ustd::getegid())
+                    .unwrap_or(false),
                 "-s" => ustd::stat(a[1]).map(|s| s.size > 0).unwrap_or(false),
                 "-z" => a[1].is_empty(),
                 "-n" => !a[1].is_empty(),
@@ -10930,6 +10939,39 @@ impl Term {
                 // RE -> its length (0 when nothing matches). Otherwise the
                 // args join into one integer expression (vars resolve).
                 let mut a = args.to_vec();
+                // GNU string ops: length STR / index STR CHARS / substr S P L
+                match (a.first().copied(), a.len()) {
+                    (Some("length"), 2) => {
+                        let n = a[1].chars().count();
+                        self.emit(&alloc::format!("{}", n));
+                        self.last_ok = n > 0;
+                        return;
+                    }
+                    (Some("index"), 3) => {
+                        // first 1-based position in STR of any char in CHARS
+                        let pos = a[1]
+                            .chars()
+                            .position(|c| a[2].contains(c))
+                            .map(|p| p + 1)
+                            .unwrap_or(0);
+                        self.emit(&alloc::format!("{}", pos));
+                        self.last_ok = pos > 0;
+                        return;
+                    }
+                    (Some("substr"), 4) => {
+                        let pos: usize = a[2].parse().unwrap_or(0);
+                        let len: usize = a[3].parse().unwrap_or(0);
+                        let sub: String = a[1]
+                            .chars()
+                            .skip(pos.saturating_sub(1))
+                            .take(len)
+                            .collect();
+                        self.last_ok = !sub.is_empty();
+                        self.emit(&sub);
+                        return;
+                    }
+                    _ => {}
+                }
                 if a.first() == Some(&"match") {
                     a.remove(0);
                     a.insert(1, ":");
@@ -13405,19 +13447,32 @@ impl Term {
                 }
             }
             "shuf" => {
-                // shuf [file|-n N|-i lo-hi]: Fisher-Yates over input lines
-                // using kernel rand; -i shuffles lo..hi, -n limits output
+                // shuf [file|-n N|-i lo-hi|-e args...|-r]: Fisher-Yates over
+                // input lines using kernel rand; -i shuffles lo..hi, -e takes
+                // the remaining args as input lines, -r samples with
+                // replacement (infinite without -n → streams like `yes`)
                 let mut lo = 1u64;
                 let mut hi = 0u64;
                 let mut limit = usize::MAX;
                 let mut file = "";
+                let mut explicit: Vec<String> = Vec::new();
+                let mut rep = false;
+                let mut n_set = false;
                 let mut skip = false;
                 for (i, a) in args.iter().enumerate() {
                     if skip {
                         skip = false;
                         continue;
                     }
-                    if let Some(r) = a.strip_prefix("-i") {
+                    if a == &"-e" {
+                        explicit = args[i + 1..]
+                            .iter()
+                            .map(|s| String::from(*s))
+                            .collect();
+                        break;
+                    } else if a == &"-r" {
+                        rep = true;
+                    } else if let Some(r) = a.strip_prefix("-i") {
                         let r = if r.is_empty() {
                             skip = true;
                             args.get(i + 1).copied().unwrap_or("")
@@ -13436,11 +13491,14 @@ impl Term {
                             n
                         };
                         limit = n.parse().unwrap_or(usize::MAX);
+                        n_set = true;
                     } else if !a.starts_with('-') {
                         file = a;
                     }
                 }
-                let mut lines: Vec<String> = if hi >= lo && file.is_empty() {
+                let mut lines: Vec<String> = if !explicit.is_empty() {
+                    explicit
+                } else if hi >= lo && file.is_empty() {
                     (lo..=hi).map(|n| alloc::format!("{}", n)).collect()
                 } else {
                     let data = if file.is_empty() {
@@ -13456,6 +13514,27 @@ impl Term {
                     };
                     data.lines().map(|l| String::from(l)).collect()
                 };
+                if rep {
+                    if lines.is_empty() {
+                        self.last_ok = false;
+                        return;
+                    }
+                    if !n_set {
+                        // shuf -r with no -n never stops — stream picks like
+                        // `yes` does (Esc/Enter to stop)
+                        self.shufr = Some(lines);
+                        self.emit("shuf -r running -- Esc/Enter to stop");
+                        return;
+                    }
+                    // with replacement: n independent uniform picks
+                    for _ in 0..limit.min(65_536) {
+                        let j = (ustd::rand_u64().unwrap_or(0)
+                            % lines.len() as u64)
+                            as usize;
+                        self.emit(&lines[j]);
+                    }
+                    return;
+                }
                 // Fisher-Yates with kernel rand_u64
                 for i in (1..lines.len()).rev() {
                     let j = (ustd::rand_u64().unwrap_or(i as u64) % (i as u64 + 1)) as usize;
@@ -14787,6 +14866,61 @@ impl Term {
                 }
                 if nums.is_empty() {
                     self.fail("usage: seq [-w] [-s sep] [start] [step] end");
+                    return;
+                }
+                // fractional steps: any operand with a '.' switches the whole
+                // sequence to scaled-integer math (exact decimals, GNU-style
+                // precision = the widest operand's fraction width)
+                let frac = nums.iter().any(|n| n.contains('.'));
+                if frac {
+                    let prec = nums
+                        .iter()
+                        .map(|n| {
+                            n.split('.')
+                                .nth(1)
+                                .map(|f| f.len())
+                                .unwrap_or(0)
+                        })
+                        .max()
+                        .unwrap_or(0)
+                        .min(9);
+                    let pf = |n: &str| n.parse::<f64>().unwrap_or(0.0);
+                    let (a, st, b) = match nums.len() {
+                        1 => (1.0, 1.0, pf(nums[0])),
+                        2 => (pf(nums[0]), 1.0, pf(nums[1])),
+                        _ => (pf(nums[0]), pf(nums[1]), pf(nums[2])),
+                    };
+                    if st == 0.0 {
+                        self.fail("seq: step can't be 0");
+                        return;
+                    }
+                    let mut v: Vec<String> = Vec::new();
+                    let mut n = a;
+                    let eps = 1e-9;
+                    while if st > 0.0 { n <= b + eps } else { n >= b - eps } {
+                        let ns = match &fmt {
+                            Some(f) => {
+                                let d = alloc::format!("{:.p$}", n, p = prec);
+                                printf_render(f, &[&d])
+                            }
+                            None => alloc::format!("{:.p$}", n, p = prec),
+                        };
+                        v.push(ns);
+                        n += st;
+                        if v.len() >= 65_536 {
+                            break;
+                        }
+                    }
+                    if wide {
+                        let w = v.iter().map(|s| s.len()).max().unwrap_or(0);
+                        for x in v.iter_mut() {
+                            let pad_at = x.starts_with('-') as usize;
+                            while x.len() < w {
+                                x.insert(pad_at, '0');
+                            }
+                        }
+                    }
+                    self.emit(&v.join(sep));
                     return;
                 }
                 let (a, st, b) = match nums.len() {
@@ -16683,9 +16817,22 @@ impl Term {
                 let ni = args.iter().position(|a| a == &"-n");
                 // head/tail -c N: byte counts instead of line counts
                 let ci = args.iter().position(|a| a == &"-c");
-                let cbytes: Option<usize> = (cmd != "sort")
-                    .then(|| ci.and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()))
+                // GNU signed byte specs: tail -c +K = from byte K (1-based),
+                // head -c -N = all but the last N bytes; bare N = first/last N
+                let craw: Option<String> = (cmd != "sort")
+                    .then(|| ci.and_then(|i| args.get(i + 1)).map(|s| String::from(*s)))
                     .flatten();
+                let (cbytes, cfrom, cbutlast): (Option<usize>, usize, usize) =
+                    match craw.as_deref() {
+                        Some(v) if v.starts_with('+') => {
+                            (None, v[1..].parse().unwrap_or(1), 0)
+                        }
+                        Some(v) if v.starts_with('-') => {
+                            (None, 0, v[1..].parse().unwrap_or(0))
+                        }
+                        Some(v) => (v.parse().ok(), 0, 0),
+                        None => (None, 0, 0),
+                    };
                 // value-arg positions: -n, -k, -t each consume their next token
                 let mut valpos: Vec<usize> = Vec::new();
                 for (i, a) in args.iter().enumerate() {
@@ -16977,10 +17124,26 @@ impl Term {
                                 }
                                 let lsv: Vec<&str> = sc.lines().collect();
                                 if cmd == "head" {
-                                    match cbytes {
-                                        Some(cn) => {
-                                            let text: String =
-                                                sc.chars().take(cn).collect();
+                                    let bytewin: Option<String> = match (
+                                        cbytes, cfrom, cbutlast,
+                                    ) {
+                                        (Some(cn), _, _) => Some(
+                                            sc.chars().take(cn).collect(),
+                                        ),
+                                        // -c -N: everything but the last N
+                                        (_, _, cb) if cb > 0 => Some(
+                                            sc.chars()
+                                                .take(
+                                                    sc.chars()
+                                                        .count()
+                                                        .saturating_sub(cb),
+                                                )
+                                                .collect(),
+                                        ),
+                                        _ => None,
+                                    };
+                                    match bytewin {
+                                        Some(text) => {
                                             for l in text.lines() {
                                                 term.emit(l);
                                             }
@@ -16997,15 +17160,31 @@ impl Term {
                                         }
                                     }
                                 } else {
-                                    match cbytes {
-                                        Some(cn) => {
+                                    let bytewin: Option<String> = match (
+                                        cbytes, cfrom,
+                                    ) {
+                                        (Some(cn), _) => {
                                             let total = sc.chars().count();
-                                            let text: String = sc
-                                                .chars()
-                                                .skip(
-                                                    total.saturating_sub(cn),
-                                                )
-                                                .collect();
+                                            Some(
+                                                sc.chars()
+                                                    .skip(
+                                                        total.saturating_sub(
+                                                            cn,
+                                                        ),
+                                                    )
+                                                    .collect(),
+                                            )
+                                        }
+                                        // -c +K: from byte K (1-based)
+                                        (_, cf) if cf > 0 => Some(
+                                            sc.chars()
+                                                .skip(cf.saturating_sub(1))
+                                                .collect(),
+                                        ),
+                                        _ => None,
+                                    };
+                                    match bytewin {
+                                        Some(text) => {
                                             for l in text.lines() {
                                                 term.emit(l);
                                             }
@@ -17514,7 +17693,7 @@ impl Term {
                                 skip_next = false;
                                 return false;
                             }
-                            if **a == "-f" || **a == "-w" {
+                            if **a == "-f" || **a == "-w" || **a == "-s" {
                                 skip_next = true;
                                 return false;
                             }
@@ -17534,7 +17713,8 @@ impl Term {
                             // -d only dup runs, -u only singleton runs,
                             // -i case-insensitive; -f skips N leading
                             // whitespace-separated fields when comparing,
-                            // -w compares only the first N characters
+                            // -w compares only the first N characters,
+                            // -s skips N leading chars, -z reads NUL records
                             let count = args.iter().any(|a| a == &"-c");
                             let only_dup = args.iter().any(|a| a == &"-d");
                             // -D/--all-repeated: emit every line of each dup run
@@ -17548,6 +17728,7 @@ impl Term {
                                 return;
                             }
                             let mut skipf = 0usize;
+                            let mut skipc = 0usize;
                             let mut width = usize::MAX;
                             let mut vit = args.iter().peekable();
                             while let Some(a) = vit.next() {
@@ -17565,6 +17746,15 @@ impl Term {
                                         .unwrap_or(usize::MAX);
                                 } else if let Some(v) = a.strip_prefix("-w") {
                                     width = v.parse().unwrap_or(usize::MAX);
+                                } else if *a == "-s" {
+                                    skipc = vit
+                                        .next()
+                                        .and_then(|v| v.parse().ok())
+                                        .unwrap_or(0);
+                                } else if let Some(v) = a.strip_prefix("-s") {
+                                    if !v.is_empty() {
+                                        skipc = v.parse().unwrap_or(0);
+                                    }
                                 }
                             }
                             let key = |l: &str| -> String {
@@ -17578,6 +17768,15 @@ impl Term {
                                         .unwrap_or(rest.len());
                                     rest = &rest[adv..];
                                 }
+                                // -s: drop N leading chars of the remainder
+                                if skipc > 0 {
+                                    let byte_off = rest
+                                        .char_indices()
+                                        .nth(skipc)
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(rest.len());
+                                    rest = &rest[byte_off..];
+                                }
                                 let mut k: String =
                                     rest.chars().take(width).collect();
                                 if ci {
@@ -17585,9 +17784,18 @@ impl Term {
                                 }
                                 k
                             };
-                            // group consecutive runs on the compare key
+                            // group consecutive runs on the compare key;
+                            // -z splits records on NUL instead of '\n'
+                            let nulrec = args.iter().any(|a| {
+                                a == &"-z" || a == &"--zero-terminated"
+                            });
+                            let recs: Vec<&str> = if nulrec {
+                                s.split('\0').collect()
+                            } else {
+                                s.lines().collect()
+                            };
                             let mut runs: Vec<(Vec<&str>, String)> = Vec::new();
-                            for l in s.lines() {
+                            for l in recs {
                                 let k = key(l);
                                 match runs.last_mut() {
                                     Some((ls, pk)) if *pk == k => ls.push(l),
@@ -24336,7 +24544,7 @@ impl Term {
             return;
         }
         // during watch/tail -f/yes modes, Esc or Enter stops; other keys ignored
-        if self.watch.is_some() || self.tailf.is_some() || self.yesing.is_some() || self.top.is_some() || self.strace_p.is_some() || self.inotw.is_some() {
+        if self.watch.is_some() || self.tailf.is_some() || self.yesing.is_some() || self.shufr.is_some() || self.top.is_some() || self.strace_p.is_some() || self.inotw.is_some() {
             if k.key == KeyCode::Escape as u32
                 || k.key == KeyCode::Enter as u32
                 || (self.top.is_some() && k.chr == b'q')
@@ -24370,6 +24578,10 @@ impl Term {
                 if self.yesing.is_some() {
                     self.yesing = None;
                     self.push_line("yes: stopped");
+                }
+                if self.shufr.is_some() {
+                    self.shufr = None;
+                    self.push_line("shuf -r stopped");
                 }
                 if self.top.is_some() {
                     self.top = None;
@@ -24698,6 +24910,8 @@ impl Term {
                     "          iconv -f E -t E  ascii  mount -a  find -printf  timeout -s/-k",
                     "          stat -f  df -k/-m/-i  ps -p  uname -i  getent passwd|group",
                     "          sh -n  break/continue N  which -a  truncate -r/-s  numfmt",
+                    "          seq (fractional)  test -O/-G  shuf -e/-r  expr length/index/substr",
+                    "          tail -c +K  head -c -N  uniq -s/-z",
                     "          setsid <cmd>  dir/vdir  mkdir -m  df -P  stat -t  chown -R",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];
@@ -26086,6 +26300,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         last_cap_bin: Vec::new(),
         script_fd: None,
         yesing: None,
+        shufr: None,
         prev_buttons: 0,
         aliases: Vec::new(),
         subst_depth: 0,
@@ -26771,6 +26986,17 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         if let Some(text) = t.yesing.clone() {
             for _ in 0..4 {
                 t.push_line(&text);
+            }
+            t.dirty_all = true;
+        }
+        // shuf -r (no -n): random pick per tick, forever
+        if let Some(pool) = t.shufr.clone() {
+            if !pool.is_empty() {
+                for _ in 0..4 {
+                    let j = (ustd::rand_u64().unwrap_or(0)
+                        % pool.len() as u64) as usize;
+                    t.push_line(&pool[j]);
+                }
             }
             t.dirty_all = true;
         }
