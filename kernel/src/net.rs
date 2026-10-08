@@ -487,102 +487,28 @@ fn parse_tcp(p: &[u8]) -> Option<TcpSeg> {
 /// Blocking minimal HTTP GET: `http_get(ip, "example.com", "/")`.
 /// Returns the response bytes (header + body prefix). Real TCP through
 /// slirp to the live internet.
+/// GET over a real TCP socket — now just a consumer of the socket layer,
+/// like dns_query rides UdpSock.
 pub fn http_get(dst_ip: [u8; 4], host: &str, path: &str) -> Option<Vec<u8>> {
     const SPORT: u16 = 49200;
-    let mac = next_hop(dst_ip, 1500)?;
-    let isn = 0xC05A_0001u32;
-
-    // --- handshake: SYN -> SYN-ACK -> ACK ---
-    let deadline = now_ms() + 3000;
-    let mut rseg: Option<TcpSeg> = None;
-    let mut last_syn = 0u64;
-    while now_ms() < deadline {
-        if now_ms() - last_syn >= 1000 {
-            send_tcp(mac, dst_ip, SPORT, 80, isn, 0, TCP_SYN, &[]);
-            last_syn = now_ms();
-        }
-        for (src_ip, proto, p) in pump_rx() {
-            if proto != 6 || src_ip != dst_ip {
-                continue;
-            }
-            if let Some(s) = parse_tcp(&p) {
-                if s.dport == SPORT && s.sport == 80 {
-                    if s.flags & TCP_SYN != 0 && s.flags & TCP_ACK != 0 && s.ack == isn + 1 {
-                        rseg = Some(s);
-                        break;
-                    }
-                    if s.flags & TCP_RST != 0 {
-                        sprintln!("[net] tcp refused by {}.{}.{}.{}", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
-                        return None;
-                    }
-                }
-            }
-        }
-        if rseg.is_some() {
-            break;
-        }
-        wait_irq();
-    }
-    let rseg = rseg?;
-    let mut their_seq = rseg.seq + 1;
-    let mut my_seq = isn + 1;
-    send_tcp(mac, dst_ip, SPORT, 80, my_seq, their_seq, TCP_ACK, &[]);
-    sprintln!("[net] tcp established -> {}.{}.{}.{}:80", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
-
-    // --- send request ---
+    tcp_open(SPORT, dst_ip, 80, 3000).ok()?;
     let req = alloc::format!(
         "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
         path, host
     );
-    let mut last_tx = 0u64;
-    let mut req_acked = false;
-    my_seq += req.len() as u32;
-
-    // --- receive until FIN (or idle deadline), ack each segment ---
+    if tcp_send(SPORT, req.as_bytes(), 4000).is_err() {
+        tcp_close(SPORT);
+        return None;
+    }
     let mut out: Vec<u8> = Vec::new();
     let deadline = now_ms() + 8000;
-    let mut got_fin = false;
-    while now_ms() < deadline && !got_fin {
-        // retransmit the request until the server ACKs it
-        if !req_acked && now_ms() - last_tx >= 800 {
-            send_tcp(mac, dst_ip, SPORT, 80, my_seq - req.len() as u32, their_seq, TCP_ACK | TCP_PSH, req.as_bytes());
-            last_tx = now_ms();
-        }
-        let mut progressed = false;
-        for (src_ip, proto, p) in pump_rx() {
-            if proto != 6 || src_ip != dst_ip {
-                continue;
-            }
-            if let Some(s) = parse_tcp(&p) {
-                if s.dport != SPORT || s.sport != 80 {
-                    continue;
-                }
-                progressed = true;
-                if s.ack >= my_seq {
-                    req_acked = true;
-                }
-                if s.seq == their_seq && !s.payload.is_empty() {
-                    out.extend_from_slice(&s.payload);
-                    their_seq += s.payload.len() as u32;
-                }
-                // ack current position (dup-acks are fine)
-                send_tcp(mac, dst_ip, SPORT, 80, my_seq, their_seq, TCP_ACK, &[]);
-                if s.flags & TCP_FIN != 0 {
-                    their_seq += 1;
-                    send_tcp(mac, dst_ip, SPORT, 80, my_seq, their_seq, TCP_ACK, &[]);
-                    got_fin = true;
-                }
-                if s.flags & TCP_RST != 0 {
-                    got_fin = true;
-                }
-            }
-        }
-        if !progressed {
-            wait_irq();
+    while now_ms() < deadline {
+        match tcp_recv(SPORT, 1000) {
+            Some(chunk) => out.extend_from_slice(&chunk),
+            None => break, // peer closed (FIN/RST)
         }
     }
-    // close politely
-    send_tcp(mac, dst_ip, SPORT, 80, my_seq, their_seq, TCP_FIN | TCP_ACK, &[]);
+    tcp_close(SPORT);
     sprintln!("[net] tcp closed, {} bytes received", out.len());
     if out.is_empty() { None } else { Some(out) }
 }
@@ -763,7 +689,7 @@ pub fn udp_send(lport: u16, dst_ip: [u8; 4], dport: u16, payload: &[u8]) -> Resu
 
 /// Blocking recvfrom: returns (src_ip, src_port, payload). Datagrams for the
 /// bound port are consumed from the wire in order; others are dropped (the
-//  stack is cooperative — at most one task waits on packets at a time).
+/// stack is cooperative — at most one task waits on packets at a time).
 pub fn udp_recv(lport: u16, timeout_ms: u64) -> Option<([u8; 4], u16, Vec<u8>)> {
     // already-queued datagram first
     if let Some(d) = SOCKS.lock().get_mut(&lport).and_then(|q| q.pop_front()) {
@@ -772,21 +698,10 @@ pub fn udp_recv(lport: u16, timeout_ms: u64) -> Option<([u8; 4], u16, Vec<u8>)> 
     let deadline = now_ms() + timeout_ms;
     while now_ms() < deadline {
         for (src_ip, proto, p) in pump_rx() {
-            if proto != 17 || p.len() < 8 {
-                continue;
-            }
-            let sport = be16(&p[0..]);
-            let dport = be16(&p[2..]);
-            let dgram = (src_ip, sport, p[8..].to_vec());
-            let mut socks = SOCKS.lock();
-            if let Some(q) = socks.get_mut(&dport) {
-                if q.len() < MAX_SOCK_Q {
-                    q.push_back(dgram);
-                }
-                if dport == lport {
-                    return q.pop_front();
-                }
-            }
+            dispatch(src_ip, proto, p);
+        }
+        if let Some(d) = SOCKS.lock().get_mut(&lport).and_then(|q| q.pop_front()) {
+            return Some(d);
         }
         wait_irq();
     }
@@ -795,6 +710,241 @@ pub fn udp_recv(lport: u16, timeout_ms: u64) -> Option<([u8; 4], u16, Vec<u8>)> 
 
 pub fn udp_bound(lport: u16) -> bool {
     SOCKS.lock().contains_key(&lport)
+}
+
+// ---------------------------------------------------------------------------
+// Socket dispatch — every packet a wait loop pumps feeds the socket tables
+// (UDP dgram -> SOCKS queue, TCP seg -> TCP_SOCKS feed). Returns false for
+// traffic no socket claimed (ICMP replies, broadcast UDP, unmatched TCP) so
+// raw consumers (ping, dhcp) still see it.
+// ---------------------------------------------------------------------------
+
+fn dispatch(src_ip: [u8; 4], proto: u8, p: Vec<u8>) -> bool {
+    match proto {
+        17 if p.len() >= 8 => {
+            let dport = be16(&p[2..]);
+            let mut socks = SOCKS.lock();
+            match socks.get_mut(&dport) {
+                Some(q) => {
+                    if q.len() < MAX_SOCK_Q {
+                        q.push_back((src_ip, be16(&p[0..]), p[8..].to_vec()));
+                    }
+                    true
+                }
+                None => false,
+            }
+        }
+        6 => {
+            let Some(s) = parse_tcp(&p) else {
+                return false;
+            };
+            let mut t = TCP_SOCKS.lock();
+            let Some(k) = t
+                .values_mut()
+                .find(|k| k.rip == src_ip && k.rport == s.sport && k.lport == s.dport)
+            else {
+                return false;
+            };
+            tcp_feed(k, &s);
+            true
+        }
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TCP socket layer — the real stream abstraction. Kernel consumers (http_get)
+// and userspace (SYS_NET_TCP_*) share it.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum TcpState {
+    SynSent,
+    Open,
+    Closed,
+}
+
+pub struct TcpSock {
+    lport: u16,
+    rip: [u8; 4],
+    rport: u16,
+    mac: [u8; 6],
+    snd_nxt: u32, // next seq we transmit
+    snd_una: u32, // lowest unacked seq (retransmit frontier)
+    rcv_nxt: u32, // next rx seq we accept in-order
+    state: TcpState,
+    q: VecDeque<Vec<u8>>, // in-order payload chunks
+}
+
+static TCP_SOCKS: Mutex<BTreeMap<u16, TcpSock>> = Mutex::new(BTreeMap::new());
+
+fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
+    match k.state {
+        TcpState::SynSent => {
+            if s.flags & (TCP_SYN | TCP_ACK) == TCP_SYN | TCP_ACK && s.ack == k.snd_nxt {
+                k.rcv_nxt = s.seq + 1;
+                k.snd_una = s.ack;
+                k.state = TcpState::Open;
+                send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[]);
+            } else if s.flags & TCP_RST != 0 {
+                k.state = TcpState::Closed;
+            }
+        }
+        TcpState::Open => {
+            if s.flags & TCP_RST != 0 {
+                k.state = TcpState::Closed;
+                return;
+            }
+            if s.ack > k.snd_una {
+                k.snd_una = s.ack;
+            }
+            if s.seq == k.rcv_nxt && !s.payload.is_empty() {
+                k.q.push_back(s.payload.clone());
+                k.rcv_nxt += s.payload.len() as u32;
+            }
+            if s.flags & TCP_FIN != 0 {
+                k.rcv_nxt += 1;
+                k.state = TcpState::Closed;
+            }
+            // ack whatever we consumed (dup acks are fine)
+            send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[]);
+        }
+        TcpState::Closed => {}
+    }
+}
+
+/// SYN handshake -> Open. Err(-1) lport bound, Err(-2) no route/timeout/refused.
+pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result<(), i64> {
+    if TCP_SOCKS.lock().contains_key(&lport) {
+        return Err(-1);
+    }
+    let Some(mac) = next_hop(rip, 1500) else {
+        return Err(-2);
+    };
+    let isn = (now_ms() as u32).wrapping_add(lport as u32) ^ 0xC05A_0000;
+    TCP_SOCKS.lock().insert(
+        lport,
+        TcpSock {
+            lport,
+            rip,
+            rport,
+            mac,
+            snd_nxt: isn + 1,
+            snd_una: isn,
+            rcv_nxt: 0,
+            state: TcpState::SynSent,
+            q: VecDeque::new(),
+        },
+    );
+    let deadline = now_ms() + timeout_ms;
+    let mut last_syn = 0u64;
+    let mut open = false;
+    while now_ms() < deadline {
+        if now_ms() - last_syn >= 1000 {
+            send_tcp(mac, rip, lport, rport, isn, 0, TCP_SYN, &[]);
+            last_syn = now_ms();
+        }
+        for (src_ip, proto, p) in pump_rx() {
+            dispatch(src_ip, proto, p);
+        }
+        match TCP_SOCKS.lock().get(&lport).map(|k| k.state) {
+            Some(TcpState::Open) => {
+                open = true;
+                break;
+            }
+            Some(TcpState::Closed) => break, // RST
+            _ => {}
+        }
+        wait_irq();
+    }
+    if open {
+        sprintln!(
+            "[net] tcp established -> {}.{}.{}.{}:{}",
+            rip[0], rip[1], rip[2], rip[3], rport
+        );
+        Ok(())
+    } else {
+        TCP_SOCKS.lock().remove(&lport);
+        Err(-2)
+    }
+}
+
+/// Send a chunk (<=1400), retransmitting every 800ms until the peer's ack
+/// covers it. Err(-1) not open, Err(-2) peer went away/timeout.
+pub fn tcp_send(lport: u16, data: &[u8], timeout_ms: u64) -> Result<(), i64> {
+    let deadline = now_ms() + timeout_ms;
+    let mut last_tx = 0u64;
+    let (seq_at_send, sent_len) = {
+        let mut t = TCP_SOCKS.lock();
+        let Some(k) = t.get_mut(&lport) else {
+            return Err(-1);
+        };
+        if k.state != TcpState::Open {
+            return Err(-1);
+        }
+        let n = data.len().min(1400);
+        (k.snd_nxt, n)
+    };
+    while now_ms() < deadline {
+        if now_ms() - last_tx >= 800 {
+            let t = TCP_SOCKS.lock();
+            if let Some(k) = t.get(&lport) {
+                send_tcp(k.mac, k.rip, k.lport, k.rport, seq_at_send, k.rcv_nxt, TCP_ACK | TCP_PSH, &data[..sent_len]);
+            }
+            last_tx = now_ms();
+        }
+        for (src_ip, proto, p) in pump_rx() {
+            dispatch(src_ip, proto, p);
+        }
+        {
+            let mut t = TCP_SOCKS.lock();
+            let Some(k) = t.get_mut(&lport) else {
+                return Err(-2);
+            };
+            if k.snd_una >= seq_at_send + sent_len as u32 {
+                k.snd_nxt = seq_at_send + sent_len as u32;
+                return Ok(());
+            }
+            if k.state == TcpState::Closed {
+                return Err(-2);
+            }
+        }
+        wait_irq();
+    }
+    Err(-2)
+}
+
+/// Blocking recv: next in-order payload chunk, or None on orderly close
+/// (peer FIN/RST or timeout with nothing buffered).
+pub fn tcp_recv(lport: u16, timeout_ms: u64) -> Option<Vec<u8>> {
+    let deadline = now_ms() + timeout_ms;
+    loop {
+        {
+            let mut t = TCP_SOCKS.lock();
+            let k = t.get_mut(&lport)?;
+            if let Some(d) = k.q.pop_front() {
+                return Some(d);
+            }
+            if k.state == TcpState::Closed {
+                return None;
+            }
+        }
+        if now_ms() >= deadline {
+            return None;
+        }
+        for (src_ip, proto, p) in pump_rx() {
+            dispatch(src_ip, proto, p);
+        }
+        wait_irq();
+    }
+}
+
+/// FIN + drop the socket (close is fire-and-forget — the peer's side is
+/// already Closed or will be once our FIN lands).
+pub fn tcp_close(lport: u16) {
+    if let Some(k) = TCP_SOCKS.lock().remove(&lport) {
+        send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_FIN | TCP_ACK, &[]);
+    }
 }
 
 pub fn init() {

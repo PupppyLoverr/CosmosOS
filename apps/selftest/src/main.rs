@@ -192,6 +192,30 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         })()
         .is_some();
         check("udp-socket", sock_ok);
+        // userspace TCP socket: connect+send+recv an HTTP GET through the
+        // same kernel socket layer http_get now rides on
+        let tcp_ok = (|| {
+            let ip = ustd::net_dns("example.com")?;
+            let s = ustd::TcpSock::connect(49300, ip, 80)?;
+            s.send(b"GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n")?;
+            let mut out = alloc::vec::Vec::new();
+            let deadline = ustd::uptime_ms() + 8000;
+            while ustd::uptime_ms() < deadline {
+                match s.recv(1000) {
+                    Some(c) => out.extend_from_slice(&c),
+                    None => break,
+                }
+            }
+            if out.windows(5).any(|w| w == b"HTTP/") {
+                Some(out.len())
+            } else {
+                None
+            }
+        })();
+        check("tcp-socket", tcp_ok.is_some());
+        if let Some(n) = tcp_ok {
+            metric("tcp-sock-bytes", n as u64);
+        }
     } else {
         check("net-mac", false);
         check("net-ip", false);
@@ -199,6 +223,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         check("dns-resolve", false);
         check("http-example", false);
         check("udp-socket", false);
+        check("tcp-socket", false);
     }
 
     let (pass, fail) = unsafe { (PASS, FAIL) };

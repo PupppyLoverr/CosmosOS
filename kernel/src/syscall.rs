@@ -230,6 +230,28 @@ pub fn dispatch(ctx: &mut CpuContext) {
             0
         }
         shared::SYS_NET_DHCP => net::dhcp().map(|ip| u32::from_be_bytes(ip) as u64).unwrap_or(ERR),
+        shared::SYS_NET_TCP_OPEN => {
+            let ip = [(a2>>24) as u8,(a2>>16) as u8,(a2>>8) as u8,a2 as u8];
+            net::tcp_open(a1 as u16, ip, a3 as u16, 4000).map(|_|0).unwrap_or(ERR)
+        }
+        shared::SYS_NET_TCP_SEND => match copy_in(a2, a3.min(1400)) {
+            Some(d) => net::tcp_send(a1 as u16, &d, 5000).map(|_|0).unwrap_or(ERR),
+            None => ERR,
+        },
+        shared::SYS_NET_TCP_RECV => match net::tcp_recv(a1 as u16, a4.min(10_000)) {
+            Some(d) => {
+                let n = d.len().min(a3 as usize);
+                match copy_out(a2, &d[..n]) {
+                    Some(()) => n as u64,
+                    None => ERR,
+                }
+            }
+            None => ERR,
+        },
+        shared::SYS_NET_TCP_CLOSE => {
+            net::tcp_close(a1 as u16);
+            0
+        }
         shared::SYS_NET_INFO => match net::info() {
             Some((mac, ip)) => {
                 let mut b = [0u8; 10];

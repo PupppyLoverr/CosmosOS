@@ -192,6 +192,45 @@ impl Drop for UdpSock {
         sc1(shared::SYS_NET_UDP_CLOSE, self.lport as u64);
     }
 }
+/// A userspace TCP stream: SYN handshake on connect, send/recv on the
+/// kernel socket queue, FIN on drop.
+pub struct TcpSock {
+    pub lport: u16,
+}
+impl TcpSock {
+    /// Connect local port `lport` to `ip:rport` (real 3-way handshake).
+    pub fn connect(lport: u16, ip: [u8; 4], rport: u16) -> Option<Self> {
+        if sc3(shared::SYS_NET_TCP_OPEN, lport as u64, u32::from_be_bytes(ip) as u64, rport as u64) == shared::SYS_ERR {
+            None
+        } else {
+            Some(Self { lport })
+        }
+    }
+    /// Send data (<=1400B per call); retransmitted by the kernel until ACKed.
+    pub fn send(&self, data: &[u8]) -> Option<()> {
+        if sc3(shared::SYS_NET_TCP_SEND, self.lport as u64, data.as_ptr() as u64, data.len() as u64) == shared::SYS_ERR {
+            None
+        } else {
+            Some(())
+        }
+    }
+    /// Next in-order chunk, or None on peer close/timeout.
+    pub fn recv(&self, timeout_ms: u64) -> Option<Vec<u8>> {
+        let mut buf = alloc::vec![0u8; 4096];
+        let n = sc4(shared::SYS_NET_TCP_RECV, self.lport as u64, buf.as_mut_ptr() as u64, buf.len() as u64, timeout_ms);
+        if n == shared::SYS_ERR || n == 0 {
+            return None;
+        }
+        buf.truncate(n as usize);
+        Some(buf)
+    }
+}
+impl Drop for TcpSock {
+    fn drop(&mut self) {
+        sc1(shared::SYS_NET_TCP_CLOSE, self.lport as u64);
+    }
+}
+
 /// Re-run a real DHCP DISCOVER/OFFER/REQUEST/ACK; returns the leased ip.
 pub fn net_dhcp() -> Option<[u8; 4]> {
     let r = sc0(shared::SYS_NET_DHCP);
