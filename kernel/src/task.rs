@@ -180,6 +180,8 @@ pub struct Task {
     pub child_tns: u64,
     /// IPC namespace (SysV shm + POSIX mqueue views are scoped to it).
     pub ipc_ns: u64,
+    /// User namespace (uid_map/gid_map id translations).
+    pub user_ns: u64,
     pub sid: u32,               // session id (setsid detaches)
     pub ctty: u64,              // controlling tty: /dev/pts/{id} index (0 = none)
     pub ctid_va: u64,           // clear_child_tid: user u64 zeroed+futex-woken on exit
@@ -378,6 +380,7 @@ pub fn init() {
             time_ns: 0,
             child_tns: 0,
             ipc_ns: 0,
+            user_ns: 0,
         sid: 0,
         ctty: 0,
         ctid_va: 0,
@@ -899,6 +902,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         time_ns: s.tasks.iter().find(|t| t.id == parent).map(|t| t.time_ns).unwrap_or(0),
         child_tns: s.tasks.iter().find(|t| t.id == parent).map(|t| t.child_tns).unwrap_or(0),
         ipc_ns: s.tasks.iter().find(|t| t.id == parent).map(|t| t.ipc_ns).unwrap_or(0),
+        user_ns: s.tasks.iter().find(|t| t.id == parent).map(|t| t.user_ns).unwrap_or(0),
         sid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.sid).unwrap_or(0),
         ctty: s.tasks.iter().find(|t| t.id == parent).map(|t| t.ctty).unwrap_or(0),
         ctid_va: 0,
@@ -1020,6 +1024,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
             time_ns: 0,
             child_tns: 0,
             ipc_ns: 0,
+            user_ns: 0,
         sid: 0,
         ctty: 0,
         ctid_va: 0,
@@ -1192,6 +1197,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         time_ns: ctns,
         child_tns: cur.child_tns,
         ipc_ns: cur.ipc_ns,
+        user_ns: cur.user_ns,
         pid_ns: pns,
         nspid: pnsv,
         child_ns: cur.child_ns,
@@ -1799,6 +1805,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         time_ns: ctns,
         child_tns: cur.child_tns,
         ipc_ns: cur.ipc_ns,
+        user_ns: cur.user_ns,
         pid_ns: pns,
         nspid: pnsv,
         child_ns: cur.child_ns,
@@ -2498,6 +2505,183 @@ pub fn ipc_ns_of(pid: u32) -> u64 {
 /// The current task's IPC-ns id — shm/mqueue visibility keys on this.
 pub fn cur_ipc_ns() -> u64 {
     with_current(|t| t.ipc_ns)
+}
+
+/// User namespace — owns uid_map/gid_map tables that translate id
+/// views inside the ns. unshare(CLONE_NEWUSER) moves the caller
+/// immediately (Linux semantics), unlike the pidns/timens staging.
+pub struct UserNs {
+    pub id: u64,
+    /// real euid of the creator — the ns's owner.
+    pub owner: u32,
+    /// (inner, outer, len) ranges — display mapping inside the ns.
+    pub uid_map: Vec<(u32, u32, u32)>,
+    pub gid_map: Vec<(u32, u32, u32)>,
+}
+static USERNS: spin::Mutex<BTreeMap<u64, alloc::sync::Arc<spin::Mutex<UserNs>>>> =
+    spin::Mutex::new(BTreeMap::new());
+static NEXT_UNS: AtomicU64 = AtomicU64::new(1);
+
+/// unshare(CLONE_NEWUSER): caller moves into a fresh userns owned by
+/// its real euid (maps start empty — writes to uid_map/gid_map fill
+/// them, like Linux's one-shot map writes).
+pub fn unshare_userns() {
+    let (id, owner) = (NEXT_UNS.fetch_add(1, Ordering::Relaxed), with_current(|t| t.euid));
+    USERNS.lock().insert(
+        id,
+        alloc::sync::Arc::new(spin::Mutex::new(UserNs {
+            id,
+            owner,
+            uid_map: Vec::new(),
+            gid_map: Vec::new(),
+        })),
+    );
+    with_current(|t| t.user_ns = id);
+}
+
+/// setns on a userns object — caller moves in directly.
+pub fn set_userns(arc: alloc::sync::Arc<spin::Mutex<UserNs>>) {
+    let id = arc.lock().id;
+    with_current(|t| t.user_ns = id);
+}
+
+/// The userns arc `pid` lives in — for `/proc/<pid>/ns/user` fds.
+pub fn userns_arc_of(pid: u32) -> Option<alloc::sync::Arc<spin::Mutex<UserNs>>> {
+    let g = SCHED.lock();
+    let id = g
+        .as_ref()
+        .and_then(|s| s.tasks.iter().find(|t| t.id == pid && t.state != State::Dead))
+        .map(|t| t.user_ns)?;
+    USERNS.lock().get(&id).cloned()
+}
+
+/// The userns id `pid` lives in (0 = the initial userns).
+pub fn user_ns_of(pid: u32) -> u64 {
+    let g = SCHED.lock();
+    g.as_ref()
+        .and_then(|s| s.tasks.iter().find(|t| t.id == pid))
+        .map(|t| t.user_ns)
+        .unwrap_or(0)
+}
+
+/// Translate an outer uid through a userns map — returns the inner id,
+/// or 65534 (Linux's overflow "nobody") when unmapped / ns 0.
+pub fn map_uid_in(ns_id: u64, outer: u32, is_gid: bool) -> u32 {
+    if ns_id == 0 {
+        return outer;
+    }
+    USERNS
+        .lock()
+        .get(&ns_id)
+        .map(|n| {
+            let n = n.lock();
+            let m = if is_gid { &n.gid_map } else { &n.uid_map };
+            for &(inner, start, len) in m.iter() {
+                if outer >= start && outer < start + len {
+                    return inner + (outer - start);
+                }
+            }
+            65534
+        })
+        .unwrap_or(outer)
+}
+
+/// Append "(inner outer len)" lines to the caller's userns map —
+/// Linux semantics: only allowed on your own ns while the map is
+/// still empty (one-shot). which: false = uid_map, true = gid_map.
+pub fn userns_map_write(text: &str, is_gid: bool, for_pid: u32) -> i64 {
+    let (my_ns, my_euid) = with_current(|t| (t.user_ns, t.euid));
+    let ns_id = {
+        let g = SCHED.lock();
+        match g
+            .as_ref()
+            .and_then(|s| s.tasks.iter().find(|t| t.id == for_pid && t.state != State::Dead))
+        {
+            Some(t) => t.user_ns,
+            None => return -3, // ESRCH
+        }
+    };
+    if ns_id == 0 {
+        return -1; // EPERM — the initial userns has no maps
+    }
+    // caller may only touch its own ns's map, or a ns it owns
+    // (Linux: write with CAP_SETUID in the ns — ownership is the
+    // closest real proxy).
+    {
+        let g = USERNS.lock();
+        let owner = g.get(&ns_id).map(|n| n.lock().owner).unwrap_or(u32::MAX);
+        if ns_id != my_ns && my_euid != owner {
+            return -1; // EPERM
+        }
+    }
+    let mut rows: Vec<(u32, u32, u32)> = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (a, b, c) = (
+            it.next().and_then(|v| v.parse::<u32>().ok()),
+            it.next().and_then(|v| v.parse::<u32>().ok()),
+            it.next().and_then(|v| v.parse::<u32>().ok()),
+        );
+        let (Some(a), Some(b), Some(c)) = (a, b, c) else { return -22 };
+        rows.push((a, b, c));
+    }
+    if rows.is_empty() {
+        return -22;
+    }
+        let g = USERNS.lock();
+    let Some(n) = g.get(&ns_id) else { return -22 };
+    let mut n = n.lock();
+    let m = if is_gid { &mut n.gid_map } else { &mut n.uid_map };
+    if !m.is_empty() {
+        return -1; // EPERM — one-shot like Linux
+    }
+    *m = rows;
+    0
+}
+
+/// Render a userns map file (Linux format, one "inner outer len" per
+/// line). Empty map = empty file.
+pub fn userns_map_read(ns_id: u64, is_gid: bool) -> String {
+    if ns_id == 0 {
+        return String::new();
+    }
+    USERNS
+        .lock()
+        .get(&ns_id)
+        .map(|n| {
+            let n = n.lock();
+            let m = if is_gid { &n.gid_map } else { &n.uid_map };
+            let mut s = String::new();
+            for &(inner, outer, len) in m.iter() {
+                s.push_str(&alloc::format!("{} {} {}\n", inner, outer, len));
+            }
+            s
+        })
+        .unwrap_or_default()
+}
+
+/// In-ns DAC capability: a task whose euid maps to inner 0 gets the
+/// DAC capability set against resources its userns owns (Linux's
+/// "full caps in your user namespace" rule), but never global caps.
+/// DAC_SET: CHOWN, DAC_OVERRIDE, DAC_READ_SEARCH, FOWNER, SETUID,
+/// SETGID — the file-permission/su family.
+pub const CAP_NS_DAC: u64 = CAP_CHOWN
+    | CAP_DAC_OVERRIDE
+    | CAP_DAC_READ_SEARCH
+    | CAP_FOWNER
+    | CAP_SETUID
+    | CAP_SETGID;
+/// capable_in_ns for the CURRENT task — takes SCHED; never call from
+/// inside a with_current closure (use capable_in_ns(t, ...) there).
+pub fn capable_ns_dac(cap: u64) -> bool {
+    with_current(|t| capable_in_ns(t, cap))
+}
+
+pub fn capable_in_ns(t: &Task, cap: u64) -> bool {
+    if caps_eff_of(t) & cap != 0 {
+        return true;
+    }
+    t.user_ns != 0 && cap & !CAP_NS_DAC == 0 && map_uid_in(t.user_ns, t.euid, false) == 0
 }
 
 pub fn pidns_arc_of(pid: u32) -> Option<alloc::sync::Arc<spin::Mutex<PidNs>>> {

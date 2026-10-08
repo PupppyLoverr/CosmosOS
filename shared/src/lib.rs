@@ -315,6 +315,8 @@ pub const CLONE_NEWUTS: u64 = 0x0400_0000;
 pub const CLONE_NEWIPC: u64 = 0x0800_0000;
 /// CLONE_NEWTIME: stage a fresh time namespace for future children.
 pub const CLONE_NEWTIME: u64 = 0x80;
+/// CLONE_NEWUSER: unshare a fresh user namespace (moves the caller).
+pub const CLONE_NEWUSER: u64 = 0x1000_0000;
 /// CLONE_NEWPID: unshare/setns a PID namespace — children land inside
 /// (pidns_for_children semantics), the caller never moves.
 pub const CLONE_NEWPID: u64 = 0x2000_0000;

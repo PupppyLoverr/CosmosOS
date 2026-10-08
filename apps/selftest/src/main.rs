@@ -4768,6 +4768,39 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::mq_unlink("/ipcn-q");
         ok
     });
+    check("user-ns", {
+        // unshare(CLONE_NEWUSER) moves the caller; uid_map translates
+        // the id VIEW — map inner 5->outer 0 and geteuid reports 5.
+        let mut ok = true;
+        match ustd::fork() {
+            0 => {
+                if ustd::unshare(shared::CLONE_NEWUSER) != 0 {
+                    ustd::exit(5);
+                }
+                let link_ok = ustd::readlink("/proc/self/ns/user")
+                    .map(|s| s.starts_with("user:[") && !s.contains("[0]"))
+                    .unwrap_or(false);
+                if !link_ok {
+                    ustd::exit(6);
+                }
+                if ustd::write_all("/proc/self/uid_map", b"5 0 1\n").is_err() {
+                    ustd::exit(7);
+                }
+                if ustd::write_all("/proc/self/gid_map", b"9 0 1\n").is_err() {
+                    ustd::exit(8);
+                }
+                let (u, g) = (ustd::geteuid(), ustd::getegid());
+                // the map file reads back what was written
+                let m = ustd::read_all("/proc/self/uid_map")
+                    .map(|b| String::from_utf8_lossy(&b).contains("5 0 1"))
+                    .unwrap_or(false);
+                ustd::exit(if u == 5 && g == 9 && m { 0 } else { 9 });
+            }
+            p if p > 0 => ok = ok && ustd::waitpid(p as u32, 10_000) == Ok(0),
+            _ => ok = false,
+        }
+        ok
+    });
     check("pid-ns", {
         // unshare(CLONE_NEWPID) + fork: the child is init of a fresh
         // pid space (getpid()==1, invisible parent), its own child is 2.

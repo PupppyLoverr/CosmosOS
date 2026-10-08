@@ -59,7 +59,7 @@ fn pid_of(path: &str) -> Option<u32> {
 const PID_FILES: &[&str] = &[
     "status", "cmdline", "stat", "fds", "fdinfo", "cwd", "maps", "io",
     "statm", "exe", "smaps", "wchan", "children", "task", "syscall",
-    "sig", "mountinfo", "timens_offsets",
+    "sig", "mountinfo", "timens_offsets", "uid_map", "gid_map",
 ];
 
 pub fn is_dir(path: &str) -> bool {
@@ -92,7 +92,7 @@ pub fn exists(path: &str) -> bool {
         // /proc/<pid>/ns/<nsfile> — the setns fd targets
         if path.matches('/').count() == 4 {
             let n = path.rsplit('/').next().unwrap_or("");
-            if ["mntns", "uts", "pid", "ipc", "time", "time_for_children"]
+            if ["mntns", "uts", "pid", "ipc", "time", "time_for_children", "user"]
                 .contains(&n)
             {
                 return task::pids().contains(&p);
@@ -115,7 +115,7 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
     if let Some(p) = pid_of(path) {
         if is_dir(path) {
             if path.ends_with("/ns") {
-                for n in ["mntns", "uts", "pid", "ipc", "time", "time_for_children"] {
+                for n in ["mntns", "uts", "pid", "ipc", "time", "time_for_children", "user"] {
                     let mut de = shared::DirEntry::default();
                     de.name[..n.len()].copy_from_slice(n.as_bytes());
                     de.name_len = n.len() as u8;
@@ -273,6 +273,12 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
                 alloc::format!("time_for_children:[{}]
 ", if c != 0 { c } else { task::time_ns_of(p) })
                     .into_bytes(),
+            );
+        }
+        if path.matches('/').count() == 4 && path.ends_with("/ns/user") {
+            return Some(
+                alloc::format!("user:[{}]
+", task::user_ns_of(p)).into_bytes(),
             );
         }
         if path.matches('/').count() == 4 && path.ends_with("/ns/time") {
@@ -464,6 +470,15 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
         let text = String::from(String::from_utf8_lossy(buf));
         return (crate::task::timens_offsets_write(&text) == 0).then_some(buf.len());
     }
+    if path.ends_with("/uid_map") || path.ends_with("/gid_map") {
+        let text = String::from(String::from_utf8_lossy(buf));
+        return (crate::task::userns_map_write(
+            &text,
+            path.ends_with("/gid_map"),
+            pid_of(path).unwrap_or(0),
+        ) == 0)
+        .then_some(buf.len());
+    }
     if path == "/proc/sysrq-trigger" {
         // sysrq reboot/poweroff are privileged — CAP_SYS_ADMIN.
         if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
@@ -539,6 +554,9 @@ pub fn readlink(path: &str) -> Option<String> {
                 "time_for_children:[{}]",
                 if c != 0 { c } else { task::time_ns_of(p) }
             ));
+        }
+        if path.ends_with("/ns/user") {
+            return Some(alloc::format!("user:[{}]", task::user_ns_of(p)));
         }
     }
     None
@@ -649,6 +667,8 @@ fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
             let ns = off.rem_euclid(100) * 10_000_000;
             alloc::format!("monotonic {} {}\nboottime {} {}\n", sec, ns, sec, ns)
         }
+        "uid_map" => task::userns_map_read(task::user_ns_of(pid), false),
+        "gid_map" => task::userns_map_read(task::user_ns_of(pid), true),
         _ => return None,
     };
     Some(s.into_bytes())

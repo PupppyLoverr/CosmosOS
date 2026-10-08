@@ -909,10 +909,18 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_PIDFD_GETFD => sys_pidfd_getfd(a1, a2, a3),
         shared::SYS_SYSLOG => sys_syslog(a1, a2, a3),
         shared::SYS_TFD_GET => sys_tfd_gettime(a1, a2),
-        shared::SYS_GETUID => task::creds().0 as u64,
-        shared::SYS_GETGID => task::creds().1 as u64,
-        shared::SYS_GETEUID => task::creds().2 as u64,
-        shared::SYS_GETEGID => task::creds().3 as u64,
+        shared::SYS_GETUID => {
+            task::with_current(|t| task::map_uid_in(t.user_ns, t.uid, false) as u64)
+        }
+        shared::SYS_GETGID => {
+            task::with_current(|t| task::map_uid_in(t.user_ns, t.gid, true) as u64)
+        }
+        shared::SYS_GETEUID => {
+            task::with_current(|t| task::map_uid_in(t.user_ns, t.euid, false) as u64)
+        }
+        shared::SYS_GETEGID => {
+            task::with_current(|t| task::map_uid_in(t.user_ns, t.egid, true) as u64)
+        }
         shared::SYS_SETUID => sys_setid(a1, false),
         shared::SYS_SETGID => sys_setid(a1, true),
         shared::SYS_GETGROUPS => sys_getgroups(a1, a2),
@@ -3755,7 +3763,8 @@ fn sys_unshare(flags: u64) -> u64 {
         | shared::CLONE_NEWUTS
         | shared::CLONE_NEWPID
         | shared::CLONE_NEWIPC
-        | shared::CLONE_NEWTIME;
+        | shared::CLONE_NEWTIME
+        | shared::CLONE_NEWUSER;
     if flags & !want != 0 {
         return (-22i64) as u64; // EINVAL: unsupported share bits
     }
@@ -3773,6 +3782,9 @@ fn sys_unshare(flags: u64) -> u64 {
     }
     if flags & shared::CLONE_NEWTIME != 0 {
         task::unshare_timens();
+    }
+    if flags & shared::CLONE_NEWUSER != 0 {
+        task::unshare_userns();
     }
     0
 }
@@ -3864,7 +3876,7 @@ fn sys_setid(v: u64, group: bool) -> u64 {
     let u = v as u32;
     let cap = if group { task::CAP_SETGID } else { task::CAP_SETUID };
     task::with_current(|t| {
-        if task::caps_eff_of(t) & cap != 0 {
+        if task::capable_in_ns(t, cap) {
             if group {
                 t.gid = u;
                 t.egid = u;
@@ -3921,7 +3933,7 @@ fn sys_setgroups(ptr: u64, count: u64) -> u64 {
         ]));
     }
     task::with_current(|t| {
-        if task::caps_eff_of(t) & task::CAP_SETGID == 0 {
+        if !task::capable_in_ns(t, task::CAP_SETGID) {
             (-1i64) as u64 // EPERM
         } else {
             t.groups = gs;
@@ -3943,7 +3955,7 @@ fn sys_setresid(r: u64, e: u64, s: u64, group: bool) -> u64 {
         let keep = u32::MAX;
         let cap = if group { task::CAP_SETGID } else { task::CAP_SETUID };
         let allowed =
-            |v: u32| task::caps_eff_of(t) & cap != 0 || v == cr || v == ce || v == cs;
+            |v: u32| task::capable_in_ns(t, cap) || v == cr || v == ce || v == cs;
         for v in [r, e, s] {
             if v != keep && !allowed(v) {
                 return (-1i64) as u64; // EPERM
@@ -4082,6 +4094,10 @@ fn sys_setns(fd: u64) -> u64 {
             task::set_ipcns(arc);
             0
         }
+        Some(crate::nsfd::NsObj::User(arc)) => {
+            task::set_userns(arc);
+            0
+        }
         None => (-9i64) as u64,
     }
 }
@@ -4162,8 +4178,18 @@ fn sys_statx(argp: u64) -> u64 {
         mtime: st.mtime,
         ctime: vfs::btime(&path),
         btime: vfs::btime(&path),
-        uid: crate::tmpfs::owner(&path).0,
-        gid: crate::tmpfs::owner(&path).1,
+        // owner ids are stored real; callers in a userns see the
+        // mapped (inner) ids — Linux's kuid→uid translation.
+        uid: task::map_uid_in(
+            task::with_current(|t| t.user_ns),
+            crate::tmpfs::owner(&path).0,
+            false,
+        ),
+        gid: task::map_uid_in(
+            task::with_current(|t| t.user_ns),
+            crate::tmpfs::owner(&path).1,
+            true,
+        ),
     };
     let bytes = unsafe {
         core::slice::from_raw_parts(
