@@ -514,6 +514,29 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
             _ => ERR,
         }),
+        shared::SYS_TCGETPGRP => task::with_current(|t| match t.fds.get(a1 as usize) {
+            Some(Some(f)) if crate::pty::handles(&f.path) => {
+                crate::pty::fg_pgid_of(&f.path) as u64
+            }
+            _ => ERR,
+        }),
+        shared::SYS_TCSETPGRP => task::with_current(|t| match t.fds.get(a1 as usize) {
+            Some(Some(f)) if crate::pty::handles(&f.path) => {
+                crate::pty::set_fg_pgid(&f.path, a2 as u32) as u64
+            }
+            _ => ERR,
+        }),
+        shared::SYS_TIOCSTI => task::with_current(|t| match t.fds.get(a1 as usize) {
+            Some(Some(f)) if crate::pty::handles(&f.path) => {
+                // Linux gates TIOCSTI on CAP_SYS_ADMIN — root only here.
+                if t.euid != 0 {
+                    ERR
+                } else {
+                    crate::pty::tiocsti(&f.path, a2 as u8) as u64
+                }
+            }
+            _ => ERR,
+        }),
         shared::SYS_PTSNAME => {
             let sp = task::with_current(|t| match t.fds.get(a1 as usize) {
                 Some(Some(f)) => crate::pty::slave_path(&f.path),

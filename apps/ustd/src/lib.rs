@@ -1772,6 +1772,18 @@ pub fn ptsname(master_fd: i64) -> Option<String> {
     }
 }
 
+/// tcgetpgrp: foreground process group of the pty (0 = unset), or err.
+pub fn tcgetpgrp(fd: i64) -> i64 {
+    sc1(shared::SYS_TCGETPGRP, fd as u64) as i64
+}
+/// tcsetpgrp: set the pty's foreground process group (0 clears).
+pub fn tcsetpgrp(fd: i64, pgid: u32) -> i64 {
+    sc2(shared::SYS_TCSETPGRP, fd as u64, pgid as u64) as i64
+}
+/// TIOCSTI: inject a byte into the pty's input queue (root only).
+pub fn tiocsti(fd: i64, byte: u8) -> i64 {
+    sc2(shared::SYS_TIOCSTI, fd as u64, byte as u64) as i64
+}
 /// tcsets: set line-discipline flags on a pty fd (bit0 canon, bit1 echo).
 pub fn tcsets(fd: i64, flags: u64) -> i64 {
     sc2(shared::SYS_TCSETS, fd as u64, flags) as i64
