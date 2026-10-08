@@ -5588,7 +5588,7 @@ struct TailFollow {
 }
 
 /// Options for one grep pass (file or stdin).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct GrepOpts {
     rec: bool,
     inv: bool,
@@ -5608,6 +5608,8 @@ struct GrepOpts {
     before: usize,
     after: usize,
     maxm: usize,
+    inc: Option<String>, // --include=GLOB (matches basename)
+    exc: Option<String>, // --exclude=GLOB
 }
 
 struct Term {
@@ -16215,6 +16217,15 @@ impl Term {
                         _ => {}
                     }
                 }
+                // --include=GLOB / --exclude=GLOB: long-form file filters,
+                // applied to basenames during the -r walk (GNU).
+                for a in args.iter() {
+                    if let Some(g) = a.strip_prefix("--include=") {
+                        o.inc = Some(String::from(g));
+                    } else if let Some(g) = a.strip_prefix("--exclude=") {
+                        o.exc = Some(String::from(g));
+                    }
+                }
                 // -f FILE: each non-empty line is a pattern, OR'd. Read it,
                 // escape every literal char, join with '|', and force the
                 // ERE matcher so the alternation is real (not a literal '|').
@@ -20826,6 +20837,7 @@ impl Term {
                 let mut limit: Option<usize> = None;
                 let mut skip: usize = 0;
                 let mut verb = false; // -v: show all lines (no `*` compression)
+                let mut width = 16usize; // -w N / --width=N bytes per row
                 let mut oi = 0usize;
                 while oi < args.len() {
                     let a = args[oi];
@@ -20879,6 +20891,18 @@ impl Term {
                             skip = a[2..].parse().unwrap_or(0);
                         }
                         "-v" => verb = true,
+                        "-w" | "--width" => {
+                            if let Some(v) = args.get(oi + 1) {
+                                width = v.parse().unwrap_or(16).max(1);
+                                oi += 1;
+                            }
+                        }
+                        _ if a.starts_with("-w") && a.len() > 2 => {
+                            width = a[2..].parse().unwrap_or(16).max(1);
+                        }
+                        _ if a.starts_with("--width=") => {
+                            width = a[8..].parse().unwrap_or(16).max(1);
+                        }
                         _ if !a.starts_with('-') => path = a,
                         _ => {}
                     }
@@ -20909,7 +20933,7 @@ impl Term {
                         // into a single `*` line unless -v is given
                         let mut prev: Option<&[u8]> = None;
                         let mut star = false;
-                        for (i, ch) in d.chunks(16).enumerate() {
+                        for (i, ch) in d.chunks(width).enumerate() {
                             if !verb && prev == Some(ch) {
                                 if !star {
                                     self.emit("*");
@@ -20919,7 +20943,7 @@ impl Term {
                             }
                             star = false;
                             prev = Some(ch);
-                            let off = skip + i * 16;
+                            let off = skip + i * width;
                             let mut l = if offbase == 16 {
                                 alloc::format!("{:08x}  ", off)
                             } else if offbase == 8 {
@@ -20932,7 +20956,7 @@ impl Term {
                             for b in ch {
                                 l.push_str(&alloc::format!("{:02x} ", b));
                             }
-                            for _ in 0..16 - ch.len() {
+                            for _ in 0..width - ch.len() {
                                 l.push_str("   ");
                             }
                             if chars {
@@ -22209,7 +22233,17 @@ impl Term {
                 //   s///[g][p]  y/src/dst/  N[,M]p  N[,M]d  a/i/c text
                 //   q  r file  w file  ; separates commands in one script
                 // -z/--null-data: records are NUL-separated in and out
-                let inplace = args.iter().any(|a| a == &"-i");
+                // -i[SUFFIX] / --in-place[=SUFFIX]: GNU backup semantics —
+                // the original is copied to <file><SUFFIX> before rewrite.
+                let isuf = args.iter().find_map(|a| {
+                    if *a == "-i" { Some("") }
+                    else if a.starts_with("-i") && a.len() > 2 {
+                        Some(&a[2..])
+                    } else if let Some(v) = a.strip_prefix("--in-place=") {
+                        Some(v)
+                    } else { None }
+                });
+                let inplace = isuf.is_some();
                 let quiet = args.iter().any(|a| a == &"-n");
                 let ere = args.iter().any(|a| a == &"-E" || a == &"-r");
                 let zrec = args.iter().any(|a| a == &"-z" || a == &"--null-data");
@@ -22410,6 +22444,14 @@ impl Term {
                 if inplace {
                     match files.first() {
                         Some(f) => {
+                            if let Some(suf) = isuf.filter(|v| !v.is_empty()) {
+                                // GNU: original preserved to <f><suf> first
+                                if let Ok(orig) = ustd::read_all(f) {
+                                    let _ = ustd::write_all(
+                                        &alloc::format!("{}{}", f, suf),
+                                        &orig);
+                                }
+                            }
                             let mut body = if zrec {
                                 out.join("\u{0}")
                             } else {
@@ -26344,7 +26386,15 @@ impl Term {
                         if e.is_dir != 0 {
                             stack.push(p);
                         } else {
-                            total += self.grep_file(pat, &p, o);
+                            let inc_ok = o.inc.as_ref()
+                                .map(|g| wild_match(g, name))
+                                .unwrap_or(true);
+                            let exc_ok = o.exc.as_ref()
+                                .map(|g| !wild_match(g, name))
+                                .unwrap_or(true);
+                            if inc_ok && exc_ok {
+                                total += self.grep_file(pat, &p, o);
+                            }
                         }
                     }
                 }
