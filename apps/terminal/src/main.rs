@@ -346,6 +346,18 @@ impl Term {
         if k.down == 0 {
             return;
         }
+        // Ctrl+V pastes the kernel clipboard into the edit line
+        if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 && (k.chr == b'v' || k.chr == b'V') {
+            for b in ustd::clip_get() {
+                if b.is_ascii() && b != b'\n' && b != b'\r' {
+                    self.cur.insert(self.cx, b as char);
+                    self.cx += 1;
+                }
+            }
+            self.view = 0;
+            self.dirty_all = true;
+            return;
+        }
         if k.key == KeyCode::PageUp as u32 {
             let max = self.lines.len().saturating_sub(1);
             self.view = (self.view + 20).min(max);

@@ -231,6 +231,20 @@ impl Drop for TcpSock {
     }
 }
 
+/// Kernel clipboard (survives app exit — real cross-app copy/paste).
+pub fn clip_set(data: &[u8]) {
+    sc2(shared::SYS_CLIP_SET, data.as_ptr() as u64, data.len() as u64);
+}
+pub fn clip_get() -> Vec<u8> {
+    let mut buf = alloc::vec![0u8; 64 * 1024];
+    let n = sc2(shared::SYS_CLIP_GET, buf.as_mut_ptr() as u64, buf.len() as u64);
+    if n == shared::SYS_ERR {
+        return Vec::new();
+    }
+    buf.truncate(n as usize);
+    buf
+}
+
 /// Re-run a real DHCP DISCOVER/OFFER/REQUEST/ACK; returns the leased ip.
 pub fn net_dhcp() -> Option<[u8; 4]> {
     let r = sc0(shared::SYS_NET_DHCP);

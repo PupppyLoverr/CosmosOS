@@ -9,6 +9,9 @@ use x86_64::structures::paging::PhysFrame;
 
 const ERR: u64 = u64::MAX;
 
+/// Cross-app clipboard (Ctrl+C/X/V) — kernel-held so it survives app exit.
+static CLIPBOARD: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
+
 /// Copy `len` bytes from user buffer `ptr` (current task's address space).
 fn copy_in(ptr: u64, len: u64) -> Option<Vec<u8>> {
     if len > 1 << 20 {
@@ -251,6 +254,21 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_NET_TCP_CLOSE => {
             net::tcp_close(a1 as u16);
             0
+        }
+        shared::SYS_CLIP_SET => match copy_in(a1, a2.min(1 << 16)) {
+            Some(d) => {
+                *CLIPBOARD.lock() = d;
+                0
+            }
+            None => ERR,
+        },
+        shared::SYS_CLIP_GET => {
+            let c = CLIPBOARD.lock();
+            let n = c.len().min(a2 as usize);
+            match copy_out(a1, &c[..n]) {
+                Some(()) => n as u64,
+                None => ERR,
+            }
         }
         shared::SYS_NET_INFO => match net::info() {
             Some((mac, ip)) => {
