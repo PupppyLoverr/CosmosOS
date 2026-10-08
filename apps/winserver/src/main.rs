@@ -112,6 +112,7 @@ struct S {
     dirty: bool,
     damage: Option<(i32, i32, i32, i32)>, // union of damaged rects (x,y,w,h)
     last_tick: u64,
+    last_frame: u64,
     wall: Vec<u32>, // wallpaper cache (fh-TBAR_H rows)
 }
 
@@ -184,6 +185,7 @@ fn main_loop() -> ! {
         dirty: true,
         damage: None,
         last_tick: 0,
+        last_frame: 0,
     };
 
     composite(&mut s);
@@ -205,24 +207,32 @@ fn main_loop() -> ! {
             progressed = true;
             handle_req(&mut s, &buf[..n]);
         }
-        // per-second taskbar refresh — damage the taskbar strip; the single
-        // composite path below draws it (never clear dirty without
-        // compositing — a dropped composite leaves "ghost" windows).
+        // per-second taskbar refresh + reap windows whose owner died —
+        // damage the taskbar strip and let the single composite path draw
+        // it (never clear dirty without compositing — dropped composites
+        // leave "ghost" windows).
         let up = ustd::uptime_ms();
         if up / 1000 != s.last_tick {
             s.last_tick = up / 1000;
+            reap_dead(&mut s);
             let (fh, fw) = (s.fh, s.fw);
             dmg(&mut s, 0, fh - TBAR_H, fw, TBAR_H);
         }
-        if s.dirty {
-            s.fb.reset_clip();
-            composite(&mut s);
-            s.dirty = false;
-            s.damage = None;
-        } else if let Some((dx, dy, dw, dh)) = s.damage.take() {
-            s.fb.set_clip(dx, dy, dw, dh);
-            composite(&mut s);
-            s.fb.reset_clip();
+        // composite throttle: ~50fps max so input/ws-port drains keep up
+        // under floods (damage composites are cheap but share the gate).
+        if up.wrapping_sub(s.last_frame) >= 20 {
+            if s.dirty {
+                s.fb.reset_clip();
+                composite(&mut s);
+                s.last_frame = ustd::uptime_ms();
+                s.dirty = false;
+                s.damage = None;
+            } else if let Some((dx, dy, dw, dh)) = s.damage.take() {
+                s.fb.set_clip(dx, dy, dw, dh);
+                composite(&mut s);
+                s.last_frame = ustd::uptime_ms();
+                s.fb.reset_clip();
+            }
         }
         if !progressed {
             // wait for more input — the message that wakes us still counts
@@ -609,6 +619,25 @@ fn top_id(s: &S) -> u32 {
         .find(|w| w.ws == s.workspace && !w.min)
         .map(|w| w.id)
         .unwrap_or(0)
+}
+
+/// Remove windows whose owning app died (port freed by kernel teardown).
+fn reap_dead(s: &mut S) {
+    let mut i = 0;
+    while i < s.wins.len() {
+        if ustd::ipc_owner(s.wins[i].owner) == 0 {
+            let w = s.wins.remove(i);
+            if w.shm_id != 0 {
+                ustd::shm_drop(w.shm_id);
+            }
+            if s.focus == w.id {
+                s.focus = top_id(s);
+            }
+            s.dirty = true;
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn close_win(s: &mut S, id: u32) {

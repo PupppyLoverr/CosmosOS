@@ -436,6 +436,10 @@ pub fn ipc_recv(port: u32, buf: &mut [u8], timeout_ms: u64) -> Result<usize, i64
 pub fn ipc_close(port: u32) {
     sc1(shared::SYS_IPC_CLOSE, port as u64);
 }
+/// Owning task of a port, 0 if the port is gone (owner died or closed it).
+pub fn ipc_owner(port: u32) -> u32 {
+    sc1(shared::SYS_IPC_OWNER, port as u64) as u32
+}
 
 // ---------------------------------------------------------------------------
 // shm
