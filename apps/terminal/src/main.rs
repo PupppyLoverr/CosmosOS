@@ -7958,6 +7958,26 @@ fn now_str() -> String {
     )
 }
 
+/// POSIX `od -t a` display name for one byte: 3-char control names,
+/// ' sp' for space, the graphic char itself when printable, octal else.
+fn od_aname(b: u8) -> String {
+    const NAMES: [&str; 33] = [
+        "nul", "soh", "stx", "etx", "eot", "enq", "ack", "bel", " bs",
+        " ht", " nl", " vt", " ff", " cr", " so", " si", "dle", "dc1",
+        "dc2", "dc3", "dc4", "nak", "syn", "etb", "can", " em", "sub",
+        "esc", " fs", " gs", " rs", " us", " sp",
+    ];
+    if b < 33 {
+        String::from(NAMES[b as usize])
+    } else if b == 127 {
+        String::from("del")
+    } else if (33..=126).contains(&b) {
+        alloc::format!("{:>3}", b as char)
+    } else {
+        alloc::format!("{:03o}", b)
+    }
+}
+
 fn fmt_fixed(millionths: u64) -> String {
     // millionths -> "i.frac" with trailing zeros trimmed
     let i = millionths / 1_000_000;
@@ -16438,6 +16458,9 @@ impl Term {
                     let mut rest = l;
                     while rest.len() > w && w > 0 {
                         let mut cut = w;
+                        // -b or not, widths are counted in bytes; the cut
+                        // still backs up to a char boundary so &str slices
+                        // can't panic on multi-byte splits.
                         while !rest.is_char_boundary(cut) {
                             cut -= 1;
                         }
@@ -17609,6 +17632,10 @@ impl Term {
                     if ebx7 & (1 << 18) != 0 { flags.push("rdseed"); }
                     self.emit(&alloc::format!("  flags: {}", flags.join(" ")));
                 }
+            }
+            "arch" => {
+                // arch — machine architecture (same string as uname -m)
+                self.emit("x86_64");
             }
             "uname" => {
                 // uname [-snrvmoap]: kernel name/nodename/release/machine --
@@ -20544,6 +20571,29 @@ impl Term {
                                     (if neg { -v } else { v }) as i64
                                 };
                                 ls.sort_by_key(hum);
+                            } else if args.iter().any(|a| a == &"-g") {
+                                // -g: general numeric — leading float incl.
+                                // scientific notation; unparsable -> 0
+                                let gen = |l: &&str| -> u64 {
+                                    let t = l.trim_start();
+                                    let mut end = 0usize;
+                                    for (i, c) in t.char_indices() {
+                                        if c.is_ascii_digit()
+                                            || "+-.eE".contains(c)
+                                        {
+                                            end = i + c.len_utf8();
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    let v: f64 =
+                                        t[..end].parse().unwrap_or(0.0);
+                                    // f64 bits ordered: flip sign bit of
+                                    // positives, invert negatives entirely
+                                    let b = v.to_bits();
+                                    if v.is_sign_negative() { !b } else { b | (1 << 63) }
+                                };
+                                ls.sort_by_key(gen);
                             } else if args.iter().any(|a| a == &"-n") {
                                 ls.sort_by_key(num);
                             } else {
@@ -21552,6 +21602,21 @@ impl Term {
                                     .and_then(|s| s.chars().next())
                             })
                             .unwrap_or('\t');
+                        // --output-delimiter=X: join the selected fields
+                        // with X instead of the input delimiter (GNU)
+                        let odelim: String = args
+                            .iter()
+                            .find_map(|a| {
+                                a.strip_prefix("--output-delimiter=")
+                                    .map(String::from)
+                            })
+                            .or_else(|| {
+                                args.iter()
+                                    .position(|a| a == &"--output-delimiter")
+                                    .and_then(|i| args.get(i + 1))
+                                    .map(|s| String::from(*s))
+                            })
+                            .unwrap_or_else(|| alloc::format!("{}", delim));
                         // -f spec: comma list of N | A-B | -B | A-
                         // (open-ended ranges store usize::MAX as the hi)
                         let fspec: Option<&str> = args
@@ -21658,7 +21723,6 @@ impl Term {
                                 }
                             }
                             (Some(s), false) => {
-                                let dstr = alloc::format!("{}", delim);
                                 let mut recs: Vec<&str> = if cz {
                                     s.split('\0').collect()
                                 } else {
@@ -21678,7 +21742,7 @@ impl Term {
                                         .filter(|f| in_sel(*f) != complement)
                                         .filter_map(|f| parts.get(f - 1).copied())
                                         .collect();
-                                    self.emit_rec(&got.join(&dstr), cz);
+                                    self.emit_rec(&got.join(&odelim), cz);
                                 }
                             }
                             (Some(_), true) => self.fail("cut: need -f|-c N[,M..]"),
@@ -26515,7 +26579,7 @@ impl Term {
                             // the type (x|o|d|u|c), size suffix ignored
                             match args.get(oi + 1).and_then(|v| v.chars().next()) {
                                 Some('c') => { chars = true; oi += 1; }
-                                Some(t) if "xodu".contains(t) => {
+                                Some(t) if "xodua".contains(t) => {
                                     fmt = t as u8; oi += 1;
                                 }
                                 Some(_) => oi += 1,
@@ -26527,7 +26591,7 @@ impl Term {
                             // attached: -to1, -td1, -tu1, -tc
                             match a.chars().nth(2) {
                                 Some('c') => chars = true,
-                                Some(t) if "xodu".contains(t) => fmt = t as u8,
+                                Some(t) if "xodua".contains(t) => fmt = t as u8,
                                 _ => {}
                             }
                         }
@@ -26622,6 +26686,7 @@ impl Term {
                                 l.push_str(&match fmt {
                                     b'o' => alloc::format!("{:03o} ", b),
                                     b'd' | b'u' => alloc::format!("{:3} ", b),
+                                    b'a' => alloc::format!("{:>3} ", od_aname(*b)),
                                     _ => alloc::format!("{:02x} ", b),
                                 });
                             }
