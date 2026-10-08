@@ -70,6 +70,7 @@ pub const SYS_NET_TCP_ACCEPT: u64 = 71;   // (lport, ptr to 8B out, timeout) -> 
 pub const SYS_NET_TCP_UNLISTEN: u64 = 72; // (lport) -> 0
 pub const SYS_SHOT: u64 = 73;             // (path_ptr,path_len) -> 0 | ERR  fb -> PPM file
 pub const SYS_RAND: u64 = 74;             // (buf,cap<=4096) -> n | ERR  hardware/seeded random bytes
+pub const SYS_PCI_SCAN: u64 = 75;         // (&mut PciEnt buf, max) -> n | ERR
 
 pub const SYS_ERR: u64 = u64::MAX;
 
@@ -147,6 +148,20 @@ impl Default for DirEntry {
     }
 }
 pub const DIR_ENTRY_MAX: usize = 64;
+
+/// One PCI function, filled by SYS_PCI_SCAN.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PciEnt {
+    pub bus: u8,
+    pub dev: u8,
+    pub fun: u8,
+    pub class: u8,    // base class code (cfg 0x0B)
+    pub subclass: u8, // cfg 0x0A
+    pub _pad: u8,
+    pub vendor: u16,
+    pub device: u16,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

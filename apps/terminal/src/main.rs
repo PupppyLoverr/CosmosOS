@@ -1619,6 +1619,208 @@ impl Term {
                     mi.total_kb, mi.used_kb, mi.kernel_heap_kb, mi.tasks
                 ));
             }
+            "factor" => {
+                // factor N...: trial-division prime factorization
+                let mut ok = true;
+                for a in args.iter().filter(|a| !a.starts_with('-')) {
+                    match a.parse::<u64>() {
+                        Ok(0) | Err(_) => {
+                            self.fail(&alloc::format!("factor: '{}' not a positive int", a));
+                            ok = false;
+                        }
+                        Ok(n) => {
+                            let (mut m, mut fs, mut d) = (n, Vec::new(), 2u64);
+                            while d * d <= m && d < 1_000_000 {
+                                while m % d == 0 {
+                                    fs.push(d);
+                                    m /= d;
+                                }
+                                d += if d == 2 { 1 } else { 2 };
+                            }
+                            if m > 1 {
+                                fs.push(m);
+                            }
+                            let mut line = alloc::format!("{}:", n);
+                            for f in &fs {
+                                line.push_str(&alloc::format!(" {}", f));
+                            }
+                            self.emit(&line);
+                        }
+                    }
+                }
+                if !ok {
+                    self.last_ok = false;
+                }
+            }
+            "shuf" => {
+                // shuf [file|-n N|-i lo-hi]: Fisher-Yates over input lines
+                // using kernel rand; -i shuffles lo..hi, -n limits output
+                let mut lo = 1u64;
+                let mut hi = 0u64;
+                let mut limit = usize::MAX;
+                let mut file = "";
+                let mut skip = false;
+                for (i, a) in args.iter().enumerate() {
+                    if skip {
+                        skip = false;
+                        continue;
+                    }
+                    if let Some(r) = a.strip_prefix("-i") {
+                        let r = if r.is_empty() {
+                            skip = true;
+                            args.get(i + 1).copied().unwrap_or("")
+                        } else {
+                            r
+                        };
+                        if let Some((l, h)) = r.split_once('-') {
+                            lo = l.parse().unwrap_or(1);
+                            hi = h.parse().unwrap_or(0);
+                        }
+                    } else if let Some(n) = a.strip_prefix("-n") {
+                        let n = if n.is_empty() {
+                            skip = true;
+                            args.get(i + 1).copied().unwrap_or("")
+                        } else {
+                            n
+                        };
+                        limit = n.parse().unwrap_or(usize::MAX);
+                    } else if !a.starts_with('-') {
+                        file = a;
+                    }
+                }
+                let mut lines: Vec<String> = if hi >= lo && file.is_empty() {
+                    (lo..=hi).map(|n| alloc::format!("{}", n)).collect()
+                } else {
+                    let data = if file.is_empty() {
+                        self.pipe_in.clone().unwrap_or_default()
+                    } else {
+                        match ustd::read_all(file) {
+                            Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                            Err(e) => {
+                                self.fail(&alloc::format!("shuf: {}: err {}", file, e));
+                                String::new()
+                            }
+                        }
+                    };
+                    data.lines().map(|l| String::from(l)).collect()
+                };
+                // Fisher-Yates with kernel rand_u64
+                for i in (1..lines.len()).rev() {
+                    let j = (ustd::rand_u64().unwrap_or(i as u64) % (i as u64 + 1)) as usize;
+                    lines.swap(i, j);
+                }
+                for l in lines.iter().take(limit) {
+                    self.emit(l);
+                }
+            }
+            "cksum" => {
+                // cksum file: POSIX CRC (0x04C11DB7, reflected, len-augmented)
+                let f = args.first().copied().filter(|a| !a.starts_with('-')).unwrap_or("");
+                let mut bad = false;
+                let data = if f.is_empty() {
+                    self.pipe_in.clone().unwrap_or_default().into_bytes()
+                } else {
+                    match ustd::read_all(f) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            self.fail(&alloc::format!("cksum: {}: err {}", f, e));
+                            bad = true;
+                            Vec::new()
+                        }
+                    }
+                };
+                if !bad {
+                    // POSIX cksum: MSB-first poly 0x04C11DB7, then the byte
+                    // count fed in LSB-first, final inversion
+                    let mut tbl = [0u32; 256];
+                    for (i, e) in tbl.iter_mut().enumerate() {
+                        let mut c = (i as u32) << 24;
+                        for _ in 0..8 {
+                            c = if c & 0x8000_0000 != 0 { (c << 1) ^ 0x04C11DB7 } else { c << 1 };
+                        }
+                        *e = c;
+                    }
+                    let mut crc = 0u32;
+                    for b in &data {
+                        crc = (crc << 8) ^ tbl[(((crc >> 24) as u8) ^ *b) as usize];
+                    }
+                    let mut len = data.len() as u64;
+                    while len > 0 {
+                        crc = (crc << 8) ^ tbl[(((crc >> 24) as u8) ^ (len & 0xFF) as u8) as usize];
+                        len >>= 8;
+                    }
+                    self.emit(&alloc::format!("{} {} {}", !crc, data.len(), f));
+                }
+            }
+            "lspci" => {
+                // real PCI config-space enumeration (SYS_PCI_SCAN)
+                let mut ents = [shared::PciEnt::default(); 64];
+                let n = ustd::pci_scan(&mut ents);
+                for e in ents.iter().take(n) {
+                    self.emit(&alloc::format!(
+                        "  {:02x}:{:02x}.{}  class {:02x}{:02x}  {:04x}:{:04x}",
+                        e.bus, e.dev, e.fun, e.class, e.subclass, e.vendor, e.device
+                    ));
+                }
+                if n == 0 {
+                    self.emit("  (no pci devices)");
+                }
+            }
+            "lscpu" => {
+                // real CPUID vendor/brand/features + rdtsc MHz estimate
+                let (mut vendor, mut brand) = ([0u8; 12], [0u8; 48]);
+                let (mut ecx1, mut edx1, mut ebx7) = (0u32, 0u32, 0u32);
+                unsafe {
+                    let r = core::arch::x86_64::__cpuid(0);
+                    vendor[0..4].copy_from_slice(&r.ebx.to_le_bytes());
+                    vendor[4..8].copy_from_slice(&r.edx.to_le_bytes());
+                    vendor[8..12].copy_from_slice(&r.ecx.to_le_bytes());
+                    let r = core::arch::x86_64::__cpuid(1);
+                    ecx1 = r.ecx;
+                    edx1 = r.edx;
+                    if core::arch::x86_64::__cpuid(0x80000000).eax >= 0x80000004 {
+                        for (i, leaf) in (0x80000002u32..=0x80000004).enumerate() {
+                            let r = core::arch::x86_64::__cpuid(leaf);
+                            for (j, reg) in [r.eax, r.ebx, r.ecx, r.edx].iter().enumerate() {
+                                brand[i * 16 + j * 4..i * 16 + j * 4 + 4]
+                                    .copy_from_slice(&reg.to_le_bytes());
+                            }
+                        }
+                    }
+                    if core::arch::x86_64::__cpuid(0).eax >= 7 {
+                        ebx7 = core::arch::x86_64::__cpuid_count(7, 0).ebx;
+                    }
+                    let t0 = core::arch::x86_64::_rdtsc();
+                    let m0 = ustd::uptime_ms();
+                    while ustd::uptime_ms() - m0 < 20 {
+                        core::hint::spin_loop();
+                    }
+                    let mhz = (core::arch::x86_64::_rdtsc() - t0)
+                        / ((ustd::uptime_ms() - m0).max(1) * 1000);
+                    let vend = core::str::from_utf8(&vendor).unwrap_or("?");
+                    let br = core::str::from_utf8(&brand).unwrap_or("?").trim_matches('\0').trim();
+                    self.emit(&alloc::format!("  vendor: {}", vend));
+                    self.emit(&alloc::format!("  model: {}", if br.is_empty() { "?" } else { br }));
+                    self.emit(&alloc::format!("  clock: ~{} MHz (rdtsc)", mhz));
+                    let mut flags: Vec<&str> = Vec::new();
+                    if edx1 & (1 << 0) != 0 { flags.push("fpu"); }
+                    if edx1 & (1 << 23) != 0 { flags.push("mmx"); }
+                    if edx1 & (1 << 25) != 0 { flags.push("sse"); }
+                    if edx1 & (1 << 26) != 0 { flags.push("sse2"); }
+                    if ecx1 & (1 << 0) != 0 { flags.push("sse3"); }
+                    if ecx1 & (1 << 9) != 0 { flags.push("ssse3"); }
+                    if ecx1 & (1 << 19) != 0 { flags.push("sse4.1"); }
+                    if ecx1 & (1 << 20) != 0 { flags.push("sse4.2"); }
+                    if ecx1 & (1 << 25) != 0 { flags.push("aesni"); }
+                    if ecx1 & (1 << 28) != 0 { flags.push("avx"); }
+                    if ecx1 & (1 << 30) != 0 { flags.push("rdrand"); }
+                    if ebx7 & (1 << 5) != 0 { flags.push("avx2"); }
+                    if ebx7 & (1 << 7) != 0 { flags.push("smep"); }
+                    if ebx7 & (1 << 20) != 0 { flags.push("smap"); }
+                    if ebx7 & (1 << 18) != 0 { flags.push("rdseed"); }
+                    self.emit(&alloc::format!("  flags: {}", flags.join(" ")));
+                }
+            }
             "uname" => {
                 // uname [-srmva]: kernel name/release/machine -- bare prints -s
                 let all = args.iter().any(|a| a.contains('a'));
@@ -4087,6 +4289,7 @@ impl Term {
         "source", "comm", "join", "paste", "expand", "unexpand", "at", "file",
         "test", "[", "rand", "mount", "rmdir",
         "export", "unset", "man",
+        "lspci", "lscpu", "factor", "shuf", "cksum",
     ];
 
     /// Tab-complete: command names before the first space, paths after.
