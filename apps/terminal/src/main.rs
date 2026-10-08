@@ -13158,12 +13158,50 @@ impl Term {
             },
             "uptime" => {
                 let ms = ustd::uptime_ms();
-                self.emit(&alloc::format!(
-                    "up {}h {:02}m {:02}s",
-                    ms / 3_600_000,
-                    (ms / 60_000) % 60,
-                    (ms / 1000) % 60
-                ));
+                match args.first().map(|s| *s) {
+                    // -s: boot wall-clock (current epoch minus uptime)
+                    Some("-s") | Some("--since") => {
+                        let d = ustd::datetime();
+                        let now = cal_days(d.year, d.month, d.day) * 86400
+                            + d.hour as u64 * 3600 + d.minute as u64 * 60
+                            + d.second as u64;
+                        let (y, mo, dd, h, mi, se) =
+                            epoch_to_dt(now.saturating_sub(ms / 1000));
+                        self.emit(&alloc::format!(
+                            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                            y, mo, dd, h, mi, se
+                        ));
+                    }
+                    // -p: GNU pretty "up X hours, Y minutes"
+                    Some("-p") | Some("--pretty") => {
+                        let mins = ms / 60_000;
+                        let mut out = String::from("up ");
+                        let (days, hours, m) =
+                            (mins / 1440, (mins / 60) % 24, mins % 60);
+                        if days > 0 {
+                            out.push_str(&alloc::format!(
+                                "{} day{}, ", days,
+                                if days == 1 { "" } else { "s" }
+                            ));
+                        }
+                        if hours > 0 {
+                            out.push_str(&alloc::format!(
+                                "{} hour{}, ", hours,
+                                if hours == 1 { "" } else { "s" }
+                            ));
+                        }
+                        out.push_str(&alloc::format!(
+                            "{} minute{}", m, if m == 1 { "" } else { "s" }
+                        ));
+                        self.emit(&out);
+                    }
+                    _ => self.emit(&alloc::format!(
+                        "up {}h {:02}m {:02}s",
+                        ms / 3_600_000,
+                        (ms / 60_000) % 60,
+                        (ms / 1000) % 60
+                    )),
+                }
             }
             "chown" | "chgrp" => {
                 // chown U[:G] f... / chgrp G f... — real on tmpfs, EPERM on FAT.
@@ -13214,10 +13252,34 @@ impl Term {
                 let r = root.clone();
                 self.tree_recur(&r, "".into(), 0);
             }
-            "sleep" => match args.first().and_then(|s| s.parse::<u64>().ok()) {
-                Some(ms) => ustd::sleep_ms(ms),
-                None => self.fail("usage: sleep <ms>"),
-            },
+            "sleep" => {
+                // real sleep semantics: seconds by default (fractional ok),
+                // s/m/h/d suffixes; `usleep` covers milliseconds
+                let mut ms_total = 0u64;
+                let mut bad = false;
+                for a in &args {
+                    let (num, mult) = if let Some(n) = a.strip_suffix('d') {
+                        (n, 86_400_000u64)
+                    } else if let Some(n) = a.strip_suffix('h') {
+                        (n, 3_600_000u64)
+                    } else if let Some(n) = a.strip_suffix('m') {
+                        (n, 60_000u64)
+                    } else {
+                        (a.trim_end_matches('s'), 1_000u64)
+                    };
+                    match num.parse::<f64>() {
+                        Ok(f) if f >= 0.0 => {
+                            ms_total = ms_total.saturating_add((f * mult as f64) as u64)
+                        }
+                        _ => bad = true,
+                    }
+                }
+                if args.is_empty() || bad {
+                    self.fail("usage: sleep N[s|m|h|d]...");
+                } else {
+                    ustd::sleep_ms(ms_total);
+                }
+            }
             "seq" => {
                 // seq [-w] [-s sep] END | START END | START STEP END
                 // -w zero-pads to equal width; -s joins with a separator
@@ -18880,9 +18942,11 @@ impl Term {
                 }
             }
             "dd" => {
-                // dd if=X of=Y [bs=N] [count=M] [skip=N] -- real byte-level copy
+                // dd if=X of=Y [bs=N] [count=M] [skip=N] [conv=ucase,lcase,
+                // swab,sync] -- real byte-level copy + byte transforms
                 let (mut fi, mut fo) = ("", "");
                 let (mut bs, mut count, mut skip) = (512usize, usize::MAX, 0usize);
+                let mut conv = 0u8;
                 for a in args {
                     if let Some(v) = a.strip_prefix("if=") {
                         fi = v;
@@ -18890,6 +18954,16 @@ impl Term {
                         fo = v;
                     } else if let Some(v) = a.strip_prefix("bs=") {
                         bs = v.parse().unwrap_or(512);
+                    } else if let Some(v) = a.strip_prefix("conv=") {
+                        for c in v.split(',') {
+                            match c {
+                                "ucase" => conv |= 1,
+                                "lcase" => conv |= 2,
+                                "swab" => conv |= 4,
+                                "sync" => conv |= 8,
+                                _ => {}
+                            }
+                        }
                     } else if let Some(v) = a.strip_prefix("count=") {
                         count = v.parse().unwrap_or(usize::MAX);
                     } else if let Some(v) = a.strip_prefix("skip=") {
@@ -18897,14 +18971,33 @@ impl Term {
                     }
                 }
                 if fi.is_empty() {
-                    self.fail("usage: dd if=<in> of=<out> [bs=N] [count=M] [skip=N]");
+                    self.fail("usage: dd if=<in> of=<out> [bs=N] [count=M] [skip=N] [conv=...]");
                     return;
                 }
                 match ustd::read_all(fi) {
                     Ok(d) => {
                         let s0 = (skip * bs).min(d.len());
                         let n = (count.saturating_mul(bs)).min(d.len() - s0);
-                        let chunk = &d[s0..s0 + n];
+                        let mut chunk_v = d[s0..s0 + n].to_vec();
+                        if conv & 4 != 0 {
+                            // swab: swap adjacent byte pairs
+                            for w in chunk_v.chunks_exact_mut(2) {
+                                w.swap(0, 1);
+                            }
+                        }
+                        if conv & 1 != 0 {
+                            chunk_v.make_ascii_uppercase();
+                        }
+                        if conv & 2 != 0 {
+                            chunk_v.make_ascii_lowercase();
+                        }
+                        if conv & 8 != 0 && !chunk_v.is_empty() {
+                            // sync: pad the final partial block with NULs
+                            let pad = (bs - chunk_v.len() % bs) % bs;
+                            chunk_v.extend(core::iter::repeat(0u8).take(pad));
+                        }
+                        let n = chunk_v.len();
+                        let chunk = &chunk_v[..];
                         if fo.is_empty() {
                             for l in String::from_utf8_lossy(chunk).lines() {
                                 self.emit(l);
