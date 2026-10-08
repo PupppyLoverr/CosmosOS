@@ -1165,6 +1165,55 @@ fn parse_date_expr(s: &str) -> Option<DateTime> {
     })
 }
 
+/// Filename extension for `ls -X`: bytes after the last '.', empty for
+/// dotfiles and names without a dot.
+fn name_ext(n: &[u8]) -> &[u8] {
+    match n.iter().rposition(|b| *b == b'.') {
+        Some(p) if p > 0 => &n[p + 1..],
+        _ => &[],
+    }
+}
+
+/// Natural (version) compare for `ls -v`: digit runs compare numerically,
+/// everything else byte-wise. a2 < a10, a02 < a2 tie-breaks on length.
+fn nat_cmp(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            let (mut ei, mut ej) = (i, j);
+            while ei < a.len() && a[ei].is_ascii_digit() {
+                ei += 1;
+            }
+            while ej < b.len() && b[ej].is_ascii_digit() {
+                ej += 1;
+            }
+            let na: u64 = core::str::from_utf8(&a[i..ei])
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            let nb: u64 = core::str::from_utf8(&b[j..ej])
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            match na.cmp(&nb) {
+                core::cmp::Ordering::Equal => {}
+                o => return o,
+            }
+            i = ei;
+            j = ej;
+        } else {
+            match a[i].cmp(&b[j]) {
+                core::cmp::Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+                o => return o,
+            }
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j))
+}
+
 /// Render one month as text lines (Sunday-first), or mark today.
 fn cal_render(m: u8, y: u16) -> Vec<String> {
     let mut out = Vec::new();
@@ -7165,18 +7214,21 @@ impl Term {
             } else if let Some(rest) = var.strip_prefix("__CPI:") {
                 // cp -i: 'y' completes the deferred copy
                 if let Some((f, t)) = rest.split_once(':') {
-                    let (t, rec, verb) = match t.split_once(':') {
+                    let (t, rec, verb, pres) = match t.split_once(':') {
                         Some((t, r)) => {
-                            let (r, vb) = match r.split_once(':') {
-                                Some((r, vb)) => (r, vb == "1"),
-                                None => (r, false),
+                            let (r, vb, pr) = match r.split_once(':') {
+                                Some((r, vb)) => match vb.split_once(':') {
+                                    Some((vb, pr)) => (r, vb == "1", pr == "1"),
+                                    None => (r, vb == "1", false),
+                                },
+                                None => (r, false, false),
                             };
-                            (t, r == "1", vb)
+                            (t, r == "1", vb, pr)
                         }
-                        None => (t, false, false),
+                        None => (t, false, false, false),
                     };
                     if v.trim_start().starts_with('y') {
-                        self.cp_any(f, t, rec, verb);
+                        self.cp_any(f, t, rec, verb, pres);
                     } else {
                         self.emit("cp: not overwritten");
                     }
@@ -8790,6 +8842,9 @@ impl Term {
                 let mut show_all = false;
                 let mut by_size = false;
                 let mut by_time = false;
+                let mut by_ext = false;
+                let mut by_ver = false;
+                let mut unsorted = false;
                 let mut rev = false;
                 let mut rec = false;
                 let mut classify = false;
@@ -8801,6 +8856,9 @@ impl Term {
                             'a' => show_all = true,
                             'S' => by_size = true,
                             't' => by_time = true,
+                            'X' => by_ext = true,
+                            'v' => by_ver = true,
+                            'U' => unsorted = true,
                             'r' => rev = true,
                             'R' => rec = true,
                             'F' => classify = true,
@@ -8848,6 +8906,26 @@ impl Term {
                                 });
                             } else if by_time {
                                 ents.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+                            } else if by_ver {
+                                // -v: natural sort — digit runs compare
+                                // numerically (v2 < v10)
+                                ents.sort_by(|a, b| {
+                                    nat_cmp(
+                                        &a.name[..a.name_len as usize],
+                                        &b.name[..b.name_len as usize],
+                                    )
+                                });
+                            } else if by_ext {
+                                // -X: extension (after last '.'), then name
+                                ents.sort_by(|a, b| {
+                                    let an = &a.name[..a.name_len as usize];
+                                    let bn = &b.name[..b.name_len as usize];
+                                    name_ext(an)
+                                        .cmp(name_ext(bn))
+                                        .then(an.cmp(bn))
+                                });
+                            } else if unsorted {
+                                // -U: directory order, no sort
                             } else {
                                 ents.sort_by(|a, b| {
                                     a.name[..a.name_len as usize]
@@ -11482,15 +11560,16 @@ impl Term {
                 }
             }
             "cp" => {
-                // cp [-r] [-i] [-n] [-u] <from> <to>: -i asks before
+                // cp [-r] [-i] [-n] [-u] [-p] <from> <to>: -i asks before
                 // overwriting, -n never overwrites, -u only when src is
-                // newer or dst absent
+                // newer or dst absent, -p preserves mtime + FAT attrs
                 let rec = args.iter().any(|a| a == &"-r" || a == &"-R" || a == &"-a");
                 let nolink = args.iter().any(|a| a == &"-P" || a == &"-d" || a == &"-a");
                 let inter = args.iter().any(|a| a.starts_with('-') && a.contains('i'));
                 let noclob = args.iter().any(|a| a.starts_with('-') && a.contains('n'));
                 let update = args.iter().any(|a| a.starts_with('-') && a.contains('u'));
                 let verb = args.iter().any(|a| a.starts_with('-') && a.contains('v'));
+                let pres = args.iter().any(|a| a.starts_with('-') && a.contains('p'));
                 let pos: Vec<&str> = args
                     .iter()
                     .filter(|a| !a.starts_with('-'))
@@ -11597,8 +11676,9 @@ impl Term {
                                 ));
                                 self.read_modal = Some((
                                     alloc::format!(
-                                        "__CPI:{}:{}:{}:{}",
-                                        f, t, rec as u8, verb as u8
+                                        "__CPI:{}:{}:{}:{}:{}",
+                                        f, t, rec as u8, verb as u8,
+                                        pres as u8
                                     ),
                                     0,
                                     0,
@@ -11607,7 +11687,7 @@ impl Term {
                                 return;
                             }
                         }
-                        self.cp_any(f, t, rec, verb)
+                        self.cp_any(f, t, rec, verb, pres)
                     }
                     _ => self.fail("usage: cp [-r] [-i] <from> <to>"),
                 }
@@ -13337,10 +13417,12 @@ impl Term {
                 }
             }
             "seq" => {
-                // seq [-w] [-s sep] END | START END | START STEP END
-                // -w zero-pads to equal width; -s joins with a separator
+                // seq [-w] [-s sep] [-f fmt] END | START END | START STEP END
+                // -w zero-pads to equal width; -s joins with a separator;
+                // -f renders each number through printf_render
                 let mut wide = false;
                 let mut sep = "\n";
+                let mut fmt: Option<String> = None;
                 let mut nums: Vec<&str> = Vec::new();
                 let mut i = 0usize;
                 while i < args.len() {
@@ -13354,8 +13436,12 @@ impl Term {
                     } else if let Some(s) = a.strip_prefix("-s") {
                         sep = if s.is_empty() { "\n" } else { s };
                         i += 1;
-                    } else if a == "-f" || a.starts_with("-f") {
-                        i += 1; // integer-only shell; fmt ignored
+                    } else if a == "-f" {
+                        fmt = args.get(i + 1).map(|s| String::from(*s));
+                        i += 2;
+                    } else if let Some(f) = a.strip_prefix("-f") {
+                        fmt = Some(String::from(if f.is_empty() { "%g" } else { f }));
+                        i += 1;
                     } else {
                         nums.push(a);
                         i += 1;
@@ -13385,7 +13471,13 @@ impl Term {
                     return;
                 }
                 while if st > 0 { n <= b } else { n >= b } {
-                    v.push(alloc::format!("{}", n));
+                    match &fmt {
+                        Some(f) => {
+                            let ns = alloc::format!("{}", n);
+                            v.push(printf_render(f, &[&ns]));
+                        }
+                        None => v.push(alloc::format!("{}", n)),
+                    }
                     n += st;
                     if v.len() >= 65_536 {
                         break; // runaway guard
@@ -14266,32 +14358,69 @@ impl Term {
                 None => self.fail("usage: hex <file>  (first 1KiB)"),
             },
             "du" => {
-                // du [-hsa] <path>: -h human sizes, -s summary only, -a all
-                // files (not just top level)
+                // du [-hsac] [--max-depth=N|-d N] <paths...>: -h human,
+                // -s per-arg summary only, -a files too, -c grand total.
+                // Per-dir subtotals print bottom-up like GNU du.
                 let human = args.iter().any(|a| *a == "-h");
                 let summ = args.iter().any(|a| *a == "-s");
                 let all = args.iter().any(|a| *a == "-a");
-                let p = args
-                    .iter()
-                    .find(|a| !a.starts_with('-'))
-                    .copied();
-                match p {
-                    Some(p) => {
-                        let n = self.du_tree(
-                            p,
-                            0,
-                            human,
-                            if summ { 0 } else if all { 2 } else { 1 },
-                        );
-                        {
-                            if human {
-                                self.emit(&alloc::format!("  {} total", human_size(n)));
-                            } else {
-                                self.emit(&alloc::format!("  {} B total", n));
-                            }
+                let gtot = args.iter().any(|a| *a == "-c");
+                let mut maxd = usize::MAX;
+                let mut valpos: Vec<usize> = Vec::new();
+                for (i, a) in args.iter().enumerate() {
+                    if let Some(v) = a.strip_prefix("--max-depth=") {
+                        maxd = v.parse().unwrap_or(usize::MAX);
+                    } else if *a == "-d" {
+                        valpos.push(i + 1);
+                        if let Some(v) = args.get(i + 1) {
+                            maxd = v.parse().unwrap_or(usize::MAX);
                         }
                     }
-                    None => self.fail("usage: du [-hsa] <path>  (recursive bytes)"),
+                }
+                let paths: Vec<&str> = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, a)| !a.starts_with('-') && !valpos.contains(i))
+                    .map(|(_, a)| *a)
+                    .collect();
+                if paths.is_empty() {
+                    self.fail(
+                        "usage: du [-hsac] [--max-depth=N] <paths...>  (recursive bytes)",
+                    );
+                    return;
+                }
+                let emit = if summ {
+                    0
+                } else if all {
+                    2
+                } else {
+                    1
+                };
+                let mut grand = 0u64;
+                for p in paths {
+                    let n = self.du_tree(p, 0, human, emit, maxd);
+                    grand += n;
+                    if summ {
+                        if human {
+                            self.emit(&alloc::format!(
+                                "  {:>8} {}",
+                                human_size(n),
+                                p
+                            ));
+                        } else {
+                            self.emit(&alloc::format!("  {:>8} {}", n, p));
+                        }
+                    }
+                }
+                if gtot {
+                    if human {
+                        self.emit(&alloc::format!(
+                            "  {:>8} total",
+                            human_size(grand)
+                        ));
+                    } else {
+                        self.emit(&alloc::format!("  {:>8} total", grand));
+                    }
                 }
             }
             "df" => {
@@ -21684,7 +21813,7 @@ impl Term {
 
     /// Recursive byte total for `du`.
     // emit: 0 = no per-entry lines (-s), 1 = top-level files only, 2 = all (-a)
-    fn du_tree(&mut self, path: &str, depth: usize, human: bool, emit: u8) -> u64 {
+    fn du_tree(&mut self, path: &str, depth: usize, human: bool, emit: u8, maxd: usize) -> u64 {
         match ustd::readdir(path) {
             Ok(ents) => {
                 let mut total = 0u64;
@@ -21692,16 +21821,29 @@ impl Term {
                     let name = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("?");
                     let p = alloc::format!("{}{}{}", path, if path.ends_with('/') { "" } else { "/" }, name);
                     if e.is_dir != 0 {
-                        total += self.du_tree(&p, depth + 1, human, emit);
+                        total += self.du_tree(&p, depth + 1, human, emit, maxd);
                     } else {
                         total += e.size;
-                        if emit == 2 || (emit == 1 && depth == 0) {
+                        // files only under -a (GNU default prints dirs only)
+                        if emit == 2 {
                             if human {
                                 self.emit(&alloc::format!("  {:>8} {}", human_size(e.size), p));
                             } else {
                                 self.emit(&alloc::format!("  {:>8} {}", e.size, p));
                             }
                         }
+                    }
+                }
+                // GNU-style per-dir subtotal, bottom-up, depth <= maxd
+                if emit != 0 && depth <= maxd {
+                    if human {
+                        self.emit(&alloc::format!(
+                            "  {:>8} {}",
+                            human_size(total),
+                            path
+                        ));
+                    } else {
+                        self.emit(&alloc::format!("  {:>8} {}", total, path));
                     }
                 }
                 total
@@ -22564,7 +22706,7 @@ impl Term {
 
     /// cp -r: copy a file, or a directory tree when `rec`. `to` naming
     /// follows real cp: a directory target copies INTO it.
-    fn cp_any(&mut self, from: &str, to: &str, rec: bool, verb: bool) {
+    fn cp_any(&mut self, from: &str, to: &str, rec: bool, verb: bool, pres: bool) {
         match ustd::stat(from) {
             Ok(st) if st.is_dir != 0 => {
                 if !rec {
@@ -22593,7 +22735,7 @@ impl Term {
                                 core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("?");
                             let f = alloc::format!("{}/{}", from.trim_end_matches('/'), name);
                             let t = alloc::format!("{}/{}", dst, name);
-                            self.cp_any(&f, &t, rec, verb);
+                            self.cp_any(&f, &t, rec, verb, pres);
                         }
                     }
                     Err(e) => self.fail(&alloc::format!("cp: {}: err {}", from, e)),
@@ -22623,8 +22765,17 @@ impl Term {
                         ustd::close(outf);
                         if n < 0 {
                             self.fail(&alloc::format!("cp: {}: err {}", dst, n));
-                        } else if verb {
-                            self.emit(&alloc::format!("'{}' -> '{}'", from, dst));
+                        } else {
+                            // -p: preserve mtime + FAT attr bits on the copy
+                            if pres {
+                                if let Ok(s) = ustd::stat(from) {
+                                    let _ = ustd::utime(&dst, s.mtime);
+                                    let _ = ustd::setattr(&dst, s.attr as u8);
+                                }
+                            }
+                            if verb {
+                                self.emit(&alloc::format!("'{}' -> '{}'", from, dst));
+                            }
                         }
                     }
                     (Err(e), _) => {
