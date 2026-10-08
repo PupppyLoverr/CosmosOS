@@ -30,7 +30,7 @@ const FILES: &[&str] = &[
 const NET_FILES: &[&str] = &["tcp", "udp", "unix", "dev", "operstate", "owners", "route"];
 
 /// files under /proc/sys/kernel
-const SYS_FILES: &[&str] = &["hostname"];
+const SYS_FILES: &[&str] = &["hostname", "cow_pages"];
 
 pub fn handles(path: &str) -> bool {
     path == "/proc" || path.starts_with("/proc/")
@@ -217,6 +217,9 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         ),
         "/proc/net/owners" => net::net_owners(),
         "/proc/sys/kernel/hostname" => alloc::format!("{}\n", crate::syscall::hostname()),
+        "/proc/sys/kernel/cow_pages" => {
+            alloc::format!("{}\n", crate::mem::cow_shared_total())
+        }
         "/proc/stat" => {
             let (user, all) = task::cpu_sums();
             let ticks = timer::ticks();

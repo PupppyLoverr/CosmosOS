@@ -501,6 +501,74 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             _ => false,
         }
     });
+    check("fork-cow-shared", {
+        // COW: fork shares every present private frame — the kernel's
+        // shared-frame counter must jump while the child is alive
+        let rd = |p: &str| -> u64 {
+            ustd::read_all(p)
+                .ok()
+                .and_then(|b| {
+                    String::from_utf8_lossy(&b)
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                })
+                .unwrap_or(0)
+        };
+        let before = rd("/proc/sys/kernel/cow_pages");
+        match ustd::fork() {
+            0 => {
+                ustd::sleep_ms(700);
+                ustd::exit(0);
+            }
+            p if p > 0 => {
+                let during = rd("/proc/sys/kernel/cow_pages");
+                let _ = ustd::waitpid(p as u32, 4000);
+                during > before
+            }
+            _ => false,
+        }
+    });
+    check("fork-cow-split", {
+        // parent writes after fork: it gets a private copy — the child
+        // still reads the ORIGINAL shared contents (true COW semantics)
+        use core::sync::atomic::Ordering;
+        static V2: AtomicU64 = AtomicU64::new(5);
+        match ustd::fork() {
+            0 => {
+                ustd::sleep_ms(600);
+                let v = V2.load(Ordering::SeqCst);
+                ustd::exit(if v == 5 { 0 } else { -1 });
+            }
+            p if p > 0 => {
+                V2.store(77, Ordering::SeqCst);
+                let c = ustd::waitpid(p as u32, 4000).unwrap_or(-1);
+                c == 0 && V2.load(Ordering::SeqCst) == 77
+            }
+            _ => false,
+        }
+    });
+    check("fork-pipe-share", {
+        // fd table cloned at fork: the child writes into the same pipe
+        match ustd::pipe() {
+            Some((rfd, wfd)) => match ustd::fork() {
+                0 => {
+                    let _ = ustd::write(wfd, b"K");
+                    ustd::exit(0);
+                }
+                p if p > 0 => {
+                    let mut b = [0u8; 1];
+                    let n = ustd::read(rfd, &mut b).unwrap_or(0);
+                    let _ = ustd::waitpid(p as u32, 3000);
+                    ustd::close(rfd);
+                    ustd::close(wfd);
+                    n == 1 && b[0] == b'K'
+                }
+                _ => false,
+            },
+            None => false,
+        }
+    });
     check("kern-ptr-rejected", {
         // syscall boundary must reject a kernel VA (phys-map region)
         ustd::sc1(shared::SYS_MEMINFO, 0xFFFF_8000_0000_0000) == u64::MAX
