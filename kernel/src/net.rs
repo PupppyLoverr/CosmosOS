@@ -6,8 +6,15 @@ use crate::virtio_net::{self, NET};
 use alloc::vec::Vec;
 use spin::Mutex;
 
-pub const OUR_IP: [u8; 4] = [10, 0, 2, 15];
+/// Fallback IP when DHCP fails (slirp's static-assignment convention).
+pub const DEFAULT_IP: [u8; 4] = [10, 0, 2, 15];
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
+
+/// Current configured IPv4 — set by DHCP at init, defaults to `DEFAULT_IP`.
+static CUR_IP: Mutex<[u8; 4]> = Mutex::new(DEFAULT_IP);
+pub fn our_ip() -> [u8; 4] {
+    *CUR_IP.lock()
+}
 
 static ARP_CACHE: Mutex<Vec<([u8; 4], [u8; 6])>> = Mutex::new(Vec::new());
 
@@ -22,7 +29,8 @@ fn wait_irq() {
 /// Next-hop MAC for `ip`: same-subnet addresses resolve directly, anything
 /// else goes via the gateway (real routing, not ARP-for-the-world).
 fn next_hop(ip: [u8; 4], timeout_ms: u64) -> Option<[u8; 6]> {
-    let on_net = ip[0] == OUR_IP[0] && ip[1] == OUR_IP[1] && ip[2] == OUR_IP[2];
+    let me = our_ip();
+    let on_net = ip[0] == me[0] && ip[1] == me[1] && ip[2] == me[2];
     arp_resolve(if on_net { ip } else { GW_IP }, timeout_ms)
 }
 
@@ -101,7 +109,7 @@ fn send_arp_request(target: [u8; 4]) {
     } else {
         return;
     }
-    p.extend_from_slice(&OUR_IP);
+    p.extend_from_slice(&our_ip());
     p.extend_from_slice(&[0u8; 6]);
     p.extend_from_slice(&target);
     let _ = send_frame([0xFF; 6], 0x0806, &p);
@@ -119,7 +127,7 @@ fn send_arp_reply(dst_mac: [u8; 6], dst_ip: [u8; 4]) {
     } else {
         return;
     }
-    p.extend_from_slice(&OUR_IP);
+    p.extend_from_slice(&our_ip());
     p.extend_from_slice(&dst_mac);
     p.extend_from_slice(&dst_ip);
     let _ = send_frame(dst_mac, 0x0806, &p);
@@ -164,7 +172,7 @@ fn handle_frame(f: &[u8]) -> Option<(u8, Vec<u8>)> {
                 c.push((sender_ip, sender_mac));
             }
             drop(c);
-            if op == 1 && target_ip == OUR_IP {
+            if op == 1 && target_ip == our_ip() {
                 send_arp_reply(sender_mac, sender_ip);
             }
             None
@@ -179,7 +187,9 @@ fn handle_frame(f: &[u8]) -> Option<(u8, Vec<u8>)> {
                 return None;
             }
             let dst: [u8; 4] = ip[16..20].try_into().ok()?;
-            if dst != OUR_IP {
+            // unicast to us, or broadcast (DHCP replies arrive before we
+            // own an address)
+            if dst != our_ip() && dst != [255, 255, 255, 255] {
                 return None;
             }
             Some((ip[9], ip[ihl..].to_vec()))
@@ -220,7 +230,8 @@ pub fn ping(ip: [u8; 4], timeout_ms: u64) -> Option<u64> {
         sprintln!("[net] ping: no device");
         return None;
     }
-    let on_net = ip[0] == OUR_IP[0] && ip[1] == OUR_IP[1] && ip[2] == OUR_IP[2];
+    let me = our_ip();
+    let on_net = ip[0] == me[0] && ip[1] == me[1] && ip[2] == me[2];
     let arp_for = if on_net { ip } else { GW_IP };
     let dst_mac = arp_resolve(arp_for, 1500)?;
     sprintln!(
@@ -247,6 +258,10 @@ pub fn ping(ip: [u8; 4], timeout_ms: u64) -> Option<u64> {
 }
 
 fn send_ip(dst_mac: [u8; 6], dst_ip: [u8; 4], proto: u8, payload: &[u8]) {
+    send_ip_src(our_ip(), dst_mac, dst_ip, proto, payload);
+}
+
+fn send_ip_src(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], proto: u8, payload: &[u8]) {
     let mut ip = Vec::with_capacity(20 + payload.len());
     ip.push(0x45);
     ip.push(0);
@@ -256,7 +271,7 @@ fn send_ip(dst_mac: [u8; 6], dst_ip: [u8; 4], proto: u8, payload: &[u8]) {
     ip.push(64);
     ip.push(proto);
     ip.extend_from_slice(&[0u8; 2]);
-    ip.extend_from_slice(&OUR_IP);
+    ip.extend_from_slice(&src_ip);
     ip.extend_from_slice(&dst_ip);
     let c = csum(&ip);
     put16(&mut ip[10..], c);
@@ -407,7 +422,7 @@ fn send_tcp(
     seg.extend_from_slice(&[0u8; 2]); // checksum
     seg.extend_from_slice(&[0u8; 2]); // urg
     seg.extend_from_slice(payload);
-    let c = tcp_csum(OUR_IP, dst_ip, &seg);
+    let c = tcp_csum(our_ip(), dst_ip, &seg);
     put16(&mut seg[16..], c);
     send_ip(dst_mac, dst_ip, 6, &seg);
 }
@@ -533,11 +548,150 @@ pub fn http_get(dst_ip: [u8; 4], host: &str, path: &str) -> Option<Vec<u8>> {
 
 /// (mac, ip) for `ifconfig`-style reporting.
 pub fn info() -> Option<([u8; 6], [u8; 4])> {
-    NET.lock().as_ref().map(|n| (n.mac, OUR_IP))
+    NET.lock().as_ref().map(|n| (n.mac, our_ip()))
+}
+
+// ---------------------------------------------------------------------------
+// DHCP — real DISCOVER/OFFER/REQUEST/ACK to configure CUR_IP.
+// ---------------------------------------------------------------------------
+
+const DHCP_XID: u32 = 0xC050_D00D;
+
+fn dhcp_packet(msg_type: u8, offered: Option<[u8; 4]>, server: Option<[u8; 4]>) -> Vec<u8> {
+    let n = NET.lock().clone().expect("net dev");
+    let mut p = Vec::with_capacity(300);
+    p.push(1); // op BOOTREQUEST
+    p.push(1); // htype eth
+    p.push(6); // hlen
+    p.push(0); // hops
+    p.extend_from_slice(&DHCP_XID.to_be_bytes());
+    p.extend_from_slice(&[0u8; 2]); // secs
+    p.extend_from_slice(&0x8000u16.to_be_bytes()); // broadcast flag
+    p.extend_from_slice(&[0u8; 4]); // ciaddr
+    p.extend_from_slice(&[0u8; 4]); // yiaddr (server fills)
+    p.extend_from_slice(&[0u8; 4]); // siaddr
+    p.extend_from_slice(&[0u8; 4]); // giaddr
+    p.extend_from_slice(&n.mac);
+    p.extend_from_slice(&[0u8; 10]); // chaddr pad
+    p.extend_from_slice(&[0u8; 64]); // sname
+    p.extend_from_slice(&[0u8; 128]); // file
+    p.extend_from_slice(&[99, 130, 83, 99]); // magic cookie
+    p.extend_from_slice(&[53, 1, msg_type]); // DHCP message type
+    if let Some(ip) = offered {
+        p.extend_from_slice(&[50, 4]); // requested IP
+        p.extend_from_slice(&ip);
+    }
+    if let Some(ip) = server {
+        p.extend_from_slice(&[54, 4]); // server id
+        p.extend_from_slice(&ip);
+    }
+    p.extend_from_slice(&[55, 3, 1, 3, 6]); // param req: subnet, router, dns
+    p.push(255); // end
+    while p.len() < 300 {
+        p.push(0);
+    }
+    p
+}
+
+fn dhcp_send(payload: &[u8]) {
+    let mut udp = Vec::with_capacity(8 + payload.len());
+    udp.extend_from_slice(&68u16.to_be_bytes()); // client port
+    udp.extend_from_slice(&67u16.to_be_bytes()); // server port
+    udp.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    udp.extend_from_slice(&[0u8; 2]);
+    udp.extend_from_slice(payload);
+    send_ip_src(
+        [0, 0, 0, 0],
+        [0xFF; 6],
+        [255, 255, 255, 255],
+        17,
+        &udp,
+    );
+}
+
+/// Parse a DHCP reply: (msg_type, yiaddr, server_id) or None.
+fn dhcp_parse(udp: &[u8]) -> Option<(u8, [u8; 4], Option<[u8; 4]>)> {
+    if udp.len() < 244 {
+        return None;
+    }
+    if udp[0] != 2 || udp[2] != 6 {
+        return None; // BOOTREPLY, eth
+    }
+    if u32::from_be_bytes(udp[4..8].try_into().ok()?) != DHCP_XID {
+        return None;
+    }
+    if &udp[236..240] != &[99, 130, 83, 99] {
+        return None;
+    }
+    let yiaddr: [u8; 4] = udp[16..20].try_into().ok()?;
+    let mut msg = 0u8;
+    let mut server = None;
+    let mut i = 240;
+    while i + 2 <= udp.len() {
+        let (opt, len) = (udp[i], udp[i + 1] as usize);
+        if opt == 255 {
+            break;
+        }
+        if i + 2 + len > udp.len() {
+            break;
+        }
+        match opt {
+            53 if len == 1 => msg = udp[i + 2],
+            54 if len == 4 => server = udp[i + 2..i + 6].try_into().ok(),
+            _ => {}
+        }
+        i += 2 + len;
+    }
+    Some((msg, yiaddr, server))
+}
+
+fn dhcp_recv(want_type: u8, deadline: u64) -> Option<([u8; 4], Option<[u8; 4]>)> {
+    while now_ms() < deadline {
+        for (proto, p) in pump_rx() {
+            if proto != 17 || p.len() < 8 {
+                continue;
+            }
+            if be16(&p[0..]) != 67 || be16(&p[2..]) != 68 {
+                continue;
+            }
+            if let Some((msg, yiaddr, server)) = dhcp_parse(&p[8..]) {
+                if msg == want_type {
+                    return Some((yiaddr, server));
+                }
+            }
+        }
+        wait_irq();
+    }
+    None
+}
+
+/// Real DHCP lease. On success updates `our_ip()` and logs the lease.
+pub fn dhcp() -> Option<[u8; 4]> {
+    // DISCOVER -> OFFER
+    dhcp_send(&dhcp_packet(1, None, None));
+    let (offer, server) = dhcp_recv(2, now_ms() + 3000)?;
+    sprintln!(
+        "[net] dhcp offer {}.{}.{}.{}",
+        offer[0], offer[1], offer[2], offer[3]
+    );
+    // REQUEST -> ACK
+    dhcp_send(&dhcp_packet(3, Some(offer), server));
+    let (ack_ip, _) = dhcp_recv(5, now_ms() + 3000)?;
+    *CUR_IP.lock() = ack_ip;
+    sprintln!(
+        "[net] dhcp lease {}.{}.{}.{}",
+        ack_ip[0], ack_ip[1], ack_ip[2], ack_ip[3]
+    );
+    Some(ack_ip)
 }
 
 pub fn init() {
     if virtio_net::init() {
-        sprintln!("[net] up: ip {}.{}.{}.{}", OUR_IP[0], OUR_IP[1], OUR_IP[2], OUR_IP[3]);
+        match dhcp() {
+            Some(_) => {}
+            None => sprintln!("[net] dhcp failed; static ip {}.{}.{}.{}", DEFAULT_IP[0], DEFAULT_IP[1], DEFAULT_IP[2], DEFAULT_IP[3]),
+        }
+        let ip = our_ip();
+        sprintln!("[net] up: ip {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
     }
 }
