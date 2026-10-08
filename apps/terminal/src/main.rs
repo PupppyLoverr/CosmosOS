@@ -10567,9 +10567,8 @@ impl Term {
                 }
             }
             "nohup" => {
-                // nohup CMD...: spawn /bin/CMD detached from this shell's
-                // job table (SIGHUP semantics don't exist — detaching from
-                // jobs is the real equivalent)
+                // nohup CMD...: fork, SIGHUP->SIG_IGN in the child, exec —
+                // immune to a session leader's death for real
                 if args.is_empty() {
                     self.fail("usage: nohup <cmd> [args...]");
                     return;
@@ -10579,9 +10578,16 @@ impl Term {
                     self.fail(&alloc::format!("nohup: {}: not a binary", args[0]));
                     return;
                 }
-                match ustd::spawn(&path, &args[1..].join(" ")) {
-                    Ok(pid) => self.emit(&alloc::format!("nohup: {} spawned (pid {})", args[0], pid)),
-                    Err(_) => self.fail("nohup: spawn failed"),
+                match ustd::fork() {
+                    0 => {
+                        ustd::sigaction(1, ustd::SIG_IGN);
+                        ustd::execve(&path, &args[1..].join(" "));
+                        ustd::exit(127);
+                    }
+                    p if p > 0 => self.emit(&alloc::format!(
+                        "nohup: {} spawned (pid {})", args[0], p
+                    )),
+                    _ => self.fail("nohup: fork failed"),
                 }
             }
             "install" => {

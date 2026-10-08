@@ -131,6 +131,18 @@ pub fn set_name(name: &str) -> i64 {
     sc2(shared::SYS_PRCTL, 15, name.as_ptr() as u64) as i64
 }
 
+/// Pending-signal bitmask for this process.
+pub fn sigpending() -> u64 {
+    sc1(shared::SYS_SIGPENDING, 0)
+}
+
+/// Atomically swap the signal mask and sleep until a signal is
+/// deliverable; the old mask is restored before the handler runs.
+/// Returns -4 (EINTR) when it wakes.
+pub fn sigsuspend(mask: u64) -> i64 {
+    sc1(shared::SYS_SIGSUSPEND, mask) as i64
+}
+
 /// pthread-style thread: `f(arg)` runs in the caller's address space on a
 /// private 256KiB stack; the thread exits with `f`'s return code (reap
 /// with `waitpid`, same as a process). Err = no stack slot / bad entry.

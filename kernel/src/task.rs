@@ -116,6 +116,9 @@ pub struct Task {
     pub pdeathsig: u8,          // PR_SET_PDEATHSIG: signal on parent's death
     pub stop_notified: bool,    // this stop already reported to waitpid
     pub stop_sig: u8,           // signal that stopped it (for WUNTRACED)
+    pub sigsuspend_saved: u64,  // pre-suspend mask; u64::MAX = not in sigsuspend
+    pub sigsuspend_seq: u64,    // sig_seq at arm time
+    pub sig_seq: u64,           // bumped each time maybe_deliver consumes a pending bit
 }
 
 pub struct Sched {
@@ -209,6 +212,9 @@ pub fn init() {
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
+        sigsuspend_saved: u64::MAX,
+        sigsuspend_seq: 0,
+        sig_seq: 0,
     };
     *SCHED.lock() = Some(Sched { tasks: vec![Box::new(boot)], cur: 0, next_pid: 1 });
 }
@@ -615,6 +621,9 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
+        sigsuspend_saved: u64::MAX,
+        sigsuspend_seq: 0,
+        sig_seq: 0,
     };
     mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -695,6 +704,9 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
+        sigsuspend_saved: u64::MAX,
+        sigsuspend_seq: 0,
+        sig_seq: 0,
     }));
     pid
 }
@@ -824,6 +836,9 @@ pub fn clone_user(entry: u64, arg: u64) -> Option<u32> {
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
+        sigsuspend_saved: u64::MAX,
+        sigsuspend_seq: 0,
+        sig_seq: 0,
     };
     mm_inc(pml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -878,6 +893,7 @@ pub fn maybe_deliver(s: &mut Sched, idx: usize, ctx: *mut CpuContext) {
         return; // everything pending is blocked — stays queued
     }
     let sig = deliverable.trailing_zeros() as usize;
+    t.sig_seq = t.sig_seq.wrapping_add(1); // a pending signal is being consumed
     let handler = t.sighandlers[sig];
     if handler == 1 {
         t.sigpending &= !(1 << sig);
@@ -1262,6 +1278,9 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         pdeathsig: 0,
         stop_notified: false,
         stop_sig: 0,
+        sigsuspend_saved: u64::MAX,
+        sigsuspend_seq: 0,
+        sig_seq: 0,
     };
     mm_inc(cpml4.start_address().as_u64());
     s.tasks.push(Box::new(t));
@@ -1599,6 +1618,7 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
     let id = t.id;
     let name = t.name.clone();
     let parent = t.parent;
+    let dead_sid = t.sid;
     s.tasks.push(t); // keep as tombstone for wait_pid
     // SIGCHLD: every death path (exit, kill, fault) notifies the parent;
     // default disposition ignores it, a registered handler interrupts
@@ -1611,6 +1631,21 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
                     p.waiting_on = 0;
                     p.wait_port = 0;
                     p.wait_futex = 0;
+                }
+            }
+        }
+    }
+    // SIGHUP: a session leader's death hangs up its whole session —
+    // sid equals the leader's pid (setsid), so sid==id means we were it
+    if dead_sid == id {
+        for c in s.tasks.iter_mut() {
+            if c.sid == id && c.id != id && c.state != State::Dead {
+                c.sigpending |= 1 << 1; // SIGHUP
+                if c.state == State::Blocked {
+                    c.state = State::Running;
+                    c.waiting_on = 0;
+                    c.wait_port = 0;
+                    c.wait_futex = 0;
                 }
             }
         }
