@@ -1772,6 +1772,62 @@ pub fn ptsname(master_fd: i64) -> Option<String> {
     }
 }
 
+/// getgroups: fill `out` with supplementary gids; returns the real count
+/// (may exceed `out.len()` — Linux semantics).
+pub fn getgroups(out: &mut [u32]) -> usize {
+    if out.is_empty() {
+        return sc2(shared::SYS_GETGROUPS, 0, 0) as usize;
+    }
+    sc2(
+        shared::SYS_GETGROUPS,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+    ) as usize
+}
+/// setgroups: replace the supplementary list (root only).
+pub fn setgroups(gs: &[u32]) -> i64 {
+    sc2(
+        shared::SYS_SETGROUPS,
+        gs.as_ptr() as u64,
+        gs.len() as u64,
+    ) as i64
+}
+/// initgroups(user, base): every gid whose /etc/group line lists `user` in
+/// its member field, plus `base` — then setgroups. Real semantics.
+pub fn initgroups(user: &str, base: u32) -> i64 {
+    let mut gs = alloc::vec![base];
+    if let Ok(g) = read_all("/etc/group") {
+        for line in String::from_utf8_lossy(&g).lines() {
+            let f: Vec<&str> = line.trim().split(':').collect();
+            if f.len() >= 4 {
+                let gid: u32 = f[2].parse().unwrap_or(u32::MAX);
+                if f[3].split(',').any(|m| m == user) && gid != u32::MAX && !gs.contains(&gid) {
+                    gs.push(gid);
+                }
+            }
+        }
+    }
+    setgroups(&gs)
+}
+/// setresuid(r, e, s): u32::MAX keeps a field. Root sets anything;
+/// non-root shuffles among its current ids.
+pub fn setresuid(r: u32, e: u32, s: u32) -> i64 {
+    sc3(shared::SYS_SETRESUID, r as u64, e as u64, s as u64) as i64
+}
+pub fn setresgid(r: u32, e: u32, s: u32) -> i64 {
+    sc3(shared::SYS_SETRESGID, r as u64, e as u64, s as u64) as i64
+}
+/// getresuid -> (real, effective, saved).
+pub fn getresuid() -> (u32, u32, u32) {
+    let mut b = [0u32; 3];
+    let _ = sc1(shared::SYS_GETRESUID, b.as_mut_ptr() as u64);
+    (b[0], b[1], b[2])
+}
+pub fn getresgid() -> (u32, u32, u32) {
+    let mut b = [0u32; 3];
+    let _ = sc1(shared::SYS_GETRESGID, b.as_mut_ptr() as u64);
+    (b[0], b[1], b[2])
+}
 /// tcgetpgrp: foreground process group of the pty (0 = unset), or err.
 pub fn tcgetpgrp(fd: i64) -> i64 {
     sc1(shared::SYS_TCGETPGRP, fd as u64) as i64

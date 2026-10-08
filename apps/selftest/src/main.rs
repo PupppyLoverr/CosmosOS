@@ -4546,6 +4546,75 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::close(m);
         ok
     });
+    check("groups-dac", {
+        // supplementary groups give real group-bit access
+        let mut ok = ustd::setgroups(&[10]) == 0;
+        let mut got = [0u32; 8];
+        let n = ustd::getgroups(&mut got);
+        ok = ok && n == 1 && got[0] == 10;
+        // a file only group-10 may write (owner gets nothing)
+        let _ = ustd::write_all("/tmp/g10", b"a");
+        let _ = ustd::chown("/tmp/g10", 0, 10);
+        let _ = ustd::chmod("/tmp/g10", 0o070);
+        match ustd::fork() {
+            0 => {
+                // group list must be installed while still root, then the
+                // drop keeps it (POSIX: setgroups is privileged)
+                let _ = ustd::setgroups(&[10]);
+                let _ = ustd::setgid(1000);
+                let _ = ustd::setuid(1000);
+                ustd::exit(if ustd::write_all("/tmp/g10", b"b").is_ok() { 0 } else { 7 });
+            }
+            pid if pid > 0 => {
+                ok = ok && ustd::waitpid(pid as u32, 10_000) == Ok(0);
+            }
+            _ => ok = false,
+        }
+        // without the group, uid 1000 is denied the same file
+        match ustd::fork() {
+            0 => {
+                let _ = ustd::setgroups(&[]);
+                let _ = ustd::setgid(1000);
+                let _ = ustd::setuid(1000);
+                ustd::exit(if ustd::write_all("/tmp/g10", b"c").is_err() { 0 } else { 8 });
+            }
+            pid if pid > 0 => {
+                ok = ok && ustd::waitpid(pid as u32, 10_000) == Ok(0);
+            }
+            _ => ok = false,
+        }
+        let _ = ustd::remove("/tmp/g10");
+        ok
+    });
+    check("resuid", {
+        // setresuid shuffles real/effective/saved like POSIX
+        let mut ok = ustd::setresuid(1000, u32::MAX, u32::MAX) == 0;
+        let (r, e, s) = ustd::getresuid();
+        ok = ok && r == 1000 && e == 0;
+        let _ = s;
+        let _ = ustd::setresuid(0, 0, 0);
+        match ustd::fork() {
+            0 => {
+                // drop all three — nothing left to regain
+                if ustd::setresuid(1000, 1000, 1000) != 0 {
+                    ustd::exit(6);
+                }
+                let (r, e, s) = ustd::getresuid();
+                if r != 1000 || e != 1000 || s != 1000 {
+                    ustd::exit(7);
+                }
+                // non-root may shuffle among its own ids but not escalate
+                let back = ustd::setresuid(0, u32::MAX, u32::MAX);
+                let selfok = ustd::setresuid(1000, u32::MAX, u32::MAX);
+                ustd::exit(if back == -1 && selfok == 0 { 0 } else { 8 });
+            }
+            pid if pid > 0 => {
+                ok = ok && ustd::waitpid(pid as u32, 10_000) == Ok(0);
+            }
+            _ => ok = false,
+        }
+        ok
+    });
     check("gettimeofday", {
         let (s, u) = ustd::gettimeofday();
         s > 1_700_000_000 && u < 1_000_000

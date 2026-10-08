@@ -506,10 +506,17 @@ fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
     let (min_flt, maj_flt, rss) = task::pid_faults(pid).unwrap_or((0, 0, 0));
     let s = match file {
         "status" => {
-            let (u, g, eu, eg) = task::pid_creds(pid).unwrap_or((0, 0, 0, 0));
+            let c = task::pid_creds6(pid).unwrap_or((0, 0, 0, 0, 0, 0, Vec::new()));
+            let glist = c
+                .6
+                .iter()
+                .map(|g| g.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
             alloc::format!(
-                "Name:\t{}\nPid:\t{}\nPPid:\t{}\nState:\t{}\nUser:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nMinFlt:\t{}\nMajFlt:\t{}\nCpuTicks:\t{}\nNice:\t{}\nRt:\t{}\nVrun:\t{}\n",
-                name, pid, ppid, state, is_user, u, eu, u, u, g, eg, g, g, mem / 1024, rss * 4,
+                "Name:\t{}\nPid:\t{}\nPPid:\t{}\nState:\t{}\nUser:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nGroups:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nMinFlt:\t{}\nMajFlt:\t{}\nCpuTicks:\t{}\nNice:\t{}\nRt:\t{}\nVrun:\t{}\n",
+                name, pid, ppid, state, is_user, c.0, c.1, c.2, c.0, c.3, c.4, c.5, c.3,
+                glist, mem / 1024, rss * 4,
                 min_flt, maj_flt, ticks, nice,
                 task::pid_rt(pid).unwrap_or(false) as u8, vrun
             )

@@ -297,6 +297,12 @@ pub const SYS_CHMOD: u64 = 241;
 pub const SYS_TCGETPGRP: u64 = 242;      // (pty_fd) -> fg pgid | err
 pub const SYS_TCSETPGRP: u64 = 243;      // (pty_fd, pgid) -> 0 | err
 pub const SYS_TIOCSTI: u64 = 244;        // (pty_fd, byte) -> 0 | err (root only)
+pub const SYS_GETGROUPS: u64 = 245;      // (out u32[], cap) -> count | err
+pub const SYS_SETGROUPS: u64 = 246;      // (u32[], count) -> 0 | err (root only)
+pub const SYS_SETRESUID: u64 = 247;      // (ruid,euid,suid u32::MAX=keep) -> 0|EPERM
+pub const SYS_SETRESGID: u64 = 248;      // same shape for gids
+pub const SYS_GETRESUID: u64 = 249;      // (out u32[3]) -> 0 | err
+pub const SYS_GETRESGID: u64 = 250;      // (out u32[3]) -> 0 | err
 /// MS_MOVE: move a mount point instead of creating one
 pub const MS_MOVE: u64 = 0x2000;
 /// CLONE_NEWUTS: unshare the UTS namespace (hostname)

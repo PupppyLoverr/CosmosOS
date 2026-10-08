@@ -18562,10 +18562,52 @@ impl Term {
                         (ustd::getuid(), ustd::getgid(), ustd::geteuid(), ustd::getegid());
                     let un = |i: u32| user_name(i).unwrap_or_else(|| alloc::format!("{}", i));
                     let gn = |i: u32| group_name(i).unwrap_or_else(|| alloc::format!("{}", i));
+                    let mut gbuf = [0u32; 64];
+                    let ng = ustd::getgroups(&mut gbuf);
+                    let gstr = gbuf[..ng.min(64)]
+                        .iter()
+                        .map(|i| alloc::format!("{}({})", i, gn(*i)))
+                        .collect::<Vec<_>>()
+                        .join(",");
                     self.emit(&alloc::format!(
-                        "uid={}({}) gid={}({}) euid={}({}) egid={}({})",
-                        u, un(u), g, gn(g), eu, un(eu), eg, gn(eg)
+                        "uid={}({}) gid={}({}) euid={}({}) egid={}({}) groups={}",
+                        u, un(u), g, gn(g), eu, un(eu), eg, gn(eg), gstr
                     ));
+                }
+            }
+            "groups" => {
+                // groups [user]: supplementary membership list
+                match args.first() {
+                    None => {
+                        let mut gbuf = [0u32; 64];
+                        let ng = ustd::getgroups(&mut gbuf);
+                        let s = gbuf[..ng.min(64)]
+                            .iter()
+                            .map(|i| group_name(*i).unwrap_or_else(|| alloc::format!("{}", i)))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        self.emit(&s);
+                    }
+                    Some(u) => {
+                        // answer from /etc/group member lists + passwd gid
+                        let mut out: Vec<String> = Vec::new();
+                        if let Some((_, pg)) = passwd_ent(u) {
+                            if let Some(n) = group_name(pg) {
+                                out.push(n);
+                            }
+                        }
+                        if let Ok(g) = ustd::read_all("/etc/group") {
+                            for l in String::from_utf8_lossy(&g).lines() {
+                                let f: Vec<&str> = l.trim().split(':').collect();
+                                if f.len() >= 4 && f[3].split(',').any(|m| m == *u) {
+                                    if !out.iter().any(|o| o == f[0]) {
+                                        out.push(String::from(f[0]));
+                                    }
+                                }
+                            }
+                        }
+                        self.emit(&out.join(" "));
+                    }
                 }
             }
             "printf" => {
@@ -20748,7 +20790,7 @@ impl Term {
         "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
         "alias", "unalias", "type", "hostname", "id", "printf", "dd", "split",
         "source", "comm", "join", "paste", "expand", "unexpand", "at", "file",
-        "test", "[", "rand", "mount", "umount", "chroot", "pivot_root", "unshare", "reboot", "su", "chown", "chgrp", "rmdir",
+        "test", "[", "rand", "mount", "umount", "chroot", "pivot_root", "unshare", "reboot", "su", "chown", "chgrp", "groups", "rmdir",
         "export", "unset", "man",
         "lspci", "lscpu", "factor", "shuf", "cksum",
         "eval", "break", "continue", "return",

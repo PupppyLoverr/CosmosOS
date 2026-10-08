@@ -899,6 +899,12 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_GETEGID => task::creds().3 as u64,
         shared::SYS_SETUID => sys_setid(a1, false),
         shared::SYS_SETGID => sys_setid(a1, true),
+        shared::SYS_GETGROUPS => sys_getgroups(a1, a2),
+        shared::SYS_SETGROUPS => sys_setgroups(a1, a2),
+        shared::SYS_SETRESUID => sys_setresid(a1, a2, a3, false),
+        shared::SYS_SETRESGID => sys_setresid(a1, a2, a3, true),
+        shared::SYS_GETRESUID => sys_getresid(a1, false),
+        shared::SYS_GETRESGID => sys_getresid(a1, true),
         shared::SYS_CHOWN => sys_chown(a1, a2, a3, a4),
         shared::SYS_FCHOWN => sys_fchown(a1, a2, a3),
         shared::SYS_CHMOD => sys_chmod(a1, a2, a3),
@@ -3781,9 +3787,11 @@ fn sys_setid(v: u64, group: bool) -> u64 {
             if group {
                 t.gid = u;
                 t.egid = u;
+                t.sgid = u;
             } else {
                 t.uid = u;
                 t.euid = u;
+                t.suid = u;
             }
             0
         } else if group && u == t.gid {
@@ -3796,6 +3804,105 @@ fn sys_setid(v: u64, group: bool) -> u64 {
             (-1i64) as u64 // EPERM
         }
     })
+}
+
+/// SYS_GETGROUPS(out u32[], cap): copy the supplementary list (up to cap).
+fn sys_getgroups(out: u64, cap: u64) -> u64 {
+    let gs = task::groups_of();
+    let n = gs.len() as u64;
+    if cap == 0 {
+        return n; // size query, Linux-style
+    }
+    let want = cap.min(n) as usize;
+    let mut buf = alloc::vec![0u8; want * 4];
+    for (i, g) in gs.iter().take(want).enumerate() {
+        buf[i * 4..i * 4 + 4].copy_from_slice(&g.to_le_bytes());
+    }
+    match copy_out(out, &buf) {
+        Some(_) => want as u64,
+        None => ERR,
+    }
+}
+
+/// SYS_SETGROUPS(u32[], count): replace the supplementary list (root only).
+fn sys_setgroups(ptr: u64, count: u64) -> u64 {
+    if count > 256 {
+        return ERR;
+    }
+    let Some(raw) = copy_in(ptr, count * 4) else { return ERR };
+    let mut gs = alloc::vec::Vec::new();
+    for i in 0..count as usize {
+        gs.push(u32::from_le_bytes([
+            raw[i * 4],
+            raw[i * 4 + 1],
+            raw[i * 4 + 2],
+            raw[i * 4 + 3],
+        ]));
+    }
+    task::with_current(|t| {
+        if t.euid != 0 {
+            (-1i64) as u64 // EPERM
+        } else {
+            t.groups = gs;
+            0
+        }
+    })
+}
+
+/// setresuid/setresgid semantics: u32::MAX keeps a field; root may set any
+/// value; non-root may only shuffle among its current real/effective/saved.
+fn sys_setresid(r: u64, e: u64, s: u64, group: bool) -> u64 {
+    let (r, e, s) = (r as u32, e as u32, s as u32);
+    task::with_current(|t| {
+        let (cr, ce, cs) = if group {
+            (t.gid, t.egid, t.sgid)
+        } else {
+            (t.uid, t.euid, t.suid)
+        };
+        let keep = u32::MAX;
+        let allowed = |v: u32| t.euid == 0 || v == cr || v == ce || v == cs;
+        for v in [r, e, s] {
+            if v != keep && !allowed(v) {
+                return (-1i64) as u64; // EPERM
+            }
+        }
+        if group {
+            if r != keep {
+                t.gid = r;
+            }
+            if e != keep {
+                t.egid = e;
+            }
+            if s != keep {
+                t.sgid = s;
+            }
+        } else {
+            if r != keep {
+                t.uid = r;
+            }
+            if e != keep {
+                t.euid = e;
+            }
+            if s != keep {
+                t.suid = s;
+            }
+        }
+        0
+    })
+}
+
+/// getresuid/getresgid: copy out (real, effective, saved) as u32[3].
+fn sys_getresid(out: u64, group: bool) -> u64 {
+    let c = task::creds6();
+    let ids = if group { (c.3, c.4, c.5) } else { (c.0, c.1, c.2) };
+    let mut buf = alloc::vec![0u8; 12];
+    for (i, v) in [ids.0, ids.1, ids.2].iter().enumerate() {
+        buf[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    match copy_out(out, &buf) {
+        Some(_) => 0,
+        None => ERR,
+    }
 }
 
 /// SYS_CHOWN(path_ptr, len, uid, gid; u64::MAX keeps a field): real
