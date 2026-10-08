@@ -393,6 +393,38 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
               0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72]
     });
 
+    // ---- strace: trace ourselves, run a syscall, drain records ----
+    check("strace-self", {
+        let pid = ustd::getpid();
+        let ok = ustd::strace(0, pid, &mut []) == 0;
+        let mut saw_uptime = false;
+        if ok {
+            let _ = ustd::uptime_ms(); // one syscall that must land in the ring
+            let mut buf = [0u8; 56 * 16];
+            let n = ustd::strace(2, pid, &mut buf);
+            if n >= 56 {
+                for rec in buf[..n as usize].chunks_exact(56) {
+                    let nr = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+                    if nr == shared::SYS_UPTIME_MS {
+                        saw_uptime = true;
+                    }
+                }
+            }
+            ustd::strace(1, pid, &mut []);
+        }
+        saw_uptime
+    });
+
+    // ---- /proc/iostat exists and counts real file IO ----
+    check("proc-iostat", {
+        ustd::read_all("/proc/iostat")
+            .map(|d| {
+                let s = String::from_utf8_lossy(&d).into_owned();
+                s.contains("reads") && s.contains("writes")
+            })
+            .unwrap_or(false)
+    });
+
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

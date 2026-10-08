@@ -389,6 +389,24 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
         }
         shared::SYS_NICE => task::set_nice(a1 as u32, a2 as i64) as u64,
+        shared::SYS_STRACE => match a1 {
+            // (op, pid, out, cap): 0 start, 1 stop, 2 drain packed 7*u64 recs
+            0 => task::trace_start(a2 as u32) as u64,
+            1 => task::trace_stop(a2 as u32) as u64,
+            2 => {
+                let mut v: Vec<u8> = Vec::new();
+                if task::trace_drain(a2 as u32, &mut v) < 0 {
+                    ERR
+                } else {
+                    let n = v.len().min(a4 as usize);
+                    match copy_out(a3, &v[..n]) {
+                        Some(()) => n as u64,
+                        None => ERR,
+                    }
+                }
+            }
+            _ => ERR,
+        },
         shared::SYS_BEEP => {
             crate::timer::beep(a1 as u32, a2);
             0
@@ -428,6 +446,9 @@ pub fn dispatch(ctx: &mut CpuContext) {
             ERR
         }
     };
+    if nr != shared::SYS_STRACE {
+        task::trace_rec(nr, a1, a2, a3, a4, a5, ret);
+    }
     ctx.rax = ret;
 }
 

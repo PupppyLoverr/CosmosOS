@@ -1862,6 +1862,9 @@ struct Term {
     pg_input: bool,                                    // pager `/` input active
     tailf: Option<(String, u64)>,
     top: Option<u64>,           // top mode: refresh interval ms
+    jobs: Vec<(u32, String)>,   // tracked spawned processes (jobs/fg/disown/$!)
+    last_spawn: u32,            // pid of the most recent spawned process ($!)
+    strace_p: Option<u32>,      // pid being syscall-traced (strace -p, modal)
     top_last: u64,
     top_prev: Vec<(u32, u64)>,  // (pid, cpu_ticks) snapshot for %CPU deltas                      // `tail -f`: (path, next byte offset)
     tailf_last: u64,                                   // last poll ms
@@ -2162,6 +2165,10 @@ impl Term {
             if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'$' {
                 // $$ -- own pid
                 out.push_str(&alloc::format!("{}", ustd::getpid()));
+                i += 2;
+            } else if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'!' {
+                // $! -- pid of the most recent spawned (background) job
+                out.push_str(&alloc::format!("{}", self.last_spawn));
                 i += 2;
             } else if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'?' {
                 // $? -- previous command's exit status (still in last_ok)
@@ -2927,6 +2934,27 @@ impl Term {
         // alias expansion on the command word (chains resolve, cap 8)
         let aliased = self.expand_alias(input);
         let input = aliased.as_str();
+        // `cmd &`: spawn a /bin/<cmd> process and track it as a job.
+        // (Builtins are in-process — a trailing & on one is a syntax error.)
+        if let Some(inner) = strip_bg(input) {
+            let w = inner.split_whitespace().next().unwrap_or("");
+            let rest = inner[w.len()..].trim();
+            let path = alloc::format!("/bin/{}", w);
+            if ustd::stat(&path).is_ok() {
+                match ustd::spawn(&path, rest) {
+                    Ok(pid) => {
+                        self.track(pid, inner);
+                        self.emit(&alloc::format!("[{}] {}", self.jobs.len(), pid));
+                    }
+                    Err(_) => self.fail(&alloc::format!("{}: spawn failed", w)),
+                }
+            } else {
+                self.fail(&alloc::format!(
+                    "{}: not a binary — `&` spawns /bin/<name> (builtins run synchronously)", w
+                ));
+            }
+            return;
+        }
         // statement operators: `a; b` (always), `a && b` (on ok), `a || b` (on fail)
         if let Some((l, op, r)) = stmt_split(input) {
             self.last_ok = true;
@@ -5949,11 +5977,32 @@ impl Term {
                 }
             }
             "kill" => match args.first() {
-                Some(p) => match p.parse::<u32>() {
-                    Ok(pid) if ustd::kill(pid) => self.emit(&alloc::format!("killed {}", pid)),
-                    _ => self.fail("kill: no such pid"),
-                },
-                None => self.fail("usage: kill <pid>"),
+                Some(a) => {
+                    let pid = if let Some(n) = a.strip_prefix('%') {
+                        match n.parse::<usize>().ok().and_then(|i| self.jobs.get(i.wrapping_sub(1))) {
+                            Some((p, _)) => *p,
+                            None => {
+                                self.fail(&alloc::format!("kill: %{}: no such job", n));
+                                return;
+                            }
+                        }
+                    } else {
+                        match a.parse::<u32>() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                self.fail("usage: kill <pid|%n>");
+                                return;
+                            }
+                        }
+                    };
+                    if ustd::kill(pid) {
+                        self.jobs.retain(|(p, _)| *p != pid);
+                        self.emit(&alloc::format!("killed {}", pid));
+                    } else {
+                        self.fail("kill: no such pid");
+                    }
+                }
+                None => self.fail("usage: kill <pid|%n>"),
             },
             "killall" => match args.first() {
                 Some(name) => {
@@ -6743,6 +6792,98 @@ impl Term {
                 }
                 None => self.emit("no network device"),
             },
+            "jobs" => {
+                // list tracked jobs; + marks the most recent, dead ones reap out
+                let live: alloc::vec::Vec<u32> = ustd::proclist(64).iter().map(|p| p.pid).collect();
+                let mut keep: Vec<(u32, String)> = Vec::new();
+                let last = self.jobs.len();
+                let jlist = self.jobs.clone();
+                for (i, (pid, c)) in jlist.iter().enumerate() {
+                    if live.contains(pid) {
+                        self.emit(&alloc::format!(
+                            "[{}]{} {} running  {}", i + 1, if i + 1 == last { "+" } else { " " }, pid, c
+                        ));
+                        keep.push((*pid, c.clone()));
+                    } else {
+                        self.emit(&alloc::format!("[{}]  {} done     {}", i + 1, pid, c));
+                    }
+                }
+                if self.jobs.is_empty() {
+                    self.emit("jobs: none");
+                }
+                self.jobs = keep;
+            }
+            "fg" => {
+                // fg [n]: wait on job n (default: most recent) to exit
+                let idx = args
+                    .first()
+                    .map(|a| a.trim_start_matches('%').parse::<usize>().ok())
+                    .flatten()
+                    .unwrap_or(self.jobs.len());
+                match idx.checked_sub(1).and_then(|i| self.jobs.get(i).map(|j| j.0)) {
+                    Some(pid) => {
+                        self.jobs.retain(|(p, _)| *p != pid);
+                        match ustd::waitpid(pid, 60_000) {
+                            Ok(code) => self.emit(&alloc::format!("[{}] exited ({})", pid, code)),
+                            Err(_) => self.fail(&alloc::format!("fg: {}: timeout or gone", pid)),
+                        }
+                    }
+                    None => self.fail("fg: no such job"),
+                }
+            }
+            "disown" => {
+                match args.first().map(|a| a.trim_start_matches('%').parse::<usize>().ok()).flatten() {
+                    Some(n) if n >= 1 && n <= self.jobs.len() => {
+                        let (pid, _) = self.jobs.remove(n - 1);
+                        self.emit(&alloc::format!("disowned job {} (pid {})", n, pid));
+                    }
+                    _ if args.is_empty() => {
+                        self.jobs.clear();
+                        self.emit("disowned all jobs");
+                    }
+                    _ => self.fail("disown: no such job"),
+                }
+            }
+            "strace" => {
+                // strace -p <pid>: live syscall trace (q/Esc detaches)
+                match args.iter().position(|a| a == &"-p").and_then(|i| args.get(i + 1)).and_then(|a| a.parse::<u32>().ok()) {
+                    Some(pid) => {
+                        if ustd::strace(0, pid, &mut []) < 0 {
+                            self.fail(&alloc::format!("strace: {}: no such task", pid));
+                        } else {
+                            self.emit(&alloc::format!("strace: attached to {} (q to detach)", pid));
+                            self.strace_p = Some(pid);
+                        }
+                    }
+                    None => self.fail("usage: strace -p <pid>"),
+                }
+            }
+            "iostat" => match ustd::read_all("/proc/iostat") {
+                Ok(d) => {
+                    let t = String::from_utf8_lossy(&d);
+                    self.emit("        ops       bytes");
+                    for (i, l) in t.lines().take(2).enumerate() {
+                        let mut w = l.split_whitespace();
+                        let _k = w.next();
+                        let (o, b) = (
+                            w.next().and_then(|x| x.parse::<u64>().ok()).unwrap_or(0),
+                            w.next().and_then(|x| x.parse::<u64>().ok()).unwrap_or(0),
+                        );
+                        self.emit(&alloc::format!(
+                            "{} {:>7} {:>11}", if i == 0 { "read " } else { "write" }, o, b
+                        ));
+                    }
+                }
+                Err(e) => self.fail(&alloc::format!("iostat: err {}", e)),
+            },
+            "halt" => ustd::poweroff(),
+            "arch" | "nproc" => {
+                if cmd == "arch" {
+                    self.emit("x86_64");
+                } else {
+                    self.emit("1");
+                }
+            }
             "reboot" => ustd::reboot(),
             "shutdown" | "poweroff" => ustd::poweroff(),
             "beep" => {
@@ -6808,7 +6949,7 @@ impl Term {
                 }
             }
             "show" => match args.first() {
-                Some(p) => match ustd::spawn("/bin/cosmos-view", p) {
+                Some(p) => match ustd::spawn("/bin/cosmos-view", p).map(|pid| { self.track(pid, p); pid }) {
                     Ok(pid) => self.emit(&alloc::format!("spawned view (pid {})", pid)),
                     Err(_) => self.fail("show: spawn failed"),
                 },
@@ -7081,12 +7222,45 @@ impl Term {
                     None => self.fail("usage: <cmd> | read VAR"),
                 }
             }
-            "wait" => match args.first().and_then(|a| a.parse::<u32>().ok()) {
-                Some(pid) => match ustd::waitpid(pid, 30_000) {
-                    Ok(code) => self.emit(&alloc::format!("pid {} exited (status {})", pid, code)),
-                    Err(_) => self.fail(&alloc::format!("wait: {}: timeout or no such task", pid)),
-                },
-                None => self.fail("usage: wait <pid>"),
+            "wait" => match args.first().map(|a| *a) {
+                // wait: no args waits for all tracked jobs
+                None => {
+                    if self.jobs.is_empty() {
+                        self.emit("wait: no jobs");
+                        return;
+                    }
+                    let js = core::mem::take(&mut self.jobs);
+                    for (pid, c) in js {
+                        match ustd::waitpid(pid, 30_000) {
+                            Ok(code) => self.emit(&alloc::format!("[{}] {} exited ({})", pid, c, code)),
+                            Err(_) => self.fail(&alloc::format!("wait: {}: gone", pid)),
+                        }
+                    }
+                }
+                Some(a) => {
+                    let pid = if let Some(n) = a.strip_prefix('%') {
+                        match n.parse::<usize>().ok().and_then(|i| self.jobs.get(i.wrapping_sub(1))) {
+                            Some((p, _)) => *p,
+                            None => {
+                                self.fail(&alloc::format!("wait: %{}: no such job", n));
+                                return;
+                            }
+                        }
+                    } else {
+                        match a.parse::<u32>() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                self.fail("usage: wait [pid|%n]");
+                                return;
+                            }
+                        }
+                    };
+                    self.jobs.retain(|(p, _)| *p != pid);
+                    match ustd::waitpid(pid, 30_000) {
+                        Ok(code) => self.emit(&alloc::format!("pid {} exited (status {})", pid, code)),
+                        Err(_) => self.fail(&alloc::format!("wait: {}: timeout or no such task", pid)),
+                    }
+                }
             },
             "alias" => {
                 if args.is_empty() {
@@ -7513,6 +7687,7 @@ impl Term {
                 if ustd::stat(&path).is_ok() {
                     match ustd::spawn(&path, &args.join(" ")) {
                         Ok(pid) => {
+                            self.track(pid, &path);
                             self.emit(&alloc::format!("spawned {} (pid {})", cmd, pid));
                         }
                         Err(_) => self.fail(&alloc::format!("{}: spawn failed", cmd)),
@@ -7792,11 +7967,16 @@ impl Term {
             return;
         }
         // during watch/tail -f/yes modes, Esc or Enter stops; other keys ignored
-        if self.watch.is_some() || self.tailf.is_some() || self.yesing.is_some() || self.top.is_some() {
+        if self.watch.is_some() || self.tailf.is_some() || self.yesing.is_some() || self.top.is_some() || self.strace_p.is_some() {
             if k.key == KeyCode::Escape as u32
                 || k.key == KeyCode::Enter as u32
                 || (self.top.is_some() && k.chr == b'q')
+                || (self.strace_p.is_some() && k.chr == b'q')
             {
+                if let Some(pid) = self.strace_p.take() {
+                    ustd::strace(1, pid, &mut []);
+                    self.push_line("strace: detached");
+                }
                 if self.watch.is_some() {
                     self.watch = None;
                     self.push_line("watch stopped");
@@ -7994,6 +8174,7 @@ impl Term {
         "patch", "awk", "case", "esac",
         "md5sum", "uuencode", "uudecode", "zgrep", "portscan", "dig",
         "sha1sum", "od", "xxd", "banner", "units", "pr", "apropos", "whereis",
+        "jobs", "fg", "disown", "halt", "arch", "nproc", "iostat", "strace",
         "fortune", "uuidgen", "logger", "whois", "fdisk", "vol", "blkid", "script",
         "nice", "renice", "pgrep", "pkill", "top", "dc", "vmstat", "free",
         "pcap", "ftp", "lsof", "fuser", "burn", "cron", "browse",
@@ -8045,6 +8226,12 @@ impl Term {
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];
+
+    /// Register a spawned process in the jobs table + set $!.
+    fn track(&mut self, pid: u32, cmdline: &str) {
+        self.last_spawn = pid;
+        self.jobs.push((pid, String::from(cmdline)));
+    }
 
     /// Reload /crontab into cron_q; entries `period_s cmd...` fire every period.
     fn cron_load(&mut self) {
@@ -8680,6 +8867,9 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         tailf_last: 0,
         at_q: Vec::new(),
         cron_q: Vec::new(),
+        jobs: Vec::new(),
+        last_spawn: 0,
+        strace_p: None,
         yank: String::new(),
         cap_bin: None,
         last_cap_bin: Vec::new(),
@@ -9093,6 +9283,27 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 t.dirty_all = true;
             }
         }
+        // strace -p: drain the traced task's syscall records periodically
+        if let Some(pid) = t.strace_p {
+            let mut buf = alloc::vec![0u8; 56 * 32];
+            let n = ustd::strace(2, pid, &mut buf);
+            if n < 0 {
+                t.push_line(&alloc::format!("strace: pid {} gone", pid));
+                t.strace_p = None;
+                t.dirty_all = true;
+            } else if n > 0 {
+                for rec in buf[..n as usize].chunks_exact(56) {
+                    let rd = |i: usize| {
+                        u64::from_le_bytes(rec[i * 8..i * 8 + 8].try_into().unwrap())
+                    };
+                    t.push_line(&alloc::format!(
+                        "  {}({}, {}, {}, {}, {}) = {}",
+                        sys_name(rd(0)), rd(1), rd(2), rd(3), rd(4), rd(5), rd(6)
+                    ));
+                }
+                t.dirty_all = true;
+            }
+        }
         // `at` queue: run due deferred commands (in submission order)
         {
             let mut due = 0usize;
@@ -9117,5 +9328,63 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             t.dirty_all = false;
             t.redraw();
         }
+    }
+}
+
+/// Strip a trailing unquoted `&` (job control). Returns the inner command.
+fn strip_bg(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    if b.is_empty() || b[b.len() - 1] != b'&' {
+        return None;
+    }
+    // `&&` is the stmt operator, not a background marker
+    if b.len() >= 2 && b[b.len() - 2] == b'&' {
+        return None;
+    }
+    let inner = s[..s.len() - 1].trim_end();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner)
+    }
+}
+
+/// Number -> name for the syscall table (strace output).
+fn sys_name(nr: u64) -> &'static str {
+    use shared::*;
+    match nr {
+        SYS_READ => "read",
+        SYS_WRITE => "write",
+        SYS_OPEN => "open",
+        SYS_CLOSE => "close",
+        SYS_STAT => "stat",
+        SYS_SEEK => "seek",
+        SYS_MKDIR => "mkdir",
+        SYS_REMOVE => "remove",
+        SYS_RENAME => "rename",
+        SYS_LISTDIR => "listdir",
+        SYS_SPAWN => "spawn",
+        SYS_EXIT => "exit",
+        SYS_SLEEP_MS => "sleep",
+        SYS_UPTIME_MS => "uptime",
+        SYS_DATETIME => "datetime",
+        SYS_MEMINFO => "meminfo",
+        SYS_KILL => "kill",
+        SYS_WAITPID => "waitpid",
+        SYS_PROCLIST => "proclist",
+        SYS_IPC_SEND => "ipc_send",
+        SYS_IPC_RECV => "ipc_recv",
+        SYS_SHM_CREATE => "shm_create",
+        SYS_SHM_MAP => "shm_map",
+        SYS_GETPID => "getpid",
+        SYS_NICE => "nice",
+        SYS_PCAP => "pcap",
+        SYS_KLOG => "klog",
+        SYS_BEEP => "beep",
+        SYS_DF => "df",
+        SYS_RAND => "rand",
+        SYS_GETCWD => "getcwd",
+        SYS_CHDIR => "chdir",
+        _ => "?",
     }
 }

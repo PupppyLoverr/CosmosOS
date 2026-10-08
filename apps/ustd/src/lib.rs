@@ -852,3 +852,15 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
     out
 }
 
+
+/// (op,pid,buf,cap): op 0 start syscall tracing pid, 1 stop, 2 drain
+/// packed records (7 LE u64s: nr,a1..a5,ret) into buf. Returns 0 | n | <0.
+pub fn strace(op: u64, pid: u32, out: &mut [u8]) -> i64 {
+    sc4(
+        shared::SYS_STRACE,
+        op,
+        pid as u64,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+    ) as i64
+}

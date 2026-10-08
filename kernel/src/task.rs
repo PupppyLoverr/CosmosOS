@@ -62,6 +62,8 @@ pub struct Task {
     pub argv: String,        // spawn arg string (for /proc/<pid>/cmdline)
     pub nice: i8,            // -20 (highest prio) ..= 19 (lowest); 0 = normal
     pub vrun: u64,           // virtual runtime (scaled by nice) for fair scheduling
+    pub trace: bool,         // syscall tracing on (strace -p)
+    pub trbuf: Vec<u64>,     // packed trace records, 7 u64s each: nr,a1..a5,ret
 }
 
 pub struct Sched {
@@ -105,6 +107,8 @@ pub fn init() {
         cpu_ticks: 0,
         nice: 0,
         vrun: 0,
+        trace: false,
+        trbuf: Vec::new(),
     };
     *SCHED.lock() = Some(Sched { tasks: vec![Box::new(boot)], cur: 0, next_pid: 1 });
 }
@@ -354,6 +358,8 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         cpu_ticks: 0,
         nice: 0,
         vrun: s.tasks[s.cur].vrun,
+        trace: false,
+        trbuf: Vec::new(),
     };
     s.tasks.push(Box::new(t));
     sprintln!("[task] spawned pid={} '{}' entry={:#x}", pid, name, entry);
@@ -409,6 +415,8 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         cpu_ticks: 0,
         nice: 0,
         vrun: s.tasks[s.cur].vrun,
+        trace: false,
+        trbuf: Vec::new(),
     }));
     pid
 }
@@ -700,4 +708,57 @@ pub fn set_nice(pid: u32, nice: i64) -> i64 {
         }
         None => -1000,
     }
+}
+
+// ---- syscall tracing (strace -p) ----
+// Records are packed flat into `trbuf`, 7 u64s per record:
+// [nr, a1..a5, ret]. Capped at 128 records between drains.
+
+const TRACE_MAX_RECS: usize = 128;
+
+fn with_pid_mut<F: FnOnce(&mut Task) -> i64>(pid: u32, f: F) -> i64 {
+    let mut g = SCHED.lock();
+    match g.as_mut() {
+        Some(s) => match s.tasks.iter_mut().find(|t| t.id == pid && t.state != State::Dead) {
+            Some(t) => f(t),
+            None => -3,
+        },
+        None => -1,
+    }
+}
+
+pub fn trace_start(pid: u32) -> i64 {
+    with_pid_mut(pid, |t| {
+        t.trace = true;
+        t.trbuf.clear();
+        0
+    })
+}
+
+pub fn trace_stop(pid: u32) -> i64 {
+    with_pid_mut(pid, |t| {
+        t.trace = false;
+        0
+    })
+}
+
+/// Serialize all pending records as little-endian u64s and clear the ring.
+pub fn trace_drain(pid: u32, out: &mut Vec<u8>) -> i64 {
+    with_pid_mut(pid, |t| {
+        for v in t.trbuf.iter() {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        t.trbuf.clear();
+        0
+    })
+}
+
+/// Called at the end of every syscall dispatch; no-op when untraced or full.
+pub fn trace_rec(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, ret: u64) {
+    with_current(|t| {
+        if t.trace && t.trbuf.len() < TRACE_MAX_RECS * 7 {
+            t.trbuf
+                .extend_from_slice(&[nr, a1, a2, a3, a4, a5, ret]);
+        }
+    });
 }
