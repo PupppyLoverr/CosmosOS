@@ -53,6 +53,7 @@ fn pid_of(path: &str) -> Option<u32> {
 const PID_FILES: &[&str] = &[
     "status", "cmdline", "stat", "fds", "fdinfo", "cwd", "maps", "io",
     "statm", "exe", "smaps", "wchan", "children", "task", "syscall",
+    "sig",
 ];
 
 pub fn is_dir(path: &str) -> bool {
@@ -479,6 +480,7 @@ fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
         // exe is a symlink; opening it directly yields the path text
         "exe" => alloc::format!("{}\n", task::pid_exe(pid).unwrap_or_default()),
         "syscall" => task::pid_syscall(pid).unwrap_or_else(|| alloc::format!("-1\n")),
+        "sig" => task::pid_sig(pid).unwrap_or_default(),
         _ => return None,
     };
     Some(s.into_bytes())

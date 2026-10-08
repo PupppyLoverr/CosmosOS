@@ -185,6 +185,12 @@ pub const SYS_MQ_OPEN: u64 = 164;      // (name_ptr,len,maxmsg,msgsize) -> fd|er
 pub const SYS_MQ_SEND: u64 = 165;      // (fd,buf,len,prio) -> 0|err
 pub const SYS_MQ_RECV: u64 = 166;      // (fd,buf,len) -> n | prio<<32 | err
 pub const SYS_MQ_UNLINK: u64 = 167;    // (name_ptr,len) -> 0|err
+pub const SYS_MEMFD_CREATE: u64 = 168; // (name_ptr,len) -> fd|err
+pub const SYS_TIMER_CREATE: u64 = 169; // (sig) -> timer id|err
+pub const SYS_TIMER_SETTIME: u64 = 170;// (id, init_ms, int_ms) -> 0|err
+pub const SYS_TIMER_DELETE: u64 = 171; // (id) -> 0|err
+pub const SYS_CLOCK_GETTIME: u64 = 172;// (clkid, out_ptr) -> 0|err
+                                     // clkid 0=REALTIME(rtc) 1=MONOTONIC
 
 // ptrace request ops
 pub const PT_TRACEME: u64 = 0;

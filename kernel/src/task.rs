@@ -63,6 +63,14 @@ pub struct FileMap {
     pub perm: u8, // R1W2X4 — the demand pager maps with these flags
 }
 
+/// One POSIX timer (timer_create): decays on wall ticks, pends `sig`.
+pub struct PTimer {
+    pub id: u64,
+    pub cur: u64, // ticks until fire; 0 = disarmed
+    pub int: u64, // reload interval ticks; 0 = one-shot
+    pub sig: u64,
+}
+
 pub struct Task {
     pub id: u32,
     pub name: String,
@@ -128,6 +136,7 @@ pub struct Task {
     pub cur_syscall: u64,       // nr of the syscall this task is inside (MAX = none)
     pub sc_args: [u64; 5],      // its arg registers (for /proc/<pid>/syscall)
     pub itimers: [[u64; 2]; 3], // setitimer: [REAL, VIRTUAL, PROF] = [cur,int] ticks, cur 0 = disarmed
+    pub ptimers: Vec<PTimer>,   // POSIX timer_create timers (not inherited)
     pub cont_pending: bool,     // continued (SIGCONT/ptrace) since last wait report
     pub sig: SigState,          // sa_flags, altstack, handler masking, EINTR
 }
@@ -298,6 +307,7 @@ pub fn init() {
         cur_syscall: u64::MAX,
         sc_args: [0; 5],
         itimers: [[0; 2]; 3],
+        ptimers: Vec::new(),
         cont_pending: false,
         sig: SigState::new(),
     };
@@ -357,6 +367,27 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
                 t.sigpending |= 1 << sig;
                 wake_for_signal(t, sig);
             }
+        }
+        // POSIX timers (timer_create): wall-clock decay like ITIMER_REAL
+        let mut fire: u64 = 0;
+        for pt in t.ptimers.iter_mut() {
+            if pt.cur == 0 {
+                continue;
+            }
+            pt.cur -= 1;
+            if pt.cur == 0 {
+                pt.cur = pt.int;
+                if pt.sig > 0 && pt.sig < 64 {
+                    fire |= 1 << pt.sig;
+                }
+            }
+        }
+        let mut f = fire;
+        while f != 0 {
+            let sig = f.trailing_zeros() as usize;
+            f &= !(1 << sig);
+            t.sigpending |= 1 << sig;
+            wake_for_signal(t, sig);
         }
         // RLIMIT_CPU: exceeded cpu_ticks quota pends a real SIGXCPU —
         // default disposition kills the task when it next resumes
@@ -761,6 +792,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         cur_syscall: u64::MAX,
         sc_args: [0; 5],
         itimers: [[0; 2]; 3],
+        ptimers: Vec::new(),
         cont_pending: false,
         sig: SigState::new(),
     };
@@ -855,6 +887,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         cur_syscall: u64::MAX,
         sc_args: [0; 5],
         itimers: [[0; 2]; 3],
+        ptimers: Vec::new(),
         cont_pending: false,
         sig: SigState::new(),
     }));
@@ -1025,6 +1058,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64) -> Option<u32> {
         cur_syscall: u64::MAX,
         sc_args: [0; 5],
         itimers: [[0; 2]; 3],
+        ptimers: Vec::new(),
         cont_pending: false,
         sig: s.tasks[s.cur].sig.for_thread(),
     };
@@ -1587,6 +1621,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         cur_syscall: u64::MAX,
         sc_args: [0; 5],
         itimers: [[0; 2]; 3],
+        ptimers: Vec::new(),
         cont_pending: false,
         sig: s.tasks[s.cur].sig.for_fork(),
     };
@@ -2033,6 +2068,28 @@ pub fn sys_tgkill(tgid: u32, tid: u32, sig: u64) -> i64 {
         }
     }
     signal(tid, sig)
+}
+
+/// /proc/<pid>/sig: pending + blocked masks and the delivered-handler
+/// set (like SigPnd/SigBlk/SigCgt in /proc/pid/status).
+pub fn pid_sig(pid: u32) -> Option<String> {
+    let g = SCHED.lock();
+    let s = g.as_ref().unwrap();
+    s.tasks
+        .iter()
+        .find(|t| t.id == pid && t.state != State::Dead)
+        .map(|t| {
+            let mut caught: u64 = 0;
+            for (i, h) in t.sighandlers.iter().enumerate() {
+                if *h > 1 {
+                    caught |= 1 << i;
+                }
+            }
+            alloc::format!(
+                "sigpending {:016x}\nsigmask    {:016x}\nsighandled {:016x}\n",
+                t.sigpending, t.sigmask, caught
+            )
+        })
 }
 
 /// /proc/<pid>/syscall: in-flight syscall nr + args, or -1 when the task
