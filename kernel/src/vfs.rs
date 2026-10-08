@@ -578,10 +578,12 @@ pub fn read(fd: i64, buf: &mut [u8]) -> Result<i64, i64> {
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
-    let data = fs.read_file(&path).map_err(err_to_i64)?;
-    let avail = if pos as usize >= data.len() { 0 } else { data.len() - pos as usize };
-    let n = avail.min(buf.len());
-    buf[..n].copy_from_slice(&data[pos as usize..pos as usize + n]);
+    // Read only this syscall's window — a whole-file read_file() per 4K
+    // syscall made sequential reads quadratic (a ~2MB read_all never
+    // finished under TCG).
+    let n = fs
+        .read_file_range(&path, pos, buf)
+        .map_err(err_to_i64)?;
     task::with_current(|t| {
         if let Some(Some(f)) = t.fds.get_mut(fd as usize) {
             f.pos += n as u64;
