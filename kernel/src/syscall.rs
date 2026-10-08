@@ -872,6 +872,8 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_MINCORE => sys_mincore(a1, a2, a3),
         shared::SYS_MADVISE => sys_madvise(a1, a2, a3),
         shared::SYS_UNSHARE => sys_unshare(a1),
+        shared::SYS_SETNS => sys_setns(a1),
+        shared::SYS_PIDFD_GETFD => sys_pidfd_getfd(a1, a2, a3),
         shared::SYS_CHROOT => sys_chroot(a1, a2),
         shared::SYS_GETTIMEOFDAY => {
             let sec = vfs::now_unix();
@@ -3398,7 +3400,9 @@ fn sys_mount(argp: u64) -> u64 {
         if vfs::stat_path(&s).is_err() || vfs::stat_path(&t).is_err() {
             return (-2i64) as u64;
         }
-        return crate::bind::mount(&s, &t)
+        let opts = flags
+            & (shared::MS_RDONLY | shared::MS_NOSUID | shared::MS_NODEV | shared::MS_NOEXEC);
+        return crate::bind::mount(&s, &t, opts)
             .map(|_| 0)
             .unwrap_or_else(|e| e as u64);
     }
@@ -3417,7 +3421,9 @@ fn sys_mount(argp: u64) -> u64 {
         Ok(_) => return (-20i64) as u64, // ENOTDIR
         Err(e) => return e as u64,
     }
-    crate::tmpfs::mount(&t, ro)
+    let opts = flags
+        & (shared::MS_RDONLY | shared::MS_NOSUID | shared::MS_NODEV | shared::MS_NOEXEC);
+    crate::tmpfs::mount(&t, opts)
         .map(|_| 0)
         .unwrap_or_else(|e| e as u64)
 }
@@ -3486,7 +3492,7 @@ fn sys_pivot_root(argp: u64) -> u64 {
     // register the old root as a bind on put_old BEFORE switching roots —
     // resolve rewrites /new/put_old/x -> /x of the old tree.
     if oldr != newr {
-        if let Err(e) = crate::bind::mount("/", &oldr) {
+        if let Err(e) = crate::bind::mount("/", &oldr, 0) {
             return e as u64;
         }
     }
@@ -3639,6 +3645,50 @@ fn sys_unshare(flags: u64) -> u64 {
         task::unshare_ns();
     }
     0
+}
+
+/// SYS_SETNS(fd): the fd must be an open /proc/<pid>/ns/mntns node
+/// (or /proc/self's); the task adopts that namespace wholesale.
+fn sys_setns(fd: u64) -> u64 {
+    let path = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) => f.path.clone(),
+        _ => String::new(),
+    });
+    // only namespace-object fds (/nsfd/{n} from an open
+    // /proc/<pid>/ns/mntns) are legal adopt sources — EINVAL otherwise.
+    if !crate::nsfd::handles(&path) {
+        return (-22i64) as u64;
+    }
+    match crate::nsfd::arc(&path) {
+        Some(arc) => {
+            task::set_ns(arc);
+            0
+        }
+        None => (-9i64) as u64,
+    }
+}
+
+/// SYS_PIDFD_GETFD(pidfd, fd, flags): duplicate descriptor `fd` out of the
+/// pidfd's task into ours. Access needs ptrace authority over the target
+/// (PTRACE_MODE_ATTACH equivalents: the task itself or its tracer).
+fn sys_pidfd_getfd(pidfd: u64, tfd: u64, _flags: u64) -> u64 {
+    let path = task::with_current(|t| match t.fds.get(pidfd as usize) {
+        Some(Some(f)) => f.path.clone(),
+        _ => String::new(),
+    });
+    let Some(pid) = crate::pidfd::target(&path) else {
+        return (-9i64) as u64;
+    };
+    let me = task::current_id();
+    let desc = task::fd_clone_from(pid, tfd as usize, me);
+    let Some(desc) = desc else {
+        return (-9i64) as u64;
+    };
+    vfs::acquire_desc(&desc); // refcounted objects get a second owner
+    match task::adopt_fd(desc) {
+        Some(i) => i as u64,
+        None => (-24i64) as u64, // EMFILE
+    }
 }
 
 /// SYS_STATX(&[u64;6]{dirfd,pathptr,pathlen,flags,mask,bufp}): extended
@@ -4087,6 +4137,15 @@ fn sys_execve(ctx: &mut CpuContext, pptr: u64, plen: u64, aptr: u64, alen: u64) 
     let args = String::from(
         String::from_utf8_lossy(&ab).trim_matches('\0'),
     );
+    // MS_NOEXEC on the covering mount (tmpfs or bind alias) bars exec
+    // through it — EACCES like Linux.
+    {
+        let cwd = task::with_current(|t| t.cwd.clone());
+        let pre = vfs::normalize_prebind(&cwd, &path);
+        if task::mount_opts(&pre) & shared::MS_NOEXEC != 0 {
+            return (-13i64) as u64;
+        }
+    }
     // snapshot CLOEXEC descriptors first: on success they must not reach
     // the new image (POSIX exec closes them); on failure nothing changes
     let clo: Vec<usize> = task::with_current(|t| {

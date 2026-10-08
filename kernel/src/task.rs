@@ -1966,14 +1966,36 @@ pub fn fd_path_prefix_in_use(prefix: &str) -> bool {
 /// A mount namespace: tmpfs mount table, bind alias table, and the
 /// lazy-detached prefixes (umount2 MNT_DETACH survivors) of one shared
 /// view. The initial namespace is the global one; unshare copies it.
-#[derive(Clone, Default)]
+static NEXT_NS_ID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
+
+#[derive(Clone)]
 pub struct MountNs {
-    /// (mount path, read-only) — longest-prefix-first.
-    pub tmpfs: Vec<(String, bool)>,
-    /// (target, source) bind aliases — longest-target-prefix first.
-    pub binds: Vec<(String, String)>,
+    /// Stable inode-style id shown by /proc/<pid>/ns/mntns.
+    pub id: u64,
+    /// (mount path, opts) — MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC.
+    pub tmpfs: Vec<(String, u64)>,
+    /// (target, source, opts) bind aliases — longest-target-prefix first.
+    pub binds: Vec<(String, String, u64)>,
     /// Prefixes whose tmpfs node trees outlive their mount point.
     pub detached: Vec<String>,
+}
+
+impl MountNs {
+    fn new() -> Self {
+        MountNs {
+            id: NEXT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+            tmpfs: Vec::new(),
+            binds: Vec::new(),
+            detached: Vec::new(),
+        }
+    }
+}
+
+impl Default for MountNs {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 static GLOBAL_NS: spin::Once<alloc::sync::Arc<spin::Mutex<MountNs>>> = spin::Once::new();
@@ -1998,9 +2020,80 @@ pub fn ns_of() -> alloc::sync::Arc<spin::Mutex<MountNs>> {
 /// later mounts/binds/unmounts by this task don't touch the parent's.
 pub fn unshare_ns() {
     with_current(|t| {
-        let copy = t.ns.lock().clone();
+        let mut copy = t.ns.lock().clone();
+        // a new namespace object gets a fresh mntns id
+        copy.id = NEXT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         t.ns = alloc::sync::Arc::new(spin::Mutex::new(copy));
     });
+}
+
+/// pidfd_getfd's descriptor harvest: copy descriptor `fd` out of task
+/// `pid` when `me` has ptrace-style authority over it (itself, its
+/// parent, or its attached tracer). Caller acquires + adopts the copy.
+pub fn fd_clone_from(pid: u32, fd: usize, me: u32) -> Option<FileDesc> {
+    let mut g = SCHED.lock();
+    let s = g.as_mut()?;
+    let t = s.tasks.iter().find(|t| t.id == pid && t.state != State::Dead)?;
+    if pid != me && t.parent != me && t.sig.tracer != me {
+        return None; // EPERM: no inspect authority over that task
+    }
+    t.fds.get(fd).cloned().flatten()
+}
+
+/// Insert a descriptor into the current task's table (RLIMIT_NOFILE
+/// gate). Returns the new fd number. Caller must acquire_desc first —
+/// adopt_fd owns the already-acquired reference.
+pub fn adopt_fd(desc: FileDesc) -> Option<usize> {
+    with_current(|t| {
+        let limit = (t.rlim_nofile as usize).min(t.fds.len());
+        let mut slot = None;
+        for i in 0..limit {
+            if t.fds[i].is_none() {
+                slot = Some(i);
+                break;
+            }
+        }
+        let i = slot?;
+        t.fds[i] = Some(desc);
+        Some(i)
+    })
+}
+
+/// The mount-namespace object owned by `pid` — setns's adoption source.
+pub fn ns_arc_of(pid: u32) -> Option<alloc::sync::Arc<spin::Mutex<MountNs>>> {
+    let mut g = SCHED.lock();
+    let s = g.as_mut()?;
+    s.tasks
+        .iter()
+        .find(|t| t.id == pid && t.state != State::Dead)
+        .map(|t| t.ns.clone())
+}
+
+/// setns: swap the current task into namespace `arc` (from ns_arc_of).
+pub fn set_ns(arc: alloc::sync::Arc<spin::Mutex<MountNs>>) {
+    with_current(|t| t.ns = arc);
+}
+
+/// Mount options of the longest-prefix mount covering `path` in the
+/// current namespace — tmpfs mounts and bind mounts alike.
+pub fn mount_opts(path: &str) -> u64 {
+    let ns = ns_of();
+    let g = ns.lock();
+    let mut best_len = 0usize;
+    let mut best = 0u64;
+    for m in &g.tmpfs {
+        if crate::tmpfs::under(&m.0, path) && m.0.len() >= best_len {
+            best_len = m.0.len();
+            best = m.1;
+        }
+    }
+    for b in &g.binds {
+        if crate::tmpfs::under(&b.0, path) && b.0.len() >= best_len {
+            best_len = b.0.len();
+            best = b.2;
+        }
+    }
+    best
 }
 
 /// Any live task whose cwd is under `prefix` — also makes a mount busy.

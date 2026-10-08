@@ -12879,6 +12879,9 @@ impl Term {
                                     match o {
                                         "ro" => flags |= 1,
                                         "rw" => flags &= !1,
+                                        "nosuid" => flags |= 2,
+                                        "nodev" => flags |= 4,
+                                        "noexec" => flags |= 8,
                                         "remount" => flags |= 32,
                                         "bind" => flags |= 0x1000,
                                         _ => {}
@@ -12901,6 +12904,14 @@ impl Term {
                     } else {
                         self.fail("usage: mount [-t type] [-o opts] <src> <dir>");
                     }
+                }
+            }
+            "unshare" => {
+                // unshare [-m]: apply to THIS shell's namespace — mounts
+                // and unmounts stop propagating to the rest of the system
+                match ustd::unshare(0x20000) {
+                    0 => self.emit("mount namespace unshared"),
+                    e => self.fail(&alloc::format!("unshare: err {}", e)),
                 }
             }
             "pivot_root" => match (args.first(), args.get(1)) {
@@ -20583,7 +20594,7 @@ impl Term {
         "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
         "alias", "unalias", "type", "hostname", "id", "printf", "dd", "split",
         "source", "comm", "join", "paste", "expand", "unexpand", "at", "file",
-        "test", "[", "rand", "mount", "umount", "chroot", "pivot_root", "rmdir",
+        "test", "[", "rand", "mount", "umount", "chroot", "pivot_root", "unshare", "rmdir",
         "export", "unset", "man",
         "lspci", "lscpu", "factor", "shuf", "cksum",
         "eval", "break", "continue", "return",

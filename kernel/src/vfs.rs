@@ -83,7 +83,7 @@ fn dos_dt_to_unix(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8) -> u64 {
 /// (physical) path. When the calling task is chrooted (`t.root != "/"`),
 /// absolute paths resolve under the jail root and `..` can't pop above
 /// it — cwd/root are always stored as physical paths.
-pub fn normalize(cwd: &str, path: &str) -> String {
+fn normalize_inner(cwd: &str, path: &str) -> String {
     let root = task::with_current(|t| t.root.clone());
     let root_depth = root.split('/').filter(|c| !c.is_empty()).count();
     let mut out: Vec<&str> = Vec::new();
@@ -110,9 +110,20 @@ pub fn normalize(cwd: &str, path: &str) -> String {
     }
     let mut s = String::from("/");
     s.push_str(&out.join("/"));
+    s
+}
+
+pub fn normalize(cwd: &str, path: &str) -> String {
     // Bind mounts apply on the canonical path — AFTER `..` resolution,
     // so `bind/../x` escapes to the real parent exactly like Linux.
-    crate::bind::resolve(&s)
+    crate::bind::resolve(&normalize_inner(cwd, path))
+}
+
+/// Canonical path BEFORE bind aliasing — what the user actually named.
+/// Mount-option checks (MS_NODEV/MS_NOEXEC) look up the covering mount
+/// on this path; resolution funnels through normalize() for the rest.
+pub fn normalize_prebind(cwd: &str, path: &str) -> String {
+    normalize_inner(cwd, path)
 }
 
 pub fn read_all(path: &str) -> Result<Vec<u8>, i64> {
@@ -299,6 +310,14 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     let is_proc = crate::proc::handles(&full);
     let is_dev = crate::dev::handles(&full);
     let is_pipe = crate::pipes::handles(&full);
+    // MS_NODEV on the covering mount (typically a bind alias) bars
+    // device-file access through it — EACCES like Linux.
+    if is_dev {
+        let pre = normalize_prebind(&cwd, path);
+        if task::mount_opts(&pre) & shared::MS_NODEV != 0 {
+            return Err(-13);
+        }
+    }
     if crate::tmpfs::handles(&full) {
         let pos = crate::tmpfs::open(&full, flags)?;
         crate::notify::fire(&full, crate::notify::IN_ACCESS);
@@ -360,6 +379,21 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
         // the proc file is genuinely absent (no proc files can be created)
         if crate::proc::is_dir(&full) {
             return Err(-4);
+        }
+        // /proc/<pid>/ns/mntns opens as a namespace OBJECT fd pinning the
+        // task's MountNs — the fd survives the task swapping namespaces
+        // (setns's adopt source), not just its current table entry.
+        if let Some(obj) = crate::nsfd::open(&full) {
+            let Some(fdi) = alloc_fd() else { return Err(-24) };
+            let fd = fdi as i64;
+            task::with_current(|t| {
+                t.fds[fd as usize] = Some(FileDesc {
+                    path: obj,
+                    pos: 0,
+                    flags,
+                });
+            });
+            return Ok(fd);
         }
         let ex = crate::proc::exists(&full);
         if !ex && flags & shared::O_CREATE != 0 {
@@ -631,6 +665,7 @@ fn release_desc_obj(f: &task::FileDesc, still_open: bool) {
     crate::epoll::close_obj(&f.path);
     crate::sockfd::close_obj(&f.path);
     crate::pidfd::close_obj(&f.path);
+    crate::nsfd::release(&f.path);
 }
 
 pub fn release_desc(f: &task::FileDesc) {

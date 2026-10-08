@@ -1932,6 +1932,18 @@ pub fn unshare(flags: u64) -> i64 {
     sc1(shared::SYS_UNSHARE, flags) as i64
 }
 
+/// setns(fd): adopt the namespace behind an open /proc/<pid>/ns/mntns.
+pub fn setns(fd: u64) -> i64 {
+    sc1(shared::SYS_SETNS, fd) as i64
+}
+
+/// pidfd_getfd(pidfd, fd): duplicate descriptor fd out of the target.
+pub fn pidfd_getfd(pidfd: u64, fd: u64) -> i64 {
+    sc3(shared::SYS_PIDFD_GETFD, pidfd, fd, 0) as i64
+}
+
+
+
 /// chroot(dir): jail this task's path resolution under `dir`.
 pub fn chroot(dir: &str) -> i64 {
     sc2(218, dir.as_ptr() as u64, dir.len() as u64) as i64

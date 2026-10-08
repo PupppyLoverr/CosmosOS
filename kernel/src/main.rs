@@ -38,6 +38,7 @@ mod mqueue;
 mod pty;
 mod memfd;
 mod tmpfs;
+mod nsfd;
 mod bind;
 mod signalfd;
 mod vfs;
