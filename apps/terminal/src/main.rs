@@ -12903,6 +12903,13 @@ impl Term {
                     }
                 }
             }
+            "pivot_root" => match (args.first(), args.get(1)) {
+                (Some(n), Some(o)) => match ustd::pivot_root(n, o) {
+                    0 => self.emit(&alloc::format!("root moved to {}; old root at {}", n, o)),
+                    e => self.fail(&alloc::format!("pivot_root: err {}", e)),
+                },
+                _ => self.fail("usage: pivot_root <new_root> <put_old>"),
+            },
             "chroot" => match args.first() {
                 Some(d) => match ustd::chroot(d) {
                     0 => self.emit(&alloc::format!("root is now {}", d)),
@@ -20576,7 +20583,7 @@ impl Term {
         "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
         "alias", "unalias", "type", "hostname", "id", "printf", "dd", "split",
         "source", "comm", "join", "paste", "expand", "unexpand", "at", "file",
-        "test", "[", "rand", "mount", "umount", "chroot", "rmdir",
+        "test", "[", "rand", "mount", "umount", "chroot", "pivot_root", "rmdir",
         "export", "unset", "man",
         "lspci", "lscpu", "factor", "shuf", "cksum",
         "eval", "break", "continue", "return",

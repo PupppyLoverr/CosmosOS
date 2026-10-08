@@ -257,6 +257,24 @@ pub const MNT_DETACH: u64 = 2;
 /// statx flags (reuse AT_* where identical)
 pub const AT_STATX_SYMLINK_NOFOLLOW: u64 = 0x100;
 pub const STATX_ALL: u64 = 0xfff;
+/// pivot_root(&[u64;4]{new_ptr,new_len,old_ptr,old_len})
+pub const SYS_PIVOT_ROOT: u64 = 220;
+/// openat2(&[u64;6]{dirfd,path,len,flags,mode,resolve})
+pub const SYS_OPENAT2: u64 = 221;
+/// getrandom(buf, len, flags)
+pub const SYS_GETRANDOM: u64 = 222;
+/// mincore(addr, len, vec_out) — per-page residency bits
+pub const SYS_MINCORE: u64 = 223;
+/// madvise(addr, len, advice)
+pub const SYS_MADVISE: u64 = 224;
+/// openat2 resolve flags
+pub const RESOLVE_NO_XDEV: u64 = 1;
+pub const RESOLVE_NO_SYMLINKS: u64 = 2;
+pub const RESOLVE_BENEATH: u64 = 4;
+pub const RESOLVE_IN_ROOT: u64 = 8;
+/// madvise advice values (subset)
+pub const MADV_DONTNEED: u64 = 4;
+pub const MADV_WILLNEED: u64 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

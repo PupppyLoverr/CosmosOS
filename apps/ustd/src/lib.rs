@@ -1884,6 +1884,49 @@ pub fn statx_at(dirfd: i64, path: &str, flags: u64) -> Result<shared::Statx, i64
     if r < 0 { Err(r) } else { Ok(sx) }
 }
 
+/// pivot_root(new_root, put_old): / moves to new_root; the old root
+/// stays reachable under put_old (a real bind is registered).
+pub fn pivot_root(new_root: &str, put_old: &str) -> i64 {
+    let args: [u64; 4] = [
+        new_root.as_ptr() as u64,
+        new_root.len() as u64,
+        put_old.as_ptr() as u64,
+        put_old.len() as u64,
+    ];
+    sc1(shared::SYS_PIVOT_ROOT, args.as_ptr() as u64) as i64
+}
+
+/// openat2(dirfd, path, flags, resolve) — RESOLVE_BENEATH=4 etc.
+pub fn openat2(dirfd: i64, path: &str, flags: u64, resolve: u64) -> i64 {
+    let args: [u64; 6] = [
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        flags,
+        0,
+        resolve,
+    ];
+    sc1(shared::SYS_OPENAT2, args.as_ptr() as u64) as i64
+}
+
+/// getrandom(buf) -> bytes written
+pub fn getrandom(buf: &mut [u8]) -> i64 {
+    sc3(shared::SYS_GETRANDOM, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as i64
+}
+
+/// mincore(addr,len) -> per-page residency bits (1 = resident)
+pub fn mincore(addr: u64, len: u64) -> Result<alloc::vec::Vec<u8>, i64> {
+    let pages = (len + 0xfff) / 0x1000;
+    let mut v = alloc::vec![0u8; pages as usize];
+    let r = sc3(shared::SYS_MINCORE, addr, len, v.as_mut_ptr() as u64) as i64;
+    if r < 0 { Err(r) } else { Ok(v) }
+}
+
+/// madvise(addr,len,advice): MADV_WILLNEED=3, MADV_DONTNEED=4
+pub fn madvise(addr: u64, len: u64, advice: u64) -> i64 {
+    sc3(shared::SYS_MADVISE, addr, len, advice) as i64
+}
+
 /// chroot(dir): jail this task's path resolution under `dir`.
 pub fn chroot(dir: &str) -> i64 {
     sc2(218, dir.as_ptr() as u64, dir.len() as u64) as i64
