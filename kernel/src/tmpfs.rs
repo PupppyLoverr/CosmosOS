@@ -45,17 +45,17 @@ pub fn any() -> bool {
 /// `path` at or under mount `m` — allocation-free: `handles` runs on the
 /// page-fault read path where heap allocation can deadlock (a preempted
 /// task may hold the heap lock).
-fn under(m: &str, path: &str) -> bool {
+pub fn under(m: &str, path: &str) -> bool {
     path == m || (path.len() > m.len() && path.starts_with(m) && path.as_bytes()[m.len()] == b'/')
 }
 
-fn mounted(g: &[(String, bool)], path: &str) -> bool {
+fn mounted(g: &[(String, u64)], path: &str) -> bool {
     g.iter().any(|m| under(&m.0, path))
 }
 
 /// Is `path` under a READ-ONLY mount? EROFS gate for all mutators.
-fn ro_of(g: &[(String, bool)], path: &str) -> bool {
-    g.iter().any(|m| m.1 && under(&m.0, path))
+fn ro_of(g: &[(String, u64)], path: &str) -> bool {
+    g.iter().any(|m| m.1 & shared::MS_RDONLY != 0 && under(&m.0, path))
 }
 
 /// Convenience: ro check against the current task's namespace.
@@ -79,8 +79,8 @@ pub fn handles(path: &str) -> bool {
     mounted(&g.tmpfs, path) || g.detached.iter().any(|p| under(p, path))
 }
 
-/// Mount points with ro flag in the current task's namespace.
-pub fn mounts() -> Vec<(String, bool)> {
+/// Mount points with option flags in the current task's namespace.
+pub fn mounts() -> Vec<(String, u64)> {
     let ns = crate::task::ns_of();
     let g = ns.lock();
     g.tmpfs.clone()
@@ -92,7 +92,8 @@ pub fn remount(target: &str, ro: bool) -> Result<(), i64> {
     let mut mg = ns.lock();
     match mg.tmpfs.iter_mut().find(|m| m.0 == target) {
         Some(m) => {
-            m.1 = ro;
+            // remount flips ro; other option bits persist
+            m.1 = (m.1 & !shared::MS_RDONLY) | if ro { shared::MS_RDONLY } else { 0 };
             Ok(())
         }
         None => Err(-22),
@@ -163,7 +164,7 @@ fn write_pages(n: &mut Node, off: u64, buf: &[u8]) {
 /// Mount a fresh tmpfs at `target` (already normalized, verified to be an
 /// existing directory by the caller). EBUSY(-16) if already a mount,
 /// EINVAL(-22) for "/".
-pub fn mount(target: &str, ro: bool) -> Result<(), i64> {
+pub fn mount(target: &str, opts: u64) -> Result<(), i64> {
     if target == "/" {
         return Err(-22);
     }
@@ -190,7 +191,7 @@ pub fn mount(target: &str, ro: bool) -> Result<(), i64> {
             children: Vec::new(),
         },
     );
-    mg.tmpfs.push((String::from(target), ro));
+    mg.tmpfs.push((String::from(target), opts));
     mg.tmpfs.sort_by(|a, b| b.0.len().cmp(&a.0.len())); // longest prefix wins
     ANY.fetch_add(1, Ordering::Relaxed);
     Ok(())

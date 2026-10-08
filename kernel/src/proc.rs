@@ -64,6 +64,13 @@ pub fn is_dir(path: &str) -> bool {
         || pid_of(path)
             .map(|p| task::pids().contains(&p) && path.matches('/').count() == 2)
             .unwrap_or(false)
+        || pid_of(path)
+            .map(|p| {
+                task::pids().contains(&p)
+                    && path.matches('/').count() == 3
+                    && path.ends_with("/ns")
+            })
+            .unwrap_or(false)
 }
 
 pub fn exists(path: &str) -> bool {
@@ -75,6 +82,10 @@ pub fn exists(path: &str) -> bool {
         if path.matches('/').count() == 3 {
             let f = path.rsplit('/').next().unwrap_or("");
             return task::pids().contains(&p) && PID_FILES.contains(&f);
+        }
+        // /proc/<pid>/ns/<nsfile> — the setns fd targets
+        if path.matches('/').count() == 4 && path.ends_with("/ns/mntns") {
+            return task::pids().contains(&p);
         }
         return false;
     }
@@ -92,6 +103,13 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
     let mut out = Vec::new();
     if let Some(p) = pid_of(path) {
         if is_dir(path) {
+            if path.ends_with("/ns") {
+                let mut de = shared::DirEntry::default();
+                de.name[..5].copy_from_slice(b"mntns");
+                de.name_len = 5;
+                out.push(de);
+                return out;
+            }
             for name in PID_FILES {
                 let mut de = shared::DirEntry::default();
                 let nb = name.as_bytes();
@@ -99,6 +117,11 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
                 de.name_len = nb.len() as u8;
                 out.push(de);
             }
+            // the ns/ subdirectory holding namespace link-files
+            let mut nsde = shared::DirEntry::default();
+            nsde.name[..2].copy_from_slice(b"ns");
+            nsde.name_len = 2;
+            out.push(nsde);
             return out;
         }
         let _ = p;
@@ -204,6 +227,13 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         if path.matches('/').count() == 3 && PID_FILES.contains(&file) {
             return pid_file(p, file);
         }
+        // /proc/<pid>/ns/mntns — content is the namespace's own id,
+        // like Linux's mnt:[inum] link target
+        if path.matches('/').count() == 4 && path.ends_with("/ns/mntns") {
+            return task::ns_arc_of(p)
+                .map(|ns| alloc::format!("mntns:[{}]
+", ns.lock().id).into_bytes());
+        }
         return None;
     }
     let s = match path {
@@ -288,7 +318,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
                 s.push_str(&alloc::format!(
                     "tmpfs {} tmpfs {} 0 0\n",
                     m,
-                    if ro { "ro" } else { "rw" }
+                    if ro & shared::MS_RDONLY != 0 { "ro" } else { "rw" }
                 ));
             }
             for (tgt, src) in crate::bind::mounts() {
@@ -447,8 +477,8 @@ fn mountinfo() -> String {
             id,
             id,
             m,
-            if ro { "ro" } else { "rw" },
-            if ro { "ro" } else { "rw" },
+            if ro & shared::MS_RDONLY != 0 { "ro" } else { "rw" },
+            if ro & shared::MS_RDONLY != 0 { "ro" } else { "rw" },
         ));
         id += 1;
     }

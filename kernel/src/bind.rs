@@ -21,7 +21,7 @@ fn under(m: &str, path: &str) -> bool {
     path == m || (path.len() > m.len() && path.starts_with(m) && path.as_bytes()[m.len()] == b'/')
 }
 
-fn resolve_inner(g: &Vec<(String, String)>, path: &str) -> String {
+fn resolve_inner(g: &[(String, String, u64)], path: &str) -> String {
     // Iterative so a bind chain (c -> b -> a) fully collapses; real
     // kernels compose mounts the same way. Bound the walk to keep a
     // self-referential entry from looping forever.
@@ -68,8 +68,9 @@ pub fn resolve_pf(path: &str) -> Option<String> {
 }
 
 /// mount --bind source target. Both must already exist on their fs.
-/// EINVAL on self-bind, EEXIST on a duplicate target.
-pub fn mount(source: &str, target: &str) -> Result<(), i64> {
+/// EINVAL on self-bind, EEXIST on a duplicate target. `opts` carries
+/// MS_NODEV/MS_NOEXEC for accesses through the alias.
+pub fn mount(source: &str, target: &str, opts: u64) -> Result<(), i64> {
     if source == target {
         return Err(-22);
     }
@@ -78,7 +79,7 @@ pub fn mount(source: &str, target: &str) -> Result<(), i64> {
     if g.binds.iter().any(|b| b.0 == target) {
         return Err(-16);
     }
-    g.binds.push((String::from(target), String::from(source)));
+    g.binds.push((String::from(target), String::from(source), opts));
     g.binds.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
     ANY.fetch_add(1, Ordering::Release);
     Ok(())
@@ -100,7 +101,7 @@ pub fn umount(target: &str) -> Result<(), i64> {
 pub fn mounts() -> Vec<(String, String)> {
     let ns = crate::task::ns_of();
     let g = ns.lock();
-    g.binds.clone()
+    g.binds.iter().map(|b| (b.0.clone(), b.1.clone())).collect()
 }
 
 /// Is `target` a bind mount point in the current namespace?

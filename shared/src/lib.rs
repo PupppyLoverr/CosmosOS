@@ -269,6 +269,16 @@ pub const SYS_MINCORE: u64 = 223;
 pub const SYS_MADVISE: u64 = 224;
 /// unshare(flags) — CLONE_NEWNS deep-copies the mount namespace
 pub const SYS_UNSHARE: u64 = 225;
+/// setns(fd) — adopt the namespace behind /proc/<pid>/ns/mntns
+pub const SYS_SETNS: u64 = 226;
+/// pidfd_getfd(pidfd, fd, flags) — duplicate a descriptor out of another task
+pub const SYS_PIDFD_GETFD: u64 = 229;
+/// MS_NOSUID: ignore setuid bits under the mount
+pub const MS_NOSUID: u64 = 2;
+/// MS_NODEV: do not interpret device files under the mount
+pub const MS_NODEV: u64 = 4;
+/// MS_NOEXEC: disallow program execution from the mount
+pub const MS_NOEXEC: u64 = 8;
 pub const CLONE_NEWNS: u64 = 0x0002_0000;
 /// openat2 resolve flags
 pub const RESOLVE_NO_XDEV: u64 = 1;

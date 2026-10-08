@@ -2549,7 +2549,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         // kill; read yields a status. pidfd of an absent pid must fail.
         match ustd::spawn("/bin/cosmos-calc", "") {
             Ok(pid) => {
-                let pfd = ustd::pidfd(pid);
+                let pfd = ustd::pidfd(pid as u32);
                 let ok = pfd >= 0
                     && ustd::pidfd(999_999) < 0
                     && ustd::poll(&[pfd as u32], &[1], 0) == 0
@@ -4176,6 +4176,130 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::umount("/nsp");
         let _ = ustd::remove("/nsp");
         ok && invis
+    });
+    check("setns", {
+        // adopt a child's namespace through /proc/<pid>/ns/mntns, then
+        // setns back into our own — mntns:[id] stays stable per ns.
+        let _ = ustd::mkdir("/nsx");
+        let own = ustd::open("/proc/self/ns/mntns", ustd::O_RDONLY).unwrap_or(-1);
+        let pid = ustd::fork();
+        if pid == 0 {
+            if ustd::unshare(0x20000) != 0 {
+                ustd::exit(15);
+            }
+            if ustd::mount("none", "/nsx", "tmpfs") != 0
+                || ustd::write_all("/nsx/f", b"S").is_err()
+            {
+                ustd::exit(16);
+            }
+            ustd::sleep_ms(2000); // stay alive for the parent's setns
+            ustd::exit(0);
+        }
+        ustd::sleep_ms(150); // let the child's mount land first
+        let pf = alloc::format!("/proc/{}/ns/mntns", pid);
+        let theirs = ustd::open(&pf, ustd::O_RDONLY).unwrap_or(-1);
+        let mut ok = own >= 0 && theirs >= 0 && ustd::stat("/nsx/f").is_err();
+        if theirs >= 0 && ustd::setns(theirs as u64) == 0 {
+            ok = ok && ustd::stat("/nsx/f").is_ok();
+            // ...and switching back restores the parent view
+            if own >= 0 {
+                ok = ok && ustd::setns(own as u64) == 0 && ustd::stat("/nsx/f").is_err();
+            }
+        }
+        if own >= 0 {
+            let _ = ustd::close(own);
+        }
+        if theirs >= 0 {
+            let _ = ustd::close(theirs);
+        }
+        let _ = ustd::waitpid(pid as u32, 10_000);
+        let _ = ustd::remove("/nsx");
+        ok
+    });
+    check("mount-noexec", {
+        // MS_NOEXEC(8) on the covering mount turns execve into EACCES.
+        let _ = ustd::mkdir("/nx");
+        let ok = ustd::mount_flags("none", "/nx", "tmpfs", 8) == 0
+            && ustd::execve("/nx/anything", "") == -13;
+        let _ = ustd::umount("/nx");
+        let _ = ustd::remove("/nx");
+        ok
+    });
+    check("copy-file-range", {
+        // kernel-side ranged copy: seek src to 4, copy 6 bytes through
+        // the existing null-offset API (positions advance by the move).
+        let _ = ustd::write_all("/cfr-src", b"0123456789abcdef");
+        let _ = ustd::write_all("/cfr-dst", b"XX");
+        let i = ustd::open("/cfr-src", ustd::O_RDONLY).unwrap_or(-1);
+        let o = ustd::open("/cfr-dst", ustd::O_WRONLY).unwrap_or(-1);
+        let n = if i >= 0 && o >= 0 {
+            let _ = ustd::seek(i, 4, 0);
+            let _ = ustd::seek(o, 2, 0);
+            ustd::copy_file_range(i, o, 6)
+        } else {
+            -1
+        };
+        let got = ustd::read_all("/cfr-dst").unwrap_or_default();
+        if i >= 0 {
+            let _ = ustd::close(i);
+        }
+        if o >= 0 {
+            let _ = ustd::close(o);
+        }
+        let _ = ustd::remove("/cfr-src");
+        let _ = ustd::remove("/cfr-dst");
+        n == 6 && got == b"XX456789"
+    });
+    check("syncfs", {
+        let f = ustd::open("/syncf", ustd::O_WRONLY | ustd::O_CREATE).unwrap_or(-1);
+        let ok = f >= 0 && ustd::syncfs(f) == 0 && ustd::syncfs(9999) < 0;
+        if f >= 0 {
+            let _ = ustd::close(f);
+        }
+        let _ = ustd::remove("/syncf");
+        ok
+    });
+    check("pidfd-getfd", {
+        // harvest an fd out of a child: parent pidfd_getfd's its /cfr file
+        // descriptor and reads the same bytes through the adopted fd.
+        let _ = ustd::write_all("/pfd", b"SHARED");
+        let pid = ustd::fork();
+        if pid == 0 {
+            let f = ustd::open("/pfd", ustd::O_RDONLY).unwrap_or(-1);
+            if f < 0 {
+                ustd::exit(15);
+            }
+            ustd::sleep_ms(2000); // keep the fd alive
+            let _ = ustd::close(f);
+            ustd::exit(0);
+        }
+        ustd::sleep_ms(150);
+        let pfd = ustd::pidfd(pid as u32);
+        // scan the child's table: its /pfd desc is the first fd whose
+        // path is /pfd — adopt by number like Linux (our children hold
+        // it in the first free slot after the inherited ones).
+        let mut got = Vec::new();
+        let mut ok = pfd >= 0;
+        for fd in 0..16u64 {
+            if pfd >= 0 {
+                let nf = ustd::pidfd_getfd(pfd as u64, fd);
+                if nf >= 0 {
+                    let mut b = [0u8; 16];
+                    if let Ok(n) = ustd::read(nf, &mut b) {
+                        if n == 6 && &b[..6] == b"SHARED" {
+                            got = b[..6].to_vec();
+                        }
+                    }
+                    let _ = ustd::close(nf);
+                }
+            }
+        }
+        if pfd >= 0 {
+            let _ = ustd::close(pfd);
+        }
+        let _ = ustd::waitpid(pid as u32, 10_000);
+        let _ = ustd::remove("/pfd");
+        ok && got == b"SHARED"
     });
     check("gettimeofday", {
         let (s, u) = ustd::gettimeofday();
