@@ -3856,6 +3856,7 @@ enum SedK {
     Q,
     Rf(String),
     Wf(String),
+    LineNo, // `=` prints the current line number
 }
 
 /// Read one delimiter-terminated sed field (\\x escapes pass through).
@@ -3953,10 +3954,11 @@ fn sed_parse(spec: &str) -> Result<Vec<(Option<SedAddr>, SedK)>, String> {
                     },
                 ));
             }
-            b'p' | b'd' | b'q' => {
+            b'p' | b'd' | b'q' | b'=' => {
                 let k = match b[i] {
                     b'p' => SedK::P,
                     b'd' => SedK::D,
+                    b'=' => SedK::LineNo,
                     _ => SedK::Q,
                 };
                 i += 1;
@@ -12450,6 +12452,8 @@ impl Term {
                 let rec = args
                     .iter()
                     .any(|a| a.starts_with('-') && (a.contains('r') || a.contains('R')));
+                // -d: remove empty directories only (like rmdir)
+                let dironly = args.iter().any(|a| a.starts_with('-') && a.contains('d'));
                 let inter = args.iter().any(|a| a.starts_with('-') && a.contains('i'));
                 let force = args.iter().any(|a| a.starts_with('-') && a.contains('f'));
                 let verbose = args.iter().any(|a| a.starts_with('-') && a.contains('v'));
@@ -12501,6 +12505,33 @@ impl Term {
                 }
                 for f in &files {
                     let st = ustd::stat(f);
+                    if dironly {
+                        // -d: dirs via rmdir (fails non-empty), files
+                        // are an error either way
+                        match ustd::stat(f).map(|s| s.is_dir != 0) {
+                            Ok(true) => {
+                                match ustd::remove(f) {
+                                    Ok(()) if verbose => {
+                                        self.emit(&alloc::format!("removed '{}'", f))
+                                    }
+                                    Err(e) if !force => {
+                                        self.fail(&alloc::format!(
+                                            "rm: {}: err {}", f, e
+                                        ))
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Ok(false) => self.fail(&alloc::format!(
+                                "rm: {}: not a directory (use -r to remove)", f
+                            )),
+                            Err(_) if !force => {
+                                self.fail(&alloc::format!("rm: {}: not found", f))
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     if !rec && st.map(|s| s.is_dir != 0).unwrap_or(false) {
                         self.fail(&alloc::format!("rm: {}: is a directory (use -r)", f));
                         continue;
@@ -16064,6 +16095,9 @@ impl Term {
                 let summ = args.iter().any(|a| *a == "-s");
                 let all = args.iter().any(|a| *a == "-a");
                 let gtot = args.iter().any(|a| *a == "-c");
+                // -x: stay on the argument's filesystem (compare the
+                // statfs magic of each child dir)
+                let onefs = args.iter().any(|a| *a == "-x" || *a == "--one-file-system");
                 let mut maxd = usize::MAX;
                 let mut valpos: Vec<usize> = Vec::new();
                 for (i, a) in args.iter().enumerate() {
@@ -16097,7 +16131,12 @@ impl Term {
                 };
                 let mut grand = 0u64;
                 for p in paths {
-                    let n = self.du_tree(p, 0, human, emit, maxd);
+                    let root_mag = if onefs {
+                        ustd::statfs(p).map(|t| t.0)
+                    } else {
+                        None
+                    };
+                    let n = self.du_tree(p, 0, human, emit, maxd, root_mag);
                     grand += n;
                     if summ {
                         if human {
@@ -16918,6 +16957,8 @@ impl Term {
                     Some(s) => {
                         // sort -z: NUL-terminated records (xargs -0 pairs)
                         let nulrec = cmd == "sort" && args.iter().any(|a| *a == "-z");
+                        // head/tail -z: NUL-separated records in AND out
+                        let zrec = cmd != "sort" && args.iter().any(|a| *a == "-z");
                         let mut ls: Vec<&str> = if nulrec {
                             s.split('\0').filter(|x| !x.is_empty()).collect()
                         } else {
@@ -17122,7 +17163,28 @@ impl Term {
                                     }
                                     term.emit(&alloc::format!("==> {} <==", name));
                                 }
-                                let lsv: Vec<&str> = sc.lines().collect();
+                                let lsv: Vec<&str> = if zrec {
+                                    sc.split('\0')
+                                        .filter(|x| !x.is_empty())
+                                        .collect()
+                                } else {
+                                    sc.lines().collect()
+                                };
+                                // GNU -z: NUL-joined output; shared by the
+                                // head take() / tail skip() paths below
+                                let emit_sel = |term: &mut Self,
+                                                lsv: &[&str]| {
+                                    if zrec && !lsv.is_empty() {
+                                        term.emit_no_nl(&alloc::format!(
+                                            "{}\u{0}",
+                                            lsv.join("\u{0}")
+                                        ));
+                                    } else {
+                                        for l in lsv {
+                                            term.emit(l);
+                                        }
+                                    }
+                                };
                                 if cmd == "head" {
                                     let bytewin: Option<String> = match (
                                         cbytes, cfrom, cbutlast,
@@ -17154,9 +17216,7 @@ impl Term {
                                             } else {
                                                 n
                                             };
-                                            for l in lsv.iter().take(lim) {
-                                                term.emit(l);
-                                            }
+                                            emit_sel(term, &lsv[..lim.min(lsv.len())]);
                                         }
                                     }
                                 } else {
@@ -17197,9 +17257,7 @@ impl Term {
                                             } else {
                                                 lsv.len().saturating_sub(n)
                                             };
-                                            for l in lsv.iter().skip(start) {
-                                                term.emit(l);
-                                            }
+                                            emit_sel(term, &lsv[start..]);
                                         }
                                     }
                                 }
@@ -20230,27 +20288,44 @@ impl Term {
                 }
             }
             "od" => {
-                // od [-An] [-t x1|c] [file|-] — canonical octal-dump-style
-                // view; `-`/no file reads piped stdin like GNU
+                // od [-An] [-t x1|c] [-N bytes] [file|-] — canonical
+                // octal-dump-style view; `-`/no file reads piped stdin
+                // like GNU; -N dumps at most N bytes
                 let mut offbase = 8usize; // octal offsets by default
                 let mut chars = false;
                 let mut path = "";
-                for a in args.iter() {
-                    match *a {
+                let mut limit: Option<usize> = None;
+                let mut oi = 0usize;
+                while oi < args.len() {
+                    let a = args[oi];
+                    match a {
                         "-A" | "-Ax" | "-tx1" | "-A x" => {}
                         "-Ax" => offbase = 16,
                         "-An" => offbase = 0,
                         "-c" | "-t c" | "-tc" => chars = true,
                         "-tx1c" => chars = true,
                         "-" => path = "-",
+                        "-N" | "--read-size" => {
+                            if let Some(v) = args.get(oi + 1) {
+                                limit = v.parse().ok();
+                                oi += 1;
+                            }
+                        }
+                        _ if a.starts_with("-N") && a.len() > 2 => {
+                            limit = a[2..].parse().ok();
+                        }
+                        _ if a.starts_with("--read-size=") => {
+                            limit = a[12..].parse().ok();
+                        }
                         _ if !a.starts_with('-') => path = a,
                         _ => {}
                     }
+                    oi += 1;
                 }
                 let data = if path == "-" || (path.is_empty() && self.pipe_in.is_some()) {
                     self.pipe_in.clone().unwrap_or_default().into_bytes()
                 } else if path.is_empty() {
-                    self.fail("usage: od [-An|-Ax] [-tx1c] <file>");
+                    self.fail("usage: od [-An|-Ax] [-tx1c] [-N bytes] <file>");
                     return;
                 } else {
                     match ustd::read_all(path) {
@@ -20263,6 +20338,10 @@ impl Term {
                 };
                 match Ok::<Vec<u8>, String>(data) {
                     Ok(d) => {
+                        let d = match limit {
+                            Some(n) => &d[..d.len().min(n)],
+                            None => &d[..],
+                        };
                         for (i, ch) in d.chunks(16).enumerate() {
                             let mut l = if offbase == 16 {
                                 alloc::format!("{:08x}  ", i * 16)
@@ -20573,6 +20652,12 @@ impl Term {
                     hexs(&b[0..4]), hexs(&b[4..6]), hexs(&b[6..8]),
                     hexs(&b[8..10]), hexs(&b[10..])
                 ));
+            }
+            "mcookie" => {
+                // 128-bit hex cookie (xauth format) from kernel rand
+                let mut b = [0u8; 16];
+                ustd::rand_fill(&mut b);
+                self.emit(&hexs(&b));
             }
             "logger" => {
                 // logger <msg...> — append a timestamped line to /log/messages.txt
@@ -21649,6 +21734,9 @@ impl Term {
                                     })
                                     .collect();
                             }
+                            // `=` always prints the line number, even
+                            // under -n (GNU semantics)
+                            SedK::LineNo => out.push(alloc::format!("{}", ln)),
                             SedK::P => out.push(cur.clone()),
                             SedK::D => {
                                 print = false;
@@ -24829,7 +24917,7 @@ impl Term {
         "sha1sum", "od", "xxd", "banner", "units", "pr", "apropos", "whereis",
         "jobs", "fg", "bg", "disown", "halt", "arch", "nproc", "iostat", "strace",
         "tput", "builtin", "command", "exec", "dos2unix", "unix2dos", "base32", "sysctl",
-        "fortune", "uuidgen", "logger", "whois", "fdisk", "vol", "blkid", "script",
+        "fortune", "uuidgen", "mcookie", "logger", "whois", "fdisk", "vol", "blkid", "script",
         "nice", "renice", "pgrep", "pkill", "top", "dc", "vmstat", "free",
         "pcap", "ftp", "lsof", "fuser", "burn", "cron", "browse",
         "function", "declare", "typeset",
@@ -25207,7 +25295,7 @@ impl Term {
 
     /// Recursive byte total for `du`.
     // emit: 0 = no per-entry lines (-s), 1 = top-level files only, 2 = all (-a)
-    fn du_tree(&mut self, path: &str, depth: usize, human: bool, emit: u8, maxd: usize) -> u64 {
+    fn du_tree(&mut self, path: &str, depth: usize, human: bool, emit: u8, maxd: usize, onefs: Option<u64>) -> u64 {
         match ustd::readdir(path) {
             Ok(ents) => {
                 let mut total = 0u64;
@@ -25215,7 +25303,14 @@ impl Term {
                     let name = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("?");
                     let p = alloc::format!("{}{}{}", path, if path.ends_with('/') { "" } else { "/" }, name);
                     if e.is_dir != 0 {
-                        total += self.du_tree(&p, depth + 1, human, emit, maxd);
+                        // -x: don't descend into directories on a
+                        // different filesystem (statfs magic compare)
+                        if let Some(mag) = onefs {
+                            if ustd::statfs(&p).map(|t| t.0) != Some(mag) {
+                                continue;
+                            }
+                        }
+                        total += self.du_tree(&p, depth + 1, human, emit, maxd, onefs);
                     } else {
                         total += e.size;
                         // files only under -a (GNU default prints dirs only)
