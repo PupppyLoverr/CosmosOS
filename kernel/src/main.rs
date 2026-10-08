@@ -100,6 +100,28 @@ fn main(boot_info: &'static mut BootInfo) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     sprintln!("KERNEL PANIC: {}", info);
+    // Format the panic into a fixed buffer (no allocation — the heap may be
+    // the thing that died) and paint it on the framebuffer so a panic while
+    // the desktop is running is still diagnosable.
+    struct FixBuf {
+        buf: [u8; 2048],
+        n: usize,
+    }
+    impl core::fmt::Write for FixBuf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let n = s.len().min(self.buf.len() - self.n);
+            self.buf[self.n..self.n + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.n += n;
+            Ok(())
+        }
+    }
+    let mut b = FixBuf {
+        buf: [0u8; 2048],
+        n: 0,
+    };
+    use core::fmt::Write;
+    let _ = write!(b, "KERNEL PANIC\n\n{}", info);
+    fb::panic_screen(core::str::from_utf8(&b.buf[..b.n]).unwrap_or("kernel panic"));
     loop {
         x86_64::instructions::hlt();
     }

@@ -1,6 +1,7 @@
 //! CosmosOS shared ABI: syscall numbers, kernel<->userspace data types,
 //! and the window-server wire protocol. Used by both the kernel and `ustd`.
 #![no_std]
+pub mod font16;
 
 // ---------------------------------------------------------------------------
 // Syscall numbers (int 0x80: nr=rax, args rdi,rsi,rdx,r8,r9; ret rax)
