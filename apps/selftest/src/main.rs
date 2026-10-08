@@ -473,6 +473,35 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         ok
     });
 
+    // ---- named pipes: mkfifo + buffered write/read + EOF on last-writer ----
+    check("mkfifo", ustd::mkfifo("/st.pipe") == 0);
+    check("mkfifo-dup", ustd::mkfifo("/st.pipe") < 0);
+    // nonblocking-ish sanity: writer opens (O_WRONLY), writes, reader drains
+    {
+        let wfd = ustd::open("/st.pipe", shared::O_WRONLY | shared::O_CREATE);
+        check("pipe-open-w", wfd.is_ok());
+        if let Ok(wfd) = wfd {
+            check("pipe-write", ustd::write(wfd, b"pipe-ok").map(|n| n == 7).unwrap_or(false));
+            let rfd = ustd::open("/st.pipe", shared::O_RDONLY);
+            check("pipe-open-r", rfd.is_ok());
+            if let Ok(rfd) = rfd {
+                let mut pb = [0u8; 16];
+                let n = ustd::read(rfd, &mut pb).unwrap_or(0);
+                check("pipe-read", n == 7 && &pb[..7] == b"pipe-ok");
+                ustd::close(rfd);
+            }
+            // closing the last writer + drained queue -> EOF (read == 0)
+            ustd::close(wfd);
+            if let Ok(rfd2) = ustd::open("/st.pipe", shared::O_RDONLY) {
+                let mut pb = [0u8; 8];
+                let n = ustd::read(rfd2, &mut pb).unwrap_or(usize::MAX);
+                check("pipe-eof", n == 0);
+                ustd::close(rfd2);
+            }
+        }
+        let _ = ustd::remove("/st.pipe");
+    }
+
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

@@ -86,6 +86,7 @@ pub const SYS_SETATTR: u64 = 86;           // (path_ptr,len,attr) -> 0 | ERR  se
 pub const SYS_RTC_SET: u64 = 87;           // (unix_secs) -> 0            set wall clock (RTC + base)
 pub const SYS_UMASK: u64 = 88;             // (mask|U64MAX=query) -> old   per-task file-create mask
 pub const SYS_KLOG_CLEAR: u64 = 89;        // () -> 0                      clear the kernel log ring
+pub const SYS_MKFIFO: u64 = 90;            // (path_ptr,len) -> 0 | ERR    create named pipe (mkfifo)
 pub const SYS_ERR: u64 = u64::MAX;
 
 // open flags
