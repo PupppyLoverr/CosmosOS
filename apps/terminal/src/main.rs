@@ -192,14 +192,22 @@ impl Term {
                 }
                 None => self.push_line("usage: touch <file>"),
             },
-            "rm" => match args.first() {
-                Some(p) => {
-                    if let Err(e) = ustd::remove(p) {
-                        self.push_line(&alloc::format!("rm: err {}", e));
+            "rm" => {
+                let (rec, target) = if args.first() == Some(&"-r") {
+                    (true, args.get(1))
+                } else {
+                    (false, args.first())
+                };
+                match target {
+                    Some(p) => {
+                        let r = if rec { self.rm_tree(p) } else { ustd::remove(p) };
+                        if let Err(e) = r {
+                            self.push_line(&alloc::format!("rm: {}: err {}", p, e));
+                        }
                     }
+                    None => self.push_line("usage: rm [-r] <path>"),
                 }
-                None => self.push_line("usage: rm <path>"),
-            },
+            }
             "mv" => {
                 if args.len() < 2 {
                     self.push_line("usage: mv <from> <to>");
@@ -434,6 +442,25 @@ impl Term {
             self.view = 0;
         }
         self.dirty_all = true;
+    }
+
+    /// Recursive delete: walk the tree removing files, then dirs bottom-up.
+    fn rm_tree(&mut self, path: &str) -> Result<(), i64> {
+        match ustd::readdir(path) {
+            Ok(ents) => {
+                for e in ents {
+                    let name = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("?");
+                    let p = alloc::format!("{}{}{}", path, if path.ends_with('/') { "" } else { "/" }, name);
+                    if e.is_dir != 0 {
+                        self.rm_tree(&p)?;
+                    } else {
+                        ustd::remove(&p)?;
+                    }
+                }
+                ustd::remove(path)
+            }
+            Err(_) => ustd::remove(path), // plain file (or bad path — remove reports)
+        }
     }
 
     fn grep_file(&mut self, pat: &str, path: &str) {
