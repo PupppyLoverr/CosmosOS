@@ -102,6 +102,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
         shared::SYS_SLEEP_MS => sys_sleep(ctx, a1),
         shared::SYS_MMAP => sys_mmap(a1),
+        shared::SYS_MMAP_FILE => sys_mmap_file(a1, a2, a3),
         shared::SYS_DEBUG => sys_debug(a1, a2),
         shared::SYS_OPEN => sys_open(a1, a2, a3),
         shared::SYS_CLOSE => {
@@ -1374,6 +1375,60 @@ fn sys_mmap(size: u64) -> u64 {
     })
 }
 
+/// SYS_MMAP_FILE(fd,size,offset): real demand-paged file mapping — the
+/// VA range is reserved NOW but no pages exist; the first touch of each
+/// 4KiB page faults, and the #PF handler fills it from the file (zero
+/// past EOF). Pseudo-fs fds are rejected: only real files page in.
+fn sys_mmap_file(fd: u64, size: u64, offset: u64) -> u64 {
+    if size == 0 || size > 64 << 20 {
+        return 0;
+    }
+    let path = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) => Some(f.path.clone()),
+        _ => None,
+    });
+    let Some(path) = path else {
+        return 0;
+    };
+    if crate::pipes::handles(&path)
+        || crate::dev::handles(&path)
+        || crate::proc::handles(&path)
+    {
+        return 0;
+    }
+    let Ok(st) = vfs::stat_path(&path) else {
+        return 0;
+    };
+    if st.is_dir != 0 {
+        return 0;
+    }
+    task::with_current(|t| {
+        if t.pml4.is_none() {
+            return 0;
+        }
+        let base = t.mmap_next;
+        if base == 0 {
+            return 0;
+        }
+        let pages = size.div_ceil(0x1000);
+        t.mem_bytes += pages * 0x1000;
+        t.maps.push(task::MapEnt {
+            start: base,
+            end: base + pages * 0x1000,
+            perm: 1 | 2,
+            name: path.clone(),
+        });
+        t.filemaps.push(task::FileMap {
+            start: base,
+            end: base + pages * 0x1000,
+            path,
+            off: offset,
+        });
+        t.mmap_next += pages * 0x1000 + 0x1000; // guard page
+        base
+    })
+}
+
 /// SYS_MUNMAP(addr,len): real unmap — PTEs cleared, owned frames freed,
 /// borrowed (shm/fb) frames just detached, tracked entries shrunk/split.
 fn sys_munmap(addr: u64, len: u64) -> u64 {
@@ -1435,6 +1490,31 @@ fn sys_munmap(addr: u64, len: u64) -> u64 {
             }
         }
         t.maps = out;
+        // filemap bookkeeping tracks the same split
+        let mut fout: Vec<task::FileMap> = Vec::new();
+        for f in core::mem::take(&mut t.filemaps) {
+            if f.end <= addr || f.start >= end {
+                fout.push(f);
+                continue;
+            }
+            if f.start < addr {
+                fout.push(task::FileMap {
+                    start: f.start,
+                    end: addr,
+                    path: f.path.clone(),
+                    off: f.off,
+                });
+            }
+            if f.end > end {
+                fout.push(task::FileMap {
+                    start: end,
+                    end: f.end,
+                    path: f.path,
+                    off: f.off + (end - f.start),
+                });
+            }
+        }
+        t.filemaps = fout;
         t.mem_bytes = t.mem_bytes.saturating_sub(unmapped * 0x1000);
         unsafe { x86_64::instructions::tlb::flush_all() };
         0

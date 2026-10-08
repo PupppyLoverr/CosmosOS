@@ -43,6 +43,16 @@ pub struct MapEnt {
     pub name: String,
 }
 
+/// A file-backed mmap region: VA range -> (path, file offset of `start`).
+/// Pages are NOT mapped at mmap(2) time — the #PF handler fills each one
+/// from the file on first touch (real demand paging).
+pub struct FileMap {
+    pub start: u64,
+    pub end: u64,
+    pub path: String,
+    pub off: u64,
+}
+
 pub struct Task {
     pub id: u32,
     pub name: String,
@@ -78,6 +88,7 @@ pub struct Task {
     pub umask: u32,          // file-creation mask (POSIX); inherited across spawn
     pub exe: String,         // full path the task was spawned from (/proc/<pid>/exe)
     pub maps: Vec<MapEnt>,   // tracked user-space mappings
+    pub filemaps: Vec<FileMap>, // file-backed regions for demand paging
     pub rbytes: u64,         // bytes read via vfs (/proc/<pid>/io)
     pub wbytes: u64,         // bytes written via vfs
 }
@@ -129,6 +140,7 @@ pub fn init() {
         umask: 0o022,
         exe: String::from("kernel"),
         maps: Vec::new(),
+        filemaps: Vec::new(),
         rbytes: 0,
         wbytes: 0,
     };
@@ -408,6 +420,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         umask: s.tasks.iter().find(|t| t.id == parent).map(|t| t.umask).unwrap_or(0o022),
         exe: String::from(path),
         maps: umaps,
+        filemaps: Vec::new(),
         rbytes: 0,
         wbytes: 0,
     };
@@ -471,6 +484,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         umask: 0o022,
         exe: String::from("kernel-thread"),
         maps: Vec::new(),
+        filemaps: Vec::new(),
         rbytes: 0,
         wbytes: 0,
     }));
@@ -1132,4 +1146,64 @@ pub fn pid_smaps(pid: u32) -> Option<String> {
         ));
     }
     Some(out)
+}
+
+
+/// Does `va` fall inside a file-backed mmap? Returns (path, file offset
+/// of the containing page).
+pub fn filemap_hit(va: u64) -> Option<(String, u64)> {
+    with_current(|t| {
+        let page = va & !0xFFFu64;
+        t.filemaps
+            .iter()
+            .find(|f| page >= f.start && page < f.end)
+            .map(|f| (f.path.clone(), f.off + (page - f.start)))
+    })
+}
+
+/// Page-fault driven demand paging: fills one user page from the mapped
+/// file (zero-padded past EOF) and maps it. true = the fault is
+/// satisfied and the instruction may retry.
+pub fn demand_page(va: u64) -> bool {
+    let (pml4, hit) = with_current(|t| {
+        let page = va & !0xFFFu64;
+        (
+            t.pml4,
+            t.filemaps
+                .iter()
+                .find(|f| page >= f.start && page < f.end)
+                .map(|f| (f.path.clone(), f.off + (page - f.start))),
+        )
+    });
+    let (Some(pml4), Some((path, file_off))) = (pml4, hit) else {
+        sprintln!("[demand] miss va={:#x}", va);
+        return false;
+    };
+    let mut scratch = Vec::new();
+    let Some(phys) = crate::elf::map_user_page(pml4, va & !0xFFF, &mut scratch) else {
+        sprintln!("[demand] map fail va={:#x}", va);
+        return false;
+    };
+    if scratch.is_empty() {
+        return false; // already mapped — this was a real fault
+    }
+    let mut buf = [0u8; 4096];
+    match crate::vfs::read_range_pf(&path, file_off, &mut buf) {
+        Ok(n) => {
+            let dst = crate::mem::phys_to_virt(phys) as *mut u8;
+            unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, n) };
+            true
+        }
+        Err(e) => {
+            sprintln!("[demand] read err {} path={} off={}", e, path, file_off);
+            false
+        }
+    }
+}
+
+/// sti;hlt;cli — wait one IRQ window inside exception/syscall context
+/// where interrupts are off. The demand pager's FS-lock retry uses it so
+/// a preempted lock holder gets rescheduled instead of deadlocking us.
+pub fn wait_irq() {
+    unsafe { core::arch::asm!("sti; hlt; cli", options(nomem, nostack)) };
 }

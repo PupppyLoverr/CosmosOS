@@ -1978,6 +1978,36 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    check("mmapfile", {
+        // demand-paged file mmap: each page faults in from disk on touch
+        let data: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        let mut ok = ustd::write_all("/st-mmap.bin", &data).is_ok();
+        if ok {
+            let fd = ustd::open("/st-mmap.bin", ustd::O_RDONLY);
+            ok = ok && fd.is_ok();
+            if let Ok(fd) = fd {
+                let p = ustd::mmap_file(fd, 8192, 0);
+                ok = ok && p.is_some();
+                if let Some(p) = p {
+                    unsafe {
+                        // reads land on two distinct faulted-in pages
+                        ok = ok && *p == 0 && *p.add(252) == 1
+                            && *p.add(4096) == 80 && *p.add(8191) == 159;
+                        // writable private copy — RAM only, file untouched
+                        *p = 0xAA;
+                        ok = ok && *p == 0xAA;
+                    }
+                    ok = ok && ustd::munmap(p, 8192);
+                }
+                ustd::close(fd);
+            }
+            ok = ok
+                && ustd::read_all("/st-mmap.bin")
+                    .map(|v| v[0] == 0)
+                    .unwrap_or(false);
+        }
+        ok
+    });
     check("tcprefused", {
         // SYN to an unclaimed port -> real RST back -> -111 ECONNREFUSED
         let c = ustd::socket(ustd::SOCK_STREAM);

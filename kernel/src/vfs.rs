@@ -138,6 +138,34 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, i64> {
     }
 }
 
+/// Read `buf.len()` bytes at `offset` of a real file (normal callers).
+pub fn read_range(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    if crate::pipes::handles(path) || crate::dev::handles(path) || crate::proc::handles(path) {
+        return Err(-22);
+    }
+    let mut g = FS.lock();
+    match g.as_mut() {
+        Some(fs) => fs.read_file_range(path, offset, buf).map_err(err_to_i64),
+        None => Err(-1),
+    }
+}
+
+/// Demand-paging read for the #PF path. Same read, but the FS lock is
+/// taken with try_lock+wait_irq: the holder may be a preempted task, and
+/// spinning here would deadlock the fault handler — rescheduling it
+/// lets it finish and release.
+pub fn read_range_pf(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    loop {
+        if let Some(mut g) = FS.try_lock() {
+            return match g.as_mut() {
+                Some(fs) => fs.read_file_range(path, offset, buf).map_err(err_to_i64),
+                None => Err(-1),
+            };
+        }
+        crate::task::wait_irq();
+    }
+}
+
 fn err_to_i64(e: fat32::Error) -> i64 {
     -(e as i64) - 100
 }

@@ -433,6 +433,18 @@ pub fn mmap(size: u64) -> Option<*mut u8> {
     }
 }
 
+/// mmap_file(fd, size, offset): real demand-paged file mapping — the VA
+/// range is reserved now, each 4KiB page faults in from disk on first
+/// touch (zero past EOF). None if fd isn't a real file.
+pub fn mmap_file(fd: i64, size: u64, offset: u64) -> Option<*mut u8> {
+    let p = sc3(shared::SYS_MMAP_FILE, fd as u64, size, offset);
+    if p == 0 || is_err(p) {
+        None
+    } else {
+        Some(p as *mut u8)
+    }
+}
+
 /// munmap(addr, len): unmap a tracked user mapping — PTEs cleared,
 /// owned frames freed, shm/fb borrowed pages detached.
 pub fn munmap(addr: *mut u8, len: u64) -> bool {

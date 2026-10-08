@@ -546,6 +546,41 @@ impl<D: BlockDevice> Fat32<D> {
         Ok(out)
     }
 
+    /// Read `buf.len()` bytes starting at `offset` — walks the cluster
+    /// chain skipping whole clusters; short read at EOF. This is the
+    /// demand-pager's backend (no whole-file Vec).
+    pub fn read_file_range(&mut self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let (_, entry) = self.resolve(path)?;
+        let e = entry.ok_or(Error::NotFound)?;
+        if e.attr & ATTR_DIR != 0 {
+            return Err(Error::NotDir);
+        }
+        if e.first_cluster < 2 || offset >= e.size as u64 {
+            return Ok(0);
+        }
+        let want = ((e.size as u64 - offset).min(buf.len() as u64)) as usize;
+        let cb = self.clus_bytes;
+        let mut tmp = vec![0u8; cb];
+        let mut skip = offset / cb as u64;
+        let mut inner = (offset % cb as u64) as usize;
+        let mut done = 0usize;
+        for c in self.chain(e.first_cluster)? {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            if done >= want {
+                break;
+            }
+            self.read_cluster(c, &mut tmp)?;
+            let take = (want - done).min(cb - inner);
+            buf[done..done + take].copy_from_slice(&tmp[inner..inner + take]);
+            done += take;
+            inner = 0;
+        }
+        Ok(done)
+    }
+
     /// Write a whole file: create if missing, grow/truncate as needed.
     pub fn write_file(&mut self, path: &str, data: &[u8]) -> Result<()> {
         let (parent_clus, name) = self.parent_of(path)?;
