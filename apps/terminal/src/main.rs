@@ -7978,6 +7978,121 @@ fn od_aname(b: u8) -> String {
     }
 }
 
+/// base16 (hex) decode — pairs of hex digits, whitespace skipped.
+fn b16_decode(s: &str) -> Option<Vec<u8>> {
+    let h: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if h.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(h.len() / 2);
+    for p in h.chunks(2) {
+        let v = |c: u8| -> Option<u8> {
+            match c {
+                b'0'..=b'9' => Some(c - b'0'),
+                b'a'..=b'f' => Some(c - b'a' + 10),
+                b'A'..=b'F' => Some(c - b'A' + 10),
+                _ => None,
+            }
+        };
+        out.push(v(p[0])? << 4 | v(p[1])?);
+    }
+    Some(out)
+}
+
+/// RFC 4648 base32hex (alphabet 0-9A-V) encode.
+fn b32hex_encode(data: &[u8]) -> String {
+    const ALPHA: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    let mut out = String::new();
+    for ch in data.chunks(5) {
+        let mut acc: u64 = 0;
+        let mut bits = 0u32;
+        for b in ch {
+            acc = acc << 8 | *b as u64;
+            bits += 8;
+        }
+        let total = (ch.len() * 8 + 4) / 5;
+        let mut i = 0;
+        while i < total {
+            let sh = bits as i64 - 5 * (i as i64 + 1);
+            let idx = if sh >= 0 { ((acc >> sh) & 31) as usize } else { ((acc << (-sh)) & 31) as usize };
+            out.push(ALPHA[idx] as char);
+            i += 1;
+        }
+        while out.len() % 8 != 0 {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// RFC 4648 base32hex decode.
+fn b32hex_decode(t: &str) -> Option<Vec<u8>> {
+    let mut acc: u64 = 0;
+    let mut bits = 0u32;
+    let mut out = Vec::new();
+    for c in t.bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = match c {
+            b'0'..=b'9' => c - b'0',
+            b'A'..=b'V' => c - b'A' + 10,
+            b'a'..=b'v' => c - b'a' + 10,
+            _ => return None,
+        } as u64;
+        acc = acc << 5 | v;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// Z85 encode: groups of 4 bytes -> 5 chars (input padded to a 4
+/// multiple internally; decode needs the padding stripped length —
+/// ZeroMQ spec requires a real multiple, we emit len unpadded).
+fn z85_encode(data: &[u8]) -> String {
+    const A: &[u8; 85] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
+    let mut out = String::new();
+    for ch in data.chunks(4) {
+        let mut v: u32 = 0;
+        for i in 0..4 {
+            v = v << 8 | *ch.get(i).unwrap_or(&0) as u32;
+        }
+        let mut enc = [0u8; 5];
+        let mut x = v;
+        for i in (0..5).rev() {
+            enc[i] = A[(x % 85) as usize];
+            x /= 85;
+        }
+        let n = (ch.len() * 5 + 3) / 4;
+        for i in 0..n {
+            out.push(enc[i] as char);
+        }
+    }
+    out
+}
+
+fn z85_decode(s: &str) -> Option<Vec<u8>> {
+    const A: &[u8; 85] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
+    let t: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let mut out = Vec::new();
+    for ch in t.chunks(5) {
+        let mut v: u32 = 0;
+        for &c in ch {
+            let p = A.iter().position(|x| *x == c)? as u32;
+            v = v.wrapping_mul(85).wrapping_add(p);
+        }
+        let n = ch.len() * 4 / 5;
+        let b = v.to_be_bytes();
+        out.extend_from_slice(&b[..n]);
+    }
+    Some(out)
+}
+
 fn fmt_fixed(millionths: u64) -> String {
     // millionths -> "i.frac" with trailing zeros trimmed
     let i = millionths / 1_000_000;
@@ -11772,6 +11887,7 @@ impl Term {
             "sha256sum", "strings", "sort", "uniq", "cut", "more", "diff", "base64",
             "show", "tar", "md5sum", "uuencode", "uudecode", "grep", "find", "file",
             "sha1sum", "cksum", "comm", "zgrep", "zip", "unzip", "chmod", "touch",
+            "basenc",
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look", "fmt",
         "pwck", "grpck", "pathchk", "nslookup", "b2sum",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
@@ -17631,6 +17747,615 @@ impl Term {
                     if ebx7 & (1 << 20) != 0 { flags.push("smap"); }
                     if ebx7 & (1 << 18) != 0 { flags.push("rdseed"); }
                     self.emit(&alloc::format!("  flags: {}", flags.join(" ")));
+                }
+            }
+            "curl" => {
+                // curl — real HTTP/1.1 client on the raw TCP stack.
+                // -s silent, -i include response headers, -I/--head,
+                // -o FILE / -O remote-name, -X METHOD, -d DATA (real
+                // POST body), -H 'K: v' extra request headers,
+                // -w '%{http_code} %{size_download} %{time_total}',
+                // --max-time SEC. HTTPS is not supported.
+                let mut url: Option<&str> = None;
+                let mut outfile: Option<String> = None;
+                let mut remote_name = false;
+                let mut head_only = false;
+                let mut include_hdr = false;
+                let mut silent = false;
+                let mut method: Option<String> = None;
+                let mut ddata: Option<String> = None;
+                let mut xhdrs: Vec<String> = Vec::new();
+                let mut wout: Option<String> = None;
+                let mut max_ms: u64 = 15_000;
+                let mut i = 0usize;
+                while i < args.len() {
+                    let a = args[i];
+                    match a {
+                        "-s" | "--silent" => silent = true,
+                        "-i" | "--include" => include_hdr = true,
+                        "-I" | "--head" => head_only = true,
+                        "-O" | "--remote-name" => remote_name = true,
+                        "-o" | "--output" => {
+                            outfile = args.get(i + 1).map(|s| String::from(*s));
+                            i += 1;
+                        }
+                        "-X" | "--request" => {
+                            method = args.get(i + 1).map(|s| s.to_uppercase());
+                            i += 1;
+                        }
+                        "-d" | "--data" | "--data-ascii" => {
+                            ddata = args.get(i + 1).map(|s| String::from(*s));
+                            i += 1;
+                        }
+                        "-H" | "--header" => {
+                            if let Some(h) = args.get(i + 1) {
+                                xhdrs.push(String::from(*h));
+                            }
+                            i += 1;
+                        }
+                        "-w" | "--write-out" => {
+                            wout = args.get(i + 1).map(|s| String::from(*s));
+                            i += 1;
+                        }
+                        "--max-time" => {
+                            max_ms = args
+                                .get(i + 1)
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(15)
+                                .saturating_mul(1000);
+                            i += 1;
+                        }
+                        _ if a.starts_with("-X") && a.len() > 2 => {
+                            method = Some(a[2..].to_uppercase());
+                        }
+                        _ if a.starts_with("-d") && a.len() > 2 => {
+                            ddata = Some(String::from(&a[2..]));
+                        }
+                        _ if a.starts_with("-H") && a.len() > 2 => {
+                            xhdrs.push(String::from(&a[2..]));
+                        }
+                        _ if a.starts_with("--max-time=") => {
+                            max_ms = a[11..]
+                                .parse::<u64>()
+                                .unwrap_or(15)
+                                .saturating_mul(1000);
+                        }
+                        _ if !a.starts_with('-') => url = Some(a),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let Some(url) = url else {
+                    self.fail("usage: curl [flags] http://host[:port]/path");
+                    return;
+                };
+                if url.starts_with("https://") {
+                    self.fail("curl: https not supported (no TLS)");
+                    return;
+                }
+                let u = url.strip_prefix("http://").unwrap_or(url);
+                let (authority, path) = match u.find('/') {
+                    Some(i) => (&u[..i], &u[i..]),
+                    None => (u, "/"),
+                };
+                let (host, port) = match authority.find(':') {
+                    Some(i) => (
+                        &authority[..i],
+                        authority[i + 1..].parse::<u16>().unwrap_or(80),
+                    ),
+                    None => (authority, 80u16),
+                };
+                let Some(ip) = parse_ipv4(host).or_else(|| ustd::net_dns(host))
+                else {
+                    self.last_ok = false;
+                    if !silent {
+                        self.emit(&alloc::format!(
+                            "curl: could not resolve host: {}",
+                            host
+                        ));
+                    }
+                    return;
+                };
+                let m = method.clone().unwrap_or_else(|| {
+                    String::from(if ddata.is_some() {
+                        "POST"
+                    } else if head_only {
+                        "HEAD"
+                    } else {
+                        "GET"
+                    })
+                });
+                let mut req = alloc::format!(
+                    "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: cosmos-curl/1.0\r\nAccept: */*\r\nConnection: close\r\n",
+                    m,
+                    path,
+                    authority
+                );
+                for h in &xhdrs {
+                    req.push_str(h);
+                    req.push_str("\r\n");
+                }
+                if let Some(d) = &ddata {
+                    req.push_str(&alloc::format!(
+                        "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n",
+                        d.len()
+                    ));
+                }
+                req.push_str("\r\n");
+                if let Some(d) = &ddata {
+                    req.push_str(d);
+                }
+                let t0 = ustd::uptime_ms();
+                let Some(sock) = (40000..40400)
+                    .find_map(|lp| ustd::TcpSock::connect(lp, ip, port))
+                else {
+                    self.last_ok = false;
+                    if !silent {
+                        self.emit("curl: connection failed");
+                    }
+                    return;
+                };
+                let rb = req.as_bytes();
+                let mut off = 0usize;
+                while off < rb.len() {
+                    let n = (rb.len() - off).min(1400);
+                    if sock.send(&rb[off..off + n]).is_none() {
+                        break;
+                    }
+                    off += n;
+                }
+                let mut resp: Vec<u8> = Vec::new();
+                while let Some(chunk) = sock.recv(4000) {
+                    resp.extend_from_slice(&chunk);
+                    if ustd::uptime_ms() - t0 > max_ms || resp.len() > 1_000_000 {
+                        break;
+                    }
+                }
+                let mut code = 0u32;
+                if let Some(le) = resp.iter().position(|b| *b == b'\n') {
+                    let sl = String::from_utf8_lossy(&resp[..le]);
+                    code = sl
+                        .split(' ')
+                        .nth(1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                }
+                let split = resp
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|i| i + 4)
+                    .unwrap_or(0);
+                let (head_b, body_b) = (&resp[..split], &resp[split..]);
+                if head_only {
+                    let h = String::from_utf8_lossy(head_b);
+                    for l in h.lines() {
+                        self.emit(l);
+                    }
+                } else {
+                    if include_hdr {
+                        let h = String::from_utf8_lossy(head_b);
+                        for l in h.lines() {
+                            self.emit(l);
+                        }
+                    }
+                    if remote_name && outfile.is_none() {
+                        let f = path.rsplit('/').next().unwrap_or("index.html");
+                        outfile = Some(String::from(if f.is_empty() {
+                            "index.html"
+                        } else {
+                            f
+                        }));
+                    }
+                    match &outfile {
+                        Some(f) => match ustd::write_all(f, body_b) {
+                            Ok(_) => {
+                                if !silent {
+                                    self.emit(&alloc::format!(
+                                        "  saved {}B to {}",
+                                        body_b.len(),
+                                        f
+                                    ));
+                                }
+                            }
+                            Err(e) => self.fail(&alloc::format!(
+                                "curl: {}: err {}",
+                                f,
+                                e
+                            )),
+                        },
+                        None => self.emit_bin(body_b),
+                    }
+                }
+                if let Some(w) = &wout {
+                    let ms = ustd::uptime_ms() - t0;
+                    let mut out = String::from(w.as_str());
+                    out = out.replace("%{http_code}", &alloc::format!("{}", code));
+                    out = out.replace(
+                        "%{size_download}",
+                        &alloc::format!("{}", body_b.len()),
+                    );
+                    out = out.replace(
+                        "%{time_total}",
+                        &alloc::format!("{}.{:03}", ms / 1000, ms % 1000),
+                    );
+                    self.emit(&out);
+                }
+            }
+            "whatis" => {
+                // whatis <name>... — exact-name one-line description
+                let names: Vec<&&str> =
+                    args.iter().filter(|a| !a.starts_with('-')).collect();
+                if names.is_empty() {
+                    self.fail("usage: whatis <name>...");
+                    return;
+                }
+                for a in names {
+                    let p = alloc::format!("/man/{}.txt", a);
+                    match ustd::read_all(&p) {
+                        Ok(d) => {
+                            let first = String::from_utf8_lossy(&d)
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .to_string();
+                            self.emit(&alloc::format!("{} - {}", a, first));
+                        }
+                        Err(_) => {
+                            self.emit(&alloc::format!("{}: nothing appropriate", a));
+                        }
+                    }
+                }
+            }
+            "lsb_release" => {
+                // lsb_release [-a|-i|-d|-r|-c] [-s] — /etc/os-release backed
+                if args.is_empty() {
+                    self.emit("No LSB modules are available.");
+                    return;
+                }
+                let all = args.iter().any(|a| *a == "-a" || *a == "--all");
+                let sh = args.iter().any(|a| *a == "-s" || *a == "--short");
+                let has = |f: &str, l: &str| {
+                    all || args.iter().any(|a| *a == f || *a == l)
+                };
+                let data = ustd::read_all("/etc/os-release").unwrap_or_default();
+                let txt = String::from_utf8_lossy(&data).into_owned();
+                let kv = |k: &str| -> String {
+                    for l in txt.lines() {
+                        if let Some(v) = l.strip_prefix(k) {
+                            return v.trim_matches('"').to_string();
+                        }
+                    }
+                    String::new()
+                };
+                if has("-i", "--id") {
+                    let v = kv("ID=");
+                    self.emit(&if sh {
+                        v
+                    } else {
+                        alloc::format!("Distributor ID:\t{}", v)
+                    });
+                }
+                if has("-d", "--description") {
+                    let v = kv("PRETTY_NAME=");
+                    self.emit(&if sh {
+                        v
+                    } else {
+                        alloc::format!("Description:\t{}", v)
+                    });
+                }
+                if has("-r", "--release") {
+                    let v = kv("VERSION_ID=");
+                    self.emit(&if sh {
+                        v
+                    } else {
+                        alloc::format!("Release:\t{}", v)
+                    });
+                }
+                if has("-c", "--codename") {
+                    let v = kv("VERSION_CODENAME=");
+                    self.emit(&if sh {
+                        v
+                    } else {
+                        alloc::format!("Codename:\t{}", v)
+                    });
+                }
+            }
+            "basenc" => {
+                // basenc --base16|--base32|--base32hex|--base64|
+                //        --base64url|--z85 [-d] [-w COL] [file]
+                let mut enc = "base64";
+                let mut dec = false;
+                let mut wrap = 76usize;
+                let mut file: Option<&str> = None;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "--base16" => enc = "base16",
+                        "--base32" => enc = "base32",
+                        "--base32hex" => enc = "base32hex",
+                        "--base64" => enc = "base64",
+                        "--base64url" => enc = "base64url",
+                        "--z85" => enc = "z85",
+                        "-d" | "--decode" | "-D" | "--dec" => dec = true,
+                        "-w" | "--wrap" => {
+                            wrap = args
+                                .get(i + 1)
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(76);
+                            i += 1;
+                        }
+                        a if a.starts_with("-w") => {
+                            wrap = a[2..].parse().unwrap_or(76);
+                        }
+                        a if !a.starts_with('-') => file = Some(a),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let data: Option<Vec<u8>> = match file {
+                    Some(p) => match ustd::read_all(p) {
+                        Ok(d) => Some(d),
+                        Err(e) => {
+                            self.fail(&alloc::format!("basenc: {}: err {}", p, e));
+                            None
+                        }
+                    },
+                    None => self.pipe_in.as_ref().map(|s| s.as_bytes().to_vec()),
+                };
+                let Some(d) = data else {
+                    self.fail("usage: basenc --ENCODING [-d] [-w N] [file]");
+                    return;
+                };
+                if dec {
+                    let t = String::from_utf8_lossy(&d).into_owned();
+                    let tt: String =
+                        t.chars().filter(|c| !c.is_whitespace()).collect();
+                    let out = match enc {
+                        "base16" => b16_decode(&tt),
+                        "base32" => b32_decode(&tt),
+                        "base32hex" => b32hex_decode(&tt),
+                        "base64url" => b64_decode(
+                            &tt.replace('-', "+").replace('_', "/"),
+                        ),
+                        "z85" => z85_decode(&tt),
+                        _ => b64_decode(&tt),
+                    };
+                    match out {
+                        Some(b) => self.emit_bin(&b),
+                        None => self.fail("basenc: invalid input"),
+                    }
+                } else {
+                    let s = match enc {
+                        "base16" => hexs(&d).to_uppercase(),
+                        "base32" => b32_encode(&d),
+                        "base32hex" => b32hex_encode(&d),
+                        "base64url" => b64_encode(&d)
+                            .replace('+', "-")
+                            .replace('/', "_"),
+                        "z85" => z85_encode(&d),
+                        _ => b64_encode(&d),
+                    };
+                    if wrap == 0 || s.len() <= wrap {
+                        self.emit(&s);
+                    } else {
+                        for ch in s.as_bytes().chunks(wrap) {
+                            self.emit(&String::from_utf8_lossy(ch));
+                        }
+                    }
+                }
+            }
+            "ipcmk" => {
+                // ipcmk -M bytes | -Q — create a real kernel IPC object
+                let mut any = false;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-M" | "--shmem" => {
+                            let sz = args
+                                .get(i + 1)
+                                .and_then(|s| s.parse::<usize>().ok())
+                                .unwrap_or(0);
+                            i += 1;
+                            if sz == 0 {
+                                self.fail("ipcmk: -M requires a size in bytes");
+                                return;
+                            }
+                            match ustd::shm_create(sz) {
+                                Some(id) => {
+                                    self.emit(&alloc::format!(
+                                        "Shared memory id: {}",
+                                        id
+                                    ));
+                                }
+                                None => self.fail("ipcmk: shm create failed"),
+                            }
+                            any = true;
+                        }
+                        "-Q" | "--queue" => {
+                            let name = alloc::format!(
+                                "/ipcmk-{}",
+                                ustd::rand_u64().unwrap_or(7) % 100000
+                            );
+                            let fd = ustd::mq_open(&name, 8, 256);
+                            if fd >= 0 {
+                                self.emit(&alloc::format!(
+                                    "Message queue: {}",
+                                    name
+                                ));
+                            } else {
+                                self.fail(&alloc::format!(
+                                    "ipcmk: mq create: err {}",
+                                    fd
+                                ));
+                            }
+                            any = true;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if !any {
+                    self.fail("usage: ipcmk -M bytes | -Q");
+                }
+            }
+            "getopt" => {
+                // getopt -o OPTSTRING [-l|--long LONGLIST] -- args...
+                // OPTSTRING 'a' = flag, 'a:' = requires arg. LONGLIST
+                // is comma separated, ':' suffix = required arg.
+                // Prints the normalized command line the way GNU
+                // getopt does: options first, then --, then operands.
+                let mut optstr: Option<String> = None;
+                let mut longs: Vec<(String, bool)> = Vec::new();
+                let mut rest: Vec<String> = Vec::new();
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-o" | "--options" => {
+                            optstr = args.get(i + 1).map(|s| String::from(*s));
+                            i += 1;
+                        }
+                        "-l" | "--long" | "--longoptions" => {
+                            if let Some(l) = args.get(i + 1) {
+                                for part in l.split(',') {
+                                    let has_arg = part.ends_with(':');
+                                    longs.push((
+                                        String::from(
+                                            part.trim_end_matches(':'),
+                                        ),
+                                        has_arg,
+                                    ));
+                                }
+                            }
+                            i += 1;
+                        }
+                        a if optstr.is_none() && !a.starts_with('-') => {
+                            optstr = Some(String::from(a));
+                        }
+                        "--" => {
+                            i += 1;
+                            while i < args.len() {
+                                rest.push(String::from(args[i]));
+                                i += 1;
+                            }
+                        }
+                        a => rest.push(String::from(a)),
+                    }
+                    i += 1;
+                }
+                let os = optstr.unwrap_or_default();
+                // parse optstring into (letter, takes_arg)
+                let mut specs: Vec<(u8, bool)> = Vec::new();
+                let ob = os.as_bytes();
+                let mut j = 0usize;
+                while j < ob.len() {
+                    let arg = j + 1 < ob.len() && ob[j + 1] == b':';
+                    specs.push((ob[j], arg));
+                    j += if arg { 2 } else { 1 };
+                }
+                let mut out = String::new();
+                let mut operands: Vec<String> = Vec::new();
+                let mut k = 0usize;
+                let mut err: Option<String> = None;
+                while k < rest.len() {
+                    let tok = &rest[k];
+                    if tok == "--" {
+                        k += 1;
+                        break;
+                    }
+                    if let Some(l) = tok.strip_prefix("--") {
+                        let (name, inline) = match l.find('=') {
+                            Some(e) => (
+                                String::from(&l[..e]),
+                                Some(String::from(&l[e + 1..])),
+                            ),
+                            None => (String::from(l), None),
+                        };
+                        match longs.iter().find(|(n, _)| *n == name) {
+                            Some((_, needs)) => {
+                                if *needs {
+                                    if let Some(v) = inline {
+                                        out.push_str(&alloc::format!(
+                                            " --{} '{}'",
+                                            name,
+                                            v
+                                        ));
+                                    } else if k + 1 < rest.len() {
+                                        out.push_str(&alloc::format!(
+                                            " --{} '{}'",
+                                            name,
+                                            rest[k + 1]
+                                        ));
+                                        k += 1;
+                                    } else {
+                                        err = Some(alloc::format!(
+                                            "option '--{}' requires an argument",
+                                            name
+                                        ));
+                                    }
+                                } else {
+                                    out.push_str(&alloc::format!(
+                                        " --{}",
+                                        name
+                                    ));
+                                }
+                            }
+                            None => {
+                                err = Some(alloc::format!(
+                                    "unrecognized option '--{}'",
+                                    name
+                                ));
+                            }
+                        }
+                    } else if tok.starts_with('-') && tok.len() > 1 {
+                        for &c in tok.as_bytes()[1..].iter() {
+                            match specs.iter().find(|(s, _)| *s == c) {
+                                Some((_, false)) => {
+                                    out.push_str(&alloc::format!(
+                                        " -{}",
+                                        c as char
+                                    ));
+                                }
+                                Some((_, true)) => {
+                                    if k + 1 < rest.len() {
+                                        out.push_str(&alloc::format!(
+                                            " -{} '{}'",
+                                            c as char,
+                                            rest[k + 1]
+                                        ));
+                                        k += 1;
+                                    } else {
+                                        err = Some(alloc::format!(
+                                            "option requires an argument -- '{}'",
+                                            c as char
+                                        ));
+                                    }
+                                    break;
+                                }
+                                None => {
+                                    err = Some(alloc::format!(
+                                        "invalid option -- '{}'",
+                                        c as char
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        operands.push(tok.clone());
+                    }
+                    k += 1;
+                }
+                while k < rest.len() {
+                    operands.push(rest[k].clone());
+                    k += 1;
+                }
+                out.push_str(" --");
+                for o in &operands {
+                    out.push_str(&alloc::format!(" '{}'", o));
+                }
+                self.emit(&out);
+                if let Some(e) = err {
+                    self.emit(&alloc::format!("getopt: {}", e));
+                    self.last_ok = false;
                 }
             }
             "arch" => {
@@ -31876,6 +32601,7 @@ impl Term {
         "sha1sum", "od", "xxd", "banner", "units", "pr", "apropos", "whereis",
         "jobs", "fg", "bg", "disown", "halt", "arch", "nproc", "iostat", "strace",
         "tput", "builtin", "command", "exec", "dos2unix", "unix2dos", "base32", "sysctl",
+        "curl", "whatis", "lsb_release", "basenc", "ipcmk", "getopt",
         "fortune", "uuidgen", "mcookie", "logger", "whois", "fdisk", "vol", "blkid", "script",
         "nice", "renice", "pgrep", "pkill", "top", "dc", "vmstat", "free",
         "pcap", "ftp", "lsof", "fuser", "burn", "cron", "browse",
