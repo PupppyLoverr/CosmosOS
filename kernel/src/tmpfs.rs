@@ -45,10 +45,10 @@ fn fresh(is_dir: bool) -> (u32, u32, u16) {
 /// Owner/group/other perm check: `want` is one owner-position bit
 /// (0o400 read / 0o200 write / 0o100 exec). Root (euid 0) passes all.
 pub fn allows(n: &Node, want: u16) -> bool {
-    let (eu, eg) = crate::task::cred();
+    let (eu, _eg) = crate::task::cred();
     eu == 0
         || (eu == n.uid && n.mode & want != 0)
-        || (eg == n.gid && n.mode & (want >> 3) != 0)
+        || (crate::task::in_group(n.gid) && n.mode & (want >> 3) != 0)
         || n.mode & (want >> 6) != 0
 }
 

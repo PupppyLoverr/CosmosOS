@@ -136,6 +136,12 @@ pub struct Task {
     pub gid: u32,
     pub euid: u32,
     pub egid: u32,
+    /// saved ids (setresuid/setresgid third slot; setuid writes them for
+    /// root so a non-root process may restore its effective id)
+    pub suid: u32,
+    pub sgid: u32,
+    /// supplementary group list (setgroups/getgroups)
+    pub groups: Vec<u32>,
     pub sid: u32,               // session id (setsid detaches)
     pub ctty: u64,              // controlling tty: /dev/pts/{id} index (0 = none)
     pub ctid_va: u64,           // clear_child_tid: user u64 zeroed+futex-woken on exit
@@ -322,6 +328,9 @@ pub fn init() {
             gid: 0,
             euid: 0,
             egid: 0,
+            suid: 0,
+            sgid: 0,
+            groups: Vec::new(),
         sid: 0,
         ctty: 0,
         ctid_va: 0,
@@ -821,6 +830,9 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         gid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.gid).unwrap_or(0),
         euid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.euid).unwrap_or(0),
         egid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.egid).unwrap_or(0),
+        suid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.suid).unwrap_or(0),
+        sgid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.sgid).unwrap_or(0),
+        groups: s.tasks.iter().find(|t| t.id == parent).map(|t| t.groups.clone()).unwrap_or_default(),
         sid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.sid).unwrap_or(0),
         ctty: s.tasks.iter().find(|t| t.id == parent).map(|t| t.ctty).unwrap_or(0),
         ctid_va: 0,
@@ -930,6 +942,9 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
             gid: 0,
             euid: 0,
             egid: 0,
+            suid: 0,
+            sgid: 0,
+            groups: Vec::new(),
         sid: 0,
         ctty: 0,
         ctid_va: 0,
@@ -1045,6 +1060,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
     let nsr = cur.ns.clone();
     let utsr = cur.uts.clone();
     let creds = (cur.uid, cur.gid, cur.euid, cur.egid);
+    let (sids, grps) = ((cur.suid, cur.sgid), cur.groups.clone());
     let borrowed = cur.borrowed.clone();
     let shm_ids = cur.shm.clone();
     let (nice, rt, vrun, umask, exe, pfs, rnf, rnp, rstk, rcu, ras) = (
@@ -1085,6 +1101,9 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         gid: creds.1,
         euid: creds.2,
         egid: creds.3,
+        suid: sids.0,
+        sgid: sids.1,
+        groups: grps,
         ports: Vec::new(),
         shm: shm_ids,
         frames: kframes,
@@ -1644,6 +1663,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         cur.uts.clone(),
     );
     let creds = (cur.uid, cur.gid, cur.euid, cur.egid);
+    let (sids, grps) = ((cur.suid, cur.sgid), cur.groups.clone());
     let (maps, filemaps) = (cur.maps.clone(), cur.filemaps.clone());
     let (nice, umask, exe) = (cur.nice, cur.umask, cur.exe.clone());
     let (smin, smax, mnext, apage) = (cur.stack_min, cur.stack_max, cur.mmap_next, cur.arg_page);
@@ -1676,6 +1696,9 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         gid: cur.gid,
         euid: cur.euid,
         egid: cur.egid,
+        suid: cur.suid,
+        sgid: cur.sgid,
+        groups: cur.groups.clone(),
         ports: Vec::new(),
         shm: shm_ids,
         frames: kframes,
@@ -2508,6 +2531,21 @@ pub fn cred() -> (u32, u32) {
     with_current(|t| (t.euid, t.egid))
 }
 
+/// Group-membership check for DAC: effective gid OR the supplementary list.
+pub fn in_group(gid: u32) -> bool {
+    with_current(|t| t.egid == gid || t.groups.contains(&gid))
+}
+
+/// Supplementary groups of the current task (copy out for syscall).
+pub fn groups_of() -> Vec<u32> {
+    with_current(|t| t.groups.clone())
+}
+
+/// Saved/effective/real tuple for /proc + getres*.
+pub fn creds6() -> (u32, u32, u32, u32, u32, u32) {
+    with_current(|t| (t.uid, t.euid, t.suid, t.gid, t.egid, t.sgid))
+}
+
 /// (uid, gid, euid, egid) — proc status dump + syscall answers.
 pub fn creds() -> (u32, u32, u32, u32) {
     with_current(|t| (t.uid, t.gid, t.euid, t.egid))
@@ -2519,6 +2557,14 @@ pub fn pid_creds(pid: u32) -> Option<(u32, u32, u32, u32)> {
     let s = g.as_mut()?;
     let t = s.tasks.iter_mut().find(|t| t.id == pid && t.state != State::Dead)?;
     Some((t.uid, t.gid, t.euid, t.egid))
+}
+
+/// Full credential tuple of another task: (uid,euid,suid,gid,egid,sgid,groups).
+pub fn pid_creds6(pid: u32) -> Option<(u32, u32, u32, u32, u32, u32, Vec<u32>)> {
+    let mut g = SCHED.lock();
+    let s = g.as_mut()?;
+    let t = s.tasks.iter_mut().find(|t| t.id == pid && t.state != State::Dead)?;
+    Some((t.uid, t.euid, t.suid, t.gid, t.egid, t.sgid, t.groups.clone()))
 }
 
 /// tgkill(tgid, tid, sig): signal a specific thread. tgid 0 skips the
