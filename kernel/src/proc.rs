@@ -59,7 +59,7 @@ fn pid_of(path: &str) -> Option<u32> {
 const PID_FILES: &[&str] = &[
     "status", "cmdline", "stat", "fds", "fdinfo", "cwd", "maps", "io",
     "statm", "exe", "smaps", "wchan", "children", "task", "syscall",
-    "sig", "mountinfo",
+    "sig", "mountinfo", "timens_offsets",
 ];
 
 pub fn is_dir(path: &str) -> bool {
@@ -90,10 +90,13 @@ pub fn exists(path: &str) -> bool {
             return task::pids().contains(&p) && PID_FILES.contains(&f);
         }
         // /proc/<pid>/ns/<nsfile> — the setns fd targets
-        if path.matches('/').count() == 4
-            && (path.ends_with("/ns/mntns") || path.ends_with("/ns/uts"))
-        {
-            return task::pids().contains(&p);
+        if path.matches('/').count() == 4 {
+            let n = path.rsplit('/').next().unwrap_or("");
+            if ["mntns", "uts", "pid", "ipc", "time", "time_for_children"]
+                .contains(&n)
+            {
+                return task::pids().contains(&p);
+            }
         }
         return false;
     }
@@ -112,7 +115,7 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
     if let Some(p) = pid_of(path) {
         if is_dir(path) {
             if path.ends_with("/ns") {
-                for n in ["mntns", "uts"] {
+                for n in ["mntns", "uts", "pid", "ipc", "time", "time_for_children"] {
                     let mut de = shared::DirEntry::default();
                     de.name[..n.len()].copy_from_slice(n.as_bytes());
                     de.name_len = n.len() as u8;
@@ -256,6 +259,26 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
             return Some(
                 alloc::format!("pid:[{}]
 ", task::pid_ns_of(p)).into_bytes(),
+            );
+        }
+        if path.matches('/').count() == 4 && path.ends_with("/ns/ipc") {
+            return Some(
+                alloc::format!("ipc:[{}]
+", task::ipc_ns_of(p)).into_bytes(),
+            );
+        }
+        if path.matches('/').count() == 4 && path.ends_with("/ns/time_for_children") {
+            let c = task::child_tns_of(p);
+            return Some(
+                alloc::format!("time_for_children:[{}]
+", if c != 0 { c } else { task::time_ns_of(p) })
+                    .into_bytes(),
+            );
+        }
+        if path.matches('/').count() == 4 && path.ends_with("/ns/time") {
+            return Some(
+                alloc::format!("time:[{}]
+", task::time_ns_of(p)).into_bytes(),
             );
         }
         return None;
@@ -437,6 +460,10 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
 /// (trimmed, non-empty, capped at 64 bytes). `/proc/sysrq-trigger` takes a
 /// single command letter. Returns bytes consumed.
 pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
+    if path.ends_with("/timens_offsets") {
+        let text = String::from(String::from_utf8_lossy(buf));
+        return (crate::task::timens_offsets_write(&text) == 0).then_some(buf.len());
+    }
     if path == "/proc/sysrq-trigger" {
         // sysrq reboot/poweroff are privileged — CAP_SYS_ADMIN.
         if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
@@ -499,6 +526,19 @@ pub fn readlink(path: &str) -> Option<String> {
         }
         if path.ends_with("/ns/pid") {
             return Some(alloc::format!("pid:[{}]", task::pid_ns_of(p)));
+        }
+        if path.ends_with("/ns/ipc") {
+            return Some(alloc::format!("ipc:[{}]", task::ipc_ns_of(p)));
+        }
+        if path.ends_with("/ns/time") {
+            return Some(alloc::format!("time:[{}]", task::time_ns_of(p)));
+        }
+        if path.ends_with("/ns/time_for_children") {
+            let c = task::child_tns_of(p);
+            return Some(alloc::format!(
+                "time_for_children:[{}]",
+                if c != 0 { c } else { task::time_ns_of(p) }
+            ));
         }
     }
     None
@@ -601,6 +641,14 @@ fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
         "syscall" => task::pid_syscall(pid).unwrap_or_else(|| alloc::format!("-1\n")),
         "mountinfo" => mountinfo(),
         "sig" => task::pid_sig(pid).unwrap_or_default(),
+        // Linux timens_offsets: monotonic + boottime offsets, in
+        // seconds + nanoseconds — ours fold into one tick offset.
+        "timens_offsets" => {
+            let off = task::timens_offsets_read(pid).unwrap_or(0);
+            let sec = off.div_euclid(100);
+            let ns = off.rem_euclid(100) * 10_000_000;
+            alloc::format!("monotonic {} {}\nboottime {} {}\n", sec, ns, sec, ns)
+        }
         _ => return None,
     };
     Some(s.into_bytes())

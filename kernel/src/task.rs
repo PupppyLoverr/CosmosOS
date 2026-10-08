@@ -174,7 +174,12 @@ pub struct Task {
     pub nspid: u32,
     /// Linux's pidns_for_children: ns id staged by unshare/setns —
     /// children land there while the task itself keeps its own ns.
-    pub child_ns: u64,
+    pub child_ns: u64,    /// Time namespace membership + staged child timens (children-only
+    /// entry like pidns — unshare/setns never move the caller).
+    pub time_ns: u64,
+    pub child_tns: u64,
+    /// IPC namespace (SysV shm + POSIX mqueue views are scoped to it).
+    pub ipc_ns: u64,
     pub sid: u32,               // session id (setsid detaches)
     pub ctty: u64,              // controlling tty: /dev/pts/{id} index (0 = none)
     pub ctid_va: u64,           // clear_child_tid: user u64 zeroed+futex-woken on exit
@@ -370,6 +375,9 @@ pub fn init() {
             pid_ns: 0,
             nspid: 0,
             child_ns: 0,
+            time_ns: 0,
+            child_tns: 0,
+            ipc_ns: 0,
         sid: 0,
         ctty: 0,
         ctid_va: 0,
@@ -888,6 +896,9 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         pid_ns: pns,
         nspid: pnsv,
         child_ns: s.tasks.iter().find(|t| t.id == parent).map(|t| t.child_ns).unwrap_or(0),
+        time_ns: s.tasks.iter().find(|t| t.id == parent).map(|t| t.time_ns).unwrap_or(0),
+        child_tns: s.tasks.iter().find(|t| t.id == parent).map(|t| t.child_tns).unwrap_or(0),
+        ipc_ns: s.tasks.iter().find(|t| t.id == parent).map(|t| t.ipc_ns).unwrap_or(0),
         sid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.sid).unwrap_or(0),
         ctty: s.tasks.iter().find(|t| t.id == parent).map(|t| t.ctty).unwrap_or(0),
         ctid_va: 0,
@@ -1006,6 +1017,9 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
             pid_ns: 0,
             nspid: 0,
             child_ns: 0,
+            time_ns: 0,
+            child_tns: 0,
+            ipc_ns: 0,
         sid: 0,
         ctty: 0,
         ctid_va: 0,
@@ -1128,6 +1142,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
     );
     let cns = if cur.child_ns != 0 { cur.child_ns } else { cur.pid_ns };
     let (pns, pnsv) = (cns, alloc_nspid(cns));
+    let ctns = if cur.child_tns != 0 { cur.child_tns } else { cur.time_ns };
     let borrowed = cur.borrowed.clone();
     let shm_ids = cur.shm.clone();
     let (nice, rt, vrun, umask, exe, pfs, rnf, rnp, rstk, rcu, ras) = (
@@ -1174,6 +1189,9 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         cap_eff: caps.0,
         cap_prm: caps.1,
         cap_bnd: caps.2,
+        time_ns: ctns,
+        child_tns: cur.child_tns,
+        ipc_ns: cur.ipc_ns,
         pid_ns: pns,
         nspid: pnsv,
         child_ns: cur.child_ns,
@@ -1739,6 +1757,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
     let (sids, grps) = ((cur.suid, cur.sgid), cur.groups.clone());
     let cns = if cur.child_ns != 0 { cur.child_ns } else { cur.pid_ns };
     let (pns, pnsv) = (cns, alloc_nspid(cns));
+    let ctns = if cur.child_tns != 0 { cur.child_tns } else { cur.time_ns };
     let (maps, filemaps) = (cur.maps.clone(), cur.filemaps.clone());
     let (nice, umask, exe) = (cur.nice, cur.umask, cur.exe.clone());
     let (smin, smax, mnext, apage) = (cur.stack_min, cur.stack_max, cur.mmap_next, cur.arg_page);
@@ -1777,6 +1796,9 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         cap_eff: cur.cap_eff,
         cap_prm: cur.cap_prm,
         cap_bnd: cur.cap_bnd,
+        time_ns: ctns,
+        child_tns: cur.child_tns,
+        ipc_ns: cur.ipc_ns,
         pid_ns: pns,
         nspid: pnsv,
         child_ns: cur.child_ns,
@@ -2297,6 +2319,187 @@ pub fn pid_ns_of(pid: u32) -> u64 {
 }
 
 /// The pid-ns object owned by `pid` — for /proc/<pid>/ns/pid pinning.
+/// Time namespace — `timens` on Linux. Members' monotonic/boottime
+/// clock reads are shifted by `off_ticks` (10ms units). Entry is
+/// children-only: unshare/setns stage `child_tns`, never move the
+/// caller — matching the pidns model.
+pub struct TimeNs {
+    pub id: u64,
+    pub parent: u64,
+    pub off_ticks: i64,
+}
+static TIMENS: spin::Mutex<BTreeMap<u64, alloc::sync::Arc<spin::Mutex<TimeNs>>>> =
+    spin::Mutex::new(BTreeMap::new());
+static NEXT_TNS: AtomicU64 = AtomicU64::new(1);
+
+/// IPC namespace — SysV shm and POSIX mqueue views are scoped to it.
+/// unshare(CLONE_NEWIPC) moves the caller immediately (unlike pidns).
+pub struct IpcNs {
+    pub id: u64,
+}
+static IPCNS: spin::Mutex<BTreeMap<u64, alloc::sync::Arc<spin::Mutex<IpcNs>>>> =
+    spin::Mutex::new(BTreeMap::new());
+static NEXT_INS: AtomicU64 = AtomicU64::new(1);
+
+/// unshare(CLONE_NEWTIME): stage a fresh timens for future children.
+pub fn unshare_timens() {
+    let me = with_current(|t| t.time_ns);
+    let id = NEXT_TNS.fetch_add(1, Ordering::Relaxed);
+    TIMENS.lock().insert(
+        id,
+        alloc::sync::Arc::new(spin::Mutex::new(TimeNs {
+            id,
+            parent: me,
+            off_ticks: 0,
+        })),
+    );
+    with_current(|t| t.child_tns = id);
+}
+
+/// setns on a timens object stages it as the caller's child timens.
+pub fn set_timens_for_children(arc: alloc::sync::Arc<spin::Mutex<TimeNs>>) {
+    let id = arc.lock().id;
+    with_current(|t| t.child_tns = id);
+}
+
+/// The timens arc `pid` lives in — for `/proc/<pid>/ns/time` fds.
+pub fn timens_arc_of(pid: u32) -> Option<alloc::sync::Arc<spin::Mutex<TimeNs>>> {
+    let g = SCHED.lock();
+    let id = g
+        .as_ref()
+        .and_then(|s| s.tasks.iter().find(|t| t.id == pid && t.state != State::Dead))
+        .map(|t| t.time_ns)?;
+    TIMENS.lock().get(&id).cloned()
+}
+
+/// The timens `pid`'s children will land in (staged child_tns, falling
+/// back to its own — what `/proc/<pid>/ns/time_for_children` reports).
+pub fn timens_children_arc(pid: u32) -> Option<alloc::sync::Arc<spin::Mutex<TimeNs>>> {
+    let g = SCHED.lock();
+    let (tns, ctn) = g
+        .as_ref()
+        .and_then(|s| s.tasks.iter().find(|t| t.id == pid && t.state != State::Dead))
+        .map(|t| (t.time_ns, t.child_tns))?;
+    TIMENS.lock().get(&if ctn != 0 { ctn } else { tns }).cloned()
+}
+
+/// The timens id `pid` lives in (0 = initial or dead).
+pub fn time_ns_of(pid: u32) -> u64 {
+    let g = SCHED.lock();
+    g.as_ref()
+        .and_then(|s| s.tasks.iter().find(|t| t.id == pid))
+        .map(|t| t.time_ns)
+        .unwrap_or(0)
+}
+
+/// Staged child timens id (0 when none — callers fall back to time_ns).
+pub fn child_tns_of(pid: u32) -> u64 {
+    let g = SCHED.lock();
+    g.as_ref()
+        .and_then(|s| s.tasks.iter().find(|t| t.id == pid))
+        .map(|t| t.child_tns)
+        .unwrap_or(0)
+}
+
+/// PIT ticks shifted by the caller's timens offset — the monotonic /
+/// boottime clock every per-task time read goes through.
+pub fn ticks_ns() -> u64 {
+    let id = with_current(|t| t.time_ns);
+    let off = if id == 0 {
+        0
+    } else {
+        TIMENS.lock().get(&id).map(|n| n.lock().off_ticks).unwrap_or(0)
+    };
+    (ticks() as i64 + off).max(0) as u64
+}
+
+/// uptime_ms for the current task (timens-shifted).
+pub fn uptime_ms_ns() -> u64 {
+    ticks_ns() * 10
+}
+
+/// Write `timens_offsets` text — "monotonic <sec> <nsec>" / "boottime
+/// <sec> <nsec>" lines fold into one tick offset applied to the caller's
+/// staged child timens (or its own ns when none is staged).
+pub fn timens_offsets_write(text: &str) -> i64 {
+    let mut off: Option<i64> = None;
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let Some(_key) = it.next() else { continue };
+        let s: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(-1);
+        let ns: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(-1);
+        if s < 0 || ns < 0 {
+            return -22; // EINVAL
+        }
+        off = Some(s * 100 + ns / 10_000_000);
+    }
+    let Some(off) = off else { return -22 };
+    let id = with_current(|t| if t.child_tns != 0 { t.child_tns } else { t.time_ns });
+    match TIMENS.lock().get(&id) {
+        Some(n) => {
+            n.lock().off_ticks = off;
+            0
+        }
+        None => -22,
+    }
+}
+
+/// Offsets (in ticks) of `pid`'s staged-or-own timens — the content of
+/// `/proc/<pid>/timens_offsets`.
+pub fn timens_offsets_read(pid: u32) -> Option<i64> {
+    let g = SCHED.lock();
+    let (tns, ctn) = g
+        .as_ref()
+        .and_then(|s| s.tasks.iter().find(|t| t.id == pid && t.state != State::Dead))
+        .map(|t| (t.time_ns, t.child_tns))?;
+    TIMENS
+        .lock()
+        .get(&if ctn != 0 { ctn } else { tns })
+        .map(|n| n.lock().off_ticks)
+        .or(Some(0))
+}
+
+/// unshare(CLONE_NEWIPC): move the caller into a fresh IPC namespace
+/// (Linux moves the caller for IPC — unlike the pidns staging model).
+pub fn unshare_ipcns() {
+    let id = NEXT_INS.fetch_add(1, Ordering::Relaxed);
+    IPCNS.lock().insert(
+        id,
+        alloc::sync::Arc::new(spin::Mutex::new(IpcNs { id })),
+    );
+    with_current(|t| t.ipc_ns = id);
+}
+
+/// setns on an IPC-ns object — moves the caller into it directly.
+pub fn set_ipcns(arc: alloc::sync::Arc<spin::Mutex<IpcNs>>) {
+    let id = arc.lock().id;
+    with_current(|t| t.ipc_ns = id);
+}
+
+/// The IPC-ns arc `pid` lives in — for `/proc/<pid>/ns/ipc` fds.
+pub fn ipcns_arc_of(pid: u32) -> Option<alloc::sync::Arc<spin::Mutex<IpcNs>>> {
+    let g = SCHED.lock();
+    let id = g
+        .as_ref()
+        .and_then(|s| s.tasks.iter().find(|t| t.id == pid && t.state != State::Dead))
+        .map(|t| t.ipc_ns)?;
+    IPCNS.lock().get(&id).cloned()
+}
+
+/// The IPC-ns id `pid` lives in (0 = initial or dead).
+pub fn ipc_ns_of(pid: u32) -> u64 {
+    let g = SCHED.lock();
+    g.as_ref()
+        .and_then(|s| s.tasks.iter().find(|t| t.id == pid))
+        .map(|t| t.ipc_ns)
+        .unwrap_or(0)
+}
+
+/// The current task's IPC-ns id — shm/mqueue visibility keys on this.
+pub fn cur_ipc_ns() -> u64 {
+    with_current(|t| t.ipc_ns)
+}
+
 pub fn pidns_arc_of(pid: u32) -> Option<alloc::sync::Arc<spin::Mutex<PidNs>>> {
     let ns = {
         let g = SCHED.lock();

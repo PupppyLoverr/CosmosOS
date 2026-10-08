@@ -313,7 +313,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
-        shared::SYS_UPTIME_MS => task::uptime_ms(),
+        shared::SYS_UPTIME_MS => task::uptime_ms_ns(),
         shared::SYS_PROCLIST => sys_proclist(a1, a2),
         shared::SYS_POWEROFF => {
             crate::sprint!("poweroff\n");
@@ -478,7 +478,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_CLOCK_GETTIME => {
             // (clkid, out_ptr): clk 0 = realtime (rtc epoch ms), 1 = monotonic
             let ms = if a1 == 1 {
-                task::ticks() * 10
+                task::ticks_ns() * 10
             } else if a1 == 0 {
                 crate::timer::rtc_ms()
             } else {
@@ -3751,7 +3751,11 @@ fn sys_unshare(flags: u64) -> u64 {
     if !task::capable(task::CAP_SYS_ADMIN) {
         return (-1i64) as u64; // EPERM
     }
-    let want = shared::CLONE_NEWNS | shared::CLONE_NEWUTS | shared::CLONE_NEWPID;
+    let want = shared::CLONE_NEWNS
+        | shared::CLONE_NEWUTS
+        | shared::CLONE_NEWPID
+        | shared::CLONE_NEWIPC
+        | shared::CLONE_NEWTIME;
     if flags & !want != 0 {
         return (-22i64) as u64; // EINVAL: unsupported share bits
     }
@@ -3763,6 +3767,12 @@ fn sys_unshare(flags: u64) -> u64 {
     }
     if flags & shared::CLONE_NEWPID != 0 {
         task::unshare_pidns();
+    }
+    if flags & shared::CLONE_NEWIPC != 0 {
+        task::unshare_ipcns();
+    }
+    if flags & shared::CLONE_NEWTIME != 0 {
+        task::unshare_timens();
     }
     0
 }
@@ -4062,6 +4072,14 @@ fn sys_setns(fd: u64) -> u64 {
         }
         Some(crate::nsfd::NsObj::Pid(arc)) => {
             task::set_pidns_for_children(arc);
+            0
+        }
+        Some(crate::nsfd::NsObj::Time(arc)) => {
+            task::set_timens_for_children(arc);
+            0
+        }
+        Some(crate::nsfd::NsObj::Ipc(arc)) => {
+            task::set_ipcns(arc);
             0
         }
         None => (-9i64) as u64,

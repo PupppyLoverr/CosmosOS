@@ -46,8 +46,11 @@ pub fn open(name: &str, maxmsg: usize, msgsize: usize) -> Result<String, i64> {
     {
         return Err(-22); // EINVAL
     }
+    // IPC namespacing: the same name in two namespaces maps to
+    // different queues — the registry key is (ipc_ns, name).
+    let key = alloc::format!("{}:{}", crate::task::cur_ipc_ns(), name);
     let mut names = NAMES.lock();
-    let id = match names.get(name) {
+    let id = match names.get(&key) {
         Some(&id) => id,
         None => {
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -55,7 +58,7 @@ pub fn open(name: &str, maxmsg: usize, msgsize: usize) -> Result<String, i64> {
                 id,
                 Mq { maxmsg, msgsize, msgs: Vec::new(), open_ct: 0 },
             );
-            names.insert(String::from(name), id);
+            names.insert(key, id);
             id
         }
     };
@@ -68,7 +71,8 @@ pub fn open(name: &str, maxmsg: usize, msgsize: usize) -> Result<String, i64> {
 /// mq_unlink(name): detach the name; the queue dies when its last fd
 /// closes (POSIX) — implemented by marking it unlinked.
 pub fn unlink(name: &str) -> i64 {
-    match NAMES.lock().remove(name) {
+    let key = alloc::format!("{}:{}", crate::task::cur_ipc_ns(), name);
+    match NAMES.lock().remove(&key) {
         Some(_) => 0,
         None => -2, // ENOENT
     }

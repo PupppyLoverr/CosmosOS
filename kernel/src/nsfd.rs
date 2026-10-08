@@ -15,7 +15,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
-use crate::task::{MountNs, PidNs, UtsNs};
+use crate::task::{IpcNs, MountNs, PidNs, TimeNs, UtsNs};
 
 /// Which namespace object an fd pins — setns adopts the matching field.
 #[derive(Clone)]
@@ -23,6 +23,8 @@ pub enum NsObj {
     Mount(Arc<Mutex<MountNs>>),
     Uts(Arc<Mutex<UtsNs>>),
     Pid(Arc<Mutex<PidNs>>),
+    Time(Arc<Mutex<TimeNs>>),
+    Ipc(Arc<Mutex<IpcNs>>),
 }
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -53,7 +55,11 @@ pub fn open(path: &str) -> Option<String> {
         .strip_suffix("/ns/mntns")
         .map(|r| (r, 0u8))
         .or_else(|| rest.strip_suffix("/ns/uts").map(|r| (r, 1u8)))
-        .or_else(|| rest.strip_suffix("/ns/pid").map(|r| (r, 2u8)))?;
+        .or_else(|| rest.strip_suffix("/ns/pid").map(|r| (r, 2u8)))
+        // time_for_children must be tried before the /ns/time suffix
+        .or_else(|| rest.strip_suffix("/ns/time_for_children").map(|r| (r, 4u8)))
+        .or_else(|| rest.strip_suffix("/ns/time").map(|r| (r, 3u8)))
+        .or_else(|| rest.strip_suffix("/ns/ipc").map(|r| (r, 5u8)))?;
     let pid = if rest == "self" {
         crate::task::current_id()
     } else if rest.bytes().all(|b| b.is_ascii_digit()) {
@@ -64,6 +70,9 @@ pub fn open(path: &str) -> Option<String> {
     match kind {
         0 => crate::task::ns_arc_of(pid).map(|a| register(NsObj::Mount(a))),
         1 => crate::task::uts_arc_of(pid).map(|a| register(NsObj::Uts(a))),
+        3 => crate::task::timens_arc_of(pid).map(|a| register(NsObj::Time(a))),
+        4 => crate::task::timens_children_arc(pid).map(|a| register(NsObj::Time(a))),
+        5 => crate::task::ipcns_arc_of(pid).map(|a| register(NsObj::Ipc(a))),
         _ => crate::task::pidns_arc_of(pid).map(|a| register(NsObj::Pid(a))),
     }
 }

@@ -4689,6 +4689,85 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             .unwrap_or(false);
         ok
     });
+    check("time-ns", {
+        // unshare(CLONE_NEWTIME) stages a timens for children only;
+        // timens_offsets shifts the child's monotonic clock (+600s)
+        // while the parent's stays put.
+        let mut ok = true;
+        match ustd::fork() {
+            0 => {
+                if ustd::unshare(shared::CLONE_NEWTIME) != 0 {
+                    ustd::exit(5);
+                }
+                if ustd::write_all(
+                    "/proc/self/timens_offsets",
+                    b"monotonic 600 0\n",
+                )
+                .is_err()
+                {
+                    ustd::exit(6);
+                }
+                match ustd::fork() {
+                    0 => {
+                        let link_ok = ustd::readlink("/proc/self/ns/time")
+                            .map(|s| s.starts_with("time:[") && !s.contains("[0]"))
+                            .unwrap_or(false);
+                        let t = ustd::uptime_ms();
+                        ustd::exit(if link_ok && t >= 600_000 { 0 } else { 7 });
+                    }
+                    gp if gp > 0 => {
+                        ustd::exit(if ustd::waitpid(gp as u32, 5000) == Ok(0) { 0 } else { 8 })
+                    }
+                    _ => ustd::exit(9),
+                }
+            }
+            p if p > 0 => ok = ok && ustd::waitpid(p as u32, 15_000) == Ok(0),
+            _ => ok = false,
+        }
+        // the parent's own clock was never shifted
+        ok && ustd::uptime_ms() < 600_000
+    });
+    check("ipc-ns", {
+        // unshare(CLONE_NEWIPC) moves the caller: mqueue names are
+        // namespaced, so the child's "/ipcn-q" is a DIFFERENT queue
+        // — the message the parent sent is invisible to it.
+        let mut ok = true;
+        let fd = ustd::mq_open("/ipcn-q", 8, 64);
+        ok = ok && fd >= 0 && ustd::mq_send(fd, b"hi", 1) == 0;
+        match ustd::fork() {
+            0 => {
+                if ustd::unshare(shared::CLONE_NEWIPC) != 0 {
+                    ustd::exit(5);
+                }
+                let fd2 = ustd::mq_open("/ipcn-q", 8, 64);
+                if fd2 < 0 {
+                    ustd::exit(6);
+                }
+                let link_ok = ustd::readlink("/proc/self/ns/ipc")
+                    .map(|s| s.starts_with("ipc:[") && !s.contains("[0]"))
+                    .unwrap_or(false);
+                if !link_ok {
+                    ustd::exit(7);
+                }
+                // nonblocking recv: the child's queue is empty by
+                // construction, so this must come straight back EAGAIN
+                // — the parent's queued message must not be visible.
+                ustd::fcntl(fd2, shared::F_SETFL, shared::O_NONBLOCK);
+                let mut buf = [0u8; 64];
+                match ustd::mq_recv(fd2, &mut buf) {
+                    Err(e) => ustd::exit(if e == -11 { 0 } else { 8 }),
+                    Ok(_) => ustd::exit(9), // parent's msg leaked across the ns
+                }
+            }
+            p if p > 0 => ok = ok && ustd::waitpid(p as u32, 10_000) == Ok(0),
+            _ => ok = false,
+        }
+        // the parent's queue still holds its message
+        let mut buf = [0u8; 64];
+        ok = ok && matches!(ustd::mq_recv(fd, &mut buf), Ok((2, 1)));
+        let _ = ustd::mq_unlink("/ipcn-q");
+        ok
+    });
     check("pid-ns", {
         // unshare(CLONE_NEWPID) + fork: the child is init of a fresh
         // pid space (getpid()==1, invisible parent), its own child is 2.
