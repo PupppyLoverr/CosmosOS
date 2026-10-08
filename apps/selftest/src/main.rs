@@ -1572,6 +1572,112 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 .unwrap_or(false);
         ok
     });
+    // ---- batch 39: AF_UNIX datagrams + getsockopt ----
+    check("unix-dgram", {
+        // named mailboxes: bind a receiver, send datagrams (sender
+        // auto-binds like Linux), recv pops one packet + the sender's
+        // name; boundaries preserved across reads.
+        let mut ok = false;
+        let r = ustd::socketx(ustd::SOCK_DGRAM, shared::AF_UNIX);
+        let s = ustd::socketx(ustd::SOCK_DGRAM, shared::AF_UNIX);
+        if r >= 0 && s >= 0 {
+            ustd::fcntl(r, ustd::F_SETFL, ustd::O_NONBLOCK);
+            ok = ustd::bind_path(r, "/udg-self") == 0
+                // name taken by a second bind
+                && {
+                    let t = ustd::socketx(ustd::SOCK_DGRAM, shared::AF_UNIX);
+                    let e = ustd::bind_path(t, "/udg-self");
+                    ustd::close(t);
+                    e == -98
+                }
+                // unbound receiver: EINVAL, not a hang
+                && ustd::recvfrom_path(s, &mut [0u8; 8], &mut [0u8; 64])
+                    == Err(-22)
+                && ustd::sendto_path(s, "/udg-self", b"pkt1") == 4
+                && ustd::sendto_path(s, "/udg-self", b"pkt2222") == 7
+                // nobody bound there: ENOENT
+                && ustd::sendto_path(s, "/udg-nobody", b"x") == -2;
+            if ok {
+                let mut b = [0u8; 64];
+                let mut nm = [0u8; 64];
+                ok = ustd::poll(&[r as u32], &[1], 500) > 0
+                    && ustd::recvfrom_path(r, &mut b, &mut nm)
+                        .map(|(n, nl)| {
+                            n == 4
+                                && &b[..4] == b"pkt1"
+                                && nl > 0
+                                && nm[..nl].starts_with(b"/tmp/udg-")
+                        })
+                        .unwrap_or(false);
+                // boundary preserved: second packet is whole, not the
+                // tail of the first
+                b = [0u8; 64];
+                ok = ok
+                    && ustd::recvfrom_path(r, &mut b, &mut nm)
+                        .map(|(n, _)| n == 7 && &b[..7] == b"pkt2222")
+                        .unwrap_or(false);
+                // oversized read still truncates to the packet (rest drops)
+                ok = ok
+                    && ustd::sendto_path(s, "/udg-self", b"abcdefgh") == 8
+                    && ustd::recvfrom_path(r, &mut [0u8; 3], &mut nm)
+                        .map(|(n, _)| n == 3)
+                        .unwrap_or(false);
+            }
+        }
+        if r >= 0 {
+            ustd::close(r); // frees the mailbox
+        }
+        if s >= 0 {
+            ustd::close(s);
+        }
+        // mailbox gone: send is ENOENT again
+        let s2 = ustd::socketx(ustd::SOCK_DGRAM, shared::AF_UNIX);
+        ok = ok && s2 >= 0 && ustd::sendto_path(s2, "/udg-self", b"x") == -2;
+        if s2 >= 0 {
+            ustd::close(s2);
+        }
+        ok
+    });
+    check("getsockopt", {
+        // SOL_SOCKET queries answer the real kind/domain/state, and
+        // SO_ERROR reports a recorded connect failure then clears.
+        let mut ok = false;
+        let s = ustd::socketx(ustd::SOCK_STREAM, shared::AF_UNIX);
+        let d = ustd::socketx(ustd::SOCK_DGRAM, shared::AF_UNIX);
+        if s >= 0 && d >= 0 {
+            ok = ustd::getsockopt(s, shared::SOL_SOCKET, shared::SO_TYPE) == Ok(1)
+                && ustd::getsockopt(d, shared::SOL_SOCKET, shared::SO_TYPE) == Ok(2)
+                && ustd::getsockopt(d, shared::SOL_SOCKET, shared::SO_DOMAIN)
+                    == Ok(1)
+                && ustd::getsockopt(d, shared::SOL_SOCKET, shared::SO_ACCEPTCONN)
+                    == Ok(0)
+                && ustd::getsockopt(d, shared::SOL_SOCKET, shared::SO_SNDBUF)
+                    == Ok(65536)
+                && ustd::getsockopt(d, shared::SOL_SOCKET, 999) == Err(-92);
+            // connect to nothing: -2 now, and SO_ERROR saw it
+            let e = ustd::connect_path(d, "/udg-no-such");
+            ok = ok
+                && e == -2
+                && ustd::getsockopt(d, shared::SOL_SOCKET, shared::SO_ERROR)
+                    == Ok((-2i64) as u32)
+                // cleared after read
+                && ustd::getsockopt(d, shared::SOL_SOCKET, shared::SO_ERROR)
+                    == Ok(0);
+            // a listener reports SO_ACCEPTCONN=1
+            ok = ok
+                && ustd::bind_path(s, "/gso-self") == 0
+                && ustd::listen(s, 2) == 0
+                && ustd::getsockopt(s, shared::SOL_SOCKET, shared::SO_ACCEPTCONN)
+                    == Ok(1);
+        }
+        if s >= 0 {
+            ustd::close(s);
+        }
+        if d >= 0 {
+            ustd::close(d);
+        }
+        ok
+    });
     let (pass, fail) = unsafe { (PASS, FAIL) };
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64

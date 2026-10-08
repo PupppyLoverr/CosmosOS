@@ -4973,6 +4973,7 @@ struct Term {
     nc_udp: Option<(ustd::UdpSock, Option<([u8; 4], u16)>)>, // `nc -u`/`-lu` UDP session (peer learned)
     snc_fd: Option<i64>,                               // `snc <ip> <port>` — socket-fd raw session
     udpecho_fd: Option<i64>,                           // `udpecho <port>` — UDP socket-fd echo server
+    dgrecv_fd: Option<i64>,                            // `dgrecv <path>` — AF_UNIX datagram mailbox
     ucat_l: Option<(i64, String)>,                     // `ucat -l <path>` — AF_UNIX echo listener (fd, name)
     ucat_c: Option<i64>,                               // accepted unix conn fd being echoed
     fd_httpd: Option<(i64, String)>,                   // `fd-httpd <port> [root]` — socket-fd server (lfd, root)
@@ -14049,6 +14050,51 @@ impl Term {
                     None => self.fail("usage: udpecho <port>  (real UDP socket fd)"),
                 }
             }
+            "dgrecv" => {
+                // dgrecv <path>: AF_UNIX datagram mailbox — each packet
+                // prints with its sender's (auto-)bound name. Esc stops.
+                match args.first().cloned() {
+                    Some(p) if p.starts_with('/') => {
+                        let fd = ustd::socketx(ustd::SOCK_DGRAM, shared::AF_UNIX);
+                        if fd < 0 {
+                            self.fail(&alloc::format!("dgrecv: socket err {}", fd));
+                        } else if ustd::bind_path(fd, &p) != 0 {
+                            self.fail(&alloc::format!("dgrecv: bind {} failed", p));
+                            ustd::close(fd);
+                        } else {
+                            self.emit(&alloc::format!(
+                                "dgrecv: bound {} (fd {}) — Esc to stop", p, fd
+                            ));
+                            self.dgrecv_fd = Some(fd);
+                        }
+                    }
+                    _ => self.fail("usage: dgrecv </sockname>  (AF_UNIX datagram mailbox)"),
+                }
+            }
+            "dgsend" => {
+                // dgsend <path> <msg...>: one AF_UNIX datagram to a bound
+                // mailbox (unbound sender auto-binds /tmp/udg-N).
+                match args.first().cloned() {
+                    Some(p) if p.starts_with('/') && args.len() > 1 => {
+                        let fd = ustd::socketx(ustd::SOCK_DGRAM, shared::AF_UNIX);
+                        if fd < 0 {
+                            self.fail(&alloc::format!("dgsend: socket err {}", fd));
+                        } else {
+                            let msg = args[1..].join(" ");
+                            match ustd::sendto_path(fd, &p, msg.as_bytes()) {
+                                n if n >= 0 => self.emit(&alloc::format!(
+                                    "dgsend: {}B -> {}", n, p
+                                )),
+                                e => self.fail(&alloc::format!(
+                                    "dgsend: {} err {}", p, e
+                                )),
+                            }
+                            ustd::close(fd);
+                        }
+                    }
+                    _ => self.fail("usage: dgsend </sockname> <msg...>"),
+                }
+            }
             "ucat" => {
                 // ucat -l <path>: AF_UNIX stream echo listener (socket fd).
                 // Peers: `cosmos-ucat <path> <msg> [out]` — a real spawned
@@ -19010,11 +19056,17 @@ impl Term {
                                 continue;
                             }
                             let f: Vec<&str> = l.split_whitespace().collect();
+                            let ty = f.get(4).copied().unwrap_or("?");
                             let st = f.get(5).copied().unwrap_or("?");
                             let p = f.get(7).copied().unwrap_or("");
                             self.emit(&alloc::format!(
-                                "u_str  {}  {}  {}",
-                                if st == "02" { "LISTENING" } else { "CONNECTED" },
+                                "{:<6} {}  {}  {}",
+                                if ty == "0002" { "u_dgr" } else { "u_str" },
+                                match st {
+                                    "02" => "LISTENING ",
+                                    "03" => "CONNECTED ",
+                                    _ => "UNCONN    ",
+                                },
                                 p, "-"
                             ));
                         }
@@ -19869,6 +19921,16 @@ impl Term {
             self.dirty_all = true;
             return;
         }
+        // dgrecv mode: Esc unbinds the mailbox
+        if self.dgrecv_fd.is_some() && k.key == KeyCode::Escape as u32 {
+            if let Some(fd) = self.dgrecv_fd {
+                ustd::close(fd);
+            }
+            self.dgrecv_fd = None;
+            self.push_line("dgrecv: stopped");
+            self.dirty_all = true;
+            return;
+        }
         // fd-httpd mode: Esc stops the listener + any open conn fd
         if self.fd_httpd.is_some() && k.key == KeyCode::Escape as u32 {
             if let Some((lfd, _)) = self.fd_httpd {
@@ -20136,7 +20198,7 @@ impl Term {
         "uptime", "reboot", "shutdown", "exit", "history", "time",
         "head", "tail", "sort", "wc", "hex", "du", "watch", "df",
         "set", "env", "printenv", "which", "more", "cal", "tree", "seq", "sleep", "sh", "calc",
-        "dmesg", "arp", "httpd", "fd-httpd", "ntp", "nc", "snc", "udpecho", "ucat", "fserve", "fget", "true", "false",
+        "dmesg", "arp", "httpd", "fd-httpd", "ntp", "nc", "snc", "udpecho", "ucat", "dgrecv", "dgsend", "fserve", "fget", "true", "false",
         "shot", "find", "killall", "basename", "dirname", "strings", "diff", "stat",
         "uniq", "tr", "cut", "tee", "base64", "sha256sum", "tar", "show",
         "yes", "sed", "xargs", "nl", "rev", "fmt", "cmp", "read", "wait",
@@ -21456,6 +21518,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         nc_udp: None,
         snc_fd: None,
         udpecho_fd: None,
+        dgrecv_fd: None,
         ucat_l: None,
         ucat_c: None,
         fd_httpd: None,
@@ -21786,6 +21849,30 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                         t.dirty_all = true;
                     }
                     Err(_) => {}
+                }
+            }
+        }
+        // dgrecv: drain queued datagrams — one packet per recvfrom_path
+        if let Some(fd) = t.dgrecv_fd {
+            loop {
+                if ustd::poll(&[fd as u32], &[1], 0) <= 0 {
+                    break;
+                }
+                let mut buf = [0u8; 1024];
+                let mut nm = [0u8; 64];
+                match ustd::recvfrom_path(fd, &mut buf, &mut nm) {
+                    Ok((n, nl)) => {
+                        let src = String::from_utf8_lossy(&nm[..nl.min(64)]);
+                        let txt = String::from_utf8_lossy(&buf[..n]);
+                        t.push_line(&alloc::format!(
+                            "dgrecv: {} <- {}: {}",
+                            src,
+                            n,
+                            txt.trim_end()
+                        ));
+                        t.dirty_all = true;
+                    }
+                    Err(_) => break,
                 }
             }
         }

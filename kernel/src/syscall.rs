@@ -1035,6 +1035,97 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 }
             }
         }
+        shared::SYS_SENDTO_PATH => {
+            // (fd, buf, len, name_ptr, name_len) -> n — AF_UNIX datagram
+            // destination is a path string, not an (ip,port).
+            let Some(data) = copy_in(a2, a3.min(16 * 1024)) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let Some(name) = copy_in(a4, a5.min(128)) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let Ok(name) = core::str::from_utf8(&name) else {
+                ctx.rax = (-22i64) as u64;
+                return;
+            };
+            let name = String::from(name);
+            let id = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => crate::sockfd::parse(&f.path),
+                _ => None,
+            });
+            let Some(id) = id else {
+                ctx.rax = (-9i64) as u64;
+                return;
+            };
+            match crate::sockfd::sendto_path(id, &name, &data) {
+                Ok(n) => n as u64,
+                Err(e) => e as u64,
+            }
+        }
+        shared::SYS_RECVFROM_PATH => {
+            // (fd, buf, cap, name_out|0, name_cap) -> n | fills the
+            // sender's unix path; -11 reblocks unless O_NONBLOCK.
+            let mut tmp = vec![0u8; a3.min(16 * 1024) as usize];
+            let id = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => crate::sockfd::parse(&f.path),
+                _ => None,
+            });
+            let Some(id) = id else {
+                ctx.rax = (-9i64) as u64;
+                return;
+            };
+            match crate::sockfd::recvfrom_path(id, &mut tmp) {
+                Err(-11) => {
+                    if fd_nonblock(a1 as usize) {
+                        ctx.rax = (-11i64) as u64;
+                    } else {
+                        block_reenter(ctx, task::ticks() + 2, 0);
+                    }
+                    return;
+                }
+                Err(e) => e as u64,
+                Ok((n, src)) => {
+                    if a4 != 0 {
+                        let nb = src.as_bytes();
+                        let m = nb.len().min((a5 as usize).saturating_sub(1));
+                        let mut out = nb[..m].to_vec();
+                        out.push(0);
+                        let _ = copy_out(a4, &out);
+                    }
+                    match copy_out(a2, &tmp[..n]) {
+                        Some(()) => ctx.rax = n as u64,
+                        None => ctx.rax = ERR,
+                    }
+                    return;
+                }
+            }
+        }
+        shared::SYS_GETSOCKOPT => {
+            // (fd, level, opt, out, cap) -> n — SOL_SOCKET queries write a
+            // u32-le value; read-only (no setsockopt yet — nothing we
+            // export is mutable).
+            let id = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => crate::sockfd::parse(&f.path),
+                _ => None,
+            });
+            let Some(id) = id else {
+                ctx.rax = (-9i64) as u64;
+                return;
+            };
+            match crate::sockfd::getsockopt(id, a2, a3) {
+                Ok(v) => {
+                    let b = v.to_le_bytes();
+                    let n = (a5 as usize).min(4);
+                    match copy_out(a4, &b[..n]) {
+                        Some(()) => n as u64,
+                        None => ERR,
+                    }
+                }
+                Err(e) => e as u64,
+            }
+        }
         shared::SYS_ARP => {
             let s = net::arp_stat();
             let n = s.len().min(a2 as usize);
