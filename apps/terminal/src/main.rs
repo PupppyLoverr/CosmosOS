@@ -122,9 +122,16 @@ fn split_semi(s: &str) -> Vec<String> {
 }
 
 /// Does a statement begin a `for`/`while`/`until` loop ('f'), an `if`
-/// conditional ('i'), or no block (0)? Keyword must be the first word.
+/// conditional ('i'), a `case` ('c'), or no block (0)? Keyword must be the
+/// first word.
 fn block_kw(s: &str) -> u8 {
-    for (kw, tag) in [("for", b'f'), ("while", b'f'), ("until", b'f'), ("if", b'i')] {
+    for (kw, tag) in [
+        ("for", b'f'),
+        ("while", b'f'),
+        ("until", b'f'),
+        ("if", b'i'),
+        ("case", b'c'),
+    ] {
         if s == kw || s.starts_with(kw) && s[kw.len()..].starts_with(char::is_whitespace) {
             return tag;
         }
@@ -132,16 +139,129 @@ fn block_kw(s: &str) -> u8 {
     0
 }
 
-/// Normalize script text into a flat statement stream for `run_stmts`: joins
-/// `\`-continuations, drops blank/comment lines, `;`-splits, then separates a
-/// leading `do`/`then`/`else` keyword from the rest of its statement so
-/// `for i in a; do echo x; done` becomes [for.., do, echo x, done].
-/// `elif C` is kept glued (the cond travels with the keyword); its following
-/// `then` is consumed by the if-parser.
-fn norm_stmts(src: &str) -> Vec<String> {
+/// Find an unquoted `<<DELIM` in a line: returns (byte pos of `<<`,
+/// delimiter, byte pos just past the delimiter token). Supports `<<-D`
+/// (leading tabs stripped from body) and quoted delimiters `<<'D'`/`<<"D"`.
+fn heredoc_scan(s: &str) -> Option<(usize, String, usize)> {
+    let b = s.as_bytes();
+    let (mut sq, mut dq) = (false, false);
+    let mut pd = 0i32;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' if !dq => {
+                sq = !sq;
+                i += 1;
+            }
+            b'"' if !sq => {
+                dq = !dq;
+                i += 1;
+            }
+            b'$' if !sq && i + 1 < b.len() && b[i + 1] == b'(' => {
+                pd += 1;
+                i += 1;
+            }
+            b')' if pd > 0 => {
+                pd -= 1;
+                i += 1;
+            }
+            b'<' if !sq && !dq && pd == 0 && i + 1 < b.len() && b[i + 1] == b'<' => {
+                let mut j = i + 2;
+                if j < b.len() && b[j] == b'-' {
+                    j += 1;
+                }
+                while j < b.len() && b[j] == b' ' {
+                    j += 1;
+                }
+                // `<<\x01N` is our own marker (a body already extracted) —
+                // leave it alone, don't scan a second heredoc out of it.
+                if j < b.len() && b[j] == 0x01 {
+                    i += 2;
+                    continue;
+                }
+                let q = if j < b.len() && (b[j] == b'\'' || b[j] == b'"') {
+                    let c = b[j];
+                    j += 1;
+                    Some(c)
+                } else {
+                    None
+                };
+                let ds = j;
+                while j < b.len()
+                    && !b" \t;&|<>".contains(&b[j])
+                    && Some(b[j]) != q
+                {
+                    j += 1;
+                }
+                if j == ds || j >= b.len() && q.is_some() {
+                    return None;
+                }
+                let d = String::from(&s[ds..j]);
+                if q.is_some() {
+                    j += 1; // closing quote
+                }
+                return Some((i, d, j));
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Normalize script text into a flat statement stream for `run_stmts`.
+/// Returns (stmts, heredoc_bodies, unclosed_delim): phase 0 lifts heredoc
+/// bodies out of the raw line stream (`cmd <<EOF` ... `EOF` lines become a
+/// `<<\x01N` marker on the command statement, the body lines are literal text
+/// -- never split or keyword-checked), then joins `\`-continuations, drops
+/// blank/comment lines, `;`-splits, then separates a leading `do`/`then`/`else`
+/// keyword from the rest of its statement so `for i in a; do echo x; done`
+/// becomes [for.., do, echo x, done]. `elif C` is kept glued (the cond travels
+/// with the keyword); its following `then` is consumed by the if-parser.
+fn norm_stmts(src: &str) -> (Vec<String>, Vec<String>, Option<String>) {
+    let mut bodies: Vec<String> = Vec::new();
+    let mut unclosed: Option<String> = None;
+    let mut pre: Vec<String> = Vec::new();
+    {
+        let mut lines = src.lines().peekable();
+        while let Some(raw) = lines.next() {
+            if let Some((pos, delim, dend)) = heredoc_scan(raw) {
+                let strip_tabs = raw[pos + 2..].trim_start().starts_with('-');
+                let mut body = String::new();
+                let mut closed = false;
+                for l in lines.by_ref() {
+                    let l = l.strip_suffix('\r').unwrap_or(l);
+                    let cmp = if strip_tabs {
+                        l.trim_start_matches('\t')
+                    } else {
+                        l
+                    };
+                    if cmp == delim {
+                        closed = true;
+                        break;
+                    }
+                    body.push_str(cmp);
+                    body.push('\n');
+                }
+                if !closed {
+                    unclosed = Some(delim);
+                    pre.push(String::from(raw));
+                    break; // rest of the input is unterminated body text
+                }
+                let idx = bodies.len();
+                bodies.push(body);
+                let mut ln = String::from(&raw[..pos]);
+                ln.push_str("<<\x01");
+                ln.push_str(&alloc::format!("{}", idx));
+                ln.push_str(&raw[dend..]);
+                pre.push(ln);
+            } else {
+                pre.push(String::from(raw));
+            }
+        }
+    }
     let mut out: Vec<String> = Vec::new();
     let mut pending = String::new();
-    for raw in src.lines() {
+    for raw in pre.iter().map(|s| s.as_str()) {
         let mut line = String::from(pending.as_str());
         line.push_str(raw);
         pending.clear();
@@ -173,7 +293,7 @@ fn norm_stmts(src: &str) -> Vec<String> {
             out.push(stmt);
         }
     }
-    out
+    (out, bodies, unclosed)
 }
 
 /// How many unclosed blocks a normalized statement stream opens. >0 means
@@ -184,7 +304,7 @@ fn block_depth(stmts: &[String]) -> i32 {
         let s = s.trim();
         if block_kw(s) != 0 {
             d += 1;
-        } else if s == "done" || s == "fi" {
+        } else if s == "done" || s == "fi" || s == "esac" {
             d -= 1;
         }
     }
@@ -802,7 +922,8 @@ struct Term {
     rs: Option<(String, usize)>,                       // Ctrl-R search: (query, oldest scanned hist idx)
     rs_saved: String,                                  // edit line saved when rsearch began
     run_depth: u8,                                     // nested run() calls don't record history
-    block_buf: String,                                 // unfinished for/while/if block awaiting `done`/`fi`
+    block_buf: String,                                 // unfinished for/while/if/heredoc input awaiting its closer
+    heredocs: Vec<String>,                             // heredoc bodies extracted by norm_stmts (`<<\x01N` markers)
     flow: u8,                                          // 0 none, 1 break, 2 continue, 3 script-exit
     script_depth: u8,                                  // >0 inside sh/source/eval -- `exit` stops script not window
     dirstack: Vec<String>,                             // pushd/popd stack (dirs prints it)
@@ -1268,15 +1389,16 @@ impl Term {
     /// operands, script lines, watch ticks, !! expansions) don't pollute it.
     fn run(&mut self, input: &str) {
         let top = self.run_depth == 0;
-        // continuation of a multi-line block (for/while/until/if ...)
+        // continuation of a multi-line block (for/while/until/if/case/heredoc)
         if top && !self.block_buf.is_empty() {
             let joined = alloc::format!("{}\n{}", core::mem::take(&mut self.block_buf), input);
-            let stmts = norm_stmts(&joined);
-            if block_depth(&stmts) > 0 {
+            let (stmts, bodies, unclosed) = norm_stmts(&joined);
+            if block_depth(&stmts) > 0 || unclosed.is_some() {
                 self.block_buf = joined;
                 self.emit("> "); // still unclosed -- keep collecting
             } else {
                 self.run_depth = self.run_depth.saturating_add(1);
+                self.heredocs = bodies;
                 self.run_stmts(&stmts, 0, false);
                 self.run_depth = self.run_depth.saturating_sub(1);
             }
@@ -1296,9 +1418,9 @@ impl Term {
         }
         // block statements take the structured path -- at any depth, so
         // `eval 'for i in 1 2; do echo $i; done'` works too
-        let stmts = norm_stmts(input);
-        if stmts.iter().any(|s| block_kw(s.trim()) != 0) {
-            if block_depth(&stmts) > 0 {
+        let (stmts, bodies, unclosed) = norm_stmts(input);
+        if stmts.iter().any(|s| block_kw(s.trim()) != 0) || unclosed.is_some() {
+            if block_depth(&stmts) > 0 || unclosed.is_some() {
                 if top {
                     self.block_buf = String::from(input.trim());
                     self.emit("> ");
@@ -1306,7 +1428,9 @@ impl Term {
                     self.fail("sh: unterminated block");
                 }
             } else {
+                let saved = core::mem::replace(&mut self.heredocs, bodies);
                 self.run_stmts(&stmts, 0, false);
+                self.heredocs = saved;
             }
             self.run_depth = self.run_depth.saturating_sub(1);
             return;
@@ -1334,15 +1458,14 @@ impl Term {
                 match block_kw(t) {
                     b'f' => stack.push(b'f'),
                     b'i' => stack.push(b'i'),
+                    b'c' => stack.push(b'c'),
                     0 if t == "done" => {
                         if stack.pop() != Some(b'f') {
                             return Some(j); // our closer (stack was empty)
                         }
                     }
-                    0 if t == "fi" => {
-                        if stack.pop() != Some(b'i') {
-                            return None; // fi with no open if -> malformed
-                        }
+                    0 if t == "fi" || t == "esac" => {
+                        stack.pop();
                     }
                     _ => {}
                 }
@@ -1378,14 +1501,15 @@ impl Term {
                         j += 2;
                         continue;
                     }
-                    if t == "done" {
-                        return None; // done inside if-body without a loop: malformed
+                    if t == "done" || t == "esac" {
+                        return None; // done/esac inside if-body without a loop/case: malformed
                     }
                 }
                 match block_kw(t) {
                     b'f' => stack.push(b'f'),
                     b'i' => stack.push(b'i'),
-                    0 if t == "done" || t == "fi" => {
+                    b'c' => stack.push(b'c'),
+                    0 if t == "done" || t == "fi" || t == "esac" => {
                         stack.pop();
                     }
                     _ => {}
@@ -1525,6 +1649,126 @@ impl Term {
                         }
                     }
                 }
+                b'c' => {
+                    // `case WORD in pat [| pat...]) stmts ;; ... esac`
+                    let rest = s[4..].trim();
+                    let (word, mut armtext) = match rest.find(" in") {
+                        Some(p) => (
+                            String::from(rest[..p].trim()),
+                            String::from(rest[p + 3..].trim()),
+                        ),
+                        None => (String::from(rest.trim()), String::new()),
+                    };
+                    // `in` glued to the next stmt (`case W` \n `in a) x`)
+                    if armtext.is_empty() {
+                        if let Some(nx) = stmts.get(i) {
+                            let nx = nx.trim();
+                            if nx == "in" {
+                                i += 1;
+                            } else if let Some(r) = nx.strip_prefix("in ") {
+                                armtext = String::from(r.trim());
+                                i += 1;
+                            }
+                        }
+                    }
+                    // collect the arm region until OUR esac (nested blocks
+                    // tracked so an inner esac/done/fi doesn't close us)
+                    let mut stack: alloc::vec::Vec<u8> = Vec::new();
+                    let mut region: Vec<String> = Vec::new();
+                    if !armtext.is_empty() {
+                        region.push(armtext);
+                    }
+                    let mut end = None;
+                    while i < stmts.len() {
+                        let t = stmts[i].trim();
+                        if stack.is_empty() && t == "esac" {
+                            end = Some(i + 1);
+                            break;
+                        }
+                        match block_kw(t) {
+                            b'f' => stack.push(b'f'),
+                            b'i' => stack.push(b'i'),
+                            b'c' => stack.push(b'c'),
+                            0 if t == "done" || t == "fi" || t == "esac" => {
+                                let want = if t == "done" {
+                                    b'f'
+                                } else if t == "fi" {
+                                    b'i'
+                                } else {
+                                    b'c'
+                                };
+                                if stack.pop() != Some(want) {
+                                    self.fail("sh: mismatched block end");
+                                    return;
+                                }
+                            }
+                            _ => {}
+                        }
+                        region.push(String::from(t));
+                        i += 1;
+                    }
+                    let Some(e) = end else {
+                        self.fail("sh: 'esac' expected");
+                        return;
+                    };
+                    i = e;
+                    // arms split at the empty stmt a `;;` leaves behind;
+                    // each arm head is `pats) first-body-stmt`
+                    let mut arms: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+                    let mut cur: Option<(Vec<String>, Vec<String>)> = None;
+                    for st in region {
+                        let t = st.trim();
+                        if t.is_empty() {
+                            if let Some(a) = cur.take() {
+                                arms.push(a);
+                            }
+                            continue;
+                        }
+                        // `pats)` arm head: a `)` before any whitespace. POSIX
+                        // wants `;;` between arms but we also accept bare
+                        // `pats)` lines (friendlier for hand-typed scripts).
+                        let headp = t
+                            .find(')')
+                            .filter(|p| !t[..*p].bytes().any(|c| c == b' ' || c == b'\t'));
+                        if cur.is_none() || headp.is_some() {
+                            if let Some(a) = cur.take() {
+                                arms.push(a);
+                            }
+                            let Some(p) = headp else {
+                                self.fail("sh: case arm ')' expected");
+                                return;
+                            };
+                            {
+                                let pats = t[..p].trim_start_matches('(').trim();
+                                let list: Vec<String> = pats
+                                    .split('|')
+                                    .map(|x| String::from(x.trim()))
+                                    .filter(|x| !x.is_empty())
+                                    .collect();
+                                let mut body = Vec::new();
+                                let r = t[p + 1..].trim();
+                                if !r.is_empty() {
+                                    body.push(String::from(r));
+                                }
+                                cur = Some((list, body));
+                            }
+                        } else {
+                            cur.as_mut().unwrap().1.push(String::from(t));
+                        }
+                    }
+                    if let Some(a) = cur.take() {
+                        arms.push(a);
+                    }
+                    // expand the case word, match arms in order (first wins)
+                    let wsub = self.expand_subst(&word);
+                    let w = self.expand_vars(&wsub);
+                    for (pats, body) in &arms {
+                        if pats.iter().any(|p| wild_match(p, &w)) {
+                            self.run_stmts(body, depth + 1, trace);
+                            break;
+                        }
+                    }
+                }
                 _ => {
                     if trace && self.script_depth > 0 {
                         self.emit(&alloc::format!("+ {}", s));
@@ -1604,6 +1848,35 @@ impl Term {
         if let Some(li) = find_unquoted(input, b'<') {
             let left = input[..li].trim();
             let rest = input[li + 1..].trim();
+            // heredoc: `<<\x01N` marker left by norm_stmts -> stdin = body N
+            if rest.starts_with('<') {
+                let tag = rest[1..].trim_start();
+                if let Some(nstr) = tag.strip_prefix('\x01') {
+                    let dlen = nstr.bytes().take_while(|c| c.is_ascii_digit()).count();
+                    if let Ok(n) = nstr[..dlen].parse::<usize>() {
+                        let tail = nstr[dlen..].trim();
+                        let body = match self.heredocs.get(n) {
+                            Some(b) => b.clone(),
+                            None => {
+                                self.fail("sh: missing heredoc body");
+                                return;
+                            }
+                        };
+                        let saved = self.pipe_in.replace(body);
+                        // tail may carry an output redirect (`cat <<E > out`)
+                        let line = if tail.is_empty() {
+                            String::from(left)
+                        } else {
+                            alloc::format!("{} {}", left, tail)
+                        };
+                        self.run(&line);
+                        self.pipe_in = saved;
+                        return;
+                    }
+                }
+                self.fail("usage: <cmd> < file  (or <<DELIM heredoc)");
+                return;
+            }
             let infile = rest.split_whitespace().next().unwrap_or("");
             if infile.is_empty() {
                 self.fail("usage: <cmd> < file");
@@ -1783,6 +2056,8 @@ impl Term {
                     "          sh <file> args -> $0 $1..$N $#   !<prefix> reruns match",
                     "          more: Space/b page, / search, n next",
                     "          beep [hz ms]  play <file> (NOTE|HZ,DUR per line, R=rest)",
+                    "          unzip (STORE+DEFLATE)  gunzip [-c] f.gz  zcat  /proc/*",
+                    "          sh: case W in p|p) .. ;; esac   cmd <<EOF heredoc",
                     "          reboot shutdown exit",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
                 ];
@@ -2605,6 +2880,7 @@ impl Term {
                 while n > 0 && off + 46 <= data.len() && rd32(off) == Some(0x0201_4b50) {
                     let method = rd16(off + 10).unwrap_or(0);
                     let usize_ = rd32(off + 24).unwrap_or(0) as usize;
+                    let csize_ = rd32(off + 20).unwrap_or(0) as usize;
                     let nlen = rd16(off + 28).unwrap_or(0) as usize;
                     let elen = rd16(off + 30).unwrap_or(0) as usize;
                     let clen = rd16(off + 32).unwrap_or(0) as usize;
@@ -2622,12 +2898,31 @@ impl Term {
                         let ln = rd16(lhoff + 26).unwrap_or(0) as usize;
                         let le = rd16(lhoff + 28).unwrap_or(0) as usize;
                         let dstart = lhoff + 30 + ln + le;
-                        let body = data.get(dstart..dstart + usize_);
-                        match (ok, body, method) {
-                            (_, _, m) if m != 0 => {
-                                self.fail(&alloc::format!("unzip: {}: method {} unsupported (STORE only)", name, m));
+                        // method 0 (STORE): body is raw usize_ bytes;
+                        // method 8 (DEFLATE): body is csize_ compressed bytes
+                        let body = data.get(dstart..dstart + if method == 0 { usize_ } else { csize_ });
+                        let inflated: Option<Vec<u8>> = match (ok, body, method) {
+                            (_, _, m) if m != 0 && m != 8 => {
+                                self.fail(&alloc::format!("unzip: {}: method {} unsupported (STORE/DEFLATE only)", name, m));
+                                None
                             }
-                            (true, Some(b), _) => {
+                            (true, Some(b), 8) => match ustd::inflate::inflate(b) {
+                                Ok(d) => Some(d),
+                                Err(e) => {
+                                    self.fail(&alloc::format!("unzip: {}: deflate: {}", name, e));
+                                    None
+                                }
+                            },
+                            (true, Some(b), _) => Some(b.to_vec()),
+                            _ => {
+                                self.fail(&alloc::format!("unzip: {}: bad local header", name));
+                                None
+                            }
+                        };
+                        if let Some(b) = inflated {
+                            if method == 8 && b.len() != usize_ {
+                                self.fail(&alloc::format!("unzip: {}: size mismatch", name));
+                            } else {
                                 let outp = if dest.is_empty() {
                                     alloc::format!("/{}", name)
                                 } else {
@@ -2637,17 +2932,16 @@ impl Term {
                                     let _ = ustd::mkdir(&outp);
                                 } else {
                                     mkdir_parents(&outp);
-                                    if crc32(b) != rd32(off + 16).unwrap_or(0) {
+                                    if ustd::inflate::crc32(&b) != rd32(off + 16).unwrap_or(0) {
                                         self.fail(&alloc::format!("unzip: {}: bad CRC", name));
                                     } else {
-                                        match ustd::write_all(&outp, b) {
+                                        match ustd::write_all(&outp, &b) {
                                             Ok(()) => self.emit(&alloc::format!("  inflating: {}", outp)),
                                             Err(e) => self.fail(&alloc::format!("unzip: {}: err {}", outp, e)),
                                         }
                                     }
                                 }
                             }
-                            _ => self.fail(&alloc::format!("unzip: {}: bad local header", name)),
                         }
                     }
                     count += 1;
@@ -2656,6 +2950,53 @@ impl Term {
                 }
                 if count == 0 {
                     self.fail("unzip: empty or corrupt central directory");
+                }
+            }
+            "gunzip" | "zcat" => {
+                // gunzip [-c] file.gz — real gzip/DEFLATE decompression.
+                // zcat (or -c) writes to stdout; gunzip writes <name minus .gz>.
+                let to_stdout = cmd == "zcat" || args.first().map(|a| *a == "-c").unwrap_or(false);
+                let path = args.iter().find(|a| !a.starts_with('-')).copied();
+                let Some(p) = path else {
+                    self.fail("usage: gunzip [-c] <file.gz>  |  zcat <file.gz>");
+                    return;
+                };
+                match ustd::read_all(p) {
+                    Ok(d) => match ustd::inflate::gzip_body(&d) {
+                        Ok(off) => {
+                            // body ends 8 bytes before EOF: isize32 + crc32
+                            match ustd::inflate::inflate(&d[off..d.len().saturating_sub(8)]) {
+                                Ok(out) => {
+                                    let rd32 = |o: usize| -> Option<u32> {
+                                        d.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                                    };
+                                    let isize_ = rd32(d.len() - 4).unwrap_or(0) as usize;
+                                    let crc = rd32(d.len() - 8).unwrap_or(0);
+                                    if out.len() != isize_ || ustd::inflate::crc32(&out) != crc {
+                                        self.fail("gunzip: CRC/size mismatch");
+                                    } else if to_stdout {
+                                        let s = String::from_utf8_lossy(&out);
+                                        for l in s.lines() {
+                                            self.emit(l);
+                                        }
+                                    } else {
+                                        let outp = if let Some(st) = p.strip_suffix(".gz") {
+                                            String::from(st)
+                                        } else {
+                                            alloc::format!("{}.out", p)
+                                        };
+                                        match ustd::write_all(&outp, &out) {
+                                            Ok(()) => self.emit(&alloc::format!("{} -> {}", p, outp)),
+                                            Err(e) => self.fail(&alloc::format!("gunzip: {}: err {}", outp, e)),
+                                        }
+                                    }
+                                }
+                                Err(e) => self.fail(&alloc::format!("gunzip: {}", e)),
+                            }
+                        }
+                        Err(e) => self.fail(&alloc::format!("gunzip: {}", e)),
+                    },
+                    Err(e) => self.fail(&alloc::format!("gunzip: {}: err {}", p, e)),
                 }
             }
             "lspci" => {
@@ -2869,9 +3210,15 @@ impl Term {
                             self.vars.insert(alloc::format!("{}", i + 1), String::from(*x));
                         }
                         let s = String::from_utf8_lossy(&d).into_owned();
-                        let stmts = norm_stmts(&s);
-                        self.script_depth += 1;
-                        self.run_stmts(&stmts, 0, trace);
+                        let (stmts, bodies, unclosed) = norm_stmts(&s);
+                        if let Some(d) = unclosed {
+                            self.fail(&alloc::format!("sh: unterminated heredoc <<{}", d));
+                        } else {
+                            let saved_hd = core::mem::replace(&mut self.heredocs, bodies);
+                            self.script_depth += 1;
+                            self.run_stmts(&stmts, 0, trace);
+                            self.heredocs = saved_hd;
+                        }
                         self.script_depth = self.script_depth.saturating_sub(1);
                         self.flow = 0;
                         for (k, v) in keys.iter().zip(saved) {
@@ -5265,7 +5612,8 @@ impl Term {
         "eval", "break", "continue", "return",
         "for", "while", "until", "if", "do", "done", "then", "else", "elif", "fi",
         "tac", "fold", "column", "truncate", "mktemp", "clip", "pushd", "popd",
-        "dirs", "zip", "unzip", "zipinfo", "beep", "play",
+        "dirs", "zip", "unzip", "zipinfo", "beep", "play", "gunzip", "zcat",
+        "case", "esac",
     ];
 
     /// Tab-complete: command names before the first space, paths after.
@@ -5732,6 +6080,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         subst_depth: 0,
         run_depth: 0,
         block_buf: String::new(),
+        heredocs: Vec::new(),
         flow: 0,
         script_depth: 0,
         dirstack: Vec::new(),

@@ -306,6 +306,11 @@ impl BlkDev {
     pub fn new(inner: Arc<VirtioBlk>) -> Self {
         Self { inner }
     }
+
+    /// Device capacity in 512-byte sectors (from the virtio config).
+    pub fn capacity_sectors(&self) -> u64 {
+        self.inner.sectors
+    }
 }
 
 impl BlockDevice for BlkDev {
