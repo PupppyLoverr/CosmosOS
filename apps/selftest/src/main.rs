@@ -4615,6 +4615,60 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    check("pid-ns", {
+        // unshare(CLONE_NEWPID) + fork: the child is init of a fresh
+        // pid space (getpid()==1, invisible parent), its own child is 2.
+        // The unshare runs inside an outer fork so the SELFTEST task's
+        // pidns_for_children is not permanently redirected.
+        match ustd::fork() {
+            0 => {
+                if ustd::unshare(shared::CLONE_NEWPID) != 0 {
+                    ustd::exit(5);
+                }
+                match ustd::fork() {
+                    0 => {
+                        // namespace init: virtual pid 1, parent invisible
+                        if ustd::getpid() != 1 {
+                            ustd::exit(6);
+                        }
+                        if ustd::getppid() != 0 {
+                            ustd::exit(7);
+                        }
+                        let nsok = ustd::readlink("/proc/self/ns/pid")
+                            .map(|s| {
+                                s.starts_with("pid:[") && !s.contains("[0]")
+                            })
+                            .unwrap_or(false);
+                        if !nsok {
+                            ustd::exit(8);
+                        }
+                        match ustd::fork() {
+                            0 => {
+                                // the grandchild is pid 2 IN THIS ns; fork
+                                // must report that number back to us
+                                ustd::exit(if ustd::getpid() == 2 { 0 } else { 9 });
+                            }
+                            gp if gp > 0 => {
+                                // gp arrives as the ns-local pid; waitpid
+                                // resolves it through our namespace
+                                let code =
+                                    ustd::waitpid(gp as u32, 5000).unwrap_or(-1);
+                                ustd::exit(if code == 0 && gp == 2 { 0 } else { 10 });
+                            }
+                            _ => ustd::exit(11),
+                        }
+                    }
+                    ic if ic > 0 => {
+                        let st = ustd::waitpid(ic as u32, 10_000).unwrap_or(-1);
+                        ustd::exit(if st == 0 { 0 } else { 12 });
+                    }
+                    _ => ustd::exit(13),
+                }
+            }
+            pid if pid > 0 => ustd::waitpid(pid as u32, 15_000) == Ok(0),
+            _ => false,
+        }
+    });
     check("gettimeofday", {
         let (s, u) = ustd::gettimeofday();
         s > 1_700_000_000 && u < 1_000_000

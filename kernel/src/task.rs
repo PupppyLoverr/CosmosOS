@@ -142,6 +142,14 @@ pub struct Task {
     pub sgid: u32,
     /// supplementary group list (setgroups/getgroups)
     pub groups: Vec<u32>,
+    /// PID namespace this task lives in (0 = the initial namespace).
+    pub pid_ns: u64,
+    /// virtual pid inside `pid_ns` (0 in the global namespace — `id`
+    /// is the answer there). First member of a namespace is 1.
+    pub nspid: u32,
+    /// Linux's pidns_for_children: ns id staged by unshare/setns —
+    /// children land there while the task itself keeps its own ns.
+    pub child_ns: u64,
     pub sid: u32,               // session id (setsid detaches)
     pub ctty: u64,              // controlling tty: /dev/pts/{id} index (0 = none)
     pub ctid_va: u64,           // clear_child_tid: user u64 zeroed+futex-woken on exit
@@ -331,6 +339,9 @@ pub fn init() {
             suid: 0,
             sgid: 0,
             groups: Vec::new(),
+            pid_ns: 0,
+            nspid: 0,
+            child_ns: 0,
         sid: 0,
         ctty: 0,
         ctid_va: 0,
@@ -773,6 +784,16 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
     let pid = s.next_pid;
     s.next_pid += 1;
     let name = path.rsplit('/').next().unwrap_or(path);
+    // children land in the parent's pidns_for_children (child_ns) when
+    // set, else share the parent's namespace; a nonzero ns allocates a
+    // virtual pid from that ns's counter.
+    let par_ns = s
+        .tasks
+        .iter()
+        .find(|t| t.id == parent)
+        .map(|t| if t.child_ns != 0 { t.child_ns } else { t.pid_ns })
+        .unwrap_or(0);
+    let (pns, pnsv) = (par_ns, alloc_nspid(par_ns));
     let t = Task {
         id: pid,
         name: String::from(name),
@@ -833,6 +854,9 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         suid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.suid).unwrap_or(0),
         sgid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.sgid).unwrap_or(0),
         groups: s.tasks.iter().find(|t| t.id == parent).map(|t| t.groups.clone()).unwrap_or_default(),
+        pid_ns: pns,
+        nspid: pnsv,
+        child_ns: s.tasks.iter().find(|t| t.id == parent).map(|t| t.child_ns).unwrap_or(0),
         sid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.sid).unwrap_or(0),
         ctty: s.tasks.iter().find(|t| t.id == parent).map(|t| t.ctty).unwrap_or(0),
         ctid_va: 0,
@@ -945,6 +969,9 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
             suid: 0,
             sgid: 0,
             groups: Vec::new(),
+            pid_ns: 0,
+            nspid: 0,
+            child_ns: 0,
         sid: 0,
         ctty: 0,
         ctid_va: 0,
@@ -1061,6 +1088,8 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
     let utsr = cur.uts.clone();
     let creds = (cur.uid, cur.gid, cur.euid, cur.egid);
     let (sids, grps) = ((cur.suid, cur.sgid), cur.groups.clone());
+    let cns = if cur.child_ns != 0 { cur.child_ns } else { cur.pid_ns };
+    let (pns, pnsv) = (cns, alloc_nspid(cns));
     let borrowed = cur.borrowed.clone();
     let shm_ids = cur.shm.clone();
     let (nice, rt, vrun, umask, exe, pfs, rnf, rnp, rstk, rcu, ras) = (
@@ -1104,6 +1133,9 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         suid: sids.0,
         sgid: sids.1,
         groups: grps,
+        pid_ns: pns,
+        nspid: pnsv,
+        child_ns: cur.child_ns,
         ports: Vec::new(),
         shm: shm_ids,
         frames: kframes,
@@ -1664,6 +1696,8 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
     );
     let creds = (cur.uid, cur.gid, cur.euid, cur.egid);
     let (sids, grps) = ((cur.suid, cur.sgid), cur.groups.clone());
+    let cns = if cur.child_ns != 0 { cur.child_ns } else { cur.pid_ns };
+    let (pns, pnsv) = (cns, alloc_nspid(cns));
     let (maps, filemaps) = (cur.maps.clone(), cur.filemaps.clone());
     let (nice, umask, exe) = (cur.nice, cur.umask, cur.exe.clone());
     let (smin, smax, mnext, apage) = (cur.stack_min, cur.stack_max, cur.mmap_next, cur.arg_page);
@@ -1699,6 +1733,9 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         suid: cur.suid,
         sgid: cur.sgid,
         groups: cur.groups.clone(),
+        pid_ns: pns,
+        nspid: pnsv,
+        child_ns: cur.child_ns,
         ports: Vec::new(),
         shm: shm_ids,
         frames: kframes,
@@ -2143,6 +2180,177 @@ pub fn unshare_uts() {
     });
 }
 
+/// A PID namespace. `id` is the /proc/<pid>/ns/pid inode-style number;
+/// `parent` is the enclosing ns (0 = the initial namespace, which has
+/// no registry entry — the global `Task.id` space is its pid space).
+pub struct PidNs {
+    pub id: u64,
+    pub parent: u64,
+    /// next virtual pid to hand out inside this namespace
+    pub next_vpid: u32,
+}
+
+/// Pid-namespace registry: id -> the shared object (nsfd pins keep it
+/// alive for setns-adoption).
+static PIDNS: spin::Mutex<BTreeMap<u64, alloc::sync::Arc<spin::Mutex<PidNs>>>> =
+    spin::Mutex::new(BTreeMap::new());
+
+/// Allocate the next virtual pid inside namespace `ns` (0 = global —
+/// returns 0, the global `id` is used instead).
+pub fn alloc_nspid(ns: u64) -> u32 {
+    if ns == 0 {
+        return 0;
+    }
+    let arc = {
+        let g = PIDNS.lock();
+        g.get(&ns).cloned()
+    };
+    match arc {
+        Some(a) => {
+            let mut n = a.lock();
+            let v = n.next_vpid;
+            n.next_vpid = n.next_vpid.saturating_add(1);
+            v
+        }
+        None => 0,
+    }
+}
+
+/// unshare(CLONE_NEWPID): children of this task land in a fresh pid
+/// namespace parented on the task's current one (the caller itself
+/// stays put — Linux semantics).
+pub fn unshare_pidns() {
+    let me_ns = with_current(|t| t.pid_ns);
+    let id = NEXT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let ns = alloc::sync::Arc::new(spin::Mutex::new(PidNs {
+        id,
+        parent: me_ns,
+        next_vpid: 1,
+    }));
+    PIDNS.lock().insert(id, ns);
+    with_current(|t| t.child_ns = id);
+}
+
+/// setns for pid namespaces: adopt `ns` as pidns_for_children (the
+/// caller's own namespace never moves — Linux semantics).
+pub fn set_pidns_for_children(arc: alloc::sync::Arc<spin::Mutex<PidNs>>) {
+    let id = arc.lock().id;
+    with_current(|t| t.child_ns = id);
+}
+
+/// The pid-ns id `pid` lives in (0 for the initial ns or dead tasks).
+pub fn pid_ns_of(pid: u32) -> u64 {
+    let g = SCHED.lock();
+    match g.as_ref() {
+        Some(s) => s
+            .tasks
+            .iter()
+            .find(|t| t.id == pid && t.state != State::Dead)
+            .map(|t| t.pid_ns)
+            .unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// The pid-ns object owned by `pid` — for /proc/<pid>/ns/pid pinning.
+pub fn pidns_arc_of(pid: u32) -> Option<alloc::sync::Arc<spin::Mutex<PidNs>>> {
+    let ns = {
+        let g = SCHED.lock();
+        let s = g.as_ref()?;
+        s.tasks
+            .iter()
+            .find(|t| t.id == pid && t.state != State::Dead)
+            .map(|t| t.pid_ns)?
+    };
+    PIDNS.lock().get(&ns).cloned()
+}
+
+/// The pid-ns id the current task lives in (0 = initial namespace).
+pub fn cur_pid_ns() -> u64 {
+    with_current(|t| t.pid_ns)
+}
+
+/// getpid(): the caller's pid AS SEEN IN ITS OWN NAMESPACE — inside a
+/// pid namespace that's `nspid` (1 for the ns's init).
+pub fn current_pid() -> u32 {
+    with_current(|t| if t.pid_ns == 0 { t.id } else { t.nspid })
+}
+
+/// getppid(): the parent's pid in the caller's namespace — 0 when the
+/// parent lives outside it (Linux: ns-init's parent is invisible).
+pub fn parent_pid_view() -> u64 {
+    // one SCHED lock: look up the caller and its parent in the same pass
+    // (with_current would deadlock — SCHED is a non-reentrant spin mutex)
+    let g = SCHED.lock();
+    let Some(s) = g.as_ref() else { return 0 };
+    let cur = s.tasks[s.cur].id;
+    let me = match s.tasks.iter().find(|t| t.id == cur) {
+        Some(t) => t,
+        None => return 0,
+    };
+    if me.parent == 0 {
+        return 0;
+    }
+    match s
+        .tasks
+        .iter()
+        .find(|p| p.id == me.parent && p.state != State::Dead)
+    {
+        Some(p) if p.pid_ns == me.pid_ns => {
+            if p.pid_ns == 0 { p.id as u64 } else { p.nspid as u64 }
+        }
+        Some(_) => 0, // parent lives outside this namespace
+        None => 0,
+    }
+}
+
+/// Translate a user-supplied pid into a global task id for syscall use:
+/// - arg <= 0 stays as-is (process-group and broadcast semantics are
+///   carried on global pgids)
+/// - inside a namespace: only in-ns nspids resolve; anything else is
+///   invisible (ESRCH via u32::MAX)
+/// - global callers pass through.
+pub fn visible_pid(arg: i64) -> u32 {
+    if arg <= 0 {
+        return arg as u32;
+    }
+    let ns = cur_pid_ns();
+    if ns == 0 {
+        return arg as u32;
+    }
+    let g = SCHED.lock();
+    let Some(s) = g.as_ref() else { return u32::MAX };
+    // Dead tasks stay resolvable: a blocking wait re-executes the
+    // syscall AFTER its child died, and the zombie's pid must still
+    // translate (nspids are never recycled, so the tombstone's number
+    // is unambiguous).
+    s.tasks
+        .iter()
+        .find(|t| t.pid_ns == ns && t.nspid == arg as u32)
+        .map(|t| t.id)
+        .unwrap_or(u32::MAX)
+}
+
+/// What fork/clone should REPORT to the caller for child `gid`: inside
+/// a namespace the answer is the child's virtual pid (Linux: fork
+/// returns the pid in the caller's namespace).
+pub fn reported_child_pid(gid: u32) -> u32 {
+    let ns = cur_pid_ns();
+    if ns == 0 {
+        return gid;
+    }
+    let g = SCHED.lock();
+    match g.as_ref() {
+        Some(s) => s
+            .tasks
+            .iter()
+            .find(|t| t.id == gid && t.pid_ns == ns)
+            .map(|t| t.nspid)
+            .unwrap_or(gid),
+        None => gid,
+    }
+}
+
 /// pidfd_getfd's descriptor harvest: copy descriptor `fd` out of task
 /// `pid` when `me` has ptrace-style authority over it (itself, its
 /// parent, or its attached tracer). Caller acquires + adopts the copy.
@@ -2284,6 +2492,7 @@ pub fn kill_current_or_halt(reason: &str) -> ! {
 fn kill_at(s: &mut Sched, idx: usize, code: i64) {
     let dead_cur = idx == s.cur;
     let mut t = s.tasks.remove(idx);
+    let (t_pns, t_nspid) = (t.pid_ns, t.nspid);
     t.state = State::Dead;
     t.exit_code = code;
     // no field on the tombstone may ever re-mark it schedulable
@@ -2459,6 +2668,16 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
             if c.sid == id && c.id != id && c.state != State::Dead {
                 c.sigpending |= 1 << 1; // SIGHUP
                 wake_for_signal(c, 1);
+            }
+        }
+    }
+    // PID-ns init death (Linux): when a namespace's pid-1 dies, the
+    // kernel SIGKILLs every other member of that namespace.
+    if t_nspid == 1 && t_pns != 0 {
+        for c in s.tasks.iter_mut() {
+            if c.pid_ns == t_pns && c.state != State::Dead {
+                c.sigpending |= 1 << 9;
+                wake_for_signal(c, 9);
             }
         }
     }

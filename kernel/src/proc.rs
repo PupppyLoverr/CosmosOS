@@ -47,7 +47,13 @@ fn pid_of(path: &str) -> Option<u32> {
     if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    p.parse().ok()
+    // namespaced readers resolve the number against THEIR namespace —
+    // a global pid that isn't a member is invisible inside.
+    let v: u64 = p.parse().ok()?;
+    match task::visible_pid(v as i64) {
+        u32::MAX => None,
+        id => Some(id),
+    }
 }
 
 const PID_FILES: &[&str] = &[
@@ -242,6 +248,15 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
             return task::uts_arc_of(p)
                 .map(|ns| alloc::format!("uts:[{}]
 ", ns.lock().id).into_bytes());
+        }
+        if path.matches('/').count() == 4 && path.ends_with("/ns/pid") {
+            // global-ns tasks report their own ns id (0 = the initial
+            // namespace — Linux uses a fixed inode; we report the
+            // registry id or 0 for the initial space)
+            return Some(
+                alloc::format!("pid:[{}]
+", task::pid_ns_of(p)).into_bytes(),
+            );
         }
         return None;
     }
@@ -464,11 +479,22 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
     Some(buf.len())
 }
 
-/// Symlink targets inside procfs (readlink): only `/proc/<pid>/exe`.
+/// Symlink targets inside procfs (readlink): `/proc/<pid>/exe` plus the
+/// namespace links `/proc/<pid>/ns/{mntns,uts,pid}` — Linux renders them
+/// as `mnt:[inum]` / `uts:[inum]` / `pid:[inum]`.
 pub fn readlink(path: &str) -> Option<String> {
     if let Some(p) = pid_of(path) {
         if path.ends_with("/exe") && task::pids().contains(&p) {
             return task::pid_exe(p);
+        }
+        if path.ends_with("/ns/mntns") {
+            return task::ns_arc_of(p).map(|ns| alloc::format!("mnt:[{}]", ns.lock().id));
+        }
+        if path.ends_with("/ns/uts") {
+            return task::uts_arc_of(p).map(|ns| alloc::format!("uts:[{}]", ns.lock().id));
+        }
+        if path.ends_with("/ns/pid") {
+            return Some(alloc::format!("pid:[{}]", task::pid_ns_of(p)));
         }
     }
     None

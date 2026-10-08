@@ -187,11 +187,13 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_MMAP => sys_mmap(a1, a2, a3),
         shared::SYS_MMAP_FILE => sys_mmap_file(a1, a2, a3),
         shared::SYS_CLONE => match task::clone_user(a1, a2, a3, a4) {
-            Some(pid) => pid as u64,
+            Some(pid) => task::reported_child_pid(pid) as u64,
             None => ERR,
         },
         shared::SYS_FUTEX => sys_futex(ctx, a1, a2, a3, a4),
-        shared::SYS_FORK => task::fork_current(ctx).map(|p| p as u64).unwrap_or(ERR),
+        shared::SYS_FORK => task::fork_current(ctx)
+            .map(|p| task::reported_child_pid(p) as u64)
+            .unwrap_or(ERR),
         shared::SYS_EXECVE => sys_execve(ctx, a1, a2, a3, a4),
         shared::SYS_SIGACTION => sys_sigaction(a1, a2, a3),
         shared::SYS_SIGALTSTACK => sys_sigaltstack(a1, a2, a3, a4),
@@ -216,7 +218,9 @@ pub fn dispatch(ctx: &mut CpuContext) {
         }
         shared::SYS_SETSID => task::sys_setsid() as u64,
         shared::SYS_SETPGID => task::sys_setpgid(a1 as u32, a2 as u32) as u64,
-        shared::SYS_GETPGID => task::sys_getpgid(a1 as u32) as u64,
+        shared::SYS_GETPGID => {
+            task::sys_getpgid(task::visible_pid(a1 as i64) as u32) as u64
+        }
         shared::SYS_GETSID => task::sys_getsid(a1 as u32) as u64,
         shared::SYS_PRCTL => {
             if a1 == 15 {
@@ -237,7 +241,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 task::sys_prctl(a1, a2) as u64
             }
         }
-        shared::SYS_GETPPID => task::with_current(|t| t.parent as u64),
+        shared::SYS_GETPPID => task::parent_pid_view(),
         shared::SYS_SIGPENDING => task::with_current(|t| t.sigpending),
         shared::SYS_SIGSUSPEND => sys_sigsuspend(ctx, a1),
         shared::SYS_ARCH_PRCTL => task::sys_arch_prctl(a1, a2) as u64,
@@ -319,11 +323,17 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_FB_INFO => sys_fb_info(a1),
         shared::SYS_CHDIR => sys_chdir(a1, a2),
         shared::SYS_GETCWD => sys_getcwd(a1, a2),
-        shared::SYS_WAITPID => sys_waitpid(ctx, a1, a2, a3),
+        shared::SYS_WAITPID => {
+            sys_waitpid(ctx, task::visible_pid(a1 as i64) as u64, a2, a3)
+        }
         shared::SYS_WAITID => sys_waitid(ctx, a1, a2, a3),
         shared::SYS_EXIT_GROUP => task::exit_group(ctx.rdi as i64),
         shared::SYS_GETTID => task::with_current(|t| t.id as u64),
-        shared::SYS_TGKILL => task::sys_tgkill(a1 as u32, a2 as u32, a3) as u64,
+        shared::SYS_TGKILL => task::sys_tgkill(
+            task::visible_pid(a1 as i64) as u32,
+            task::visible_pid(a2 as i64) as u32,
+            a3,
+        ) as u64,
         shared::SYS_SETITIMER => {
             // (which 0..3, init_ms, interval_ms) -> 0 | err
             if a1 > 2 {
@@ -693,7 +703,9 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
-        shared::SYS_WAIT4 => sys_wait4(ctx, a1, a2, a3, a4),
+        shared::SYS_WAIT4 => {
+            sys_wait4(ctx, task::visible_pid(a1 as i64) as u64, a2, a3, a4)
+        }
         shared::SYS_SECCOMP => {
             // one-way door: once set, the filter can only tighten (POSIX
             // seccomp rules — there is no unset).
@@ -926,7 +938,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
             let name = String::from_utf8_lossy(&nb).into_owned();
             crate::mqueue::unlink(&name) as u64
         }
-        shared::SYS_KILL => sys_kill(a1),
+        shared::SYS_KILL => sys_kill(task::visible_pid(a1 as i64) as u64),
         shared::SYS_NET_PING => {
             let ip = [
                 (a1 >> 24) as u8,
@@ -2003,7 +2015,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
-        shared::SYS_GETPID => task::current_id() as u64,
+        shared::SYS_GETPID => task::current_pid() as u64,
         shared::SYS_PCAP => {
             // a1 op, a2 buf ptr, a3 cap
             if a1 == 4 {
@@ -2019,7 +2031,9 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
         }
         shared::SYS_NICE => task::set_nice(a1 as u32, a2 as i64) as u64,
-        shared::SYS_KILL2 => task::signal(a1 as u32, a2) as u64,
+        shared::SYS_KILL2 => {
+            task::signal(task::visible_pid(a1 as i64) as u32, a2) as u64
+        }
         shared::SYS_HOSTNAME_GET => {
             let h = hostname();
             let n = h.len().min(a2 as usize);
@@ -2151,7 +2165,7 @@ fn sys_spawn(pptr: u64, plen: u64, aptr: u64, alen: u64) -> u64 {
     match task::spawn_user(&full, &args, cur_id()) {
         Ok(pid) => {
             vfs::utmp_log(pid, &full);
-            pid as u64
+            task::reported_child_pid(pid) as u64
         }
         Err(_) => ERR,
     }
@@ -3691,7 +3705,8 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
 /// SYS_UNSHARE(flags): CLONE_NEWNS gives the task a private mount
 /// namespace — mounts/binds/unmounts stop propagating to the parent.
 fn sys_unshare(flags: u64) -> u64 {
-    if flags & !(shared::CLONE_NEWNS | shared::CLONE_NEWUTS) != 0 {
+    let want = shared::CLONE_NEWNS | shared::CLONE_NEWUTS | shared::CLONE_NEWPID;
+    if flags & !want != 0 {
         return (-22i64) as u64; // EINVAL: unsupported share bits
     }
     if flags & shared::CLONE_NEWNS != 0 {
@@ -3699,6 +3714,9 @@ fn sys_unshare(flags: u64) -> u64 {
     }
     if flags & shared::CLONE_NEWUTS != 0 {
         task::unshare_uts();
+    }
+    if flags & shared::CLONE_NEWPID != 0 {
+        task::unshare_pidns();
     }
     0
 }
@@ -3984,6 +4002,10 @@ fn sys_setns(fd: u64) -> u64 {
         }
         Some(crate::nsfd::NsObj::Uts(arc)) => {
             task::set_uts(arc);
+            0
+        }
+        Some(crate::nsfd::NsObj::Pid(arc)) => {
+            task::set_pidns_for_children(arc);
             0
         }
         None => (-9i64) as u64,
