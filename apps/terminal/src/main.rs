@@ -19380,6 +19380,9 @@ impl Term {
                 // (default 4), -f prefixes every line with the filename
                 let mut minlen = 4usize;
                 let mut showf = false;
+                // -t {o,x,d} / --radix={o,x,d}: print byte offset in that
+                // radix before each string (GNU); 0 = no offset
+                let mut radix: u8 = 0;
                 let mut files: Vec<&str> = Vec::new();
                 let mut ai = 0usize;
                 while ai < args.len() {
@@ -19392,6 +19395,15 @@ impl Term {
                         ai += 2;
                     } else if a.starts_with("-n") && a.len() > 2 {
                         minlen = a[2..].parse().unwrap_or(4);
+                        ai += 1;
+                    } else if a == "-t" || a == "--radix" {
+                        radix = args
+                            .get(ai + 1)
+                            .and_then(|v| v.bytes().next())
+                            .unwrap_or(0);
+                        ai += 2;
+                    } else if a.starts_with("-t") && a.len() > 2 {
+                        radix = a.bytes().nth(2).unwrap_or(0);
                         ai += 1;
                     } else if a == "-f" || a == "--print-file-name" {
                         showf = true;
@@ -19410,27 +19422,33 @@ impl Term {
                 for p in files {
                     match ustd::read_all(p) {
                         Ok(d) => {
+                            let off = |term: &mut Self, st: usize, run: &str, p: &str| {
+                                // offset prefix honors -t radix, then -f
+                                let mut o = String::new();
+                                match radix {
+                                    b'x' => o.push_str(&alloc::format!("{:x} ", st)),
+                                    b'o' => o.push_str(&alloc::format!("{:o} ", st)),
+                                    b'd' => o.push_str(&alloc::format!("{} ", st)),
+                                    _ => {}
+                                }
+                                if showf { o.push_str(&alloc::format!("{}: ", p)); }
+                                term.emit(&alloc::format!("{}{}", o, run));
+                            };
                             let mut run = String::new();
-                            for &b in d.iter() {
+                            let mut start = 0usize;
+                            for (i, &b) in d.iter().enumerate() {
                                 if b.is_ascii_graphic() || b == b' ' {
+                                    if run.is_empty() { start = i; }
                                     run.push(b as char);
                                 } else if run.len() >= minlen {
-                                    if showf {
-                                        self.emit(&alloc::format!("{}: {}", p, run));
-                                    } else {
-                                        self.emit(&run);
-                                    }
+                                    off(self, start, &run, p);
                                     run.clear();
                                 } else {
                                     run.clear();
                                 }
                             }
                             if run.len() >= minlen {
-                                if showf {
-                                    self.emit(&alloc::format!("{}: {}", p, run));
-                                } else {
-                                    self.emit(&run);
-                                }
+                                off(self, start, &run, p);
                             }
                         }
                         Err(e) => {
@@ -20833,6 +20851,7 @@ impl Term {
                 // like GNU; -N dumps at most N bytes
                 let mut offbase = 8usize; // octal offsets by default
                 let mut chars = false;
+                let mut fmt: u8 = b'x'; // -t type char: x|o|d|u (c via chars)
                 let mut path = "";
                 let mut limit: Option<usize> = None;
                 let mut skip: usize = 0;
@@ -20857,15 +20876,26 @@ impl Term {
                         "-Ao" => offbase = 8,
                         "-An" => offbase = 0,
                         "-t" => {
-                            // -t c|x1 as a separate operand
-                            if args.get(oi + 1) == Some(&"c") {
-                                chars = true;
-                                oi += 1;
-                            } else if args.get(oi + 1).is_some() {
-                                oi += 1;
+                            // -t TYPE as a separate operand; first char is
+                            // the type (x|o|d|u|c), size suffix ignored
+                            match args.get(oi + 1).and_then(|v| v.chars().next()) {
+                                Some('c') => { chars = true; oi += 1; }
+                                Some(t) if "xodu".contains(t) => {
+                                    fmt = t as u8; oi += 1;
+                                }
+                                Some(_) => oi += 1,
+                                None => {}
                             }
                         }
                         "-tx1" => {}
+                        a if a.starts_with("-t") && a.len() > 2 => {
+                            // attached: -to1, -td1, -tu1, -tc
+                            match a.chars().nth(2) {
+                                Some('c') => chars = true,
+                                Some(t) if "xodu".contains(t) => fmt = t as u8,
+                                _ => {}
+                            }
+                        }
                         "-c" | "-t c" | "-tc" => chars = true,
                         "-tx1c" => chars = true,
                         "-" => path = "-",
@@ -20954,10 +20984,15 @@ impl Term {
                                 String::new()
                             };
                             for b in ch {
-                                l.push_str(&alloc::format!("{:02x} ", b));
+                                l.push_str(&match fmt {
+                                    b'o' => alloc::format!("{:03o} ", b),
+                                    b'd' | b'u' => alloc::format!("{:3} ", b),
+                                    _ => alloc::format!("{:02x} ", b),
+                                });
                             }
-                            for _ in 0..width - ch.len() {
-                                l.push_str("   ");
+                            let cellw = if fmt == b'x' { 3 } else { 4 };
+                            for _ in 0..(width - ch.len()) * cellw {
+                                l.push_str(" ");
                             }
                             if chars {
                                 l.push(' ');
@@ -23547,6 +23582,8 @@ impl Term {
                 let mut paste_dl = String::from("\t");
                 let mut paste_s = false;
                 let mut join_v: u8 = 0; // 1=file1 unpairables, 2=file2, 3=both
+                let mut join_e = String::new(); // -e EMPTY: fill for -o fields
+                let mut join_o: Option<String> = None; // -o FORMAT: F.N list
                 let mut pos: Vec<&str> = Vec::new();
                 let mut it = args.iter().peekable();
                 while let Some(a) = it.next() {
@@ -23568,8 +23605,21 @@ impl Term {
                         a if a.starts_with("-t") && a.len() > 2 => {
                             join_sep = String::from(&a[2..]);
                         }
+                        "-e" => {
+                            if let Some(v) = it.next() {
+                                join_e = String::from(*v);
+                            }
+                        }
+                        "-o" => {
+                            if let Some(v) = it.next() {
+                                join_o = Some(String::from(*v));
+                            }
+                        }
                         a if a.starts_with("-d") && a.len() > 2 => {
                             paste_dl = String::from(&a[2..]);
+                        }
+                        a if a.starts_with("-o") && a.len() > 2 => {
+                            join_o = Some(String::from(&a[2..]));
                         }
                         a if !a.starts_with('-') => pos.push(a),
                         _ => {}
@@ -23692,6 +23742,28 @@ impl Term {
                                         }
                                     };
                                     let sep = join_sep.as_str();
+                                    // -o FORMAT: "F.N,..." selects output
+                                    // fields; 0 = the join key; -e fills
+                                    // missing fields (GNU)
+                                    let ofields: Vec<(usize, usize)> = join_o
+                                        .as_deref()
+                                        .map(|s| {
+                                            s.split(|c| c == ',' || c == ' ')
+                                                .filter(|w| !w.is_empty())
+                                                .filter_map(|w| {
+                                                    if w == "0" {
+                                                        return Some((1usize, 0usize));
+                                                    }
+                                                    let mut p = w.splitn(2, '.');
+                                                    let f = p.next()?.parse().ok()?;
+                                                    let n = p.next()
+                                                        .unwrap_or("0")
+                                                        .parse().ok()?;
+                                                    Some((f, n))
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
                                     if join_v == 0 {
                                         for l1 in &la {
                                             let f1 = f(l1);
@@ -23701,16 +23773,33 @@ impl Term {
                                             for l2 in &lb {
                                                 let f2 = f(l2);
                                                 if f2.first() == f1.first() {
-                                                    let rest1 = f1[1..].join(sep);
-                                                    let rest2 = f2[1..].join(sep);
-                                                    let out = alloc::format!(
-                                                        "{}{}{}{}{}",
-                                                        f1[0],
-                                                        sep,
-                                                        rest1,
-                                                        sep,
-                                                        rest2
-                                                    );
+                                                    let out = if !ofields.is_empty() {
+                                                        let cells: Vec<String> = ofields
+                                                            .iter()
+                                                            .map(|(fi, n)| {
+                                                                if *n == 0 {
+                                                                    return f1[0].clone();
+                                                                }
+                                                                let src = if *fi == 1 { &f1 } else { &f2 };
+                                                                match src.get(*n - 1) {
+                                                                    Some(t) => t.clone(),
+                                                                    None => join_e.clone(),
+                                                                }
+                                                            })
+                                                            .collect();
+                                                        cells.join(sep)
+                                                    } else {
+                                                        let rest1 = f1[1..].join(sep);
+                                                        let rest2 = f2[1..].join(sep);
+                                                        alloc::format!(
+                                                            "{}{}{}{}{}",
+                                                            f1[0],
+                                                            sep,
+                                                            rest1,
+                                                            sep,
+                                                            rest2
+                                                        )
+                                                    };
                                                     self.emit_rec(&out, cz);
                                                 }
                                             }
