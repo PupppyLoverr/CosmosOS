@@ -182,6 +182,8 @@ pub struct Task {
     pub ipc_ns: u64,
     /// User namespace (uid_map/gid_map id translations).
     pub user_ns: u64,
+    /// cgroup id under /sys/fs/cgroup (0 = root group).
+    pub cgroup: u64,
     pub sid: u32,               // session id (setsid detaches)
     pub ctty: u64,              // controlling tty: /dev/pts/{id} index (0 = none)
     pub ctid_va: u64,           // clear_child_tid: user u64 zeroed+futex-woken on exit
@@ -381,6 +383,7 @@ pub fn init() {
             child_tns: 0,
             ipc_ns: 0,
             user_ns: 0,
+            cgroup: 0,
         sid: 0,
         ctty: 0,
         ctid_va: 0,
@@ -432,6 +435,7 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
     let out_idx = s.cur;
     s.tasks[s.cur].saved_rsp = saved;
     s.tasks[s.cur].cpu_ticks += 1; // the outgoing task owned this interval
+    crate::cgroup::charge(s.tasks[s.cur].cgroup);
     // charge virtual runtime: weight = 40 - nice (-20..=19 -> 60..=21)
     {
         let t = &mut s.tasks[s.cur];
@@ -509,7 +513,9 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
         for off in 1..=n {
             let i = (s.cur + off) % n;
             let t = &s.tasks[i];
-            if t.state == State::Running {
+            // cgroup cpu.max: a group past quota is unschedulable
+            // until its 1s window rolls
+            if t.state == State::Running && !crate::cgroup::throttled(t.cgroup) {
                 let key = (if t.rt { 0u8 } else { 1u8 }, t.vrun);
                 match best {
                     Some((k, _)) if key >= k => {}
@@ -521,13 +527,15 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
             Some((_, i)) => i,
             None => {
                 IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
-                if s.tasks[out_idx].state == State::Running {
+                if s.tasks[out_idx].state == State::Running
+                    && !crate::cgroup::throttled(s.tasks[out_idx].cgroup)
+                {
                     return saved; // stay on current (idle) context
                 }
                 // the interrupted task was stopped/killed by delivery —
                 // park on whatever is still runnable instead
                 if let Some(i) =
-                    s.tasks.iter().position(|t| t.state == State::Running)
+                    s.tasks.iter().position(|t| t.state == State::Running && !crate::cgroup::throttled(t.cgroup))
                 {
                     s.cur = i;
                     activate(&s.tasks[i]);
@@ -613,7 +621,7 @@ pub fn yield_ctx(ctx: *mut CpuContext) -> ! {
         // any runnable task (a stopped ctx may not resume)
         if s.tasks[s.cur].state != State::Running {
             if let Some(i) =
-                s.tasks.iter().position(|t| t.state == State::Running)
+                s.tasks.iter().position(|t| t.state == State::Running && !crate::cgroup::throttled(t.cgroup))
             {
                 s.cur = i;
                 activate(&s.tasks[i]);
@@ -903,6 +911,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         child_tns: s.tasks.iter().find(|t| t.id == parent).map(|t| t.child_tns).unwrap_or(0),
         ipc_ns: s.tasks.iter().find(|t| t.id == parent).map(|t| t.ipc_ns).unwrap_or(0),
         user_ns: s.tasks.iter().find(|t| t.id == parent).map(|t| t.user_ns).unwrap_or(0),
+        cgroup: s.tasks.iter().find(|t| t.id == parent).map(|t| t.cgroup).unwrap_or(0),
         sid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.sid).unwrap_or(0),
         ctty: s.tasks.iter().find(|t| t.id == parent).map(|t| t.ctty).unwrap_or(0),
         ctid_va: 0,
@@ -1025,6 +1034,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
             child_tns: 0,
             ipc_ns: 0,
             user_ns: 0,
+            cgroup: 0,
         sid: 0,
         ctty: 0,
         ctid_va: 0,
@@ -1198,6 +1208,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         child_tns: cur.child_tns,
         ipc_ns: cur.ipc_ns,
         user_ns: cur.user_ns,
+        cgroup: cur.cgroup,
         pid_ns: pns,
         nspid: pnsv,
         child_ns: cur.child_ns,
@@ -1806,6 +1817,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         child_tns: cur.child_tns,
         ipc_ns: cur.ipc_ns,
         user_ns: cur.user_ns,
+        cgroup: cur.cgroup,
         pid_ns: pns,
         nspid: pnsv,
         child_ns: cur.child_ns,
@@ -3021,6 +3033,7 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
     // and any flock-style file locks this task held
     ipc::close_task_ports(&mut t);
     shm::drop_task_shm(&mut t);
+    crate::cgroup::drop_task(t.id, t.cgroup);
     crate::locks::release_pid(t.id);
     crate::signalfd::drop_owner(t.id);
     // release fd-table objects (pipe roles, inotify/timerfd objects) — a
@@ -3552,6 +3565,24 @@ pub fn proclist(buf: &mut [shared::ProcInfo]) -> usize {
         n += 1;
     }
     n
+}
+
+/// cpu_ticks of one task (for cgroup cpu.stat).
+pub fn cpu_ticks_of(pid: u32) -> Option<u64> {
+    let g = SCHED.lock();
+    g.as_ref()?
+        .tasks
+        .iter()
+        .find(|t| t.id == pid)
+        .map(|t| t.cpu_ticks)
+}
+
+/// Sum of every task's cpu_ticks (root cgroup usage_usec).
+pub fn total_cpu_ticks() -> u64 {
+    let g = SCHED.lock();
+    g.as_ref()
+        .map(|s| s.tasks.iter().map(|t| t.cpu_ticks).sum())
+        .unwrap_or(0)
 }
 
 /// Alive task ids (for /proc/<pid> dir enumeration).
