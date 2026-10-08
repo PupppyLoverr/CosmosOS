@@ -1785,6 +1785,58 @@ pub const AT_EMPTY_PATH: u64 = shared::AT_EMPTY_PATH;
 pub const O_EXCL: u64 = shared::O_EXCL;
 pub const O_PATH: u64 = shared::O_PATH;
 
+/// set_tid_address: register this task's clear_child_tid word — the
+/// kernel zeroes it and futex-wakes waiters when the task exits.
+pub fn set_tid_address(tidptr: u64) -> i64 {
+    sc1(shared::SYS_SET_TID_ADDRESS, tidptr) as i64
+}
+
+/// renameat2: rename with flags — RENAME_NOREPLACE|RENAME_EXCHANGE.
+/// dirfds may be AT_FDCWD. Packs the 7 args into a u64[7] the kernel reads.
+pub fn renameat2(odfd: i64, opath: &str, ndfd: i64, npath: &str, flags: u64) -> i64 {
+    let args: [u64; 7] = [
+        odfd as u64,
+        opath.as_ptr() as u64,
+        opath.len() as u64,
+        ndfd as u64,
+        npath.as_ptr() as u64,
+        npath.len() as u64,
+        flags,
+    ];
+    sc1(shared::SYS_RENAMEAT2, args.as_ptr() as u64) as i64
+}
+
+/// utimensat: set mtime (and atime — discarded by the FS) on a path or an
+/// AT_EMPTY_PATH dirfd. `times` = {atime.sec, atime.nsec, mtime.sec,
+/// mtime.nsec}; None = now.
+pub fn utimensat(dirfd: i64, path: &str, times: Option<&[u64; 4]>, flags: u64) -> i64 {
+    let tp = times.map(|t| t.as_ptr() as u64).unwrap_or(0);
+    sc5(
+        shared::SYS_UTIMENSAT,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        tp,
+        flags,
+    ) as i64
+}
+
+/// pipe2: anonymous pipe with O_NONBLOCK|O_CLOEXEC on both ends.
+/// Returns (rfd, wfd).
+pub fn pipe2(flags: u64) -> Option<(i64, i64)> {
+    let r = sc1(shared::SYS_PIPE2, flags) as i64;
+    if r < 0 {
+        None
+    } else {
+        Some((r & 0xFFFF_FFFF, r >> 32))
+    }
+}
+
+/// eventfd2: eventfd with EFD_SEMAPHORE|EFD_NONBLOCK|EFD_CLOEXEC.
+pub fn eventfd2(initval: u64, flags: u64) -> i64 {
+    sc2(shared::SYS_EVENTFD2, initval, flags) as i64
+}
+
 /// openat(dirfd, path, flags) -> fd. Absolute paths ignore `dirfd`.
 pub fn openat(dirfd: i64, path: &str, flags: u64) -> Result<i64, i64> {
     let r = sc4(

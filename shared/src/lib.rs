@@ -235,6 +235,18 @@ pub const SYS_DUP3: u64 = 207;          // (oldfd,newfd,flags) -> newfd|err
 pub const SYS_SCHED_YIELD: u64 = 208;   // () -> 0
 pub const SYS_CLOCK_NANOSLEEP: u64 = 209;// (clock_id, abs_ms) -> 0|err (TIMER_ABSTIME)
 pub const SYS_GETTIMEOFDAY: u64 = 210;  // (&mut {sec,usec}) -> 0|err
+pub const SYS_SET_TID_ADDRESS: u64 = 211; // (tidptr) -> tid — child sets its own ctid addr
+pub const SYS_RENAMEAT2: u64 = 212;       // (&[u64;7]{odfd,optr,olen,ndfd,nptr,nlen,flags})
+pub const SYS_UTIMENSAT: u64 = 213;       // (dirfd,path,plen,times_ptr[4u64]|0,flags)
+pub const SYS_PIPE2: u64 = 214;           // (flags: O_NONBLOCK|O_CLOEXEC) -> rfd|wfd<<32
+pub const SYS_EVENTFD2: u64 = 215;        // (initval, flags: SEM|NONBLOCK|CLOEXEC) -> fd
+pub const O_CLOEXEC: u64 = 0x10000;       // per-desc flag: close on successful exec
+pub const F_GETFD: u64 = 1;               // fcntl: get descriptor flags
+pub const F_SETFD: u64 = 2;               // fcntl: set descriptor flags (FD_CLOEXEC)
+pub const RENAME_NOREPLACE: u64 = 1;      // renameat2: fail if target exists
+pub const RENAME_EXCHANGE: u64 = 2;       // renameat2: swap the two names
+pub const EFD_NONBLOCK: u64 = 0x40;       // eventfd2 flag = O_NONBLOCK
+pub const EFD_CLOEXEC: u64 = O_CLOEXEC;   // eventfd2 flag
 pub const SECCOMP_MODE_STRICT: u64 = 1;
 pub const SECCOMP_MODE_FILTER: u64 = 2;
 

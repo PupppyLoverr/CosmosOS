@@ -3792,6 +3792,106 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             }
         }
     });
+    check("settid-join", {
+        // clear_child_tid: the kernel zeroes the ctid word at exit and
+        // futex-wakes the joiner — no polling
+        use core::sync::atomic::Ordering;
+        static CELL: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn w(_: u64) -> i64 {
+            ustd::set_tid_address(&CELL as *const AtomicU64 as u64);
+            ustd::sleep_ms(120);
+            0
+        }
+        CELL.store(1, Ordering::SeqCst);
+        match ustd::thread_spawn(w, 0) {
+            Ok(tid) => {
+                let mut ok = false;
+                for _ in 0..60 {
+                    if CELL.load(Ordering::SeqCst) == 0 {
+                        ok = true;
+                        break;
+                    }
+                    ustd::futex(&CELL, 0, 1, 200);
+                }
+                ustd::waitpid(tid, 3000);
+                ok
+            }
+            Err(_) => false,
+        }
+    });
+    check("renameat2-noreplace", {
+        let _ = ustd::write_all("/rn2a", b"a");
+        let _ = ustd::write_all("/rn2b", b"b");
+        let r = ustd::renameat2(ustd::AT_FDCWD, "/rn2a", ustd::AT_FDCWD, "/rn2b", 1);
+        let ok = r == -17
+            && ustd::read_all("/rn2a").map(|d| d == b"a").unwrap_or(false)
+            && ustd::read_all("/rn2b").map(|d| d == b"b").unwrap_or(false);
+        let _ = ustd::remove("/rn2a");
+        let _ = ustd::remove("/rn2b");
+        ok
+    });
+    check("renameat2-exchange", {
+        let _ = ustd::write_all("/rn2x", b"x");
+        let _ = ustd::write_all("/rn2y", b"y");
+        let r = ustd::renameat2(ustd::AT_FDCWD, "/rn2x", ustd::AT_FDCWD, "/rn2y", 2);
+        let ok = r == 0
+            && ustd::read_all("/rn2x").map(|d| d == b"y").unwrap_or(false)
+            && ustd::read_all("/rn2y").map(|d| d == b"x").unwrap_or(false);
+        let _ = ustd::remove("/rn2x");
+        let _ = ustd::remove("/rn2y");
+        ok
+    });
+    check("utimensat", {
+        let _ = ustd::write_all("/utmn", b"t");
+        // FAT32 mtime has 2s granularity — use an even second
+        let times: [u64; 4] = [0, 0, 1_700_000_002, 0]; // mtime.sec
+        let r = ustd::utimensat(ustd::AT_FDCWD, "/utmn", Some(&times), 0);
+        let ok = r == 0
+            && ustd::stat("/utmn").map(|s| s.mtime == 1_700_000_002).unwrap_or(false);
+        let _ = ustd::remove("/utmn");
+        ok
+    });
+    check("pipe2-nonblock", {
+        match ustd::pipe2(shared::O_NONBLOCK) {
+            Some((r, w)) => {
+                let mut b = [0u8; 4];
+                let n = ustd::read(r, &mut b);
+                ustd::close(r);
+                ustd::close(w);
+                n == Err(-11)
+            }
+            None => false,
+        }
+    });
+    check("eventfd2-nonblock", {
+        let fd = ustd::eventfd2(0, shared::EFD_NONBLOCK);
+        let r = if fd >= 0 {
+            let mut b = [0u8; 8];
+            let n = ustd::read(fd, &mut b);
+            ustd::close(fd);
+            n == Err(-11)
+        } else {
+            false
+        };
+        r
+    });
+    check("cloexec-fd", {
+        let f = ustd::open("/etc/rc.conf", ustd::O_RDONLY).unwrap_or(-1);
+        if f < 0 {
+            false
+        } else {
+            // SETFD FD_CLOEXEC -> GETFD reads it back; F_DUPFD strips it
+            let set = ustd::fcntl(f, 2, 1); // F_SETFD
+            let got = ustd::fcntl(f, 1, 0); // F_GETFD
+            let dup = ustd::fcntl(f, 0, 10); // F_DUPFD @ >=10
+            let dupgot = if dup >= 0 { ustd::fcntl(dup, 1, 0) } else { -1 };
+            if dup >= 0 {
+                ustd::close(dup);
+            }
+            ustd::close(f);
+            set == 0 && got == 1 && dup >= 0 && dupgot == 0
+        }
+    });
     check("gettimeofday", {
         let (s, u) = ustd::gettimeofday();
         s > 1_700_000_000 && u < 1_000_000
