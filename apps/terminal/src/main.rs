@@ -406,6 +406,8 @@ impl Term {
             self.view = (self.view + 20).min(max);
         } else if k.key == KeyCode::PageDown as u32 {
             self.view = self.view.saturating_sub(20);
+        } else if k.key == KeyCode::Tab as u32 {
+            self.complete();
         } else if k.key == KeyCode::Char as u32 {
             self.cur.insert(self.cx, k.chr as char);
             self.cx += 1;
@@ -452,6 +454,93 @@ impl Term {
             self.view = 0;
         }
         self.dirty_all = true;
+    }
+
+    /// Tab-complete: command names before the first space, paths after.
+    /// Inserts the longest common prefix of the matches.
+    fn complete(&mut self) {
+        const CMDS: &[&str] = &[
+            "help", "ls", "cd", "pwd", "cat", "mkdir", "touch", "rm", "mv", "cp",
+            "echo", "clear", "ps", "mem", "uname", "whoami", "date", "ping",
+            "resolve", "httpget", "ifconfig", "dhcp", "netstat", "kill", "grep",
+            "uptime", "reboot", "shutdown", "exit",
+        ];
+        // word being completed = text after the last space before the caret
+        let head = &self.cur[..self.cx];
+        let word_start = head.rfind(' ').map(|i| i + 1).unwrap_or(0);
+        let word = &head[word_start..];
+        let mut cands: Vec<String> = Vec::new();
+        if word_start == 0 {
+            // command position — match built-ins + /bin binaries
+            for c in CMDS {
+                if c.starts_with(word) {
+                    cands.push(String::from(*c));
+                }
+            }
+            if let Ok(ents) = ustd::readdir("/bin") {
+                for e in ents {
+                    if e.is_dir == 0 {
+                        let n = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("");
+                        if n.starts_with(word) {
+                            cands.push(String::from(n));
+                        }
+                    }
+                }
+            }
+        } else {
+            // path position — split dir/prefix, readdir, keep trailing / on dirs
+            let (dir, prefix) = match word.rfind('/') {
+                Some(i) => (&word[..i + 1], &word[i + 1..]),
+                None => ("", word),
+            };
+            let dir_path = if dir.is_empty() { "." } else { dir };
+            if let Ok(ents) = ustd::readdir(dir_path) {
+                for e in ents {
+                    let n = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("");
+                    if n.starts_with(prefix) {
+                        cands.push(alloc::format!(
+                            "{}{}{}",
+                            dir,
+                            n,
+                            if e.is_dir != 0 { "/" } else { "" }
+                        ));
+                    }
+                }
+            }
+        }
+        if cands.is_empty() {
+            return;
+        }
+        // longest common prefix
+        let mut lcp = cands[0].clone();
+        for c in &cands[1..] {
+            let mut i = 0;
+            for (a, b) in lcp.bytes().zip(c.bytes()) {
+                if a != b {
+                    break;
+                }
+                i += 1;
+            }
+            lcp.truncate(i);
+        }
+        if lcp.len() > word.len() {
+            let add = String::from(&lcp[word.len()..]);
+            for (i, ch) in add.chars().enumerate() {
+                self.cur.insert(self.cx + i, ch);
+            }
+            self.cx += add.len();
+        } else if cands.len() == 1 {
+            // exact match — add a space after commands
+            if word_start == 0 {
+                self.cur.insert(self.cx, ' ');
+                self.cx += 1;
+            }
+        } else {
+            // ambiguous — list the matches
+            for c in &cands {
+                self.push_line(&alloc::format!("  {}", c));
+            }
+        }
     }
 
     /// Recursive delete: walk the tree removing files, then dirs bottom-up.
