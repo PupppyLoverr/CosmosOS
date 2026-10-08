@@ -1739,6 +1739,37 @@ pub fn close_range(first: u32, last: u32) -> i64 {
     sc2(shared::SYS_CLOSE_RANGE, first as u64, last as u64) as i64
 }
 
+/// openpt: create a PTY pair, return the master fd. Slave = ptsname(fd).
+pub fn openpt() -> i64 {
+    sc0(shared::SYS_OPENPT) as i64
+}
+
+/// ptsname: slave node path ("/dev/pts/{id}") for a master fd.
+pub fn ptsname(master_fd: i64) -> Option<String> {
+    let mut b = [0u8; 64];
+    let n = sc3(
+        shared::SYS_PTSNAME,
+        master_fd as u64,
+        b.as_mut_ptr() as u64,
+        b.len() as u64,
+    );
+    if is_err(n) || n == 0 {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&b[..n as usize]).into_owned())
+    }
+}
+
+/// tcsets: set line-discipline flags on a pty fd (bit0 canon, bit1 echo).
+pub fn tcsets(fd: i64, flags: u64) -> i64 {
+    sc2(shared::SYS_TCSETS, fd as u64, flags) as i64
+}
+
+/// tcgets: read line-discipline flags.
+pub fn tcgets(fd: i64) -> i64 {
+    sc1(shared::SYS_TCGETS, fd as u64) as i64
+}
+
 /// pidfd_send_signal: send `sig` to the task behind `pidfd` (0 = probe).
 pub fn pidfd_send_signal(pidfd: i32, sig: u64) -> i64 {
     sc2(shared::SYS_PIDFD_SIGNAL, pidfd as u64, sig) as i64

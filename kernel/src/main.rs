@@ -35,6 +35,7 @@ mod task;
 mod timer;
 mod timerfd;
 mod mqueue;
+mod pty;
 mod memfd;
 mod signalfd;
 mod vfs;

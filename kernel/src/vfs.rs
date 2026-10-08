@@ -258,6 +258,24 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     let is_proc = crate::proc::handles(&full);
     let is_dev = crate::dev::handles(&full);
     let is_pipe = crate::pipes::handles(&full);
+    // PTY slave nodes (/dev/pts/{id}) and direct /ptym/{id} opens: real
+    // objects with refcounted descs; the pair must exist already
+    if crate::pty::handles(&full) {
+        if !crate::pty::exists(&full) {
+            return Err(-2);
+        }
+        crate::pty::acquire(&full);
+        let Some(fdi) = alloc_fd() else { return Err(-24) };
+        let fd = fdi as i64;
+        task::with_current(|t| {
+            t.fds[fd as usize] = Some(FileDesc {
+                path: full,
+                pos: 0,
+                flags,
+            });
+        });
+        return Ok(fd);
+    }
     if is_pipe {
         if crate::pipes::is_dir(&full) {
             return Err(-4);
@@ -502,6 +520,7 @@ pub fn acquire_desc(f: &task::FileDesc) {
     crate::sockpair::acquire(&f.path);
     crate::mqueue::acquire(&f.path);
     crate::memfd::acquire(&f.path);
+    crate::pty::acquire(&f.path);
 }
 
 /// Release one desc's hold on its kernel object. Pipe roles and socketpair
@@ -521,6 +540,8 @@ fn release_desc_obj(f: &task::FileDesc, still_open: bool) {
     crate::mqueue::release(&f.path);
     // memfd stores die at last close
     crate::memfd::release(&f.path);
+    // pty pairs: last master desc destroys the pair
+    crate::pty::release(&f.path);
     if still_open {
         return;
     }

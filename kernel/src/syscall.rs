@@ -470,6 +470,49 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_SYSINFO => sys_sysinfo(a1),
         shared::SYS_CLOSE_RANGE => sys_close_range(a1, a2),
         shared::SYS_PIDFD_SIGNAL => sys_pidfd_signal(a1, a2),
+        shared::SYS_OPENPT => {
+            // posix_openpt folded: master fd; slave lives at /dev/pts/{id}
+            let path = crate::pty::create();
+            task::with_current(|t| {
+                let Some(s) = alloc_slot(t) else { return ERR; };
+                t.fds[s] = Some(task::FileDesc {
+                    path,
+                    pos: 0,
+                    flags: shared::O_RDWR,
+                });
+                s as u64
+            })
+        }
+        shared::SYS_TCSETS => task::with_current(|t| match t.fds.get(a1 as usize) {
+            Some(Some(f)) if crate::pty::handles(&f.path) => {
+                crate::pty::tcset(&f.path, a2) as u64
+            }
+            _ => ERR,
+        }),
+        shared::SYS_TCGETS => task::with_current(|t| match t.fds.get(a1 as usize) {
+            Some(Some(f)) if crate::pty::handles(&f.path) => {
+                crate::pty::tcget(&f.path) as u64
+            }
+            _ => ERR,
+        }),
+        shared::SYS_PTSNAME => {
+            let sp = task::with_current(|t| match t.fds.get(a1 as usize) {
+                Some(Some(f)) => crate::pty::slave_path(&f.path),
+                _ => None,
+            });
+
+            match sp {
+                Some(name) => {
+                    let want = (a3 as usize).min(64);
+                    let bytes = &name.as_bytes()[..name.len().min(want)];
+                    match copy_out(a2, bytes) {
+                        Some(_) => bytes.len() as u64,
+                        None => ERR,
+                    }
+                }
+                None => ERR,
+            }
+        }
         shared::SYS_MQ_UNLINK => {
             let Some(nb) = copy_in(a1, a2.min(64)) else {
                 ctx.rax = ERR;
@@ -2022,6 +2065,9 @@ fn fd_read_once(fd: usize, buf: &mut [u8]) -> Result<usize, i64> {
     if crate::sockfd::handles(&path) {
         return crate::sockfd::try_read(&path, buf);
     }
+    if crate::pty::handles(&path) {
+        return crate::pty::try_read(&path, buf);
+    }
     match vfs::read(fd as i64, buf) {
         Ok(n) => Ok(n as usize),
         Err(e) => Err(e),
@@ -2045,6 +2091,9 @@ fn fd_write_once(fd: usize, data: &[u8]) -> Result<usize, i64> {
     if crate::sockfd::handles(&path) {
         let nb = fd_nonblock(fd);
         return crate::sockfd::try_write(&path, data, nb);
+    }
+    if crate::pty::handles(&path) {
+        return crate::pty::try_write(&path, data);
     }
     // pipes are dispatched inside vfs::write (try_write -> -11 full / -32
     // no-readers); real files and dev/proc go the normal route
@@ -2412,6 +2461,9 @@ pub fn fd_ready(path: &str, ev: u32) -> bool {
         // readable while a message is queued; writable while under maxmsg
         (ev & 1 != 0 && crate::mqueue::ready(path))
             || (ev & 2 != 0 && crate::mqueue::exists(path))
+    } else if crate::pty::handles(path) {
+        (ev & 1 != 0 && crate::pty::ready(path, true))
+            || (ev & 2 != 0 && crate::pty::ready(path, false))
     } else {
         true
     }

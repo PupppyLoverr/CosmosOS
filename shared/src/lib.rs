@@ -197,6 +197,10 @@ pub const SYS_PPOLL: u64 = 175;        // (fds,evs,nfds,timeout,mask) -> n|err
 pub const SYS_SYSINFO: u64 = 176;      // (out_ptr) -> 0|err
 pub const SYS_CLOSE_RANGE: u64 = 177;  // (first,last) -> 0|err
 pub const SYS_PIDFD_SIGNAL: u64 = 178; // (pidfd, sig) -> 0|err
+pub const SYS_OPENPT: u64 = 179;        // () -> master fd (/ptym/{id})
+pub const SYS_TCSETS: u64 = 180;        // (pty_fd, flags) -> 0|err
+pub const SYS_TCGETS: u64 = 181;        // (pty_fd) -> flags|err
+pub const SYS_PTSNAME: u64 = 182;       // (master_fd, out, len) -> 0|err
 
 // ptrace request ops
 pub const PT_TRACEME: u64 = 0;
