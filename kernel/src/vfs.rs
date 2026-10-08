@@ -255,3 +255,13 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
     let fs = g.as_mut().ok_or(-1i64)?;
     fs.rename(&f, &t2).map_err(err_to_i64)
 }
+
+/// (total_bytes, free_bytes) for the mounted volume.
+pub fn df() -> Option<(u64, u64)> {
+    let mut g = FS.lock();
+    let fs = g.as_mut()?;
+    let cb = fs.cluster_bytes();
+    let total = fs.total_clusters() * cb;
+    let free = fs.free_clusters().ok()? * cb;
+    Some((total, free))
+}
