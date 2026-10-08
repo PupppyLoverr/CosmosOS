@@ -20120,14 +20120,39 @@ impl Term {
             }
             return;
         }
-        // Ctrl+C cancels the current input line (like a real tty)
-        if k.key == KeyCode::Char as u32 && k.mods & 1 != 0 && (k.chr == b'c' || k.chr == b'C') {
-            if !self.cur.is_empty() {
-                let prompt = self.prompt_str();
-                self.emit(&alloc::format!("{}{}^C", prompt, self.cur));
-                self.cur.clear();
-                self.cx = 0;
-                self.dirty_all = true;
+        // Ctrl+C: SIGINT to the live foreground job, else cancel input
+        // (like a real tty — the child decides: default kills, a handler
+        // catches). Ctrl+Z sends SIGTSTP -> job stops; `bg`/`fg` resumes.
+        if k.key == KeyCode::Char as u32 && k.mods & 1 != 0
+            && (k.chr == b'c' || k.chr == b'C' || k.chr == b'z' || k.chr == b'Z')
+        {
+            let sig = if k.chr == b'z' || k.chr == b'Z' { 20 } else { 2 };
+            let job = self
+                .jobs
+                .iter()
+                .rev()
+                .find(|(p, _)| ustd::kill2(*p, 0) == 0)
+                .map(|(p, _)| *p);
+            match job {
+                Some(p) => {
+                    let _ = ustd::kill2(p, sig);
+                    self.push_line(&alloc::format!(
+                        "^[{}] pid {} {}",
+                        if sig == 2 { "C" } else { "Z" },
+                        p,
+                        if sig == 2 { "SIGINT" } else { "SIGTSTP" }
+                    ));
+                    self.dirty_all = true;
+                }
+                None => {
+                    if !self.cur.is_empty() {
+                        let prompt = self.prompt_str();
+                        self.emit(&alloc::format!("{}{}^C", prompt, self.cur));
+                        self.cur.clear();
+                        self.cx = 0;
+                        self.dirty_all = true;
+                    }
+                }
             }
             return;
         }

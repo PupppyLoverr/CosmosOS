@@ -160,6 +160,7 @@ pub const SYS_SETPGID: u64 = 147;        // (pid, pgid; 0=self/same) -> 0 | !0
 pub const SYS_GETPGID: u64 = 148;        // (pid; 0=self) -> pgid | !0
 pub const SYS_GETSID: u64 = 149;         // (pid; 0=self) -> sid | !0
 pub const SYS_PRCTL: u64 = 150;          // (op, arg) — op 1 = PR_SET_PDEATHSIG
+pub const SYS_GETPPID: u64 = 151;        // () -> parent pid
 pub const SOL_SOCKET: u64 = 1;
 pub const SO_REUSEADDR: u64 = 2;
 pub const SO_TYPE: u64 = 3;

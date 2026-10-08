@@ -149,7 +149,26 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_SETPGID => task::sys_setpgid(a1 as u32, a2 as u32) as u64,
         shared::SYS_GETPGID => task::sys_getpgid(a1 as u32) as u64,
         shared::SYS_GETSID => task::sys_getsid(a1 as u32) as u64,
-        shared::SYS_PRCTL => task::sys_prctl(a1, a2) as u64,
+        shared::SYS_PRCTL => {
+            if a1 == 15 {
+                // PR_SET_NAME: copy up to 16 bytes into the task name
+                match copy_in(a2, 16) {
+                    Some(b) => {
+                        let n = String::from(
+                            String::from_utf8_lossy(&b).trim_matches('\0'),
+                        );
+                        task::with_current(|t| {
+                            t.name = n;
+                            0u64
+                        })
+                    }
+                    None => ERR,
+                }
+            } else {
+                task::sys_prctl(a1, a2) as u64
+            }
+        }
+        shared::SYS_GETPPID => task::with_current(|t| t.parent as u64),
         shared::SYS_ALARM => task::with_current(|t| {
             let left = if t.alarm_at == 0 {
                 0
@@ -230,7 +249,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_FB_INFO => sys_fb_info(a1),
         shared::SYS_CHDIR => sys_chdir(a1, a2),
         shared::SYS_GETCWD => sys_getcwd(a1, a2),
-        shared::SYS_WAITPID => sys_waitpid(ctx, a1, a2),
+        shared::SYS_WAITPID => sys_waitpid(ctx, a1, a2, a3),
         shared::SYS_KILL => sys_kill(a1),
         shared::SYS_NET_PING => {
             let ip = [
@@ -1390,8 +1409,10 @@ pub fn dispatch(ctx: &mut CpuContext) {
     let mut g = task::SCHED.lock();
     if let Some(s) = g.as_mut() {
         task::maybe_deliver(s, s.cur, ctx);
-        if s.tasks[s.cur].state == task::State::Dead {
-            // uncaught signal killed us — never resume the corpse
+        if s.tasks[s.cur].state == task::State::Dead
+            || s.tasks[s.cur].state == task::State::Stopped
+        {
+            // uncaught signal killed or stopped us — never resume it
             drop(g);
             task::yield_ctx(ctx);
         }
@@ -2490,9 +2511,25 @@ fn sys_sleep(ctx: &mut CpuContext, ms: u64) -> u64 {
     0
 }
 
-fn sys_waitpid(ctx: &mut CpuContext, pid: u64, timeout_ms: u64) -> u64 {
+fn sys_waitpid(ctx: &mut CpuContext, pid: u64, timeout_ms: u64, opts: u64) -> u64 {
     let me = cur_id();
     let any = pid as u32 == u32::MAX;
+    // WUNTRACED (bit0 of opts): report a stopped child before blocking —
+    // status is the POSIX encoding 0x7f | (sig << 8), once per transition
+    if opts & 1 != 0 {
+        let got = if any {
+            task::child_stopped_any(me)
+        } else {
+            task::child_stopped_one(me, pid as u32)
+        };
+        if let Some((cpid, st)) = got {
+            return if any {
+                ((cpid as u64) << 32) | (st as u64 & 0xffff_ffff)
+            } else {
+                st as u64
+            };
+        }
+    }
     if any {
         // wait(-1): returns pid<<32 | exit_code of the first dead child
         if let Some((cpid, code)) = task::child_exit_any(me) {

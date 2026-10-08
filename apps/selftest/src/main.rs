@@ -757,6 +757,47 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::close(pw);
         ok
     });
+    check("sigtstp-stop", {
+        // SIGTSTP default disposition = job-control stop; CONT resumes
+        match ustd::fork() {
+            0 => {
+                ustd::sleep_ms(8000);
+                ustd::exit(0);
+            }
+            p if p > 0 => {
+                ustd::sleep_ms(120);
+                let _ = ustd::kill2(p as u32, 20);
+                ustd::sleep_ms(150);
+                // WUNTRACED reports the stop once: 0x7f | (sig << 8)
+                let st = ustd::waitpid_opt(p as u32, ustd::WUNTRACED, 1500)
+                    .unwrap_or(-1);
+                let stopped = (st & 0xff) == 0x7f && (st >> 8) == 20;
+                let _ = ustd::kill2(p as u32, 18);
+                let _ = ustd::kill2(p as u32, 9); // don't leak the sleeper
+                let code = ustd::waitpid(p as u32, 4000).unwrap_or(-1);
+                stopped && code == 137
+            }
+            _ => false,
+        }
+    });
+    check("getppid", {
+        match ustd::fork() {
+            0 => {
+                let ok = ustd::getppid() == 2; // selftest is pid 2
+                ustd::exit(if ok { 0 } else { 1 });
+            }
+            p if p > 0 => ustd::waitpid(p as u32, 4000).unwrap_or(-1) == 0,
+            _ => false,
+        }
+    });
+    check("prctl-setname", {
+        ustd::set_name("st-renamed");
+        let n = ustd::read_all("/proc/self/status")
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .unwrap_or_default();
+        ustd::set_name("cosmos-selftest");
+        n.contains("st-renamed")
+    });
     check("kern-ptr-rejected", {
         // syscall boundary must reject a kernel VA (phys-map region)
         ustd::sc1(shared::SYS_MEMINFO, 0xFFFF_8000_0000_0000) == u64::MAX
