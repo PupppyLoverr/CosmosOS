@@ -231,6 +231,33 @@ pub fn alarm(secs: u64) -> i64 {
     sc1(shared::SYS_ALARM, secs) as i64
 }
 
+/// setsid: leave the session/group and lead a new one (fails if already
+/// a group leader — fork first like POSIX daemons do).
+pub fn setsid() -> i64 {
+    sc1(shared::SYS_SETSID, 0) as i64
+}
+
+/// setpgid(pid, pgid): 0 = self / same-as-pid.
+pub fn setpgid(pid: u32, pgid: u32) -> i64 {
+    sc2(shared::SYS_SETPGID, pid as u64, pgid as u64) as i64
+}
+pub fn getpgid(pid: u32) -> i64 {
+    sc1(shared::SYS_GETPGID, pid as u64) as i64
+}
+pub fn getsid(pid: u32) -> i64 {
+    sc1(shared::SYS_GETSID, pid as u64) as i64
+}
+
+/// Signal the whole process group (POSIX kill(-pgid)).
+pub fn killpg(pgid: u32, sig: u64) -> i64 {
+    kill2((pgid as i32).wrapping_neg() as u32, sig)
+}
+
+/// PR_SET_PDEATHSIG: deliver `sig` to this task when its parent dies.
+pub fn set_pdeathsig(sig: u64) -> i64 {
+    sc2(shared::SYS_PRCTL, 1, sig) as i64
+}
+
 /// Real fork(): the child resumes here with 0, in a private copy of the
 /// parent's whole address space; the parent gets the child pid.
 pub fn fork() -> i64 {

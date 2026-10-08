@@ -155,6 +155,11 @@ pub const SYS_SIGRETURN: u64 = 142;    // () -> restores the pushed signal frame
 pub const SYS_SIGPROCMASK: u64 = 143;    // (how 0=BLOCK 1=UNBLOCK 2=SETMASK, mask) -> old mask | !0
 pub const SYS_SIGNALFD: u64 = 144;       // (mask) -> fd | !0 — reads pending sigs as 128B records
 pub const SYS_ALARM: u64 = 145;          // (secs) -> prev remaining secs — SIGALRM one-shot
+pub const SYS_SETSID: u64 = 146;         // () -> 0 | !0 — caller leads a new session+group
+pub const SYS_SETPGID: u64 = 147;        // (pid, pgid; 0=self/same) -> 0 | !0
+pub const SYS_GETPGID: u64 = 148;        // (pid; 0=self) -> pgid | !0
+pub const SYS_GETSID: u64 = 149;         // (pid; 0=self) -> sid | !0
+pub const SYS_PRCTL: u64 = 150;          // (op, arg) — op 1 = PR_SET_PDEATHSIG
 pub const SOL_SOCKET: u64 = 1;
 pub const SO_REUSEADDR: u64 = 2;
 pub const SO_TYPE: u64 = 3;

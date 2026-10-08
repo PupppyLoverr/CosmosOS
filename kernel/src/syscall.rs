@@ -145,6 +145,11 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 fd as u64
             })
         }
+        shared::SYS_SETSID => task::sys_setsid() as u64,
+        shared::SYS_SETPGID => task::sys_setpgid(a1 as u32, a2 as u32) as u64,
+        shared::SYS_GETPGID => task::sys_getpgid(a1 as u32) as u64,
+        shared::SYS_GETSID => task::sys_getsid(a1 as u32) as u64,
+        shared::SYS_PRCTL => task::sys_prctl(a1, a2) as u64,
         shared::SYS_ALARM => task::with_current(|t| {
             let left = if t.alarm_at == 0 {
                 0
