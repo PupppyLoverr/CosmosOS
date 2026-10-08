@@ -126,6 +126,8 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_FUTEX => sys_futex(ctx, a1, a2, a3, a4),
         shared::SYS_FORK => task::fork_current(ctx).map(|p| p as u64).unwrap_or(ERR),
         shared::SYS_EXECVE => sys_execve(ctx, a1, a2, a3, a4),
+        shared::SYS_SIGACTION => sys_sigaction(a1, a2),
+        shared::SYS_SIGRETURN => sys_sigreturn(ctx),
         shared::SYS_DEBUG => sys_debug(a1, a2),
         shared::SYS_OPEN => sys_open(a1, a2, a3),
         shared::SYS_CLOSE => {
@@ -1351,6 +1353,17 @@ pub fn dispatch(ctx: &mut CpuContext) {
         task::trace_rec(nr, a1, a2, a3, a4, a5, ret);
     }
     ctx.rax = ret;
+    // a pending userspace signal delivers right here — the saved frame
+    // captures rax=ret so the handler's sigreturn resumes correctly
+    let mut g = task::SCHED.lock();
+    if let Some(s) = g.as_mut() {
+        task::maybe_deliver(s, s.cur, ctx);
+        if s.tasks[s.cur].state == task::State::Dead {
+            // uncaught signal killed us — never resume the corpse
+            drop(g);
+            task::yield_ctx(ctx);
+        }
+    }
 }
 
 fn sys_spawn(pptr: u64, plen: u64, aptr: u64, alen: u64) -> u64 {
@@ -2361,6 +2374,45 @@ fn sys_execve(ctx: &mut CpuContext, pptr: u64, plen: u64, aptr: u64, alen: u64) 
     } else {
         ERR
     }
+}
+
+/// SYS_SIGACTION(sig, handler): handler 0=SIG_DFL, 1=SIG_IGN, else a
+/// userspace handler address. SIGKILL/SIGSTOP are uncatchable.
+/// Returns the previous handler value.
+fn sys_sigaction(sig: u64, handler: u64) -> u64 {
+    if sig == 0 || sig >= 32 || sig == 9 || sig == 19 {
+        return ERR;
+    }
+    if handler > 1 && (handler < 0x1000 || handler >= 0x8000_0000_0000) {
+        return ERR;
+    }
+    task::with_current(|t| {
+        let old = t.sighandlers[sig as usize];
+        t.sighandlers[sig as usize] = handler;
+        old
+    })
+}
+
+/// SYS_SIGRETURN: invoked by the restorer trampoline when a signal
+/// handler returns — restores the CpuContext pushed by maybe_deliver.
+/// Segments/rflags are forced safe: the frame lives on the user stack
+/// and could have been tampered with.
+fn sys_sigreturn(ctx: &mut CpuContext) -> u64 {
+    let fbase = ctx.rsp.wrapping_sub(168);
+    let Some(bytes) = copy_in(fbase, 160) else {
+        return ERR;
+    };
+    if bytes.len() < 160 {
+        return ERR;
+    }
+    let mut saved: CpuContext =
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const CpuContext) };
+    saved.cs = unsafe { crate::gdt::USER_CS.0 as u64 };
+    saved.ss = unsafe { crate::gdt::USER_DS.0 as u64 };
+    saved.rflags = (saved.rflags & !0x0003_7000) | 0x202;
+    let rax = saved.rax;
+    *ctx = saved;
+    rax // dispatch writes ctx.rax=ret — keeps the restored value
 }
 
 fn sys_sleep(ctx: &mut CpuContext, ms: u64) -> u64 {

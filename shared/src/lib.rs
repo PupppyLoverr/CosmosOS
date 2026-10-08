@@ -150,6 +150,8 @@ pub const SYS_CLONE: u64 = 137;        // (entry, arg) -> pid | !0  — thread i
 pub const SYS_FUTEX: u64 = 138;        // (uaddr, op, val, timeout_ms) -> 0|n | -errno  — futex wait/wake
 pub const SYS_FORK: u64 = 139;         // () -> pid | 0 (child) | !0  — eager copy-on-fork
 pub const SYS_EXECVE: u64 = 140;       // (path_ptr,path_len,args_ptr,args_len) -> 0 | !0 — replaces the image
+pub const SYS_SIGACTION: u64 = 141;    // (sig, handler) -> old handler | !0 — 0=DFL 1=IGN
+pub const SYS_SIGRETURN: u64 = 142;    // () -> restores the pushed signal frame
 pub const SOL_SOCKET: u64 = 1;
 pub const SO_REUSEADDR: u64 = 2;
 pub const SO_TYPE: u64 = 3;

@@ -569,6 +569,38 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             None => false,
         }
     });
+    check("sig-handler", {
+        // real signal delivery: kill2(self,10) diverts into the handler
+        // via a kernel-pushed frame; sigreturn resumes right here
+        use core::sync::atomic::Ordering;
+        static HIT: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn h(sig: u64) {
+            HIT.store(sig + 100, Ordering::SeqCst);
+        }
+        ustd::sigaction(10, h as usize as u64);
+        let _ = ustd::raise(10);
+        HIT.load(Ordering::SeqCst) == 110
+    });
+    check("sig-ign", {
+        // SIG_IGN: the signal is dropped, we survive
+        ustd::sigaction(12, ustd::SIG_IGN);
+        let _ = ustd::raise(12);
+        true
+    });
+    check("sig-default-term", {
+        // uncaught SIGTERM kills with the POSIX 128+sig wait status
+        match ustd::fork() {
+            0 => {
+                ustd::sleep_ms(4000);
+                ustd::exit(0);
+            }
+            p if p > 0 => {
+                let _ = ustd::kill2(p as u32, 15);
+                ustd::waitpid(p as u32, 4000).unwrap_or(-1) == 128 + 15
+            }
+            _ => false,
+        }
+    });
     check("kern-ptr-rejected", {
         // syscall boundary must reject a kernel VA (phys-map region)
         ustd::sc1(shared::SYS_MEMINFO, 0xFFFF_8000_0000_0000) == u64::MAX

@@ -191,6 +191,26 @@ impl Mutex {
     }
 }
 
+/// Signal dispositions.
+pub const SIG_DFL: u64 = 0;
+pub const SIG_IGN: u64 = 1;
+
+/// Register a userspace handler for `sig` (0=DFL 1=IGN else fn addr).
+/// Returns the previous disposition. SIGKILL/SIGSTOP can't be caught.
+pub fn sigaction(sig: u64, handler: u64) -> i64 {
+    sc2(shared::SYS_SIGACTION, sig, handler) as i64
+}
+
+/// C-friendly alias — pass the function's address.
+pub fn signal(sig: u64, handler: extern "C" fn(u64)) -> i64 {
+    sigaction(sig, handler as usize as u64)
+}
+
+/// Send `sig` to the calling process.
+pub fn raise(sig: u64) -> i64 {
+    kill2(getpid(), sig)
+}
+
 /// Real fork(): the child resumes here with 0, in a private copy of the
 /// parent's whole address space; the parent gets the child pid.
 pub fn fork() -> i64 {
