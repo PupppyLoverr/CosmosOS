@@ -140,6 +140,8 @@ pub struct SigState {
     pub sigmask_depth: u8,
     pub last_sig: u8,            // signal most recently run through a frame
     pub wake_eintr: bool,        // a signal woke our blocked syscall -> EINTR
+    pub traced: bool,            // this task is ptrace'd — stops on signals
+    pub tracer: u32,             // task id allowed to inspect/control it
 }
 
 impl SigState {
@@ -153,6 +155,8 @@ impl SigState {
             sigmask_depth: 0,
             last_sig: 0,
             wake_eintr: false,
+            traced: false,
+            tracer: 0,
         }
     }
 
@@ -163,6 +167,8 @@ impl SigState {
         n.sigmask_depth = 0;
         n.last_sig = 0;
         n.wake_eintr = false;
+        n.traced = false; // ptrace linkage is never inherited
+        n.tracer = 0;
         n
     }
 
@@ -1012,7 +1018,7 @@ fn stack_grow(t: &mut Task, page: u64) -> bool {
 /// the handler was installed with SA_RESTART (block_reenter consumes
 /// `wake_eintr`). Masked or handler-less signals just wake the task; the
 /// disposition is decided in maybe_deliver.
-fn wake_for_signal(t: &mut Task, sig: usize) {
+pub fn wake_for_signal(t: &mut Task, sig: usize) {
     if t.state != State::Blocked {
         return;
     }
@@ -1025,6 +1031,21 @@ fn wake_for_signal(t: &mut Task, sig: usize) {
     t.waiting_on = 0;
     t.wait_port = 0;
     t.wait_futex = 0;
+}
+
+/// #DB handler hook: a traced task completing a single-step gets a real
+/// SIGTRAP — pending it and returning true so the exception handler can
+/// resume (the traced-stop fires at the next delivery point).
+pub fn db_hit() -> bool {
+    let mut g = SCHED.lock();
+    if let Some(s) = g.as_mut() {
+        let t = &mut s.tasks[s.cur];
+        if t.sig.traced {
+            t.sigpending |= 1 << 5; // SIGTRAP
+            return true;
+        }
+    }
+    false
 }
 
 pub fn maybe_deliver(s: &mut Sched, idx: usize, ctx: *mut CpuContext) {
@@ -1048,6 +1069,16 @@ pub fn maybe_deliver(s: &mut Sched, idx: usize, ctx: *mut CpuContext) {
     let eintr_frame = t.sig.wake_eintr;
     t.sig.wake_eintr = false;
     t.sig_seq = t.sig_seq.wrapping_add(1); // a pending signal is being consumed
+    if t.sig.traced && t.sig.tracer != 0 && sig != 9 {
+        // ptrace signal-delivery stop: park BEFORE the disposition runs;
+        // the bit stays pending — PTRACE_CONT decides suppress vs deliver
+        t.state = State::Stopped;
+        t.stop_sig = sig as u8;
+        t.waiting_on = 0;
+        t.wait_port = 0;
+        t.wait_futex = 0;
+        return;
+    }
     let handler = t.sighandlers[sig];
     if handler == 1 {
         t.sigpending &= !(1 << sig);
@@ -1930,10 +1961,12 @@ pub fn child_stopped_any(pid: u32) -> Option<(u32, i64)> {
     let mut g = SCHED.lock();
     let s = g.as_mut().unwrap();
     let t = s.tasks.iter_mut().find(|t| {
-        t.parent == pid && t.state == State::Stopped && !t.stop_notified
+        (t.parent == pid || t.sig.tracer == pid)
+            && t.state == State::Stopped
+            && !t.stop_notified
     })?;
     t.stop_notified = true;
-    Some((t.id, 0x7f | ((t.stop_sig.max(19) as i64) << 8)))
+    Some((t.id, 0x7f | ((t.stop_sig as i64) << 8)))
 }
 
 /// Same for a specific child pid.
@@ -1941,10 +1974,13 @@ pub fn child_stopped_one(pid: u32, cpid: u32) -> Option<(u32, i64)> {
     let mut g = SCHED.lock();
     let s = g.as_mut().unwrap();
     let t = s.tasks.iter_mut().find(|t| {
-        t.id == cpid && t.parent == pid && t.state == State::Stopped && !t.stop_notified
+        t.id == cpid
+            && (t.parent == pid || t.sig.tracer == pid)
+            && t.state == State::Stopped
+            && !t.stop_notified
     })?;
     t.stop_notified = true;
-    Some((t.id, 0x7f | ((t.stop_sig.max(19) as i64) << 8)))
+    Some((t.id, 0x7f | ((t.stop_sig as i64) << 8)))
 }
 
 /// POSIX wait(-1): first dead child of `pid`, reaped (removed) on return.
@@ -1963,7 +1999,7 @@ pub fn child_exit_any(pid: u32) -> Option<(u32, i64)> {
 pub fn has_children(pid: u32) -> bool {
     let g = SCHED.lock();
     g.as_ref()
-        .map(|s| s.tasks.iter().any(|t| t.parent == pid))
+        .map(|s| s.tasks.iter().any(|t| t.parent == pid || t.sig.tracer == pid))
         .unwrap_or(false)
 }
 
@@ -1989,7 +2025,7 @@ pub fn kill_pid(pid: u32) -> bool {
 
 /// Kill task `pid` recording `code` as its exit status (used by signal()
 /// to report the POSIX 128+sig wait-status for signal termination).
-fn kill_pid_code(pid: u32, code: i64) -> bool {
+pub fn kill_pid_code(pid: u32, code: i64) -> bool {
     let mut g = SCHED.lock();
     let s = g.as_mut().unwrap();
     let Some(idx) = s.tasks.iter().position(|t| t.id == pid && t.state != State::Dead) else {
@@ -2164,7 +2200,7 @@ pub fn set_nice(pid: u32, nice: i64) -> i64 {
 
 const TRACE_MAX_RECS: usize = 128;
 
-fn with_pid_mut<F: FnOnce(&mut Task) -> i64>(pid: u32, f: F) -> i64 {
+pub fn with_pid_mut<F: FnOnce(&mut Task) -> i64>(pid: u32, f: F) -> i64 {
     let mut g = SCHED.lock();
     match g.as_mut() {
         Some(s) => match s.tasks.iter_mut().find(|t| t.id == pid && t.state != State::Dead) {

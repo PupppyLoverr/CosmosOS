@@ -114,6 +114,20 @@ pub fn dispatch(ctx: &mut CpuContext) {
     let (a1, a2, a3, a4, a5) = (ctx.rdi, ctx.rsi, ctx.rdx, ctx.r8, ctx.r9);
     let ret: u64 = match nr {
         shared::SYS_EXIT => {
+            // POSIX ptrace: a traced task must stop for pending signals
+            // before it dies — the tracer sees the exit boundary stop
+            let traced = task::with_current(|t| t.sig.traced && t.sigpending != 0);
+            if traced {
+                let mut g = task::SCHED.lock();
+                if let Some(s) = g.as_mut() {
+                    task::maybe_deliver(s, s.cur, ctx);
+                    if s.tasks[s.cur].state != task::State::Running {
+                        drop(g);
+                        ctx.rip -= 2; // re-enter SYS_EXIT once CONTed
+                        task::yield_ctx(ctx);
+                    }
+                }
+            }
             task::exit_current(ctx.rdi as i64);
         }
         shared::SYS_YIELD => {
@@ -133,6 +147,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_EXECVE => sys_execve(ctx, a1, a2, a3, a4),
         shared::SYS_SIGACTION => sys_sigaction(a1, a2, a3),
         shared::SYS_SIGALTSTACK => sys_sigaltstack(a1, a2, a3, a4),
+        shared::SYS_PTRACE => sys_ptrace(a1, a2 as u32, a3, a4),
         shared::SYS_SIGRETURN => sys_sigreturn(ctx),
         shared::SYS_SIGPROCMASK => sys_sigprocmask(a1, a2),
         shared::SYS_SIGNALFD => {
@@ -2460,6 +2475,189 @@ fn sys_execve(ctx: &mut CpuContext, pptr: u64, plen: u64, aptr: u64, alen: u64) 
 /// SYS_SIGACTION(sig, handler): handler 0=SIG_DFL, 1=SIG_IGN, else a
 /// userspace handler address. SIGKILL/SIGSTOP are uncatchable.
 /// Returns the previous handler value.
+/// SYS_PTRACE(op, pid, addr, data): real process tracing.
+/// - TRACEME: mark self traced by parent (traced+tracer set)
+/// - ATTACH/DETACH: claim/release a tracee; attach pends a SIGTRAP stop
+/// - PEEK/POKE: 8B at addr through the tracee's pml4 (POKE splits COW)
+/// - GETREGS/SETREGS: the tracee's parked CpuContext on its kstack
+/// - CONT: resume from the stop; data>0 injects that signal, data==0
+///   suppresses the signal that caused the stop (POSIX semantics)
+/// - STEP: TF-bit single-step — resumes, #DB fires after one insn,
+///   SIGTRAP pends and the traced-stop lands on the next delivery
+/// - KILL: unconditional 128+9
+fn sys_ptrace(op: u64, pid: u32, addr: u64, data: u64) -> u64 {
+    let me = cur_id();
+    match op {
+        shared::PT_TRACEME => {
+            let parent = task::with_current(|t| t.parent);
+            task::with_current(|t| {
+                t.sig.traced = true;
+                t.sig.tracer = parent;
+            });
+            0
+        }
+        shared::PT_ATTACH => {
+            let ok = task::with_pid_mut(pid, |t| {
+                if !t.is_user
+                    || t.state == task::State::Dead
+                    || t.id == 1
+                    || t.name == "cosmos-winserver"
+                    || t.sig.traced
+                    || pid == me
+                {
+                    return -1;
+                }
+                t.sig.traced = true;
+                t.sig.tracer = me;
+                t.sigpending |= 1 << 5; // SIGTRAP -> traced-stop
+                task::wake_for_signal(t, 5);
+                0
+            });
+            if ok == 0 { 0 } else { ERR }
+        }
+        shared::PT_DETACH => {
+            let ok = task::with_pid_mut(pid, |t| {
+                if !t.sig.traced || t.sig.tracer != me {
+                    return -1;
+                }
+                t.sig.traced = false;
+                t.sig.tracer = 0;
+                t.stop_notified = false;
+                if t.state == task::State::Stopped {
+                    t.state = task::State::Running;
+                }
+                0
+            });
+            if ok == 0 { 0 } else { ERR }
+        }
+        shared::PT_PEEK => {
+            // read 8B at addr via the tracee's page tables
+            let (pml4, ok) = tracee_for(me, pid);
+            if !ok {
+                return ERR;
+            }
+            let Some(pml4) = pml4 else { return ERR };
+            if addr & 7 != 0 {
+                return ERR;
+            }
+            match crate::elf::translate_user(pml4, addr) {
+                Some(p) => unsafe { *(crate::mem::phys_to_virt(p) as *const u64) },
+                None => ERR,
+            }
+        }
+        shared::PT_POKE => {
+            let (pml4, ok) = tracee_for(me, pid);
+            if !ok {
+                return ERR;
+            }
+            let Some(pml4) = pml4 else { return ERR };
+            if addr & 7 != 0 {
+                return ERR;
+            }
+            let Some(p) = crate::elf::translate_user(pml4, addr) else {
+                return ERR;
+            };
+            // a write on a COW-shared page must split it first
+            let phys = task::cow_split(pml4, addr & !0xFFF, p & !0xFFF)
+                .then(|| crate::elf::translate_user(pml4, addr))
+                .flatten()
+                .unwrap_or(p);
+            unsafe {
+                *(crate::mem::phys_to_virt(phys) as *mut u64) = data;
+            }
+            0
+        }
+        shared::PT_GETREGS | shared::PT_SETREGS => {
+            // the stopped tracee's ctx lives at saved_rsp on its kstack
+            let rsp = task::with_pid_mut(pid, |t| {
+                if !t.sig.traced || t.sig.tracer != me
+                    || t.state != task::State::Stopped
+                    || t.saved_rsp == 0
+                {
+                    return 0;
+                }
+                t.saved_rsp as i64
+            });
+            if rsp <= 0 {
+                return ERR; // guards with_pid_mut's not-found/-3 error codes
+            }
+            let rsp = rsp as u64;
+            if op == shared::PT_GETREGS {
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(rsp as *const u8, 160)
+                };
+                match copy_out_pub(data, bytes) {
+                    Some(_) => 0,
+                    None => ERR,
+                }
+            } else {
+                let Some(bytes) = copy_in(data, 160) else { return ERR };
+                if bytes.len() < 160 {
+                    return ERR;
+                }
+                let mut saved: CpuContext = unsafe {
+                    core::ptr::read_unaligned(bytes.as_ptr() as *const CpuContext)
+                };
+                saved.cs = unsafe { crate::gdt::USER_CS.0 as u64 };
+                saved.ss = unsafe { crate::gdt::USER_DS.0 as u64 };
+                saved.rflags = (saved.rflags & !0x0003_7000) | 0x202;
+                unsafe { *(rsp as *mut CpuContext) = saved };
+                0
+            }
+        }
+        shared::PT_CONT | shared::PT_STEP => {
+            let ok = task::with_pid_mut(pid, |t| {
+                if !t.sig.traced || t.sig.tracer != me
+                    || t.state != task::State::Stopped
+                {
+                    return -1;
+                }
+                if data > 0 && data < 32 {
+                    t.sigpending |= 1 << data; // inject this signal
+                } else if data == 0 {
+                    // POSIX CONT(0): suppress the signal that caused the stop
+                    t.sigpending &= !(1 << (t.stop_sig as u64));
+                }
+                if op == shared::PT_STEP {
+                    if t.saved_rsp == 0 {
+                        return -1;
+                    }
+                    unsafe {
+                        (*(t.saved_rsp as *mut CpuContext)).rflags |= 0x100;
+                    }
+                }
+                t.stop_notified = false;
+                t.state = task::State::Running;
+                0
+            });
+            if ok == 0 { 0 } else { ERR }
+        }
+        shared::PT_KILL => {
+            if task::kill_pid_code(pid, 128 + 9) { 0 } else { ERR }
+        }
+        _ => ERR,
+    }
+}
+
+/// Is `pid` a tracee of `me` that is stopped and inspectable?
+fn tracee_for(me: u32, pid: u32) -> (Option<PhysFrame>, bool) {
+    let pml4 = task::with_pid_mut(pid, |t| {
+        if !t.sig.traced || t.sig.tracer != me
+            || t.state != task::State::Stopped
+        {
+            return 0;
+        }
+        t.pml4.map(|p| p.start_address().as_u64() as i64).unwrap_or(-1)
+    });
+    if pml4 <= 0 {
+        return (None, false);
+    }
+    (
+        Some(unsafe { PhysFrame::from_start_address_unchecked(x86_64::PhysAddr::new(pml4 as u64)) }),
+        true,
+    )
+}
+
 /// SYS_SIGALTSTACK(sp, size, flags, old_ptr): register the alternate
 /// signal stack handlers run on when installed SA_ONSTACK. flags=SS_DISABLE
 /// clears it; old_ptr (24B) receives the previous {sp,size,flags}.
@@ -2622,6 +2820,7 @@ fn sys_waitpid(ctx: &mut CpuContext, pid: u64, timeout_ms: u64, opts: u64) -> u6
             task::child_stopped_one(me, pid as u32)
         };
         if let Some((cpid, st)) = got {
+            task::with_current(|t| t.wait_timeout = 0);
             return if any {
                 ((cpid as u64) << 32) | (st as u64 & 0xffff_ffff)
             } else {

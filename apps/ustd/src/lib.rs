@@ -308,6 +308,36 @@ pub fn sigaction_fl(sig: u64, handler: u64, flags: u64) -> i64 {
     sc3(shared::SYS_SIGACTION, sig, handler, flags) as i64
 }
 
+pub const PT_TRACEME: u64 = 0;
+pub const PT_PEEK: u64 = 1;
+pub const PT_POKE: u64 = 4;
+pub const PT_CONT: u64 = 7;
+pub const PT_KILL: u64 = 8;
+pub const PT_STEP: u64 = 9;
+pub const PT_GETREGS: u64 = 12;
+pub const PT_SETREGS: u64 = 13;
+pub const PT_ATTACH: u64 = 16;
+pub const PT_DETACH: u64 = 17;
+
+pub use shared::PtRegs;
+
+/// ptrace(op, pid, addr, data): process tracing. Returns -1 on error;
+/// PEEK returns the read word directly.
+pub fn ptrace(op: u64, pid: u32, addr: u64, data: u64) -> i64 {
+    sc4(shared::SYS_PTRACE, op, pid as u64, addr, data) as i64
+}
+
+/// PTRACE_GETREGS into a shared::PtRegs.
+pub fn ptrace_getregs(pid: u32) -> Option<PtRegs> {
+    let mut r = PtRegs::default();
+    let p = &mut r as *mut PtRegs as u64;
+    if ptrace(PT_GETREGS, pid, 0, p) == 0 {
+        Some(r)
+    } else {
+        None
+    }
+}
+
 /// Register an alternate signal stack (sa_flags=SA_ONSTACK handlers run
 /// on it). Pass SS_DISABLE as flags to unregister.
 pub fn sigaltstack(sp: u64, size: u64) -> i64 {
