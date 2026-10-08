@@ -4076,6 +4076,81 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             })
             .unwrap_or(false)
     });
+    check("pivot-root", {
+        // after pivot_root(/nr,/nr/old): / is the new root and the old
+        // tree is reachable at /old — a real bind does the old-side work
+        let _ = ustd::mkdir("/nr");
+        let _ = ustd::mkdir("/nr/old");
+        let pid = ustd::fork();
+        if pid == 0 {
+            if ustd::pivot_root("/nr", "/nr/old") != 0 {
+                ustd::exit(13);
+            }
+            // /x under the new root hits /nr/x — absent
+            let new_missing = ustd::stat("/welcome.txt").is_err();
+            // /old/x binds to the old tree's /x — real file readable
+            let old_ok = ustd::read_all("/old/welcome.txt")
+                .map(|d| !d.is_empty())
+                .unwrap_or(false);
+            ustd::exit(if new_missing && old_ok { 0 } else { 14 });
+        }
+        ustd::waitpid(pid as u32, 10_000) == Ok(0)
+    });
+    check("openat2-beneath", {
+        // RESOLVE_BENEATH pins resolution inside the dirfd subtree
+        let _ = ustd::mkdir("/x2");
+        let ok = ustd::write_all("/x2/inner", b"I").is_ok();
+        let dfd = ustd::open("/x2", ustd::O_PATH);
+        let ok = ok && dfd.is_ok();
+        let dfd = dfd.unwrap_or(-1);
+        // ../ escape -> EXDEV; absolute -> EXDEV; inner file -> fd
+        let esc = ustd::openat2(dfd, "../welcome.txt", 0, 4) < 0
+            && ustd::openat2(dfd, "/etc/rc.conf", 0, 4) < 0
+            && ustd::openat2(dfd, "inner", 0, 4) >= 0;
+        let _ = ustd::close(dfd);
+        ok && esc
+    });
+    check("openat2-nosym", {
+        // RESOLVE_NO_SYMLINKS refuses a symlink component with ELOOP
+        let _ = ustd::unlinkat(ustd::AT_FDCWD, "/lnx", 0);
+        let ok = ustd::symlinkat("/welcome.txt", ustd::AT_FDCWD, "/lnx").is_ok();
+        let blocked = ustd::openat2(ustd::AT_FDCWD, "/lnx", 0, 2) < 0;
+        // plain open still follows it — same file contents
+        let follows = ustd::read_all("/lnx").is_ok();
+        let _ = ustd::unlinkat(ustd::AT_FDCWD, "/lnx", 0);
+        ok && blocked && follows
+    });
+    check("getrandom", {
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        ustd::getrandom(&mut a) == 16
+            && ustd::getrandom(&mut b) == 16
+            && a != b
+            && a.iter().any(|&x| x != 0)
+    });
+    check("mincore-madvise", {
+        // fresh file mmap is non-resident; a touch faults it in;
+        // DONTNEED drops it back out — all real page-table facts
+        let fd = ustd::open("/welcome.txt", 0).unwrap_or(-1);
+        let p = ustd::mmap_file(fd, 0x2000, 0);
+        let mut ok = fd >= 0 && p.is_some();
+        if let Some(pp) = p {
+            let va = pp as u64;
+            let _ = va;
+            let v0 = ustd::mincore(va, 0x2000).unwrap_or_default();
+            unsafe { core::ptr::read_volatile(pp) };
+            let v1 = ustd::mincore(va, 0x2000).unwrap_or_default();
+            let _ = ustd::madvise(va, 0x2000, 4); // DONTNEED
+            let v2 = ustd::mincore(va, 0x2000).unwrap_or_default();
+            ok = ok
+                && v0.len() == 2 && v0[0] == 0
+                && v1.len() == 2 && v1[0] == 1
+                && v2.len() == 2 && v2[0] == 0;
+            let _ = ustd::munmap(pp, 0x2000);
+        }
+        let _ = ustd::close(fd);
+        ok
+    });
     check("gettimeofday", {
         let (s, u) = ustd::gettimeofday();
         s > 1_700_000_000 && u < 1_000_000

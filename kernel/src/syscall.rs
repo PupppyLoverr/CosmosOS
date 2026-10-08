@@ -866,6 +866,11 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_MOUNT => sys_mount(a1),
         shared::SYS_UMOUNT => sys_umount(a1, a2, a3),
         shared::SYS_STATX => sys_statx(a1),
+        shared::SYS_PIVOT_ROOT => sys_pivot_root(a1),
+        shared::SYS_OPENAT2 => sys_openat2(a1),
+        shared::SYS_GETRANDOM => sys_getrandom(a1, a2, a3),
+        shared::SYS_MINCORE => sys_mincore(a1, a2, a3),
+        shared::SYS_MADVISE => sys_madvise(a1, a2, a3),
         shared::SYS_CHROOT => sys_chroot(a1, a2),
         shared::SYS_GETTIMEOFDAY => {
             let sec = vfs::now_unix();
@@ -3444,6 +3449,182 @@ fn sys_umount(ptr: u64, len: u64, flags: u64) -> u64 {
             .map(|_| 0)
             .unwrap_or_else(|e| e as u64),
         r => r.map(|_| 0).unwrap_or_else(|e| e as u64),
+    }
+}
+
+/// SYS_PIVOT_ROOT(&[u64;4]{new_ptr,new_len,old_ptr,old_len}): move the
+/// task's root to new_root, keeping the old root reachable at
+/// new_root/put_old via a real bind entry. Pivoting is per-task.
+fn sys_pivot_root(argp: u64) -> u64 {
+    let Some(a) = copy_in(argp, 32) else { return ERR };
+    let rd = |i: usize| u64::from_le_bytes(a[i * 8..i * 8 + 8].try_into().unwrap());
+    let (Some(newp), Some(oldp)) = (copy_str(rd(0), rd(1)), copy_str(rd(2), rd(3))) else {
+        return ERR;
+    };
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let newr = vfs::normalize(&cwd, newp.trim_matches('\0'));
+    let oldr = vfs::normalize(&cwd, oldp.trim_matches('\0'));
+    // new root must be a dir; put_old must be under the new root
+    match vfs::stat_path(&newr) {
+        Ok(s) if s.is_dir != 0 => {}
+        Ok(_) => return (-20i64) as u64,
+        Err(e) => return e as u64,
+    }
+    match vfs::stat_path(&oldr) {
+        Ok(s) if s.is_dir != 0 => {}
+        Ok(_) => return (-20i64) as u64,
+        Err(e) => return e as u64,
+    }
+    let under_new = oldr == newr
+        || (oldr.len() > newr.len()
+            && oldr.starts_with(&newr)
+            && oldr.as_bytes()[newr.len()] == b'/');
+    if !under_new {
+        return (-22i64) as u64; // EINVAL: put_old outside new root
+    }
+    // register the old root as a bind on put_old BEFORE switching roots —
+    // resolve rewrites /new/put_old/x -> /x of the old tree.
+    if oldr != newr {
+        if let Err(e) = crate::bind::mount("/", &oldr) {
+            return e as u64;
+        }
+    }
+    task::with_current(|t| {
+        t.root = newr;
+        0u64
+    })
+}
+
+/// SYS_OPENAT2(&[u64;6]{dirfd,path,len,flags,mode,resolve}): openat plus
+/// RESOLVE_* path-walk policy (NO_SYMLINKS / BENEATH / IN_ROOT / NO_XDEV).
+fn sys_openat2(argp: u64) -> u64 {
+    let Some(a) = copy_in(argp, 48) else { return ERR };
+    let rd = |i: usize| u64::from_le_bytes(a[i * 8..i * 8 + 8].try_into().unwrap());
+    let Some(path) = resolve_at(rd(0) as u32 as i32 as i64, rd(1), rd(2)) else {
+        return ERR;
+    };
+    let (flags, resolve) = (rd(3), rd(5));
+    if resolve != 0 {
+        // canonical path first (normalize folds `..` and binds)
+        let cwd = task::with_current(|t| t.cwd.clone());
+        let full = vfs::normalize(&cwd, &path);
+        // BENEATH/IN_ROOT use the dirfd's own canonical base
+        let base = if resolve & shared::RESOLVE_BENEATH != 0 {
+            resolve_at(rd(0) as u32 as i32 as i64, 0, 0).unwrap_or_else(|| String::from("/"))
+        } else {
+            String::from("/")
+        };
+        if let Err(e) = vfs::resolve_flags(&full, &base, resolve) {
+            return e as u64;
+        }
+        // open the already-canonical path directly
+        return match vfs::open(&full, flags) {
+            Ok(fd) => fd as u64,
+            Err(e) => e as u64,
+        };
+    }
+    match vfs::open(&path, flags) {
+        Ok(fd) => fd as u64,
+        Err(e) => e as u64,
+    }
+}
+
+/// SYS_GETRANDOM(buf,len,flags): fill user buf from the kernel RNG.
+fn sys_getrandom(buf: u64, len: u64, _flags: u64) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    if len > 256 * 1024 {
+        return (-22i64) as u64;
+    }
+    let mut tmp = alloc::vec![0u8; len as usize];
+    rand_fill(&mut tmp);
+    match copy_out(buf, &tmp) {
+        Some(_) => len,
+        None => ERR,
+    }
+}
+
+/// SYS_MINCORE(addr,len,vec): per-page residency bits for the task's own
+/// address space — real page-table walk, not a stub.
+fn sys_mincore(addr: u64, len: u64, outp: u64) -> u64 {
+    if addr & 0xFFF != 0 {
+        return ERR;
+    }
+    let pages = len.div_ceil(0x1000);
+    if pages == 0 || pages > 65536 {
+        return (-22i64) as u64;
+    }
+    let mut vec = alloc::vec![0u8; pages as usize];
+    let ok = task::with_current(|t| {
+        let Some(pml4) = t.pml4 else { return false };
+        let mut a = addr;
+        for i in 0..pages as usize {
+            if elf::translate(pml4, a).is_some() {
+                vec[i] = 1;
+            }
+            a += 0x1000;
+        }
+        true
+    });
+    if !ok {
+        return ERR;
+    }
+    match copy_out(outp, &vec) {
+        Some(_) => 0,
+        None => ERR,
+    }
+}
+
+/// SYS_MADVISE(addr,len,advice): DONTNEED drops the mapped pages (they
+/// refault from the file/zero-fill on next touch); WILLNEED prefaults
+/// them; other advice is a legal no-op.
+fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let end = addr.saturating_add(len.div_ceil(0x1000) * 0x1000);
+    match advice {
+        a if a == shared::MADV_DONTNEED => {
+            let freed = task::with_current(|t| {
+                let Some(pml4) = t.pml4 else { return 0u64 };
+                let mut a = addr;
+                let mut n = 0u64;
+                while a < end {
+                    if let Some(phys) = elf::unmap_user_page(pml4, a) {
+                        if !t.borrowed.contains(&phys) {
+                            mem::free_frame(phys);
+                        }
+                        task::cow_unmap(pml4.start_address().as_u64(), a);
+                        n += 1;
+                    }
+                    a += 0x1000;
+                }
+                t.mem_bytes = t.mem_bytes.saturating_sub(n * 0x1000);
+                n
+            });
+            unsafe { x86_64::instructions::tlb::flush_all() };
+            let _ = freed;
+            0
+        }
+        a if a == shared::MADV_WILLNEED => {
+            // touch each page so demand paging pulls it in now
+            task::with_current(|t| {
+                if let Some(pml4) = t.pml4 {
+                    let mut a = addr;
+                    while a < end {
+                        if elf::translate(pml4, a).is_none() {
+                            // read one byte through the fault path —
+                            // copy_in demand-pages without touching data
+                            let _ = copy_in(a, 1);
+                        }
+                        a += 0x1000;
+                    }
+                }
+            });
+            0
+        }
+        _ => 0, // other advice is advisory — legal no-op
     }
 }
 

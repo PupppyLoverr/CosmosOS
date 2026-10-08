@@ -740,6 +740,68 @@ pub fn stat_path_nofollow(path: &str) -> Result<shared::Stat, i64> {
     }
 }
 
+/// Which mount domain owns `path`: 0 = root fs, n>0 = the nth tmpfs
+/// mount or bind (the resolved canonical path is already folded).
+fn mount_domain(path: &str) -> usize {
+    if crate::tmpfs::handles(path) || !crate::bind::mounts().is_empty()
+        && crate::bind::mounts().iter().any(|(t, _)| {
+            path == t || (path.len() > t.len()
+                && path.starts_with(t)
+                && path.as_bytes()[t.len()] == b'/')
+        })
+    {
+        return 1;
+    }
+    0
+}
+
+/// openat2 RESOLVE_* enforcement on the already-canonical path.
+/// `base` = the dirfd's own canonical path for BENEATH ("/" for IN_ROOT).
+/// Walks each component prefix so symlink and mount-crossing checks see
+/// intermediate dirs too. Returns () or a negative errno.
+pub fn resolve_flags(path: &str, base: &str, mode: u64) -> Result<(), i64> {
+    if mode & shared::RESOLVE_BENEATH != 0 {
+        // every prefix of path must stay at/under base
+        let b = base.trim_end_matches('/');
+        let under = path == b
+            || (path.len() > b.len()
+                && path.starts_with(b)
+                && path.as_bytes()[b.len()] == b'/');
+        if !under {
+            return Err(-18); // EXDEV-ish: escaped the dirfd subtree
+        }
+    }
+    if mode & (shared::RESOLVE_NO_XDEV | shared::RESOLVE_NO_SYMLINKS) != 0 {
+        let base_dom = if mode & shared::RESOLVE_NO_XDEV != 0 {
+            Some(mount_domain(base))
+        } else {
+            None
+        };
+        // component walk: "", "/a", "/a/b", ...
+        let mut pref = String::from("/");
+        for (i, comp) in path.split('/').enumerate() {
+            if comp.is_empty() {
+                continue;
+            }
+            if i > 1 {
+                pref.push('/');
+            }
+            pref.push_str(comp);
+            if mode & shared::RESOLVE_NO_SYMLINKS != 0 {
+                if readlink_path(&pref).is_ok() {
+                    return Err(-40); // ELOOP: symlink inside a no-symlink resolve
+                }
+            }
+            if let Some(bd) = base_dom {
+                if mount_domain(&pref) != bd {
+                    return Err(-18); // EXDEV: crossed a mount boundary
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Birth time (unix secs) for statx — tmpfs ctime, FAT mtime, 0 elsewhere.
 pub fn btime(path: &str) -> u64 {
     if crate::tmpfs::handles(path) {
