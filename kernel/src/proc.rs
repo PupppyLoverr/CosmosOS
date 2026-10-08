@@ -23,6 +23,9 @@ const FILES: &[&str] = &[
 /// files under /proc/net
 const NET_FILES: &[&str] = &["tcp", "udp"];
 
+/// files under /proc/sys/kernel
+const SYS_FILES: &[&str] = &["hostname"];
+
 pub fn handles(path: &str) -> bool {
     path == "/proc" || path.starts_with("/proc/")
 }
@@ -42,6 +45,8 @@ const PID_FILES: &[&str] = &["status", "cmdline", "stat", "fds", "cwd"];
 pub fn is_dir(path: &str) -> bool {
     path == "/proc"
         || path == "/proc/net"
+        || path == "/proc/sys"
+        || path == "/proc/sys/kernel"
         || pid_of(path)
             .map(|p| task::pids().contains(&p) && path.matches('/').count() == 2)
             .unwrap_or(false)
@@ -61,6 +66,9 @@ pub fn exists(path: &str) -> bool {
     }
     if let Some(f) = path.strip_prefix("/proc/net/") {
         return NET_FILES.contains(&f);
+    }
+    if let Some(f) = path.strip_prefix("/proc/sys/kernel/") {
+        return SYS_FILES.contains(&f);
     }
     FILES.contains(&path.trim_start_matches("/proc/"))
 }
@@ -91,6 +99,27 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         }
         return out;
     }
+    if path == "/proc/sys/kernel" {
+        for name in SYS_FILES {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            de.size = read_file(&alloc::format!("/proc/sys/kernel/{}", name))
+                .map(|d| d.len() as u64)
+                .unwrap_or(0);
+            out.push(de);
+        }
+        return out;
+    }
+    if path == "/proc/sys" {
+        let mut de = shared::DirEntry::default();
+        de.name[..6].copy_from_slice(b"kernel");
+        de.name_len = 6;
+        de.is_dir = 1;
+        out.push(de);
+        return out;
+    }
     for name in FILES {
         let mut de = shared::DirEntry::default();
         let nb = name.as_bytes();
@@ -103,11 +132,12 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         de.mtime = 0;
         out.push(de);
     }
-    // numeric pid dirs alongside the flat files, plus /proc/net
-    {
+    // numeric pid dirs alongside the flat files, plus /proc/net and /proc/sys
+    for name in ["net", "sys"] {
         let mut de = shared::DirEntry::default();
-        de.name[..3].copy_from_slice(b"net");
-        de.name_len = 3;
+        let nb = name.as_bytes();
+        de.name[..nb.len()].copy_from_slice(nb);
+        de.name_len = nb.len() as u8;
         de.is_dir = 1;
         out.push(de);
     }
@@ -165,6 +195,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
     let s = match path {
         "/proc/net/tcp" => net::net_tcp(),
         "/proc/net/udp" => net::net_udp(),
+        "/proc/sys/kernel/hostname" => alloc::format!("{}\n", crate::syscall::hostname()),
         "/proc/stat" => {
             let (user, all) = task::cpu_sums();
             let ticks = timer::ticks();
@@ -265,6 +296,20 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(s.into_bytes())
+}
+
+/// Writable proc files: `/proc/sys/kernel/hostname` accepts a new nodename
+/// (trimmed, non-empty, capped at 64 bytes). Returns bytes consumed.
+pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
+    if path != "/proc/sys/kernel/hostname" {
+        return None;
+    }
+    let s = String::from(String::from_utf8_lossy(buf).trim());
+    if s.is_empty() || s.len() > 64 {
+        return None;
+    }
+    crate::syscall::set_hostname(s);
+    Some(buf.len())
 }
 
 /// Render a `/proc/<pid>/<file>` — live task state each read.

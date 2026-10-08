@@ -12,6 +12,25 @@ const ERR: u64 = u64::MAX;
 /// Cross-app clipboard (Ctrl+C/X/V) — kernel-held so it survives app exit.
 static CLIPBOARD: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
 
+/// System nodename — read via SYS_HOSTNAME_GET, /proc/sys/kernel/hostname and
+/// `uname -n`; set via SYS_HOSTNAME_SET / `hostname <name>`.
+static HOSTNAME: spin::Mutex<String> = spin::Mutex::new(String::new());
+
+pub fn hostname() -> String {
+    let g = HOSTNAME.lock();
+    if g.is_empty() {
+        String::from("cosmos")
+    } else {
+        g.clone()
+    }
+}
+
+/// Set the nodename (also writable via /proc/sys/kernel/hostname).
+pub fn set_hostname(s: String) {
+    let mut g = HOSTNAME.lock();
+    *g = s.chars().take(64).collect();
+}
+
 /// Copy `len` bytes from user buffer `ptr` (current task's address space).
 fn copy_in(ptr: u64, len: u64) -> Option<Vec<u8>> {
     if len > 1 << 20 {
@@ -317,6 +336,15 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
+        shared::SYS_ARP_DEL => {
+            let ip = [
+                (a1 >> 24) as u8,
+                (a1 >> 16) as u8,
+                (a1 >> 8) as u8,
+                a1 as u8,
+            ];
+            net::arp_del(ip) as u64
+        }
         shared::SYS_ARP => {
             let s = net::arp_stat();
             let n = s.len().min(a2 as usize);
@@ -390,6 +418,26 @@ pub fn dispatch(ctx: &mut CpuContext) {
         }
         shared::SYS_NICE => task::set_nice(a1 as u32, a2 as i64) as u64,
         shared::SYS_KILL2 => task::signal(a1 as u32, a2) as u64,
+        shared::SYS_HOSTNAME_GET => {
+            let h = hostname();
+            let n = h.len().min(a2 as usize);
+            match copy_out(a1, &h.as_bytes()[..n]) {
+                Some(()) => n as u64,
+                None => ERR,
+            }
+        }
+        shared::SYS_HOSTNAME_SET => match copy_in(a1, a2.min(64)) {
+            Some(b) => {
+                let h = String::from(String::from_utf8_lossy(&b).trim());
+                if h.is_empty() {
+                    ERR
+                } else {
+                    set_hostname(h);
+                    0
+                }
+            }
+            None => ERR,
+        },
         shared::SYS_STRACE => match a1 {
             // (op, pid, out, cap): 0 start, 1 stop, 2 drain packed 7*u64 recs
             0 => task::trace_start(a2 as u32) as u64,

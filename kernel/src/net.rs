@@ -229,6 +229,14 @@ fn arp_resolve(ip: [u8; 4], ms: u64) -> Option<[u8; 6]> {
 }
 
 /// Dump the ARP cache as text lines (for `arp`).
+/// Remove an ARP cache entry (`arp -d`). Returns true when one was deleted.
+pub fn arp_del(ip: [u8; 4]) -> bool {
+    let mut c = ARP_CACHE.lock();
+    let n = c.len();
+    c.retain(|(i, _)| *i != ip);
+    c.len() != n
+}
+
 pub fn arp_stat() -> String {
     let c = ARP_CACHE.lock();
     let mut s = String::from("ip              mac\n");
