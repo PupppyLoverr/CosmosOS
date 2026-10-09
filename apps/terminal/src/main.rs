@@ -36288,23 +36288,47 @@ impl Term {
                         let qi = args.iter().position(|a| *a == "qdisc").unwrap_or(0);
                         let verb = args.get(qi + 1).copied().unwrap_or("show");
                         match verb {
-                            "add" => {
-                                // tc qdisc add dev eth0 root tbf rate R
-                                let rate = args
-                                    .iter()
-                                    .position(|a| *a == "rate")
-                                    .and_then(|i| args.get(i + 1))
-                                    .copied();
-                                let Some(rate) = rate else {
-                                    self.fail("usage: tc qdisc add dev eth0 root tbf rate <bps>[k|m]");
-                                    return;
+                            "add" | "change" | "replace" => {
+                                // tc qdisc add dev eth0 root tbf rate R |
+                                // tc qdisc add dev eth0 root netem delay D [J] [loss L]
+                                let is_netem = args.iter().any(|a| *a == "netem");
+                                let line = if is_netem {
+                                    // real tc: `delay <ms> [<jitter ms>] [loss <pct>[%]]`
+                                    let di = args.iter().position(|a| *a == "delay");
+                                    let Some(di) = di else {
+                                        self.fail("usage: tc qdisc add dev eth0 root netem delay <ms> [<jit>] [loss <pct>%]");
+                                        return;
+                                    };
+                                    let d = args.get(di + 1).copied().unwrap_or("");
+                                    // positional jitter = next bare number
+                                    let mut j = "";
+                                    if let Some(v) = args.get(di + 2).copied() {
+                                        if v.trim_end_matches("ms").parse::<f64>().is_ok() {
+                                            j = v;
+                                        }
+                                    }
+                                    let mut l = "0";
+                                    if let Some(li) = args.iter().position(|a| *a == "loss") {
+                                        l = args.get(li + 1).copied().unwrap_or("0");
+                                    }
+                                    alloc::format!(
+                                        "add qdisc netem delay {} jitter {} loss {}\n",
+                                        d, j, l
+                                    )
+                                } else {
+                                    let rate = args
+                                        .iter()
+                                        .position(|a| *a == "rate")
+                                        .and_then(|i| args.get(i + 1))
+                                        .copied();
+                                    let Some(rate) = rate else {
+                                        self.fail("usage: tc qdisc add dev eth0 root tbf rate <bps>[k|m] | netem delay <ms>");
+                                        return;
+                                    };
+                                    alloc::format!("add qdisc tbf rate {}\n", rate)
                                 };
-                                let line = alloc::format!("add qdisc tbf rate {}\n", rate);
                                 match ustd::write_all("/proc/net/tc", line.as_bytes()) {
-                                    Ok(_) => self.emit(&alloc::format!(
-                                        "qdisc tbf added on eth0 (rate {})",
-                                        rate
-                                    )),
+                                    Ok(_) => self.emit("qdisc added on eth0"),
                                     Err(e) => self.fail(&alloc::format!("tc: {}", e)),
                                 }
                             }
