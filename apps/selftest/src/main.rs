@@ -2444,6 +2444,27 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok && ustd::write_all("/proc/net/arp", b"del 192.0.2.250").is_ok()
     });
+    check("ct-events", {
+        // conntrack -E: the kernel event ring records the flow
+        // lifecycle — a fresh UDP flow emits [NEW]; its reply
+        // flips [UPDATE] ASSURED.
+        let _ = ustd::read_all("/proc/net/conntrack_events"); // drain
+        let fd = ustd::socket(ustd::SOCK_DGRAM);
+        let mut ok = fd >= 0;
+        if fd >= 0 {
+            let _ = ustd::sendto(fd, b"x", [10, 0, 2, 2], 45123);
+            ustd::sleep_ms(300);
+            ustd::close(fd);
+        }
+        if let Ok(d) = ustd::read_all("/proc/net/conntrack_events") {
+            let t = String::from_utf8_lossy(&d);
+            ok = ok && t.contains("[NEW] udp")
+                && t.contains("dport=45123");
+        } else {
+            ok = false;
+        }
+        ok
+    });
     check("dhcp-release", {
         // dhcp -r: a real DHCPRELEASE leaves the interface unconfigured
         // (0.0.0.0); a fresh DISCOVER cycle restores the lease.

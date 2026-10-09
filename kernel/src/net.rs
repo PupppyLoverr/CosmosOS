@@ -507,7 +507,13 @@ fn ct_timeout(e: &CtEnt) -> u64 {
 /// Drop every flow past its idle timeout.
 fn ct_expire(ct: &mut Vec<CtEnt>) {
     let now = now_ms();
-    ct.retain(|e| now - e.last_ms < ct_timeout(e));
+    ct.retain(|e| {
+        let live = now - e.last_ms < ct_timeout(e);
+        if !live {
+            ct_ev(ct_line("DESTROY", e, ""));
+        }
+        live
+    });
 }
 
 /// Update the flow table for one packet and return its state bits
@@ -531,12 +537,16 @@ fn ct_update(
         let fwd = e.a_ip == src && e.b_ip == dst && e.a_port == sport && e.b_port == dport;
         let rev = e.b_ip == src && e.a_ip == dst && e.b_port == sport && e.a_port == dport;
         if fwd || rev {
+            let first_reply = rev && !e.seen_reply;
             if rev {
                 e.seen_reply = true;
             }
             e.last_ms = now;
             e.pkts += 1;
             e.bytes += plen;
+            if first_reply {
+                ct_ev(ct_line("UPDATE", e, " [ASSURED]"));
+            }
             return if e.seen_reply { 2 } else { 1 };
         }
     }
@@ -556,10 +566,57 @@ fn ct_update(
         pkts: 1,
         bytes: plen,
     });
+    if let Some(e) = ct.last() {
+        ct_ev(ct_line("NEW", e, " [UNREPLIED]"));
+    }
     if ct.len() > 512 {
-        ct.remove(0); // drop the oldest entry — flows are cheap, memory isn't
+        let e = ct.remove(0); // drop the oldest entry — flows are cheap, memory isn't
+        ct_ev(ct_line("DESTROY", &e, ""));
     }
     1
+}
+
+/// `conntrack -E` event ring — [NEW]/[UPDATE]/[DESTROY] per flow
+/// lifecycle, drained per read like an nfnetlink listener.
+static CT_EVENTS: Mutex<alloc::collections::VecDeque<String>> =
+    Mutex::new(alloc::collections::VecDeque::new());
+
+fn ct_ev(msg: String) {
+    let mut q = CT_EVENTS.lock();
+    if q.len() >= 128 {
+        q.pop_front(); // ring overrun drops the oldest
+    }
+    q.push_back(msg);
+}
+
+/// `/proc/net/conntrack_events` read: drain every queued event.
+pub fn conntrack_events_drain() -> String {
+    let mut s = String::new();
+    let mut q = CT_EVENTS.lock();
+    while let Some(e) = q.pop_front() {
+        s.push_str(&e);
+        s.push('\n');
+    }
+    s
+}
+
+fn l4n(proto: u8) -> &'static str {
+    match proto {
+        6 => "tcp",
+        17 => "udp",
+        1 => "icmp",
+        _ => "?",
+    }
+}
+
+fn ct_line(tag: &str, e: &CtEnt, extra: &str) -> String {
+    alloc::format!(
+        "[{}] {} src={}.{}.{}.{} dst={}.{}.{}.{} sport={} dport={}{}",
+        tag, l4n(e.proto),
+        e.a_ip[0], e.a_ip[1], e.a_ip[2], e.a_ip[3],
+        e.b_ip[0], e.b_ip[1], e.b_ip[2], e.b_ip[3],
+        e.a_port, e.b_port, extra
+    )
 }
 
 /// Packet direction against the live flow table, for `-m conntrack
@@ -3683,6 +3740,7 @@ pub fn net_trace(
     per_ms: u64,
     base_port: u16,
     probes: u8,
+    src_override: Option<[u8; 4]>,
 ) -> Vec<(u8, Option<([u8; 4], u64)>, bool)> {
     let mut hops = Vec::new();
     let Some(mac) = next_hop(dst, 1500) else {
@@ -3698,7 +3756,7 @@ pub fn net_trace(
         let dport = base_port.wrapping_add(ttl as u16);
         let t0 = now_ms();
         for _ in 0..probes {
-            send_udp_ttl(mac, dst, TRACER_SPORT, dport, b"cosmos-trace", ttl);
+            send_udp_ttl(mac, dst, TRACER_SPORT, dport, b"cosmos-trace", ttl, src_override);
         }
         let mut hit: Option<([u8; 4], bool)> = None;
         while now_ms() - t0 < per_ms && hit.is_none() {
@@ -3756,6 +3814,7 @@ pub fn net_trace_icmp(
     max_hops: u8,
     per_ms: u64,
     probes: u8,
+    src_override: Option<[u8; 4]>,
 ) -> Vec<(u8, Option<([u8; 4], u64)>, bool)> {
     let mut hops = Vec::new();
     let Some(mac) = next_hop(dst, 1500) else {
@@ -3766,7 +3825,7 @@ pub fn net_trace_icmp(
     for ttl in first..=max_hops.min(30).max(first) {
         let t0 = now_ms();
         for _ in 0..probes {
-            send_icmp_echo_ttl(mac, dst, TRACER_EID, ttl as u16, ttl, b"cosmos-trace-icmp");
+            send_icmp_echo_src(src_override.unwrap_or_else(our_ip), mac, dst, TRACER_EID, ttl as u16, ttl, b"cosmos-trace-icmp");
         }
         let mut hit: Option<([u8; 4], bool)> = None;
         while now_ms() - t0 < per_ms && hit.is_none() {
@@ -3834,6 +3893,7 @@ pub fn net_trace_tcp(
     per_ms: u64,
     dport_probe: u16,
     probes: u8,
+    src_override: Option<[u8; 4]>,
 ) -> Vec<(u8, Option<([u8; 4], u64)>, bool)> {
     let mut hops = Vec::new();
     let Some(mac) = next_hop(dst, 1500) else {
@@ -3845,7 +3905,7 @@ pub fn net_trace_tcp(
         let isn = (now_ms() as u32) ^ 0x7ACE_0000;
         let t0 = now_ms();
         for _ in 0..probes {
-            send_tcp_ttl(mac, dst, TRACER_SPORT, dport_probe, isn, 0, TCP_SYN, &[], 65535, ttl);
+            send_tcp_ttl(mac, dst, TRACER_SPORT, dport_probe, isn, 0, TCP_SYN, &[], 65535, ttl, src_override);
         }
         let mut hit: Option<([u8; 4], bool)> = None;
         while now_ms() - t0 < per_ms && hit.is_none() {
@@ -4641,7 +4701,7 @@ fn send_ip_src_qos(
 
 /// UDP send (IPv4 UDP checksum is optional — 0 means "none").
 fn send_udp(dst_mac: [u8; 6], dst_ip: [u8; 4], sport: u16, dport: u16, payload: &[u8]) {
-    send_udp_ttl(dst_mac, dst_ip, sport, dport, payload, def_ttl())
+    send_udp_ttl(dst_mac, dst_ip, sport, dport, payload, def_ttl(), None)
 }
 
 fn send_udp_ttl(
@@ -4651,6 +4711,7 @@ fn send_udp_ttl(
     dport: u16,
     payload: &[u8],
     ttl: u8,
+    src_override: Option<[u8; 4]>,
 ) {
     let mut udp = Vec::with_capacity(8 + payload.len());
     udp.extend_from_slice(&sport.to_be_bytes());
@@ -4658,7 +4719,9 @@ fn send_udp_ttl(
     udp.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
     udp.extend_from_slice(&[0u8; 2]); // checksum disabled (valid in IPv4)
     udp.extend_from_slice(payload);
-    let src = if dst_ip[0] == 127 { LOOPBACK_IP } else { our_ip() };
+    let src = src_override.unwrap_or(
+        if dst_ip[0] == 127 { LOOPBACK_IP } else { our_ip() },
+    );
     send_ip_src_ttl(src, dst_mac, dst_ip, 17, ttl, &udp);
 }
 
@@ -4943,7 +5006,7 @@ fn send_tcp(
     payload: &[u8],
     win: u16,
 ) {
-    send_tcp_ttl(dst_mac, dst_ip, sport, dport, seq, ack, flags, payload, win, def_ttl())
+    send_tcp_ttl(dst_mac, dst_ip, sport, dport, seq, ack, flags, payload, win, def_ttl(), None)
 }
 
 /// send_tcp with an explicit IP TTL — TCP traceroute probes stamp a
@@ -4960,6 +5023,7 @@ fn send_tcp_ttl(
     payload: &[u8],
     win: u16,
     ttl: u8,
+    src_override: Option<[u8; 4]>,
 ) {
     let mut seg = Vec::with_capacity(20 + payload.len());
     seg.extend_from_slice(&sport.to_be_bytes());
@@ -4972,7 +5036,9 @@ fn send_tcp_ttl(
     seg.extend_from_slice(&[0u8; 2]); // checksum
     seg.extend_from_slice(&[0u8; 2]); // urg
     seg.extend_from_slice(payload);
-    let src = if dst_ip[0] == 127 { LOOPBACK_IP } else { our_ip() };
+    let src = src_override.unwrap_or(
+        if dst_ip[0] == 127 { LOOPBACK_IP } else { our_ip() },
+    );
     let c = tcp_csum(src, dst_ip, &seg);
     put16(&mut seg[16..], c);
     send_ip_src_ttl(src, dst_mac, dst_ip, 6, ttl, &seg);
@@ -5444,7 +5510,7 @@ pub fn udp_send_ttl(
     let Some(mac) = next_hop(dst_ip, 1500) else {
         return Err(-3);
     };
-    send_udp_ttl(mac, dst_ip, lport, dport, payload, ttl);
+    send_udp_ttl(mac, dst_ip, lport, dport, payload, ttl, None);
     Ok(())
 }
 

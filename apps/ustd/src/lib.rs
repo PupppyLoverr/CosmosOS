@@ -2694,12 +2694,27 @@ pub fn net_trace_proto(
     per_ms: u64,
     probes: u8,
 ) -> alloc::vec::Vec<(u8, Option<([u8; 4], u64)>, bool)> {
+    net_trace_src(ip, proto, first_hop, max_hops, base_port, per_ms, probes, 0)
+}
+
+/// `traceroute -s`: same probe list with a real source-address bind
+/// (src BE-packed u32; 0 = default).
+pub fn net_trace_src(
+    ip: u32,
+    proto: u8,
+    first_hop: u8,
+    max_hops: u8,
+    base_port: u16,
+    per_ms: u64,
+    probes: u8,
+    src: u32,
+) -> alloc::vec::Vec<(u8, Option<([u8; 4], u64)>, bool)> {
     let mut buf = [0u8; 16 * 30];
     let a5 = (base_port as u64) | ((first_hop as u64) << 16) | (per_ms << 24)
         | ((probes as u64) << 56);
     let n = sc5(
         shared::SYS_NET_TRACE,
-        ip as u64,
+        (ip as u64) | ((src as u64) << 32),
         max_hops as u64 | ((proto as u64) << 16),
         buf.as_mut_ptr() as u64,
         buf.len() as u64,
