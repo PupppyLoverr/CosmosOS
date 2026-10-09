@@ -31,6 +31,7 @@ mod proc;
 mod serial;
 mod shm;
 mod acct;
+mod perf;
 mod cgroup;
 mod syscall;
 mod task;

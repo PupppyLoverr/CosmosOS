@@ -3263,3 +3263,41 @@ pub fn signalfd4(mask: u64, flags: u64) -> i64 {
 pub fn inotify_init1(flags: u64) -> i64 {
     sc1(shared::SYS_INOTIFY_INIT1, flags) as i64
 }
+
+/// perf_event_open({type,config}, pid) -> fd | err. cpu=-1, group=-1 (UP).
+/// read() on the fd returns the u64 count accumulated since the open.
+pub fn perf_event_open(typ: u32, config: u32, pid: u64) -> i64 {
+    let attr = [typ as u64 | ((config as u64) << 32)];
+    sc4(
+        shared::SYS_PERF_EVENT_OPEN,
+        attr.as_ptr() as u64,
+        pid,
+        u64::MAX, // cpu = -1
+        u64::MAX, // group_fd = -1
+    ) as i64
+}
+
+/// Read the u64 count from a perf event fd.
+pub fn perf_read(fd: i64) -> Option<u64> {
+    let mut b = [0u8; 8];
+    match crate::read(fd, &mut b) {
+        Ok(8) => Some(u64::from_le_bytes(b)),
+        _ => None,
+    }
+}
+
+/// membarrier(cmd): QUERY returns supported mask; REGISTER/EXPEDITED are
+/// ordering-only on this UP machine (and real about the registration rule).
+pub fn membarrier(cmd: u64) -> i64 {
+    sc2(shared::SYS_MEMBARRIER, cmd, 0) as i64
+}
+
+/// setreuid(r, e): either may be u32::MAX to keep.
+pub fn setreuid(r: u32, e: u32) -> i64 {
+    sc2(shared::SYS_SETREUID, r as u64, e as u64) as i64
+}
+
+/// setregid(r, e): either may be u32::MAX to keep.
+pub fn setregid(r: u32, e: u32) -> i64 {
+    sc2(shared::SYS_SETREGID, r as u64, e as u64) as i64
+}

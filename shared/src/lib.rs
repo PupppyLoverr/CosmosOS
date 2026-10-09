@@ -805,3 +805,10 @@ pub const SYS_INOTIFY_INIT1: u64 = 282;       // (flags IN_NONBLOCK|IN_CLOEXEC) 
 pub const PR_SET_NO_NEW_PRIVS: u64 = 38;      // prctl opt — one-way exec-privilege freeze
 pub const PR_GET_NO_NEW_PRIVS: u64 = 39;      // prctl opt — read back
 pub const PR_SET_SECCOMP: u64 = 22;           // prctl opt — same install as SYS_SECCOMP
+
+pub const SYS_PERF_EVENT_OPEN: u64 = 283;     // ({type,config}*,pid,cpu,grp,flags) -> fd | err
+pub const SYS_MEMBARRIER: u64 = 284;          // (cmd, flags) -> mask|0|err
+pub const SYS_SETREUID: u64 = 285;            // (ruid,euid; MAX=keep) -> 0|EPERM
+pub const SYS_SETREGID: u64 = 286;            // (rgid,egid; MAX=keep) -> 0|EPERM
+pub const SEEK_DATA: u64 = 3;                 // lseek whence — dense files: off<size? off : ENXIO
+pub const SEEK_HOLE: u64 = 4;                 // lseek whence — dense files: off<size? size : ENXIO
