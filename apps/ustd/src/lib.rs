@@ -1649,7 +1649,10 @@ pub fn dup2(oldfd: u64, newfd: u64) -> i64 {
 
 /// Wait until any of `fds`/`evs` is ready or `timeout_ms` passes
 /// (u64::MAX = forever). evs bits: 1=read, 2=write. Returns count ready.
-pub fn poll(fds: &[u32], evs: &[u32], timeout_ms: u64) -> i64 {
+/// poll: evs[i] low16 = requested events (bit0 read, bit1 write); on
+/// return the kernel writes revents into the HIGH 16 bits of each entry
+/// (bit0 read-ready, bit1 write-ready, 0x8 ERR, 0x10 HUP, 0x20 NVAL).
+pub fn poll(fds: &[u32], evs: &mut [u32], timeout_ms: u64) -> i64 {
     sc4(
         shared::SYS_POLL,
         fds.as_ptr() as u64,
@@ -1823,7 +1826,7 @@ pub fn socketpair_t(ty: u64) -> Option<(i64, i64)> {
 /// pidfd_create: an fd that becomes readable when `pid` exits; reading it
 /// yields the 8-byte exit status. -1 if the task is absent/already dead.
 /// ppoll: poll under a temporary signal mask (mask = u64::MAX = no swap).
-pub fn ppoll(fds: &[u32], evs: &[u32], timeout_ms: u64, mask: u64) -> i64 {
+pub fn ppoll(fds: &[u32], evs: &mut [u32], timeout_ms: u64, mask: u64) -> i64 {
     sc5(
         shared::SYS_PPOLL,
         fds.as_ptr() as u64,

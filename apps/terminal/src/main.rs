@@ -25765,7 +25765,7 @@ impl Term {
                                     let mut got = alloc::vec::Vec::new();
                                     let dl = ustd::uptime_ms() + 4000;
                                     while ustd::uptime_ms() < dl {
-                                        if ustd::poll(&[s.0 as u32], &[1], 250) <= 0 {
+                                        if ustd::poll(&[s.0 as u32], &mut [1], 250) <= 0 {
                                             continue;
                                         }
                                         let mut b = [0u8; 512];
@@ -45580,7 +45580,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         // poll(accept-fd) -> accept -> conn fd; poll(conn fd) -> read -> write
         if t.fd_httpd_conn.is_none() {
             if let Some((lfd, _)) = &t.fd_httpd {
-                if ustd::poll(&[*lfd as u32], &[1], 0) > 0 {
+                if ustd::poll(&[*lfd as u32], &mut [1], 0) > 0 {
                     if let Ok((cfd, _rip, _rport)) = ustd::accept(*lfd) {
                         t.fd_httpd_conn = Some((cfd, now + 3000, 0));
                     }
@@ -45589,7 +45589,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         if let Some((cfd, mut dl, mut nreq)) = t.fd_httpd_conn.take() {
             let mut keep_it = true;
-            if ustd::poll(&[cfd as u32], &[1], 0) > 0 {
+            if ustd::poll(&[cfd as u32], &mut [1], 0) > 0 {
                 let mut rbuf = [0u8; 2048];
                 match ustd::read(cfd, &mut rbuf) {
                     Ok(0) => {
@@ -45640,7 +45640,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         // udpecho: drain datagrams on the socket fd and echo each back
         // to its sender — a full UDP roundtrip through recvfrom/sendto
         if let Some(fd) = t.udpecho_fd {
-            if ustd::poll(&[fd as u32], &[1], 0) > 0 {
+            if ustd::poll(&[fd as u32], &mut [1], 0) > 0 {
                 let mut buf = [0u8; 1400];
                 match ustd::recvfrom(fd, &mut buf) {
                     Ok((n, ip, pt)) => {
@@ -45661,7 +45661,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         // dgrecv: drain queued datagrams — one packet per recvfrom_path
         if let Some(fd) = t.dgrecv_fd {
             loop {
-                if ustd::poll(&[fd as u32], &[1], 0) <= 0 {
+                if ustd::poll(&[fd as u32], &mut [1], 0) <= 0 {
                     break;
                 }
                 let mut buf = [0u8; 1024];
@@ -45684,7 +45684,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         // ucat -l: accept queued conns, then echo reads back to the writer
         if let Some((lfd, _)) = t.ucat_l {
-            if ustd::poll(&[lfd as u32], &[1], 0) > 0 {
+            if ustd::poll(&[lfd as u32], &mut [1], 0) > 0 {
                 if let Ok((cfd, _, _)) = ustd::accept(lfd) {
                     if let Some(old) = t.ucat_c.replace(cfd) {
                         ustd::close(old);
@@ -45694,7 +45694,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         if let Some(cfd) = t.ucat_c {
             let mut keep = true;
-            if ustd::poll(&[cfd as u32], &[1], 0) > 0 {
+            if ustd::poll(&[cfd as u32], &mut [1], 0) > 0 {
                 let mut b = [0u8; 1024];
                 match ustd::recvmsg(cfd, &mut b) {
                     Ok((0, got)) => {
@@ -45737,7 +45737,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         // snc: drain the socket fd — poll(read) then read; Ok(0)=remote close
         if let Some(fd) = t.snc_fd {
-            if ustd::poll(&[fd as u32], &[1], 0) > 0 {
+            if ustd::poll(&[fd as u32], &mut [1], 0) > 0 {
                 let mut buf = [0u8; 1400];
                 match ustd::read(fd, &mut buf) {
                     Ok(0) => {
@@ -45960,7 +45960,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 } else {
                 // -F: drain pending watch events; wd identifies the parent
                 // dir, the record's name the basename of the changed file
-                if tf.ifd >= 0 && ustd::poll(&[tf.ifd as u32], &[1], 0) > 0 {
+                if tf.ifd >= 0 && ustd::poll(&[tf.ifd as u32], &mut [1], 0) > 0 {
                     let mut ebuf = [0u8; 2048];
                     if let Ok(n) = ustd::read(tf.ifd, &mut ebuf) {
                         for l in String::from_utf8_lossy(&ebuf[..n]).lines() {
@@ -46012,7 +46012,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 // read below never blocks the terminal task
                 let multi = tf.ents.len() > 1;
                 for (ei, e) in tf.ents.iter_mut().enumerate() {
-                    if e.fd >= 0 && ustd::poll(&[e.fd as u32], &[1], 0) > 0 {
+                    if e.fd >= 0 && ustd::poll(&[e.fd as u32], &mut [1], 0) > 0 {
                         let mut buf = [0u8; 8192];
                         match ustd::read(e.fd, &mut buf) {
                             Ok(n) if n > 0 => {
@@ -46048,7 +46048,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         // summary at its deadline, wait mode stops after the first batch
         if let Some((ifd, dl, mut counts, monitor)) = t.inotw.clone() {
             let mut printed = false;
-            if ustd::poll(&[ifd as u32], &[1], 0) > 0 {
+            if ustd::poll(&[ifd as u32], &mut [1], 0) > 0 {
                 let mut ebuf = [0u8; 4096];
                 if let Ok(n) = ustd::read(ifd, &mut ebuf) {
                     for l in String::from_utf8_lossy(&ebuf[..n]).lines() {

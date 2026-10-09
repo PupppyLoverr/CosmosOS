@@ -824,7 +824,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                     let _ = ustd::waitpid(a as u32, 4000);
                     let mut got = false;
                     for _ in 0..40 {
-                        let n = ustd::poll(&[pr as u32], &[1], 100);
+                        let n = ustd::poll(&[pr as u32], &mut [1], 100);
                         if n > 0 {
                             let mut b = [0u8; 4];
                             let _ = ustd::read(pr, &mut b);
@@ -1599,12 +1599,12 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
     });
     check("ppoll", {
         // empty poll times out; an unmasked pending signal returns EINTR
-        let t = ustd::ppoll(&[], &[], 30, u64::MAX);
+        let t = ustd::ppoll(&[], &mut [], 30, u64::MAX);
         unsafe { PP_HIT = 0 };
         let _ = ustd::sigaction(10, pp_hit as u64);
         let _ = ustd::sigprocmask(ustd::SIG_BLOCK, 1u64 << 10);
         let _ = ustd::tgkill(ustd::getpid(), ustd::gettid(), 10);
-        let r = ustd::ppoll(&[], &[], 500, 0); // mask 0 = all unblocked
+        let r = ustd::ppoll(&[], &mut [], 500, 0); // mask 0 = all unblocked
         ustd::sleep_ms(20);
         let hit = unsafe { PP_HIT };
         let _ = ustd::sigprocmask(ustd::SIG_SETMASK, 0);
@@ -2355,7 +2355,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             let w2 = ustd::write_all("/proc/sys/net/core/somaxconn", b"4096").is_ok()
                 && ustd::write_all("/proc/sys/net/ipv4/tcp_abort_on_overflow", b"0").is_ok();
             let c3 = ustd::TcpFd::connect([127, 0, 0, 1], 19090).is_ok();
-            let pw = ustd::poll(&[l.0 as u32], &[1], 2000);
+            let pw = ustd::poll(&[l.0 as u32], &mut [1], 2000);
             let a3 = l.accept();
             ok = ok && w2 && c3 && pw > 0 && a3.is_ok();
         }
@@ -3164,15 +3164,38 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         // SYS_POLL: reader polls not-ready before the write, ready after
         ustd::pipe()
             .map(|(rfd, wfd)| {
-                let before = ustd::poll(&[rfd as u32], &[1], 0);
+                let before = ustd::poll(&[rfd as u32], &mut [1], 0);
                 let _ = ustd::write(wfd, b"x");
-                let after = ustd::poll(&[rfd as u32], &[1], 0);
-                let wr = ustd::poll(&[wfd as u32], &[2], 0);
+                let after = ustd::poll(&[rfd as u32], &mut [1], 0);
+                let wr = ustd::poll(&[wfd as u32], &mut [2], 0);
                 ustd::close(rfd);
                 ustd::close(wfd);
                 before == 0 && after == 1 && wr == 1
             })
             .unwrap_or(false)
+    });
+    check("poll-revents", {
+        // poll() writes per-fd revents into evs[i]>>16: bit0 read-ready,
+        // bit1 write-ready, 0x8 POLLERR, 0x10 POLLHUP, 0x20 POLLNVAL.
+        let mut ok = true;
+        let (rfd, wfd) = ustd::pipe().unwrap_or((-1, -1));
+        ok = ok && rfd >= 0 && wfd >= 0;
+        let _ = ustd::write(wfd, b"z");
+        let fds = [rfd as u32, wfd as u32, 9999u32];
+        let mut evs = [1u32, 2u32, 1u32];
+        let n = ustd::poll(&fds, &mut evs, 0);
+        // data on rfd + writable wfd + bad fd all count as ready
+        ok = ok && n == 3;
+        ok = ok && (evs[0] >> 16) & 1 == 1;       // rfd read-ready
+        ok = ok && (evs[1] >> 16) & 2 == 2;       // wfd write-ready
+        ok = ok && (evs[2] >> 16) & 0x20 == 0x20; // POLLNVAL on bad fd
+        ustd::close(wfd); // last writer gone -> reader HUPs
+        let fds2 = [rfd as u32];
+        let mut evs2 = [1u32];
+        ok = ok && ustd::poll(&fds2, &mut evs2, 0) == 1;
+        ok = ok && (evs2[0] >> 16) & 0x10 == 0x10; // POLLHUP
+        ustd::close(rfd);
+        ok
     });
     check("pipe-eof", {
         // last writer closing => reader sees EOF (0), not a hang
@@ -3256,7 +3279,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             false
         } else {
             ustd::timerfd_set(fd, 30, 0);
-            let rdy = ustd::poll(&[fd as u32], &[1], 2000) > 0;
+            let rdy = ustd::poll(&[fd as u32], &mut [1], 2000) > 0;
             let n = ustd::timerfd_read(fd).unwrap_or(0);
             ustd::close(fd);
             rdy && n >= 1
@@ -3285,7 +3308,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             let ok = wd >= 0
                 && ustd::write_all("/st-inot", b"e").is_ok()
                 && {
-                    let rdy = ustd::poll(&[ifd as u32], &[1], 2000) > 0;
+                    let rdy = ustd::poll(&[ifd as u32], &mut [1], 2000) > 0;
                     let mut b = [0u8; 512];
                     match ustd::read(ifd, &mut b) {
                         Ok(n) if n > 0 => {
@@ -3314,9 +3337,9 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             false
         } else {
             let ok = ustd::eventfd_write(fd, 5) == 0
-                && ustd::poll(&[fd as u32], &[1], 2000) > 0
+                && ustd::poll(&[fd as u32], &mut [1], 2000) > 0
                 && ustd::eventfd_read(fd) == Some(5)
-                && ustd::poll(&[fd as u32], &[1], 0) == 0
+                && ustd::poll(&[fd as u32], &mut [1], 0) == 0
                 && ustd::eventfd_write(fd, 3) == 0
                 && ustd::eventfd_read(fd) == Some(3);
             ustd::close(fd);
@@ -3331,7 +3354,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         } else {
             let ok = ustd::eventfd_read(fd) == Some(1)
                 && ustd::eventfd_read(fd) == Some(1)
-                && ustd::poll(&[fd as u32], &[1], 0) == 0;
+                && ustd::poll(&[fd as u32], &mut [1], 0) == 0;
             ustd::close(fd);
             ok
         }
@@ -3377,11 +3400,11 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 let mut buf = [0u8; 8];
                 let ok = ustd::write(a, b"hi").is_ok()
                     && ustd::write(b, b"yo").is_ok()
-                    && ustd::poll(&[b as u32], &[1], 1000) == 1
+                    && ustd::poll(&[b as u32], &mut [1], 1000) == 1
                     && ustd::read(b, &mut buf).map(|n| &buf[..n] == b"hi").unwrap_or(false)
-                    && ustd::poll(&[a as u32], &[1], 1000) == 1
+                    && ustd::poll(&[a as u32], &mut [1], 1000) == 1
                     && ustd::read(a, &mut buf).map(|n| &buf[..n] == b"yo").unwrap_or(false)
-                    && ustd::poll(&[b as u32], &[1], 0) == 0;
+                    && ustd::poll(&[b as u32], &mut [1], 0) == 0;
                 ustd::close(a);
                 ustd::close(b);
                 ok
@@ -3395,7 +3418,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             Some((a, b)) => {
                 ustd::close(a);
                 let mut buf = [0u8; 8];
-                let ok = ustd::poll(&[b as u32], &[1], 1000) == 1
+                let ok = ustd::poll(&[b as u32], &mut [1], 1000) == 1
                     && ustd::read(b, &mut buf) == Ok(0)
                     && ustd::write(b, b"x") == Err(-32);
                 ustd::close(b);
@@ -3412,9 +3435,9 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 let pfd = ustd::pidfd(pid as u32);
                 let ok = pfd >= 0
                     && ustd::pidfd(999_999) < 0
-                    && ustd::poll(&[pfd as u32], &[1], 0) == 0
+                    && ustd::poll(&[pfd as u32], &mut [1], 0) == 0
                     && ustd::kill2(pid, 9) == 0
-                    && ustd::poll(&[pfd as u32], &[1], 4000) == 1
+                    && ustd::poll(&[pfd as u32], &mut [1], 4000) == 1
                     && ustd::pidfd_read(pfd).is_some();
                 ustd::close(pfd);
                 ok
@@ -3565,7 +3588,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             ok = ustd::sendto(fd, b"sockfd-test", [10, 0, 2, 2], 43211) == 11
                 // nothing inbound yet: nonblock read is EAGAIN, poll is 0
                 && ustd::recvfrom(fd, &mut [0u8; 64]).is_err()
-                && ustd::poll(&[fd as u32], &[1], 0) == 0
+                && ustd::poll(&[fd as u32], &mut [1], 0) == 0
                 // double-bind is EINVAL
                 && ustd::bind(fd, 43212) != 0;
         }
@@ -3592,7 +3615,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             // nonblock: accept on an empty listener is EAGAIN, not a block
             ustd::fcntl(lfd, ustd::F_SETFL, ustd::O_NONBLOCK);
             ok = ustd::accept(lfd).is_err()
-                && ustd::poll(&[lfd as u32], &[1], 0) == 0
+                && ustd::poll(&[lfd as u32], &mut [1], 0) == 0
                 && ustd::fstat(lfd).map(|s| s.size == 0).unwrap_or(false);
         }
         if lfd >= 0 {
@@ -3631,7 +3654,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 };
             if ok {
                 // listener is readable -> accept -> server fd
-                let sfd = if ustd::poll(&[lfd as u32], &[1], 500) > 0 {
+                let sfd = if ustd::poll(&[lfd as u32], &mut [1], 500) > 0 {
                     ustd::accept(lfd).ok().map(|(f, _, _)| f)
                 } else {
                     None
@@ -3639,11 +3662,11 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 if let Some(sfd) = sfd {
                     let mut b = [0u8; 64];
                     ok = ustd::write(cfd, b"ping") == Ok(4)
-                        && ustd::poll(&[sfd as u32], &[1], 500) > 0
+                        && ustd::poll(&[sfd as u32], &mut [1], 500) > 0
                         && ustd::read(sfd, &mut b) == Ok(4)
                         && &b[..4] == b"ping"
                         && ustd::write(sfd, b"pong") == Ok(4)
-                        && ustd::poll(&[cfd as u32], &[1], 500) > 0
+                        && ustd::poll(&[cfd as u32], &mut [1], 500) > 0
                         && ustd::read(cfd, &mut b) == Ok(4)
                         && &b[..4] == b"pong"
                         // getsockname on the listener = the bound path
@@ -3667,10 +3690,10 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                     ok = ok
                         && ustd::shutdown(cfd, 1) == 0
                         && ustd::write(cfd, b"x") == Err(-32) // EPIPE
-                        && ustd::poll(&[sfd as u32], &[1], 500) > 0
+                        && ustd::poll(&[sfd as u32], &mut [1], 500) > 0
                         && ustd::read(sfd, &mut b) == Ok(0) // peer EOF
                         && ustd::write(sfd, b"tail") == Ok(4)
-                        && ustd::poll(&[cfd as u32], &[1], 500) > 0
+                        && ustd::poll(&[cfd as u32], &mut [1], 500) > 0
                         && ustd::read(cfd, &mut b) == Ok(4)
                         && &b[..4] == b"tail";
                     ustd::close(sfd);
@@ -3737,7 +3760,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 // a bogus passfd is EBADF, not a transfer
                 && ustd::sendmsg(cfd, b"x", 9999) == -9;
             if ok {
-                let sfd = if ustd::poll(&[lfd as u32], &[1], 500) > 0 {
+                let sfd = if ustd::poll(&[lfd as u32], &mut [1], 500) > 0 {
                     ustd::accept(lfd).ok().map(|(f, _, _)| f)
                 } else {
                     None
@@ -3745,7 +3768,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 if let Some(sfd) = sfd {
                     ustd::fcntl(sfd, ustd::F_SETFL, ustd::O_NONBLOCK);
                     let mut b = [0u8; 64];
-                    let got = if ustd::poll(&[sfd as u32], &[1], 500) > 0 {
+                    let got = if ustd::poll(&[sfd as u32], &mut [1], 500) > 0 {
                         ustd::recvmsg(sfd, &mut b)
                     } else {
                         Err(-1)
@@ -3812,7 +3835,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             if ok {
                 let mut b = [0u8; 64];
                 let mut nm = [0u8; 64];
-                ok = ustd::poll(&[r as u32], &[1], 500) > 0
+                ok = ustd::poll(&[r as u32], &mut [1], 500) > 0
                     && ustd::recvfrom_path(r, &mut b, &mut nm)
                         .map(|(n, nl)| {
                             n == 4
@@ -3901,7 +3924,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             ustd::fcntl(u, ustd::F_SETFL, ustd::O_NONBLOCK);
             ok = ustd::bind(u, 19777) == 0
                 && ustd::sendto(u, b"loop", [127, 0, 0, 1], 19777) == 4
-                && ustd::poll(&[u as u32], &[1], 1000) > 0
+                && ustd::poll(&[u as u32], &mut [1], 1000) > 0
                 && ustd::recvfrom(u, &mut [0u8; 8])
                     .map(|(n, ip, _)| n == 4 && ip == [127, 0, 0, 1])
                     .unwrap_or(false);
@@ -3921,7 +3944,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                     ustd::close(a);
                     w
                 }).unwrap_or(false)
-                && ustd::poll(&[c as u32], &[1], 1000) > 0
+                && ustd::poll(&[c as u32], &mut [1], 1000) > 0
                 && ustd::read(c, &mut [0u8; 4]).map(|n| n == 2).unwrap_or(false);
             ustd::close(c);
             ustd::close(l);
@@ -6706,7 +6729,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             let a1 = ustd::write_all(ipt, b"A OUTPUT udp msocket drop\n").is_ok();
             let _ = ustd::sendto(s1, b"ms", lo, 43333);
             ustd::sleep_ms(60);
-            let blocked = ustd::poll(&[s2 as u32], &[1], 0) == 0;
+            let blocked = ustd::poll(&[s2 as u32], &mut [1], 0) == 0;
             let _ = ustd::write_all(ipt, b"F\n");
             let _ = ustd::sendto(s1, b"ms", lo, 43333);
             ustd::sleep_ms(60);

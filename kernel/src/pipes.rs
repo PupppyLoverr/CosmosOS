@@ -82,6 +82,32 @@ pub fn ready(path: &str, for_read: bool) -> bool {
     }
 }
 
+/// poll()-style revents for a pipe/fifo: bit0=read-ready, bit1=write-
+/// ready, 0x8=POLLERR (EPIPE — no readers), 0x10=POLLHUP (no writers ->
+/// EOF on the read end).
+pub fn poll_revents(path: &str) -> u32 {
+    let g = PIPES.lock();
+    match g.get(path) {
+        Some(p) => {
+            let mut rv = 0u32;
+            if !p.buf.is_empty() {
+                rv |= 1;
+            }
+            if p.writers == 0 {
+                rv |= 1 | 0x10; // EOF: read end is "ready" + HUP (Linux POLLPRI? no: POLLIN|POLLHUP)
+            }
+            if p.readers == 0 && p.readers_seen {
+                rv |= 0x8; // write end -> EPIPE -> POLLERR
+            } else if p.buf.len() < pipe_cap() {
+                rv |= 2;
+            }
+            rv
+        }
+        // missing pipe object: read end would hit EOF
+        None => 1 | 0x10,
+    }
+}
+
 pub fn exists(path: &str) -> bool {
     path != "/pipes" && PIPES.lock().contains_key(path)
 }

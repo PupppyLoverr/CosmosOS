@@ -73,7 +73,7 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
     let mut got: Vec<u8> = Vec::new();
     let deadline = ustd::uptime_ms() + 4000;
     loop {
-        if ustd::poll(&[s.0 as u32], &[1], 400) <= 0 {
+        if ustd::poll(&[s.0 as u32], &mut [1], 400) <= 0 {
             if ustd::uptime_ms() > deadline {
                 break;
             }

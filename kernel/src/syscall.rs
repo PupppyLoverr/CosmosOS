@@ -3179,6 +3179,38 @@ pub fn fd_ready(path: &str, ev: u32) -> bool {
     }
 }
 
+/// Per-fd poll revents: bit0 read-ready, bit1 write-ready (masked by the
+/// caller's requested events like Linux), plus 0x8=POLLERR /
+/// 0x10=POLLHUP which report unconditionally.
+fn poll_revents(path: &str, req: u32) -> u32 {
+    let mut raw = if crate::pipes::handles(path) {
+        crate::pipes::poll_revents(path)
+    } else if crate::sockfd::handles(path) {
+        crate::sockfd::poll_revents(path)
+    } else if crate::sockpair::handles(path) {
+        let mut rv = 0u32;
+        if crate::sockpair::ready(path, true) {
+            rv |= 1;
+        }
+        if crate::sockpair::ready(path, false) {
+            rv |= 2;
+        }
+        rv
+    } else {
+        let mut rv = 0u32;
+        if fd_ready(path, 1) {
+            rv |= 1;
+        }
+        if fd_ready(path, 2) {
+            rv |= 2;
+        }
+        rv
+    };
+    // requested bits only for IN/OUT; ERR(0x8)/HUP(0x10) always surface
+    raw &= (req & 3) | 0x18;
+    raw
+}
+
 /// SYS_POLL: wait until any listed fd is ready or `timeout_ms` elapses.
 /// `fds`/`evs` are parallel user arrays of u32: events bit0=read bit1=write.
 /// Returns the count of ready fds.
@@ -3202,16 +3234,31 @@ fn sys_poll(ctx: &mut CpuContext, fds: u64, evs: u64, nfds: u64, timeout_ms: u64
             .collect()
     });
     let mut ready = 0u64;
+    let mut rvs = alloc::vec::Vec::with_capacity(paths.len());
     for (i, path) in paths.iter().enumerate() {
         if path.is_empty() {
+            // invalid fd slot: POLLNVAL — always "ready", POSIX wakes on it
+            rvs.push(0x20u32);
+            ready += 1;
             continue;
         }
-        let ev = rd32(&evv, i);
-        if fd_ready(path, ev) {
+        let req = rd32(&evv, i) & 0xFFFF;
+        let rv = poll_revents(path, req);
+        rvs.push(rv);
+        if rv != 0 {
             ready += 1;
         }
     }
     if ready > 0 || timeout_ms == 0 {
+        // Write revents into the high 16 bits of each evs entry
+        // (low 16 = caller's requested mask, preserved across re-entry):
+        // bit0 read, bit1 write, 0x8 POLLERR, 0x10 POLLHUP, 0x20 POLLNVAL.
+        let mut out = evv;
+        for (i, rv) in rvs.iter().enumerate() {
+            let req = rd32(&out, i) & 0xFFFF;
+            out[i * 4..i * 4 + 4].copy_from_slice(&(req | (rv << 16)).to_le_bytes());
+        }
+        let _ = copy_out(evs, &out);
         task::with_current(|t| t.poll_dl = 0);
         return ready;
     }

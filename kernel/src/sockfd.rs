@@ -1072,6 +1072,43 @@ pub fn sockname(id: u64) -> Option<(Dom, [u8; 4], u16, Option<String>)> {
     ))
 }
 
+/// poll()-style revents for a socket fd: bit0=read-ready, bit1=write-
+/// ready, 0x8=POLLERR (reset conn), 0x10=POLLHUP (peer EOF / dead).
+pub fn poll_revents(path: &str) -> u32 {
+    let Some(id) = parse(path) else {
+        return 0x20; // not a socket path — caller treats as NVAL
+    };
+    let Some(s) = fields(id) else {
+        return 0x10; // dead object: reads hit EOF
+    };
+    let mut rv = 0u32;
+    if ready(path, true) {
+        rv |= 1;
+    }
+    if ready(path, false) {
+        rv |= 2;
+    }
+    if let Kind::Tcp = s.kind {
+        if s.cid != 0 && crate::net::tcp_read_ready(s.cid).is_none() {
+            // conn is Closed: POLLIN so readers drain buffered bytes +
+            // ERR on RST / HUP on clean close (Linux POLLIN|POLLERR /
+            // POLLIN|POLLHUP)
+            rv |= 1;
+            if crate::net::tcp_was_rst(s.cid) == Some(true) {
+                rv |= 0x8 | 0x10;
+            } else {
+                rv |= 0x10;
+            }
+        }
+    }
+    if let Kind::Unix = s.kind {
+        if s.chan.is_none() {
+            rv |= 0x10;
+        }
+    }
+    rv
+}
+
 /// getpeername: remote address of a connected socket.
 pub fn peername(id: u64) -> Result<(Dom, [u8; 4], u16, Option<String>), i64> {
     let s = fields(id).ok_or(-9i64)?;
