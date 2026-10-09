@@ -21,6 +21,7 @@ pub const CAP_KILL: u64 = 1 << 5;
 pub const CAP_SETGID: u64 = 1 << 6;
 pub const CAP_SETUID: u64 = 1 << 7;
 pub const CAP_SETPCAP: u64 = 1 << 8;
+pub const CAP_NET_BIND_SERVICE: u64 = 1 << 10;
 pub const CAP_SYS_RAWIO: u64 = 1 << 17;
 pub const CAP_SYS_CHROOT: u64 = 1 << 18;
 pub const CAP_SYS_PTRACE: u64 = 1 << 19;

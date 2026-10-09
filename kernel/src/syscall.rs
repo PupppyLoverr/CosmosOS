@@ -1395,7 +1395,8 @@ pub fn dispatch(ctx: &mut CpuContext) {
             })
         }
         shared::SYS_EPOLL_CREATE => {
-            let Ok(path) = crate::epoll::create() else {
+            let uid = task::with_current(|t| t.uid);
+            let Ok(path) = crate::epoll::create(uid) else {
                 ctx.rax = ERR;
                 return;
             };
@@ -1420,13 +1421,13 @@ pub fn dispatch(ctx: &mut CpuContext) {
                     Some(Some(f)) => Some(f.path.clone()),
                     _ => None,
                 };
-                (ep, mp)
+                (ep, mp, t.uid)
             });
-            let (Some(ep_path), Some(m_path)) = both else {
+            let (Some(ep_path), Some(m_path), uid) = both else {
                 ctx.rax = ERR;
                 return;
             };
-            crate::epoll::ctl(&ep_path, a2, a3 as u32, &m_path, a4 as u32) as u64
+            crate::epoll::ctl(&ep_path, a2, a3 as u32, &m_path, a4 as u32, uid) as u64
         }
         shared::SYS_EPOLL_WAIT => sys_epoll_wait(ctx, a1, a2, a3, a4),
         shared::SYS_SOCKETPAIR => {
@@ -1609,7 +1610,19 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 };
                 crate::sockfd::bind(id, 0, &name) as u64
             } else {
-                crate::sockfd::bind(id, a2 as u16, &[]) as u64
+                // net.ipv4.ip_unprivileged_port_start: ports below the
+                // knob need CAP_NET_BIND_SERVICE (EACCES like Linux).
+                let port = a2 as u16;
+                let unpriv = (port as u64) < crate::sysctl::unpriv_port_start();
+                let ok = !unpriv
+                    || task::with_current(|t| {
+                        task::capable_in_ns(t, task::CAP_NET_BIND_SERVICE)
+                    });
+                if !ok {
+                    (-13i64) as u64
+                } else {
+                    crate::sockfd::bind(id, port, &[]) as u64
+                }
             }
         }
         shared::SYS_CONNECT => {
@@ -4009,7 +4022,7 @@ fn sys_getgroups(out: u64, cap: u64) -> u64 {
 
 /// SYS_SETGROUPS(u32[], count): replace the supplementary list (root only).
 fn sys_setgroups(ptr: u64, count: u64) -> u64 {
-    if count > 256 {
+    if count > crate::sysctl::ngroups_max() {
         return ERR;
     }
     let Some(raw) = copy_in(ptr, count * 4) else { return ERR };

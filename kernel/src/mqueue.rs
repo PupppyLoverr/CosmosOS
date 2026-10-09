@@ -41,8 +41,10 @@ pub fn handles(path: &str) -> bool {
 /// mq_open(name, maxmsg, msgsize): returns the fd path, or EEXIST-ish err.
 /// maxmsg/msgsize apply on creation; reopening shares the existing queue.
 pub fn open(name: &str, maxmsg: usize, msgsize: usize) -> Result<String, i64> {
+    // fs.mqueue.msg_max / fs.mqueue.msgsize_max bound queue geometry.
     if name.is_empty() || name.len() > 64 || maxmsg == 0 || msgsize == 0
-        || maxmsg > 1024 || msgsize > 1 << 16
+        || maxmsg as u64 > crate::sysctl::mq_msg_max()
+        || msgsize as u64 > crate::sysctl::mq_msgsize_max()
     {
         return Err(-22); // EINVAL
     }
@@ -53,6 +55,10 @@ pub fn open(name: &str, maxmsg: usize, msgsize: usize) -> Result<String, i64> {
     let id = match names.get(&key) {
         Some(&id) => id,
         None => {
+            // fs.mqueue.queues_max bounds the global queue count.
+            if MQS.lock().len() as u64 >= crate::sysctl::mq_queues_max() {
+                return Err(-28); // ENOSPC
+            }
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             MQS.lock().insert(
                 id,

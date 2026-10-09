@@ -39,7 +39,7 @@ struct Inotif {
 
 static INOTIF: Mutex<BTreeMap<u64, Inotif>> = Mutex::new(BTreeMap::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-const QUEUE_CAP: usize = 128;
+// queue depth is the fs.inotify.max_queued_events sysctl (Linux 16384).
 
 fn id_of(path: &str) -> Option<u64> {
     path.strip_prefix("/inotify/")?.parse().ok()
@@ -159,7 +159,7 @@ pub fn fire(touched: &str, mask: u32) {
             if w.mask & want == 0 {
                 continue;
             }
-            if i.queue.len() >= QUEUE_CAP {
+            if i.queue.len() >= crate::sysctl::inotify_max_queued() {
                 i.queue.pop_front();
                 i.queue.push_back((0, IN_Q_OVERFLOW, String::new()));
             }

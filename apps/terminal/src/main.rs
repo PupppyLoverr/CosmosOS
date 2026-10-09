@@ -38209,8 +38209,18 @@ impl Term {
                     "/proc/sys/kernel/pty/max",
                     "/proc/sys/kernel/pty/nr",
                     "/proc/sys/vm/max_map_count",
+                    "/proc/sys/kernel/shmmax",
+                    "/proc/sys/kernel/shmall",
+                    "/proc/sys/kernel/shmmni",
+                    "/proc/sys/kernel/ngroups_max",
+                    "/proc/sys/fs/mqueue/msg_max",
+                    "/proc/sys/fs/mqueue/msgsize_max",
+                    "/proc/sys/fs/mqueue/queues_max",
+                    "/proc/sys/fs/inotify/max_queued_events",
+                    "/proc/sys/fs/epoll/max_user_watches",
                     "/proc/sys/net/ipv4/icmp_echo_ignore_all",
                     "/proc/sys/net/ipv4/ip_default_ttl",
+                    "/proc/sys/net/ipv4/ip_unprivileged_port_start",
                 ];
                 // `-N` prints names only, `-n`/`--values` values only —
                 // real sysctl output modes over the same key dump.
