@@ -3215,3 +3215,51 @@ pub fn gettimeofday() -> (u64, u64) {
     let r = sc1(shared::SYS_GETTIMEOFDAY, b.as_mut_ptr() as u64) as i64;
     if r < 0 { (0, 0) } else { (b[0], b[1]) }
 }
+
+/// setfsuid(u): move the filesystem uid used by VFS DAC checks. Returns the
+/// previous fsuid ALWAYS (Linux semantics — no error channel).
+pub fn setfsuid(u: u32) -> i64 {
+    sc1(shared::SYS_SETFSUID, u as u64) as i64
+}
+
+/// setfsgid(u): filesystem gid equivalent of setfsuid.
+pub fn setfsgid(g: u32) -> i64 {
+    sc1(shared::SYS_SETFSGID, g as u64) as i64
+}
+
+/// prctl(PR_SET_NO_NEW_PRIVS): one-way — exec can never raise privilege and
+/// unprivileged seccomp filters require it. Inherited across fork/exec.
+pub fn set_no_new_privs() -> i64 {
+    sc2(shared::SYS_PRCTL, shared::PR_SET_NO_NEW_PRIVS, 1) as i64
+}
+
+/// prctl(PR_GET_NO_NEW_PRIVS) -> 0|1.
+pub fn get_no_new_privs() -> i64 {
+    sc2(shared::SYS_PRCTL, shared::PR_GET_NO_NEW_PRIVS, 0) as i64
+}
+
+/// prctl(PR_SET_SECCOMP, mode, filter_bitmap) — the prctl spelling of the
+/// seccomp install; FILTER requires no_new_privs or CAP_SYS_ADMIN.
+pub fn prctl_seccomp(mode: u64, allow: &[u8; 32]) -> i64 {
+    sc3(
+        shared::SYS_PRCTL,
+        shared::PR_SET_SECCOMP,
+        mode,
+        allow.as_ptr() as u64,
+    ) as i64
+}
+
+/// epoll_create1(flags): EPOLL_CLOEXEC marks the fd close-on-exec.
+pub fn epoll_create1(flags: u64) -> i64 {
+    sc1(shared::SYS_EPOLL_CREATE1, flags) as i64
+}
+
+/// signalfd4(mask, flags): SFD_NONBLOCK|SFD_CLOEXEC at creation time.
+pub fn signalfd4(mask: u64, flags: u64) -> i64 {
+    sc2(shared::SYS_SIGNALFD4, mask, flags) as i64
+}
+
+/// inotify_init1(flags): IN_NONBLOCK|IN_CLOEXEC at creation time.
+pub fn inotify_init1(flags: u64) -> i64 {
+    sc1(shared::SYS_INOTIFY_INIT1, flags) as i64
+}

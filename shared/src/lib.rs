@@ -797,3 +797,11 @@ pub enum KeyCode {
 
 /// IPC payload ceiling for window protocol messages.
 pub const WS_MSG_MAX: usize = 256;
+pub const SYS_SETFSUID: u64 = 278;            // (uid u32) -> previous fsuid (always; refused silently)
+pub const SYS_SETFSGID: u64 = 279;            // (gid u32) -> previous fsgid (always; refused silently)
+pub const SYS_EPOLL_CREATE1: u64 = 280;       // (flags EPOLL_CLOEXEC) -> fd | err
+pub const SYS_SIGNALFD4: u64 = 281;           // (mask, flags SFD_NONBLOCK|SFD_CLOEXEC) -> fd | err
+pub const SYS_INOTIFY_INIT1: u64 = 282;       // (flags IN_NONBLOCK|IN_CLOEXEC) -> fd | err
+pub const PR_SET_NO_NEW_PRIVS: u64 = 38;      // prctl opt — one-way exec-privilege freeze
+pub const PR_GET_NO_NEW_PRIVS: u64 = 39;      // prctl opt — read back
+pub const PR_SET_SECCOMP: u64 = 22;           // prctl opt — same install as SYS_SECCOMP

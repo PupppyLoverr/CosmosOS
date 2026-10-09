@@ -165,6 +165,11 @@ pub struct Task {
     /// root so a non-root process may restore its effective id)
     pub suid: u32,
     pub sgid: u32,
+    /// filesystem ids — the subject the VFS DAC check compares against;
+    /// they track euid/egid on every set*id call but may be moved
+    /// independently via setfsuid/setfsgid.
+    pub fsuid: u32,
+    pub fsgid: u32,
     /// supplementary group list (setgroups/getgroups)
     pub groups: Vec<u32>,
     /// POSIX capabilities: permitted = what euid==0 wields, effective =
@@ -173,6 +178,9 @@ pub struct Task {
     pub cap_eff: u64,
     pub cap_prm: u64,
     pub cap_bnd: u64,
+    /// PR_SET_NO_NEW_PRIVS — one-way: once 1, exec may never raise privilege
+    /// (and unprivileged seccomp-filter installs require it). Inherited.
+    pub no_new_privs: u8,
     /// PID namespace this task lives in (0 = the initial namespace).
     pub pid_ns: u64,
     /// virtual pid inside `pid_ns` (0 in the global namespace — `id`
@@ -382,6 +390,9 @@ pub fn init() {
             egid: 0,
             suid: 0,
             sgid: 0,
+            fsuid: 0,
+            fsgid: 0,
+            no_new_privs: 0,
             groups: Vec::new(),
             cap_eff: 0,
             cap_prm: CAP_ALL,
@@ -933,6 +944,9 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         egid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.egid).unwrap_or(0),
         suid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.suid).unwrap_or(0),
         sgid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.sgid).unwrap_or(0),
+        fsuid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.fsuid).unwrap_or(0),
+        fsgid: s.tasks.iter().find(|t| t.id == parent).map(|t| t.fsgid).unwrap_or(0),
+        no_new_privs: s.tasks.iter().find(|t| t.id == parent).map(|t| t.no_new_privs).unwrap_or(0),
         groups: s.tasks.iter().find(|t| t.id == parent).map(|t| t.groups.clone()).unwrap_or_default(),
         cap_eff: s.tasks.iter().find(|t| t.id == parent).map(|t| t.cap_eff).unwrap_or(0),
         cap_prm: s.tasks.iter().find(|t| t.id == parent).map(|t| t.cap_prm).unwrap_or(CAP_ALL),
@@ -1091,6 +1105,9 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
             egid: 0,
             suid: 0,
             sgid: 0,
+            fsuid: 0,
+            fsgid: 0,
+            no_new_privs: 0,
             groups: Vec::new(),
             cap_eff: 0,
             cap_prm: CAP_ALL,
@@ -1221,7 +1238,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
     let utsr = cur.uts.clone();
     let creds = (cur.uid, cur.gid, cur.euid, cur.egid);
     let (sids, grps, caps) = (
-        (cur.suid, cur.sgid),
+        (cur.suid, cur.sgid, cur.fsuid, cur.fsgid, cur.no_new_privs),
         cur.groups.clone(),
         (cur.cap_eff, cur.cap_prm, cur.cap_bnd),
     );
@@ -1274,6 +1291,9 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         egid: creds.3,
         suid: sids.0,
         sgid: sids.1,
+        fsuid: sids.2,
+        fsgid: sids.3,
+        no_new_privs: sids.4,
         groups: grps,
         cap_eff: caps.0,
         cap_prm: caps.1,
@@ -1897,6 +1917,9 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         egid: cur.egid,
         suid: cur.suid,
         sgid: cur.sgid,
+        fsuid: cur.fsuid,
+        fsgid: cur.fsgid,
+        no_new_privs: cur.no_new_privs,
         groups: cur.groups.clone(),
         cap_eff: cur.cap_eff,
         cap_prm: cur.cap_prm,
@@ -2406,7 +2429,7 @@ pub fn ns_of() -> alloc::sync::Arc<spin::Mutex<MountNs>> {
 /// CLONE_NEWNS: deep-copy the mount tables into a private namespace —
 /// later mounts/binds/unmounts by this task don't touch the parent's.
 pub fn unshare_ns() {
-    let euid = cred().0;
+    let euid = eff_cred().0;
     with_current(|t| {
         let mut copy = t.ns.lock().clone();
         // a new namespace object gets a fresh mntns id
@@ -2419,7 +2442,7 @@ pub fn unshare_ns() {
 
 /// unshare(CLONE_NEWUTS): the task's nodename becomes private.
 pub fn unshare_uts() {
-    let euid = cred().0;
+    let euid = eff_cred().0;
     with_current(|t| {
         let mut copy = t.uts.lock().clone();
         copy.id = NEXT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2479,7 +2502,7 @@ pub fn alloc_nspid(ns: u64) -> u32 {
 pub fn unshare_pidns() {
     let me_ns = with_current(|t| t.pid_ns);
     let id = NEXT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let euid = cred().0;
+    let euid = eff_cred().0;
     let ns = alloc::sync::Arc::new(spin::Mutex::new(PidNs {
         id,
         owner: euid,
@@ -2556,7 +2579,7 @@ pub fn unshare_timens() {
     TIMENS.lock().insert(
         id,
         {
-            let euid = cred().0;
+            let euid = eff_cred().0;
             ns_live_inc(NsKind::Time, euid);
             alloc::sync::Arc::new(spin::Mutex::new(TimeNs {
                 id,
@@ -2679,7 +2702,7 @@ pub fn unshare_ipcns() {
     IPCNS.lock().insert(
         id,
         {
-            let euid = cred().0;
+            let euid = eff_cred().0;
             ns_live_inc(NsKind::Ipc, euid);
             alloc::sync::Arc::new(spin::Mutex::new(IpcNs { id, owner: euid }))
         },
@@ -3467,12 +3490,19 @@ pub fn exit_group(code: i64) -> ! {
 
 /// (euid, egid) of the current task — the DAC identity the VFS checks.
 pub fn cred() -> (u32, u32) {
+    // the DAC subject is the FILESYSTEM ids, not effective — setfsuid moves
+    // this independently of euid.
+    with_current(|t| (t.fsuid, t.fsgid))
+}
+
+/// (euid, egid) — capability/ucounts accounting subject.
+pub fn eff_cred() -> (u32, u32) {
     with_current(|t| (t.euid, t.egid))
 }
 
 /// Group-membership check for DAC: effective gid OR the supplementary list.
 pub fn in_group(gid: u32) -> bool {
-    with_current(|t| t.egid == gid || t.groups.contains(&gid))
+    with_current(|t| t.fsgid == gid || t.groups.contains(&gid))
 }
 
 /// Supplementary groups of the current task (copy out for syscall).
@@ -3571,6 +3601,29 @@ pub fn creds6() -> (u32, u32, u32, u32, u32, u32) {
 /// (uid, gid, euid, egid) — proc status dump + syscall answers.
 pub fn creds() -> (u32, u32, u32, u32) {
     with_current(|t| (t.uid, t.gid, t.euid, t.egid))
+}
+
+/// setfsuid/setfsgid: move the filesystem id used by the DAC check.
+/// Linux semantics — the syscall's return is ALWAYS the previous fsid
+/// (there is no error channel); a refused value leaves the id alone.
+pub fn sys_setfsid(v: u64, group: bool) -> i64 {
+    with_current(|t| {
+        let u = v as u32;
+        let cap = if group { CAP_SETGID } else { CAP_SETUID };
+        let (r, e, s, cur) = if group {
+            (t.gid, t.egid, t.sgid, t.fsgid)
+        } else {
+            (t.uid, t.euid, t.suid, t.fsuid)
+        };
+        if capable_in_ns(t, cap) || u == r || u == e || u == s || u == cur {
+            if group {
+                t.fsgid = u;
+            } else {
+                t.fsuid = u;
+            }
+        }
+        cur as i64
+    })
 }
 
 /// creds of another task by pid — /proc/<pid>/status.

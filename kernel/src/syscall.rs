@@ -284,6 +284,14 @@ pub fn dispatch(ctx: &mut CpuContext) {
                     }
                     None => ERR,
                 }
+            } else if a1 == shared::PR_SET_NO_NEW_PRIVS {
+                task::with_current(|t| t.no_new_privs = 1);
+                0
+            } else if a1 == shared::PR_GET_NO_NEW_PRIVS {
+                task::with_current(|t| t.no_new_privs as u64)
+            } else if a1 == shared::PR_SET_SECCOMP {
+                // (22, mode, filter_ptr) — identical to SYS_SECCOMP(mode,ptr,32)
+                apply_seccomp(a2, a3, 32)
             } else {
                 task::sys_prctl(a1, a2) as u64
             }
@@ -759,34 +767,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_WAIT4 => {
             sys_wait4(ctx, task::visible_pid(a1 as i64) as u64, a2, a3, a4)
         }
-        shared::SYS_SECCOMP => {
-            // one-way door: once set, the filter can only tighten (POSIX
-            // seccomp rules — there is no unset).
-            let already = task::with_current(|t| t.seccomp_mode);
-            if already == 1 {
-                ERR
-            } else if a1 == shared::SECCOMP_MODE_STRICT {
-                task::with_current(|t| t.seccomp_mode = 1);
-                0
-            } else if a1 == shared::SECCOMP_MODE_FILTER {
-                match copy_in(a2, a3.min(32)) {
-                    Some(d) if d.len() == 32 => {
-                        let mut w = [0u64; 4];
-                        for i in 0..4 {
-                            w[i] = u64::from_le_bytes(d[i * 8..i * 8 + 8].try_into().unwrap());
-                        }
-                        task::with_current(|t| {
-                            t.seccomp_allow = w;
-                            t.seccomp_mode = 2;
-                        });
-                        0
-                    }
-                    _ => ERR,
-                }
-            } else {
-                ERR
-            }
-        }
+        shared::SYS_SECCOMP => apply_seccomp(a1, a2, a3),
         shared::SYS_GET_ROBUST_LIST => {
             // (out u64*) -> 0 | err — the task's registered robust head
             // (0 when none; Linux returns an empty list, not an error).
@@ -1126,6 +1107,57 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 }
                 None => ERR,
             }
+        }
+        shared::SYS_SETFSUID => task::sys_setfsid(a1, false) as u64,
+        shared::SYS_SETFSGID => task::sys_setfsid(a1, true) as u64,
+        shared::SYS_EPOLL_CREATE1 => {
+            let uid = task::with_current(|t| t.uid);
+            let Ok(path) = crate::epoll::create(uid) else {
+                ctx.rax = ERR;
+                return;
+            };
+            task::with_current(|t| {
+                let Some(fd) = alloc_slot(t) else { return ERR; };
+                t.fds[fd] = Some(task::FileDesc {
+                    path,
+                    pos: 0,
+                    flags: shared::O_RDONLY | (a1 & shared::O_CLOEXEC),
+                });
+                fd as u64
+            })
+        }
+        shared::SYS_SIGNALFD4 => {
+            let owner = task::with_current(|t| t.id);
+            let Ok(path) = crate::signalfd::create(owner, a1) else {
+                ctx.rax = ERR;
+                return;
+            };
+            task::with_current(|t| {
+                let Some(fd) = alloc_slot(t) else { return ERR; };
+                t.fds[fd] = Some(task::FileDesc {
+                    path,
+                    pos: 0,
+                    flags: shared::O_RDONLY
+                        | (a2 & (shared::O_NONBLOCK | shared::O_CLOEXEC)),
+                });
+                fd as u64
+            })
+        }
+        shared::SYS_INOTIFY_INIT1 => {
+            let Ok(path) = crate::notify::create() else {
+                ctx.rax = ERR;
+                return;
+            };
+            task::with_current(|t| {
+                let Some(fd) = alloc_slot(t) else { return ERR; };
+                t.fds[fd] = Some(task::FileDesc {
+                    path,
+                    pos: 0,
+                    flags: shared::O_RDONLY
+                        | (a1 & (shared::O_NONBLOCK | shared::O_CLOEXEC)),
+                });
+                fd as u64
+            })
         }
         shared::SYS_CLOCK_NANOSLEEP => {
             // absolute deadline in ms; ticks run 10ms each. A past deadline
@@ -4276,13 +4308,13 @@ fn sys_unshare(flags: u64) -> u64 {
     // (0 = unlimited) — the Linux ucounts analogue.
     if flags & shared::CLONE_NEWUSER != 0 {
         let max = crate::sysctl::max_user_namespaces();
-        if max != 0 && task::userns_count_by(task::cred().0) >= max as usize {
+        if max != 0 && task::userns_count_by(task::eff_cred().0) >= max as usize {
             return (-1i64) as u64; // EPERM
         }
     }
     // user.max_{mnt,uts,pid,ipc,time}_namespaces — the same ucounts
     // cap as max_user_namespaces, one knob per kind.
-    let euid = task::cred().0;
+    let euid = task::eff_cred().0;
     for (flag, kind, max) in [
         (shared::CLONE_NEWNS, task::NsKind::Mnt, crate::sysctl::max_mnt_namespaces()),
         (shared::CLONE_NEWUTS, task::NsKind::Uts, crate::sysctl::max_uts_namespaces()),
@@ -4398,6 +4430,44 @@ fn sys_reboot_call(m1: u64, m2: u64, cmd: u64) -> u64 {
 
 /// SYS_SETUID/SYS_SETGID: root swaps both ids to `v`; a non-root task may
 /// only restore its effective id to its real one — EPERM otherwise.
+/// Shared install for SYS_SECCOMP and prctl(PR_SET_SECCOMP): one-way door —
+/// once set the filter can only tighten. A FILTER install is the real
+/// privilege check: it requires no_new_privs OR CAP_SYS_ADMIN (this is what
+/// lets unprivileged callers sandbox themselves — Linux semantics).
+fn apply_seccomp(mode: u64, prog: u64, len: u64) -> u64 {
+    let already = task::with_current(|t| t.seccomp_mode);
+    if already == 1 {
+        return ERR;
+    }
+    if mode == shared::SECCOMP_MODE_STRICT {
+        task::with_current(|t| t.seccomp_mode = 1);
+        return 0;
+    }
+    if mode == shared::SECCOMP_MODE_FILTER {
+        let allowed = task::with_current(|t| {
+            t.no_new_privs == 1 || task::capable_in_ns(t, task::CAP_SYS_ADMIN)
+        });
+        if !allowed {
+            return ERR; // EPERM
+        }
+        return match copy_in(prog, len.min(32)) {
+            Some(d) if d.len() == 32 => {
+                let mut w = [0u64; 4];
+                for i in 0..4 {
+                    w[i] = u64::from_le_bytes(d[i * 8..i * 8 + 8].try_into().unwrap());
+                }
+                task::with_current(|t| {
+                    t.seccomp_allow = w;
+                    t.seccomp_mode = 2;
+                });
+                0
+            }
+            _ => ERR,
+        };
+    }
+    ERR
+}
+
 fn sys_setid(v: u64, group: bool) -> u64 {
     let u = v as u32;
     let cap = if group { task::CAP_SETGID } else { task::CAP_SETUID };
@@ -4412,12 +4482,16 @@ fn sys_setid(v: u64, group: bool) -> u64 {
                 t.euid = u;
                 t.suid = u;
             }
+            t.fsgid = t.egid;
+            t.fsuid = t.euid;
             0
         } else if group && u == t.gid {
             t.egid = u;
+            t.fsgid = u;
             0
         } else if !group && u == t.uid {
             t.euid = u;
+            t.fsuid = u;
             0
         } else {
             (-1i64) as u64 // EPERM
@@ -4508,6 +4582,9 @@ fn sys_setresid(r: u64, e: u64, s: u64, group: bool) -> u64 {
                 t.suid = s;
             }
         }
+        // Linux: fsuid/fsgid follow the effective id on every set*id call.
+        t.fsuid = t.euid;
+        t.fsgid = t.egid;
         0
     })
 }
