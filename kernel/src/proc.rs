@@ -39,7 +39,9 @@ const NET_FILES: &[&str] = &[
 const SYS_FILES: &[&str] = &["hostname", "shmmax", "shmall", "shmmni", "ngroups_max", "sysrq", "dmesg_restrict", "randomize_va_space", "kptr_restrict", "unprivileged_userns_clone", "cow_pages", "pid_max", "threads-max"];
 
 /// files under /proc/sys/fs (fs/inotify/max_user_watches lives one deeper)
-const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size", "file-max", "file-nr", "protected_symlinks", "protected_fifos"];
+const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size", "file-max", "file-nr", "protected_symlinks", "protected_fifos", "protected_regular"];
+/// files under /proc/sys/net/unix
+const NET_UNIX_FILES: &[&str] = &["max_dgram_qlen"];
 
 /// files under /proc/sys/net/ipv4
 const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range"];
@@ -96,6 +98,7 @@ pub fn is_dir(path: &str) -> bool {
         || path == "/proc/sys/fs/epoll"
         || path == "/proc/sys/net"
         || path == "/proc/sys/net/ipv4"
+        || path == "/proc/sys/net/unix"
         || pid_of(path)
             .map(|p| task::pids().contains(&p) && path.matches('/').count() == 2)
             .unwrap_or(false)
@@ -166,6 +169,9 @@ pub fn exists(path: &str) -> bool {
     }
     if let Some(f) = path.strip_prefix("/proc/sys/net/ipv4/") {
         return NET_SYS_FILES.contains(&f);
+    }
+    if let Some(f) = path.strip_prefix("/proc/sys/net/unix/") {
+        return NET_UNIX_FILES.contains(&f);
     }
     FILES.contains(&path.trim_start_matches("/proc/"))
 }
@@ -324,15 +330,27 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         return out;
     }
     if path == "/proc/sys/net" {
-        let mut de = shared::DirEntry::default();
-        de.name[..4].copy_from_slice(b"ipv4");
-        de.name_len = 4;
-        de.is_dir = 1;
-        out.push(de);
+        for (nb, nl) in [(b"ipv4" as &[u8], 4usize), (b"unix", 4)] {
+            let mut de = shared::DirEntry::default();
+            de.name[..nl].copy_from_slice(nb);
+            de.name_len = nl as u8;
+            de.is_dir = 1;
+            out.push(de);
+        }
         return out;
     }
     if path == "/proc/sys/net/ipv4" {
         for name in NET_SYS_FILES {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            out.push(de);
+        }
+        return out;
+    }
+    if path == "/proc/sys/net/unix" {
+        for name in NET_UNIX_FILES {
             let mut de = shared::DirEntry::default();
             let nb = name.as_bytes();
             de.name[..nb.len()].copy_from_slice(nb);
@@ -902,6 +920,12 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
             return None;
         }
         return crate::sysctl::set_local_port_range(parts[0], parts[1])
+            .then_some(buf.len());
+    }
+    if let Some(rel) = path.strip_prefix("/proc/sys/net/unix/") {
+        let s = String::from(String::from_utf8_lossy(buf).trim());
+        let Ok(v) = s.parse::<u64>() else { return None };
+        return crate::sysctl::set(&alloc::format!("net/unix/{}", rel), v)
             .then_some(buf.len());
     }
     if let Some(rel) = path.strip_prefix("/proc/sys/net/ipv4/") {

@@ -393,6 +393,36 @@ pub fn open(path: &str, flags: u64) -> Result<u64, i64> {
     if wants_write && ro(path) {
         return Err(-30); // EROFS
     }
+    // fs.protected_regular: O_CREAT open-for-write of an existing
+    // regular file inside a sticky+world-writable dir is denied unless
+    // the opener owns the file or the dir (CAP_FOWNER exempts) — the
+    // regular-file arm of Linux may_open.
+    if flags & shared::O_CREATE != 0
+        && flags & (shared::O_WRONLY | shared::O_RDWR | shared::O_TRUNC) != 0
+        && crate::sysctl::protected_regular() != 0
+    {
+        let (eu, _eg) = crate::task::cred();
+        if eu != 0 && !crate::task::capable_ns_dac(crate::task::CAP_FOWNER) {
+            let ng = NODES.lock();
+            if let Some(n) = ng.get(path) {
+                if !n.is_dir {
+                    let par = parent_of(path).unwrap_or_else(|| String::from("/"));
+                    let denied = ng
+                        .get(&par)
+                        .map(|p| {
+                            p.is_dir
+                                && p.mode & 0o1002 == 0o1002
+                                && eu != n.uid
+                                && eu != p.uid
+                        })
+                        .unwrap_or(false);
+                    if denied {
+                        return Err(-1); // EPERM
+                    }
+                }
+            }
+        }
+    }
     let mut ng = NODES.lock();
     match ng.get(path) {
         Some(n) if n.is_dir => return Err(-4), // EISDIR

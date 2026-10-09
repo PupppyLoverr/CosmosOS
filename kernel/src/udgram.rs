@@ -10,7 +10,6 @@ use alloc::{
 };
 use spin::Mutex;
 
-const MAXQ: usize = 64; // queued packets per mailbox
 const MAXPKT: usize = 16 * 1024; // max datagram payload
 
 struct Dbox {
@@ -54,8 +53,8 @@ pub fn send(dst: &str, src: &str, data: &[u8]) -> i64 {
     let Some(b) = g.get_mut(dst) else {
         return -2; // ENOENT: nobody bound there
     };
-    if b.packets.len() >= MAXQ {
-        return -11; // EAGAIN
+    if b.packets.len() >= crate::sysctl::unix_max_dgram_qlen() as usize {
+        return -11; // EAGAIN: past net.unix.max_dgram_qlen
     }
     b.packets.push_back((Vec::from(data), String::from(src)));
     0

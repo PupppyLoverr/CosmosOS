@@ -2210,6 +2210,69 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             })
             .unwrap_or(false)
     });
+    check("protected-regular", {
+        // fs.protected_regular: O_CREAT open-for-write of an existing
+        // file in a sticky+world-writable dir requires owning the file
+        // or the dir — verified from a uid-1000 child. Knob default is
+        // 0 upstream (O_CREAT on foreign files in /tmp is common), so
+        // the check arms it explicitly then restores it.
+        let w = ustd::write_all("/proc/sys/fs/protected_regular", b"1").is_ok()
+            && ustd::mkdir("/tmp/prdir").is_ok()
+            && ustd::chmod("/tmp/prdir", 0o1777) == 0
+            && ustd::write_all("/tmp/prdir/prf", b"aa").is_ok();
+        // file lands owned by uid 0; the same open by the owner passes
+        let owner_ok = w && ustd::open("/tmp/prdir/prf", ustd::O_WRONLY | ustd::O_CREATE)
+            .map(|fd| { ustd::close(fd); true })
+            .unwrap_or(false);
+        let foreign = match ustd::fork() {
+            0 => {
+                ustd::setuid(1000);
+                // foreign file: EPERM
+                let denied = ustd::open("/tmp/prdir/prf", ustd::O_WRONLY | ustd::O_CREATE).is_err();
+                // own file in the same dir: creates + reopens fine
+                let mut allowed = false;
+                if let Ok(fd) = ustd::open("/tmp/prdir/mine", ustd::O_WRONLY | ustd::O_CREATE) {
+                    ustd::close(fd);
+                    allowed = ustd::open("/tmp/prdir/mine", ustd::O_WRONLY | ustd::O_CREATE).is_ok();
+                }
+                ustd::exit(if denied && allowed { 0 } else { 1 });
+            }
+            c if c > 0 => ustd::waitpid(c as u32, 1500).map(|st| st == 0).unwrap_or(false),
+            _ => false,
+        };
+        ustd::remove("/tmp/prdir/mine").ok();
+        let off = w && owner_ok && foreign
+            && ustd::write_all("/proc/sys/fs/protected_regular", b"0").is_ok()
+            && match ustd::fork() {
+                0 => {
+                    ustd::setuid(1000);
+                    let r = ustd::open("/tmp/prdir/prf", ustd::O_WRONLY | ustd::O_CREATE);
+                    ustd::exit(if r.is_ok() { 0 } else { 1 });
+                }
+                p if p > 0 => ustd::waitpid(p as u32, 5000).unwrap_or(-1) == 0,
+                _ => false,
+            };
+        off
+            && ustd::remove("/tmp/prdir/prf").is_ok()
+            && ustd::remove("/tmp/prdir").is_ok()
+    });
+    check("dgram-qlen", {
+        // net.unix.max_dgram_qlen: shrink the per-mailbox queue to 2 —
+        // the third datagram send gets EAGAIN; restore the default.
+        let r = ustd::socketx(ustd::SOCK_DGRAM, shared::AF_UNIX);
+        let s = ustd::socketx(ustd::SOCK_DGRAM, shared::AF_UNIX);
+        let mut ok = r >= 0 && s >= 0
+            && ustd::bind_path(r, "/udg-qlen") == 0
+            && ustd::write_all("/proc/sys/net/unix/max_dgram_qlen", b"2").is_ok()
+            && ustd::sendto_path(s, "/udg-qlen", b"a") == 1
+            && ustd::sendto_path(s, "/udg-qlen", b"b") == 1
+            && ustd::sendto_path(s, "/udg-qlen", b"c") == -11;
+        ok = ok && ustd::write_all("/proc/sys/net/unix/max_dgram_qlen", b"64").is_ok()
+            && ustd::sendto_path(s, "/udg-qlen", b"d") == 1;
+        ustd::close(r);
+        ustd::close(s);
+        ok
+    });
     check("dev-mem", {
         ustd::open("/dev/mem", 0)
             .map(|fd| {

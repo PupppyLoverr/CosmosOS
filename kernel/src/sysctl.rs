@@ -32,6 +32,8 @@ static UNPRIV_USERNS: AtomicU64 = AtomicU64::new(1);
 static MMAP_MIN_ADDR: AtomicU64 = AtomicU64::new(0x10000);
 static MIN_FREE_KB: AtomicU64 = AtomicU64::new(8192);
 static PROTECTED_FIFOS: AtomicU64 = AtomicU64::new(1);
+static PROTECTED_REGULAR: AtomicU64 = AtomicU64::new(0);
+static UNIX_MAX_QLEN: AtomicU64 = AtomicU64::new(64);
 static ICMP_ECHO_IGNORE_BCAST: AtomicU64 = AtomicU64::new(1);
 static IP_FORWARD: AtomicU64 = AtomicU64::new(0);
 static KERNEL_SYSRQ: AtomicU64 = AtomicU64::new(1);
@@ -156,6 +158,17 @@ pub fn min_free_kbytes() -> u64 {
 pub fn protected_fifos() -> u64 {
     PROTECTED_FIFOS.load(Ordering::Relaxed)
 }
+/// fs.protected_regular: O_CREAT open-for-write of an existing regular
+/// file in a sticky+world-writable dir requires owning the file or the
+/// dir (CAP_FOWNER exempts) — the regular-file arm of may_open.
+pub fn protected_regular() -> u64 {
+    PROTECTED_REGULAR.load(Ordering::Relaxed)
+}
+/// net.unix.max_dgram_qlen: per-mailbox datagram queue bound for
+/// AF_UNIX SOCK_DGRAM — a full mailbox fails sends EAGAIN.
+pub fn unix_max_dgram_qlen() -> u64 {
+    UNIX_MAX_QLEN.load(Ordering::Relaxed)
+}
 
 /// sysctl name under /proc/sys → current value, or None when unknown.
 /// Names are given relative, e.g. "kernel/pid_max", "fs/nr_open".
@@ -199,6 +212,8 @@ pub fn get(name: &str) -> Option<u64> {
         "vm/mmap_min_addr" => MMAP_MIN_ADDR.load(Ordering::Relaxed),
         "vm/min_free_kbytes" => MIN_FREE_KB.load(Ordering::Relaxed),
         "fs/protected_fifos" => PROTECTED_FIFOS.load(Ordering::Relaxed),
+        "fs/protected_regular" => PROTECTED_REGULAR.load(Ordering::Relaxed),
+        "net/unix/max_dgram_qlen" => UNIX_MAX_QLEN.load(Ordering::Relaxed),
 
         _ => return None,
     })
@@ -255,6 +270,12 @@ pub fn set(name: &str, v: u64) -> bool {
         }
         "vm/min_free_kbytes" if v <= 4_194_304 => MIN_FREE_KB.store(v, Ordering::Relaxed),
         "fs/protected_fifos" if v <= 2 => PROTECTED_FIFOS.store(v, Ordering::Relaxed),
+        "fs/protected_regular" if v <= 1 => {
+            PROTECTED_REGULAR.store(v, Ordering::Relaxed)
+        }
+        "net/unix/max_dgram_qlen" if (1..=1024).contains(&v) => {
+            UNIX_MAX_QLEN.store(v, Ordering::Relaxed)
+        }
 
         _ => return false,
     }
