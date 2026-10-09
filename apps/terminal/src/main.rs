@@ -8030,6 +8030,7 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut proto = 0u8;
     let mut src = String::new();
     let mut dport = 0u16;
+    let mut state = String::new();
     let mut i = 0usize;
     while i < args.len() {
         match args[i] {
@@ -8062,6 +8063,15 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 }
                 i += 1;
             }
+            "-m" | "--match" => {
+                // `-m state|conntrack` — the state list rides along via
+                // --state/--ctstate below
+                i += 1;
+            }
+            "--state" | "--states" | "--ctstate" => {
+                state = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
             "-A" | "-I" | "-D" | "INPUT" | "OUTPUT" | "FORWARD" | "-i" | "-o" => {
                 if args[i] == "-i" || args[i] == "-o" {
                     i += 1; // interface arg — single nic, ignored
@@ -8077,6 +8087,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !src.is_empty() {
         line.push_str(&alloc::format!(" src {}", src));
+    }
+    if !state.is_empty() {
+        line.push_str(&alloc::format!(" state {}", state));
     }
     line.push('\n');
     Some(line)
@@ -22598,6 +22611,7 @@ impl Term {
                 // traceroute [-m hops] host -- UDP probes with rising ttl;
                 // hops answer ICMP 11 (or the target's own 3/3)
                 let mut maxh = 15u8;
+                let mut icmp = false;
                 let mut target: Option<&str> = None;
                 let mut i = 0usize;
                 while i < args.len() {
@@ -22610,6 +22624,14 @@ impl Term {
                                 .min(30);
                             i += 2;
                         }
+                        "-I" | "--icmp" => {
+                            icmp = true;
+                            i += 1;
+                        }
+                        "-U" | "--udp" => {
+                            icmp = false;
+                            i += 1;
+                        }
                         a => {
                             target = Some(a);
                             i += 1;
@@ -22617,7 +22639,7 @@ impl Term {
                     }
                 }
                 let Some(s) = target else {
-                    self.fail("usage: traceroute [-m hops] <host|a.b.c.d>");
+                    self.fail("usage: traceroute [-I] [-m hops] <host|a.b.c.d>");
                     return;
                 };
                 match host_arg(s) {
@@ -22629,7 +22651,12 @@ impl Term {
                             s, ip[0], ip[1], ip[2], ip[3], maxh
                         ));
                         let mut ok = false;
-                        for (ttl, hop, reached) in ustd::net_trace(packed, maxh) {
+                        let hops = if icmp {
+                            ustd::net_trace_icmp(packed, maxh)
+                        } else {
+                            ustd::net_trace(packed, maxh)
+                        };
+                        for (ttl, hop, reached) in hops {
                             match hop {
                                 Some((hip, ms)) => {
                                     ok |= reached;
@@ -23303,6 +23330,7 @@ impl Term {
                 }
             }
             "nc" => {
+                let zmode = args.iter().any(|a| a == &"-z" || a == &"-zv" || a == &"-vz");
                 let udp = args
                     .iter()
                     .any(|a| a == &"-u" || a == &"-lu" || a == &"-ul");
@@ -23314,6 +23342,47 @@ impl Term {
                     .filter(|a| !a.starts_with('-'))
                     .cloned()
                     .collect();
+                if zmode {
+                    // nc -z host port[-port]: real connect() per port —
+                    // open when the handshake completes, closed when the
+                    // RST comes back (or the probe times out).
+                    let spec = pos.get(1).copied().unwrap_or("");
+                    let (lo, hi) = match spec.split_once('-') {
+                        Some((a, b)) => (
+                            a.parse::<u16>().unwrap_or(0),
+                            b.parse::<u16>().unwrap_or(0),
+                        ),
+                        None => {
+                            let p = spec.parse::<u16>().unwrap_or(0);
+                            (p, p)
+                        }
+                    };
+                    match pos.first().and_then(|s| host_arg(s)) {
+                        Some(ip) if lo != 0 && hi >= lo && hi - lo <= 4096 => {
+                            let mut any = false;
+                            for port in lo..=hi {
+                                let lport = 40000u16 + (port % 3000);
+                                match ustd::TcpSock::connect(lport, ip, port) {
+                                    Some(s) => {
+                                        drop(s);
+                                        any = true;
+                                        self.emit(&alloc::format!(
+                                            "nc: connect to {}.{}.{}.{} port {} (tcp) succeeded!",
+                                            ip[0], ip[1], ip[2], ip[3], port
+                                        ));
+                                    }
+                                    None => self.emit(&alloc::format!(
+                                        "nc: connect to {}.{}.{}.{} port {} (tcp) failed: Connection refused",
+                                        ip[0], ip[1], ip[2], ip[3], port
+                                    )),
+                                }
+                            }
+                            self.last_ok = any;
+                        }
+                        _ => self.fail("usage: nc -z <host> <port|lo-hi>"),
+                    }
+                    return;
+                }
                 if udp && listen {
                     match pos.first().and_then(|s| s.parse::<u16>().ok()) {
                         Some(port) => match ustd::UdpSock::open(port) {
@@ -38234,6 +38303,15 @@ impl Term {
                                 return;
                             };
                             self.ip_route_get(dst);
+                        }
+                        Some("flush") => {
+                            // ip route flush: rebuild the kernel table to
+                            // defaults (lo + connected + gw) — verified via
+                            // a real /proc/net/route write.
+                            match ustd::write_all("/proc/net/route", b"flush\n") {
+                                Ok(_) => self.emit("route table flushed to defaults"),
+                                Err(e) => self.fail(&alloc::format!("ip: {}", e)),
+                            }
                         }
                         _ => self.route_show(false),
                     }

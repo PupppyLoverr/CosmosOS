@@ -207,6 +207,12 @@ pub fn route_ctl(line: &str) -> bool {
     let add = match f.next() {
         Some("add") => true,
         Some("del") => return route_del(f.next().unwrap_or("")),
+        // 'flush' rebuilds the table from defaults (lo + connected + gw) —
+        // same effect as `ip route flush` on an unpopulated box.
+        Some("flush") => {
+            *ROUTES.lock() = Some(default_routes());
+            return true;
+        }
         _ => return false,
     };
     let Some(spec) = f.next() else { return false };
@@ -261,6 +267,7 @@ struct FwRule {
     dport: u16,           // 0 = any (tcp/udp destination port)
     src: [u8; 4],         // [0;4] = anywhere
     smask: [u8; 4],
+    state: u8,            // 0 = any; bit0 = NEW, bit1 = ESTABLISHED
     hits: u64,
     bytes: u64,
 }
@@ -270,16 +277,122 @@ static FW: Mutex<Vec<FwRule>> = Mutex::new(Vec::new());
 /// INPUT chain policy: false = ACCEPT (default-allow), true = DROP.
 static FW_POLICY: Mutex<bool> = Mutex::new(false);
 
+/// Real conntrack: a per-flow table fed by every packet in BOTH
+/// directions (tx via `ct_observe_tx`, rx via `ct_update`). A flow is
+/// ESTABLISHED once packets have been seen both ways — the inbound SYN
+/// is NEW, our SYN-ACK flips the entry, and everything after is
+/// ESTABLISHED. UDP flows establish on the first reply datagram; ICMP
+/// flows key on the echo id.
+struct CtEnt {
+    proto: u8,
+    a_ip: [u8; 4],
+    a_port: u16,
+    b_ip: [u8; 4],
+    b_port: u16,
+    seen_reply: bool,
+    last_ms: u64,
+}
+static CT: Mutex<Vec<CtEnt>> = Mutex::new(Vec::new());
+
+/// Update the flow table for one packet and return its state bits
+/// (1 = NEW, 2 = ESTABLISHED). `sport/dport` are the packet's transport
+/// ports (0 when absent; ICMP uses the echo id as both ports).
+fn ct_update(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, proto: u8) -> u8 {
+    let now = now_ms();
+    let mut ct = CT.lock();
+    for e in ct.iter_mut() {
+        if e.proto != proto {
+            continue;
+        }
+        let fwd = e.a_ip == src && e.b_ip == dst && e.a_port == sport && e.b_port == dport;
+        let rev = e.b_ip == src && e.a_ip == dst && e.b_port == sport && e.a_port == dport;
+        if fwd || rev {
+            if rev {
+                e.seen_reply = true;
+            }
+            e.last_ms = now;
+            return if e.seen_reply { 2 } else { 1 };
+        }
+    }
+    ct.push(CtEnt {
+        proto,
+        a_ip: src,
+        a_port: sport,
+        b_ip: dst,
+        b_port: dport,
+        seen_reply: false,
+        last_ms: now,
+    });
+    if ct.len() > 512 {
+        ct.remove(0); // drop the oldest entry — flows are cheap, memory isn't
+    }
+    1
+}
+
+/// Transport ports for a packet: tcp/udp read their headers; ICMP uses
+/// the echo id (types 0/8) so replies pair with requests like a real
+/// conntrack flow. Everything else = (0, 0).
+fn pkt_ports(proto: u8, p: &[u8]) -> (u16, u16) {
+    if (proto == 6 || proto == 17) && p.len() >= 4 {
+        (be16(&p[0..]), be16(&p[2..]))
+    } else if proto == 1 && p.len() >= 6 && (p[0] == 0 || p[0] == 8) {
+        let id = be16(&p[4..]);
+        (id, id)
+    } else {
+        (0, 0)
+    }
+}
+
+/// Observe an outbound frame for conntrack: parse the IPv4/transport
+/// tuple off the wire frame and update the flow (marks the reply
+/// direction seen for flows the peer started).
+fn ct_observe_tx(f: &[u8]) {
+    if f.len() < 14 + 20 || be16(&f[12..]) != 0x0800 {
+        return;
+    }
+    let ip = &f[14..];
+    if ip[0] >> 4 != 4 {
+        return;
+    }
+    let proto = ip[9];
+    let ihl = ((ip[0] & 0xF) as usize) * 4;
+    if ip.len() < ihl + 4 {
+        return;
+    }
+    let src: [u8; 4] = ip[12..16].try_into().unwrap_or([0; 4]);
+    let dst: [u8; 4] = ip[16..20].try_into().unwrap_or([0; 4]);
+    let (sport, dport) = if proto == 6 || proto == 17 {
+        (be16(&ip[ihl..]), be16(&ip[ihl + 2..]))
+    } else if proto == 1 && ip.len() >= ihl + 6 && (ip[ihl] == 0 || ip[ihl] == 8) {
+        let id = be16(&ip[ihl + 4..]);
+        (id, id)
+    } else {
+        (0, 0)
+    };
+    let _ = ct_update(src, dst, sport, dport, proto);
+}
+
 /// true => drop this packet (a rule matched, or policy DROP).
 /// `plen` is the IPv4 payload length — it feeds the real per-rule
-/// byte counter shown by `iptables -L -v`.
-fn fw_dropped(src: [u8; 4], proto: u8, dport: u16, plen: u64) -> bool {
+/// byte counter shown by `iptables -L -v`. `st` is the packet's
+/// conntrack state bits from `ct_update` (1 NEW / 2 ESTABLISHED).
+fn fw_dropped(
+    src: [u8; 4],
+    proto: u8,
+    _sport: u16,
+    dport: u16,
+    st: u8,
+    plen: u64,
+) -> bool {
     let mut fw = FW.lock();
     for r in fw.iter_mut() {
         if r.proto != 0 && r.proto != proto {
             continue;
         }
         if r.dport != 0 && r.dport != dport {
+            continue;
+        }
+        if r.state != 0 && r.state & st == 0 {
             continue;
         }
         if r.src != [0; 4] {
@@ -315,11 +428,21 @@ pub fn net_iptables() -> String {
             let plen = r.smask.iter().map(|b| b.count_ones()).sum::<u32>();
             alloc::format!("{}.{}.{}.{}/{}", r.src[0], r.src[1], r.src[2], r.src[3], plen)
         };
-        let extra = if r.dport != 0 {
+        let mut extra = if r.dport != 0 {
             alloc::format!("  {} dpt:{}", proto, r.dport)
         } else {
             String::new()
         };
+        if r.state != 0 {
+            extra.push_str(&alloc::format!(
+                "  state {}",
+                match r.state {
+                    1 => "NEW",
+                    2 => "ESTABLISHED",
+                    _ => "NEW,ESTABLISHED",
+                }
+            ));
+        }
         out.push_str(&alloc::format!(
             "{:<4} {:<5} {:<6} {:<8} {:<6} {:<12} 0.0.0.0/0{}\n",
             i + 1,
@@ -532,7 +655,7 @@ pub fn iptables_ctl(line: &str) -> bool {
                 Some(n) => n.parse().unwrap_or(0),
                 None => return false,
             };
-            let mut r = FwRule { proto, dport: 0, src: [0; 4], smask: [0; 4], hits: 0, bytes: 0 };
+            let mut r = FwRule { proto, dport: 0, src: [0; 4], smask: [0; 4], state: 0, hits: 0, bytes: 0 };
             let mut ok = true;
             while let Some(k) = f.next() {
                 match k {
@@ -559,6 +682,24 @@ pub fn iptables_ctl(line: &str) -> bool {
                                 r.smask = mask.to_be_bytes();
                             }
                             None => ok = false,
+                        }
+                    }
+                    // `-m state --state NEW|ESTABLISHED[,...]` — real
+                    // conntrack-state match against the live flow tables.
+                    "state" => {
+                        let mut m = 0u8;
+                        for s in f.next().unwrap_or("").split(',') {
+                            match s {
+                                "NEW" => m |= 1,
+                                "ESTABLISHED" => m |= 2,
+                                "RELATED" => m |= 2, // lo/tracked ~= established here
+                                _ => {}
+                            }
+                        }
+                        if m == 0 {
+                            ok = false;
+                        } else {
+                            r.state = m;
                         }
                     }
                     _ => ok = false,
@@ -702,12 +843,15 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
     // wire, slirp-forwarded, and loopback alike — before dispatch, raw
     // consumers (ping/dhcp), or the ICMP echo responder can see it.
     out.retain(|(src_ip, proto, p)| {
-        let dport = if (*proto == 6 || *proto == 17) && p.len() >= 4 {
-            be16(&p[2..])
-        } else {
-            0
-        };
-        !fw_dropped(*src_ip, *proto, dport, p.len() as u64)
+        let (sport, dport) = pkt_ports(*proto, p);
+        // each packet updates the real conntrack flow table, then the
+        // INPUT chain sees that packet's own NEW/ESTABLISHED state. The
+        // dst half of the tuple is the interface address the packet
+        // arrived for — 127.0.0.1 on lo, our address everywhere else —
+        // so loopback flows pair with their tx counterparts.
+        let dst = if is_loopback(*src_ip) { LOOPBACK_IP } else { our_ip() };
+        let st = ct_update(*src_ip, dst, sport, dport, *proto);
+        !fw_dropped(*src_ip, *proto, sport, dport, st, p.len() as u64)
     });
     IP_IN_DELIV.fetch_add(out.len() as u64, Ordering::Relaxed);
     // ICMP: answer echo requests like a real host — wire or loopback;
@@ -906,6 +1050,73 @@ pub fn net_trace(
     hops
 }
 
+/// Match an ICMP time-exceeded/unreachable that quotes one of our
+/// echo-probe packets (the quoted inner packet is ICMP, not UDP —
+/// `icmp_probe_ports` can't see it). Returns (echo_seq, orig_dst).
+fn icmp_probe_echo(p: &[u8]) -> Option<(u16, [u8; 4])> {
+    if p.len() >= 36 && (p[0] == 11 || p[0] == 3) {
+        let ip = &p[8..];
+        if ip.len() >= 20 && ip[0] >> 4 == 4 && ip[9] == 1 {
+            let ihl = ((ip[0] & 0xF) as usize) * 4;
+            if ip.len() >= ihl + 8 && ip[ihl] == 8 {
+                let seq = be16(&ip[ihl + 6..]);
+                let dst: [u8; 4] = ip[16..20].try_into().ok()?;
+                return Some((seq, dst));
+            }
+        }
+    }
+    None
+}
+
+const TRACER_EID: u16 = 0x7ACE;
+
+/// Traceroute over ICMP echo probes (`traceroute -I`): a real echo
+/// request whose seq carries the ttl; hops answer ICMP-11 quoting it,
+/// the target answers an echo reply.
+pub fn net_trace_icmp(
+    dst: [u8; 4],
+    max_hops: u8,
+    per_ms: u64,
+) -> Vec<(u8, Option<([u8; 4], u64)>, bool)> {
+    let mut hops = Vec::new();
+    let Some(mac) = next_hop(dst, 1500) else {
+        return hops;
+    };
+    for ttl in 1..=max_hops.min(30) {
+        let t0 = now_ms();
+        send_icmp_echo_ttl(mac, dst, TRACER_EID, ttl as u16, ttl, b"cosmos-trace-icmp");
+        let mut hit: Option<([u8; 4], bool)> = None;
+        while now_ms() - t0 < per_ms && hit.is_none() {
+            for (src_ip, proto, p) in pump_rx() {
+                if proto != 1 {
+                    dispatch(src_ip, proto, p);
+                    continue;
+                }
+                if p.len() >= 8 && p[0] == 0 && src_ip == dst
+                    && be16(&p[4..]) == TRACER_EID
+                {
+                    hit = Some((src_ip, true)); // target's own echo reply
+                    break;
+                }
+                if let Some((seq, odst)) = icmp_probe_echo(&p) {
+                    if seq == ttl as u16 && odst == dst {
+                        hit = Some((src_ip, false)); // time-exceeded hop
+                    }
+                }
+            }
+            if hit.is_none() {
+                wait_irq();
+            }
+        }
+        let reached = hit.map(|h| h.1).unwrap_or(false);
+        hops.push((ttl, hit.map(|(ip, _)| (ip, now_ms() - t0)), reached));
+        if reached {
+            break;
+        }
+    }
+    hops
+}
+
 fn send_frame(dst: [u8; 6], ethertype: u16, payload: &[u8]) -> Result<(), ()> {
     if !is_up() {
         return Err(()); // interface administratively down
@@ -922,6 +1133,7 @@ fn send_frame(dst: [u8; 6], ethertype: u16, payload: &[u8]) -> Result<(), ()> {
     TX_PKTS.fetch_add(1, Ordering::Relaxed);
     TX_BYTES.fetch_add(f.len() as u64, Ordering::Relaxed);
     crate::pcap::log_frame(&f); // TX frames hit the capture too (tcpdump sees both directions)
+    ct_observe_tx(&f);          // and the conntrack flow table
     n.send(&f)
 }
 
