@@ -56,7 +56,7 @@ const USER_SYS_FILES: &[&str] = &[
 ];
 
 /// files under /proc/sys/net/ipv4
-const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "tcp_wmem", "tcp_rmem", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range", "ip_nonlocal_bind", "tcp_syn_retries", "tcp_fin_timeout", "tcp_max_tw_buckets", "tcp_keepalive_time", "tcp_keepalive_intvl", "tcp_keepalive_probes", "tcp_retries1", "tcp_retries2", "tcp_max_syn_backlog", "tcp_abort_on_overflow"];
+const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "tcp_wmem", "tcp_rmem", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range", "ip_nonlocal_bind", "tcp_syn_retries", "tcp_fin_timeout", "tcp_max_tw_buckets", "tcp_keepalive_time", "tcp_keepalive_intvl", "tcp_keepalive_probes", "tcp_retries1", "tcp_retries2", "tcp_max_syn_backlog", "tcp_abort_on_overflow", "icmp_ratelimit", "icmp_ratemask", "icmp_msgs_per_sec", "icmp_msgs_burst"];
 
 /// files under /proc/sys/net/ipv4/conf/all — a single-NIC box has one
 /// real per-interface sysctl set, surfaced as `all`.

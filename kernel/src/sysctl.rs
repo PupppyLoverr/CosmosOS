@@ -246,6 +246,10 @@ static TCP_RETRIES1: AtomicU64 = AtomicU64::new(3);
 static TCP_RETRIES2: AtomicU64 = AtomicU64::new(15);
 static TCP_MAX_SYN_BACKLOG: AtomicU64 = AtomicU64::new(128);
 static TCP_ABORT_ON_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+static ICMP_RATELIMIT: AtomicU64 = AtomicU64::new(1000);
+static ICMP_RATEMASK: AtomicU64 = AtomicU64::new(0x1818);
+static ICMP_MSGS_PER_SEC: AtomicU64 = AtomicU64::new(1000);
+static ICMP_MSGS_BURST: AtomicU64 = AtomicU64::new(50);
 
 /// net.ipv4.tcp_syn_retries — SYN re-send cap during connect()
 /// (Linux default 6); the connect loop gives up ETIMEDOUT after
@@ -299,6 +303,26 @@ pub fn tcp_max_syn_backlog() -> u64 {
 /// peer's retransmit retries when a slot frees); 1: refuse with RST.
 pub fn tcp_abort_on_overflow() -> u64 {
     TCP_ABORT_ON_OVERFLOW.load(Ordering::Relaxed)
+}
+/// net.ipv4.icmp_ratelimit — minimum ms between locally-generated
+/// ICMP errors of the same type (Linux default 1000).
+pub fn icmp_ratelimit() -> u64 {
+    ICMP_RATELIMIT.load(Ordering::Relaxed)
+}
+/// net.ipv4.icmp_ratemask — bitmask of ICMP types the ratelimit
+/// applies to (Linux default 0x1818: dest-unreach/src-quench/
+/// time-exceeded/param-problem).
+pub fn icmp_ratemask() -> u64 {
+    ICMP_RATEMASK.load(Ordering::Relaxed)
+}
+/// net.ipv4.icmp_msgs_per_sec — global token-bucket refill rate on
+/// ALL locally-generated ICMP errors.
+pub fn icmp_msgs_per_sec() -> u64 {
+    ICMP_MSGS_PER_SEC.load(Ordering::Relaxed)
+}
+/// net.ipv4.icmp_msgs_burst — token-bucket depth (Linux default 50).
+pub fn icmp_msgs_burst() -> u64 {
+    ICMP_MSGS_BURST.load(Ordering::Relaxed)
 }
 
 /// net.ipv4.conf.all.rp_filter — 0 off, 1 strict, 2 loose. Wire frames
@@ -422,6 +446,10 @@ pub fn get(name: &str) -> Option<u64> {
         "net/ipv4/tcp_retries2" => TCP_RETRIES2.load(Ordering::Relaxed),
         "net/ipv4/tcp_max_syn_backlog" => TCP_MAX_SYN_BACKLOG.load(Ordering::Relaxed),
         "net/ipv4/tcp_abort_on_overflow" => TCP_ABORT_ON_OVERFLOW.load(Ordering::Relaxed),
+        "net/ipv4/icmp_ratelimit" => ICMP_RATELIMIT.load(Ordering::Relaxed),
+        "net/ipv4/icmp_ratemask" => ICMP_RATEMASK.load(Ordering::Relaxed),
+        "net/ipv4/icmp_msgs_per_sec" => ICMP_MSGS_PER_SEC.load(Ordering::Relaxed),
+        "net/ipv4/icmp_msgs_burst" => ICMP_MSGS_BURST.load(Ordering::Relaxed),
 
         _ => return None,
     })
@@ -546,6 +574,18 @@ pub fn set(name: &str, v: u64) -> bool {
         }
         "net/ipv4/tcp_abort_on_overflow" if v <= 1 => {
             TCP_ABORT_ON_OVERFLOW.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/icmp_ratelimit" if v <= 3_600_000 => {
+            ICMP_RATELIMIT.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/icmp_ratemask" if v <= 0xFFFF_FFFF => {
+            ICMP_RATEMASK.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/icmp_msgs_per_sec" if v <= 1_000_000 => {
+            ICMP_MSGS_PER_SEC.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/icmp_msgs_burst" if v <= 1_000_000 => {
+            ICMP_MSGS_BURST.store(v, Ordering::Relaxed)
         }
 
         _ => return false,

@@ -38533,6 +38533,10 @@ impl Term {
                     "/proc/sys/net/ipv4/tcp_retries2",
                     "/proc/sys/net/ipv4/tcp_max_syn_backlog",
                     "/proc/sys/net/ipv4/tcp_abort_on_overflow",
+                    "/proc/sys/net/ipv4/icmp_ratelimit",
+                    "/proc/sys/net/ipv4/icmp_ratemask",
+                    "/proc/sys/net/ipv4/icmp_msgs_per_sec",
+                    "/proc/sys/net/ipv4/icmp_msgs_burst",
                     "/proc/sys/net/netfilter/nf_conntrack_max",
                 ];
                 // `-N` prints names only, `-n`/`--values` values only —
