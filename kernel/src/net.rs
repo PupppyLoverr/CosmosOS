@@ -3675,6 +3675,24 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>, u64)> {
                 let rto = tcp_rto(k);
                 if let Some(u) = k.unacked.front_mut() {
                     if now.saturating_sub(u.tx_ms) >= rto {
+                        u.tries += 1;
+                        // net.ipv4.tcp_retries2: the give-up bound —
+                        // retransmits past it kill the conn (read
+                        // surfaces ECONNRESET).
+                        if u.tries as u64 > crate::sysctl::tcp_retries2() {
+                            k.rst = true;
+                            k.state = TcpState::Closed;
+                            k.closed_ms = now;
+                            continue;
+                        }
+                        // net.ipv4.tcp_retries1: informational "conn is
+                        // struggling" threshold — klog once on the
+                        // crossing (Linux's blackhole-detection mark).
+                        if u.tries as u64 == crate::sysctl::tcp_retries1() + 1 {
+                            crate::klog::append(&alloc::format!(
+                                "tcp: :{} -> :{} retransmits exceeded retries1 ({})\n",
+                                k.lport, k.rport, u.tries));
+                        }
                         u.tx_ms = now;
                         u.rtx = true;
                         k.rtx += 1;
@@ -5740,6 +5758,7 @@ pub struct UnAck {
     payload: Vec<u8>,
     tx_ms: u64, // last transmit time (RTO clock)
     rtx: bool,  // already retransmitted — Karn's algorithm skips it for RTT samples
+    tries: u32, // resends of this segment — retries1/retries2 thresholds
 }
 
 /// Retransmit timeout from the RFC6298 estimator; 400ms until the
@@ -5802,6 +5821,25 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
                 k.state = TcpState::Closed;
                 k.closed_ms = now_ms();
             } else if s.flags & TCP_ACK != 0 && s.ack == k.snd_nxt {
+                // net.ipv4.tcp_abort_on_overflow (Linux default 0): a
+                // full accept queue silently drops the completing ACK
+                // — the conn stays SynRecv and the peer's retransmitted
+                // ACK retries once a slot frees. With =1 it is refused
+                // with RST below.
+                let cap = BACKLOG
+                    .lock()
+                    .get(&k.lport)
+                    .copied()
+                    .unwrap_or(128)
+                    .min(crate::sysctl::somaxconn() as usize);
+                {
+                    let ag = ACCEPTED.lock();
+                    if ag.get(&k.lport).map(|q| q.len()).unwrap_or(0) >= cap
+                        && crate::sysctl::tcp_abort_on_overflow() == 0
+                    {
+                        return;
+                    }
+                }
                 k.snd_una = s.ack;
                 k.state = TcpState::Open;
                 if s.seq == k.rcv_nxt && !s.payload.is_empty() {
@@ -5818,15 +5856,10 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
                     }
                 }
                 // accept queue: bounded by min(listen backlog,
-                // net.core.somaxconn) — a full queue refuses the
-                // completing handshake with RST rather than queueing
-                // a conn nobody will ever accept.
-                let cap = BACKLOG
-                    .lock()
-                    .get(&k.lport)
-                    .copied()
-                    .unwrap_or(128)
-                    .min(crate::sysctl::somaxconn() as usize);
+                // net.core.somaxconn) — a full queue with
+                // abort_on_overflow=1 refuses the completing handshake
+                // with RST rather than queueing a conn nobody will
+                // ever accept.
                 let mut ag = ACCEPTED.lock();
                 let q = ag.entry(k.lport).or_default();
 if q.len() < cap {
@@ -6013,6 +6046,18 @@ pub fn tcp_unlisten(lport: u16) {
 
 /// Answer an inbound SYN: send SYN+ACK and park the conn in SynRecv.
 fn accept_syn(s: &TcpSeg, src_ip: [u8; 4]) {
+    // net.ipv4.tcp_max_syn_backlog: a SYN that would overflow the
+    // half-open table is dropped — the client's retransmit retries
+    // once space frees (SYN-cookie-less Linux behavior).
+    if TCP_SOCKS
+        .lock()
+        .values()
+        .filter(|k| k.state == TcpState::SynRecv)
+        .count() as u64
+        >= crate::sysctl::tcp_max_syn_backlog()
+    {
+        return;
+    }
     let Some(mac) = next_hop(src_ip, 1000) else {
         return;
     };
@@ -6114,6 +6159,7 @@ pub fn tcp_send(lport: u16, data: &[u8], timeout_ms: u64) -> Result<(), i64> {
                     payload: data[..sent_len].to_vec(),
                     tx_ms: now_ms(),
                     rtx: false,
+                    tries: 0,
                 });
                 enqueued = true;
             }
@@ -6320,6 +6366,7 @@ pub fn tcp_send_nowait(cid: u16, data: &[u8]) -> Result<usize, i64> {
             payload: data[..n].to_vec(),
             tx_ms: now_ms(),
             rtx: false,
+            tries: 0,
         });
         k.snd_nxt = seq.wrapping_add(n as u32);
     }
@@ -6342,6 +6389,7 @@ pub fn tcp_shutdown_wr(cid: u16) {
         payload: Vec::new(),
         tx_ms: now_ms(),
         rtx: false,
+        tries: 0,
     });
     send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_FIN | TCP_ACK, &[], rx_win(k));
     k.snd_nxt = k.snd_nxt.wrapping_add(1); // FIN consumes one sequence number

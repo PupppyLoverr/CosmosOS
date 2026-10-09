@@ -38529,6 +38529,10 @@ impl Term {
                     "/proc/sys/net/ipv4/tcp_keepalive_time",
                     "/proc/sys/net/ipv4/tcp_keepalive_intvl",
                     "/proc/sys/net/ipv4/tcp_keepalive_probes",
+                    "/proc/sys/net/ipv4/tcp_retries1",
+                    "/proc/sys/net/ipv4/tcp_retries2",
+                    "/proc/sys/net/ipv4/tcp_max_syn_backlog",
+                    "/proc/sys/net/ipv4/tcp_abort_on_overflow",
                     "/proc/sys/net/netfilter/nf_conntrack_max",
                 ];
                 // `-N` prints names only, `-n`/`--values` values only —

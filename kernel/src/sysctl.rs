@@ -242,6 +242,10 @@ static TCP_MAX_TW_BUCKETS: AtomicU64 = AtomicU64::new(4096);
 static KA_TIME: AtomicU64 = AtomicU64::new(15);
 static KA_INTVL: AtomicU64 = AtomicU64::new(1);
 static KA_PROBES: AtomicU64 = AtomicU64::new(9);
+static TCP_RETRIES1: AtomicU64 = AtomicU64::new(3);
+static TCP_RETRIES2: AtomicU64 = AtomicU64::new(15);
+static TCP_MAX_SYN_BACKLOG: AtomicU64 = AtomicU64::new(128);
+static TCP_ABORT_ON_OVERFLOW: AtomicU64 = AtomicU64::new(0);
 
 /// net.ipv4.tcp_syn_retries — SYN re-send cap during connect()
 /// (Linux default 6); the connect loop gives up ETIMEDOUT after
@@ -271,6 +275,30 @@ pub fn tcp_keepalive_intvl() -> u64 {
 /// is declared dead (ECONNRESET on read).
 pub fn tcp_keepalive_probes() -> u64 {
     KA_PROBES.load(Ordering::Relaxed)
+}
+/// net.ipv4.tcp_retries1 — retransmit count on the oldest unacked
+/// segment that marks a conn as struggling (klog notice; the Linux
+/// "blackhole detection" threshold).
+pub fn tcp_retries1() -> u64 {
+    TCP_RETRIES1.load(Ordering::Relaxed)
+}
+/// net.ipv4.tcp_retries2 — give-up bound: once the retransmit count
+/// of the oldest unacked segment passes this the conn is dead
+/// (ECONNRESET on read). Linux default 15 (~15-30min there; our RTO
+/// floor keeps it seconds).
+pub fn tcp_retries2() -> u64 {
+    TCP_RETRIES2.load(Ordering::Relaxed)
+}
+/// net.ipv4.tcp_max_syn_backlog — bound on half-open (SynRecv)
+/// conns; a SYN past the cap is dropped so the queue can't fill.
+pub fn tcp_max_syn_backlog() -> u64 {
+    TCP_MAX_SYN_BACKLOG.load(Ordering::Relaxed)
+}
+/// net.ipv4.tcp_abort_on_overflow — 0 (Linux default): a full
+/// accept queue silently drops the completing handshake ACK (the
+/// peer's retransmit retries when a slot frees); 1: refuse with RST.
+pub fn tcp_abort_on_overflow() -> u64 {
+    TCP_ABORT_ON_OVERFLOW.load(Ordering::Relaxed)
 }
 
 /// net.ipv4.conf.all.rp_filter — 0 off, 1 strict, 2 loose. Wire frames
@@ -390,6 +418,10 @@ pub fn get(name: &str) -> Option<u64> {
         "net/ipv4/tcp_keepalive_time" => KA_TIME.load(Ordering::Relaxed),
         "net/ipv4/tcp_keepalive_intvl" => KA_INTVL.load(Ordering::Relaxed),
         "net/ipv4/tcp_keepalive_probes" => KA_PROBES.load(Ordering::Relaxed),
+        "net/ipv4/tcp_retries1" => TCP_RETRIES1.load(Ordering::Relaxed),
+        "net/ipv4/tcp_retries2" => TCP_RETRIES2.load(Ordering::Relaxed),
+        "net/ipv4/tcp_max_syn_backlog" => TCP_MAX_SYN_BACKLOG.load(Ordering::Relaxed),
+        "net/ipv4/tcp_abort_on_overflow" => TCP_ABORT_ON_OVERFLOW.load(Ordering::Relaxed),
 
         _ => return None,
     })
@@ -502,6 +534,18 @@ pub fn set(name: &str, v: u64) -> bool {
         }
         "net/ipv4/tcp_keepalive_probes" if v <= 127 => {
             KA_PROBES.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/tcp_retries1" if v <= 255 => {
+            TCP_RETRIES1.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/tcp_retries2" if v <= 255 => {
+            TCP_RETRIES2.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/tcp_max_syn_backlog" if v <= (1 << 22) => {
+            TCP_MAX_SYN_BACKLOG.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/tcp_abort_on_overflow" if v <= 1 => {
+            TCP_ABORT_ON_OVERFLOW.store(v, Ordering::Relaxed)
         }
 
         _ => return false,

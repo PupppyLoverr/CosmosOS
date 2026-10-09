@@ -2277,8 +2277,11 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         // net.core.somaxconn: the accept queue is bounded by
         // min(listen backlog, somaxconn) — at qlen 1 a second
         // completing handshake is refused with RST instead of
-        // queueing a conn nobody can accept.
-        let mut ok = ustd::write_all("/proc/sys/net/core/somaxconn", b"1").is_ok();
+        // queueing a conn nobody can accept. Opt into the RST by
+        // arming tcp_abort_on_overflow for this check (Linux's 0
+        // default silently drops the completing ACK).
+        let mut ok = ustd::write_all("/proc/sys/net/core/somaxconn", b"1").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_abort_on_overflow", b"1").is_ok();
         let l = ustd::TcpFd::listen(19090);
         if ok && l.is_ok() {
             let l = l.unwrap();
@@ -2296,7 +2299,8 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 Err(_) => true,
             };
             // restore the default — a fresh connect queues + accepts
-            let w2 = ustd::write_all("/proc/sys/net/core/somaxconn", b"4096").is_ok();
+            let w2 = ustd::write_all("/proc/sys/net/core/somaxconn", b"4096").is_ok()
+                && ustd::write_all("/proc/sys/net/ipv4/tcp_abort_on_overflow", b"0").is_ok();
             let c3 = ustd::TcpFd::connect([127, 0, 0, 1], 19090).is_ok();
             let pw = ustd::poll(&[l.0 as u32], &[1], 2000);
             let a3 = l.accept();
@@ -2430,6 +2434,93 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             && ustd::write_all("/proc/sys/net/ipv4/tcp_keepalive_time", b"15").is_ok()
             && ustd::write_all("/proc/sys/net/ipv4/tcp_keepalive_intvl", b"1").is_ok()
             && ustd::write_all("/proc/sys/net/ipv4/tcp_keepalive_probes", b"9").is_ok()
+    });
+    check("tcp-retries2", {
+        // net.ipv4.tcp_retries2: give-up bound on established-conn
+        // resends — behind an OUTPUT DROP the conn dies a few
+        // retransmits in and reads surface ECONNRESET.
+        let l = ustd::TcpFd::listen(19100);
+        let mut ok = l.is_ok();
+        if let Ok(l) = l {
+            let c = ustd::TcpFd::connect([127, 0, 0, 1], 19100);
+            let a = l.accept(); // hold the accepted fd — dropping it
+            // sends FIN and the client sees EOF, not the reset death
+            ok = c.is_ok() && a.is_ok();
+            if let Ok(c) = c {
+                // nonblocking write: data lands in the retransmit
+                // queue and returns — the resend budget is what
+                // retries2 caps (a blocking write just waits for the
+                // ACK inside tcp_send's own deadline).
+                ustd::fcntl(c.0, ustd::F_SETFL, ustd::O_NONBLOCK);
+                let a1 = ustd::write_all("/proc/sys/net/ipv4/tcp_retries2", b"2").is_ok();
+                let a2 = ustd::write_all("/proc/net/iptables", b"A OUT tcp dport 19100 drop\n").is_ok();
+                let wr = c.write(b"deadbeef");
+                if !(a1 && a2 && wr.is_ok()) {
+                    println!("[dbg retries2] knob={} rule={} write={:?}", a1, a2, wr);
+                }
+                ok = ok && a1 && a2 && wr.is_ok();
+                // polls for the give-up: EAGAIN while the conn still
+                // lives, ECONNRESET once retries2 resends have gone
+                // unanswered (a clean peer close would be EOF).
+                let mut dead = false;
+                let mut b = [0u8; 8];
+                for _ in 0..40 {
+                    match c.read(&mut b) {
+                        Err(-104) => { dead = true; break; }
+                        Err(-11) => ustd::sleep_ms(150),
+                        other => {
+                            println!("[dbg retries2] read={:?}", other);
+                            break;
+                        }
+                    }
+                }
+                ok = ok && dead
+                    && ustd::write_all("/proc/net/iptables", b"F OUT\n").is_ok()
+                    && ustd::write_all("/proc/sys/net/ipv4/tcp_retries2", b"15").is_ok();
+            }
+        }
+        ok
+    });
+    check("tcp-abort-on-overflow", {
+        // net.ipv4.tcp_abort_on_overflow: with =1 a full accept queue
+        // refuses the completing handshake (client gets the RST);
+        // with =0 (Linux default) the ACK is dropped and the client's
+        // own connect still completes.
+        let mut ok = ustd::write_all("/proc/sys/net/core/somaxconn", b"1").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_abort_on_overflow", b"1").is_ok();
+        let l = ustd::TcpFd::listen(19101);
+        if ok && l.is_ok() {
+            let l = l.unwrap();
+            let c1 = ustd::TcpFd::connect([127, 0, 0, 1], 19101);
+            ok = c1.is_ok();
+            // second conn: refused — connect caught the RST or the fd
+            // it returned is already dead
+            let c2 = ustd::TcpFd::connect([127, 0, 0, 1], 19101);
+            let mut b = [0u8; 8];
+            ok = ok && match c2 {
+                Ok(fd) => fd.read(&mut b).is_err(),
+                Err(_) => true,
+            };
+            // flip to drop mode — same full queue, client now completes
+            ok = ok && ustd::write_all("/proc/sys/net/ipv4/tcp_abort_on_overflow", b"0").is_ok();
+            let c3 = ustd::TcpFd::connect([127, 0, 0, 1], 19101);
+            ok = ok && c3.is_ok();
+            ok = ok && ustd::write_all("/proc/sys/net/core/somaxconn", b"4096").is_ok();
+        }
+        ok
+    });
+    check("tcp-resilience-knobs", {
+        // tcp_retries1 + tcp_max_syn_backlog round-trips.
+        ustd::write_all("/proc/sys/net/ipv4/tcp_retries1", b"5").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_max_syn_backlog", b"16").is_ok()
+            && ustd::read_all("/proc/sys/net/ipv4/tcp_retries1")
+                .map(|d| String::from_utf8_lossy(&d).trim() == "5")
+                .unwrap_or(false)
+            && ustd::read_all("/proc/sys/net/ipv4/tcp_max_syn_backlog")
+                .map(|d| String::from_utf8_lossy(&d).trim() == "16")
+                .unwrap_or(false)
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_retries1", b"3").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_max_syn_backlog", b"128").is_ok()
     });
     check("domainname-sysctl", {
         // kernel.domainname: a real UTS-scoped string sysctl — round
