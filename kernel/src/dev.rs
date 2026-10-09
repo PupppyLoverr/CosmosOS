@@ -18,6 +18,7 @@
 //! fd-granularity reads always produce fresh data (streams never EOF);
 //! read_all/stat return a bounded 4KiB snapshot so `cat`/`hex` terminate.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -26,10 +27,10 @@ use x86_64::instructions::port::Port;
 const SNAPSHOT: usize = 4096;
 /// /dev/vda caps a single open at 1 MiB (cat-style readers terminate).
 const VDA_SNAPSHOT: usize = 1 << 20;
-const NAMES: [&str; 16] = [
+const NAMES: [&str; 21] = [
     "null", "zero", "full", "random", "urandom", "rtc", "vda",
     "fb0", "kmsg", "console", "mem", "nvram", "smbios", "dsp",
-    "smbios-tables", "port",
+    "smbios-tables", "port", "loopctl", "loop0", "loop1", "loop2", "loop3",
 ];
 
 pub fn handles(path: &str) -> bool {
@@ -103,8 +104,89 @@ pub fn read_at(path: &str, pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
             Ok(buf.len())
         }
         "console" | "dsp" => Ok(0), // write-only sinks; reads EOF
-        _ => Err(-2),
+        "loopctl" => loopctl_read(pos, buf),
+        p => match p.strip_prefix("loop").and_then(|v| v.parse::<u32>().ok()) {
+            Some(n) if n < 4 => loop_read(n, pos, buf),
+            _ => Err(-2),
+        },
     }
+}
+
+/// Byte-level loop devices: /dev/loopN is a byte window over a bound
+/// backing file on any real filesystem. /dev/loopctl is the control
+/// node — write "bind <n> <path>" or "clear <n>"; read for the table
+/// "<n> <size> <path>" per bound loop (newest to oldest sorted by n).
+static LOOPS: Mutex<BTreeMap<u32, String>> = Mutex::new(BTreeMap::new());
+
+fn loop_read(n: u32, pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    let file = LOOPS.lock().get(&n).cloned().ok_or(-2i64)?;
+    crate::vfs::read_range(&file, pos, buf)
+}
+
+fn loop_write_data(n: u32, pos: u64, buf: &[u8]) -> Result<usize, i64> {
+    let file = LOOPS.lock().get(&n).cloned().ok_or(-2i64)?;
+    let r = crate::vfs::write_range_path(&file, pos, buf)?;
+    crate::notify::fire(&file, crate::notify::IN_MODIFY);
+    Ok(r)
+}
+
+fn loopctl_read(pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    let rows: Vec<(u32, String)> =
+        LOOPS.lock().iter().map(|(n, f)| (*n, f.clone())).collect();
+    let mut s = String::new();
+    for (n, file) in rows {
+        let sz = crate::vfs::stat_path(&file).map(|st| st.size).unwrap_or(0);
+        s.push_str(&alloc::format!("{} {} {}\n", n, sz, file));
+    }
+    let b = s.as_bytes();
+    if pos >= b.len() as u64 {
+        return Ok(0);
+    }
+    let n = buf.len().min(b.len() - pos as usize);
+    buf[..n].copy_from_slice(&b[pos as usize..pos as usize + n]);
+    Ok(n)
+}
+
+fn loopctl_write(buf: &[u8]) -> Result<usize, i64> {
+    let s = core::str::from_utf8(buf).map_err(|_| -22i64)?;
+    for line in s.split('\n') {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some("bind") => {
+                let n: u32 =
+                    it.next().and_then(|v| v.parse().ok()).ok_or(-22i64)?;
+                if n >= 4 {
+                    return Err(-22);
+                }
+                let file = it.next().ok_or(-22i64)?;
+                // backing must be a real file — not a device/proc/pipe/cgroup
+                if handles(file)
+                    || crate::proc::handles(file)
+                    || crate::pipes::handles(file)
+                    || crate::cgroup::handles(file)
+                    || crate::memfd::handles(file)
+                {
+                    return Err(-22);
+                }
+                let st = crate::vfs::stat_path(file).map_err(|_| -2i64)?;
+                if st.size == 0 {
+                    return Err(-22);
+                }
+                LOOPS.lock().insert(n, String::from(file));
+            }
+            Some("clear") => {
+                let n: u32 =
+                    it.next().and_then(|v| v.parse().ok()).ok_or(-22i64)?;
+                LOOPS.lock().remove(&n);
+            }
+            _ => return Err(-22),
+        }
+    }
+    Ok(buf.len())
 }
 
 /// /dev/smbios-tables: the SMBIOS structure table exactly as QEMU exports
@@ -462,6 +544,7 @@ pub fn write(path: &str, pos: u64, buf: &[u8]) -> Result<usize, i64> {
         "full" => Err(-28), // ENOSPC
         "vda" | "rtc" | "mem" | "nvram" | "smbios" => Err(-30), // EROFS
         "random" | "urandom" => Ok(len), // accepted, ignored (like a seed write)
+        "loopctl" => loopctl_write(buf),
         "fb0" => fb0_write(pos, buf),
         "port" => port_write(pos, buf),
         "kmsg" | "console" => {
@@ -495,6 +578,9 @@ pub fn write(path: &str, pos: u64, buf: &[u8]) -> Result<usize, i64> {
             }
             Ok(if i == 0 { len } else { i })
         }
-        _ => Err(-4),
+        p => match p.strip_prefix("loop").and_then(|v| v.parse::<u32>().ok()) {
+            Some(n) if n < 4 => loop_write_data(n, pos, buf),
+            _ => Err(-4),
+        },
     }
 }

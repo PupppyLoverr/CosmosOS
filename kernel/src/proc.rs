@@ -24,6 +24,7 @@ const FILES: &[&str] = &[
     "interrupts",
     "modules",
     "sysrq-trigger",
+    "swaps",
 ];
 
 /// files under /proc/net
@@ -302,6 +303,11 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         ),
         "/proc/net/owners" => net::net_owners(),
         "/proc/sys/kernel/hostname" => alloc::format!("{}\n", crate::syscall::hostname()),
+        "/proc/swaps" => {
+            // no swap devices in this kernel — header only, like an
+            // enabled-but-empty swap table on Linux
+            String::from("Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n")
+        }
         "/proc/sys/kernel/cow_pages" => {
             alloc::format!("{}\n", crate::mem::cow_shared_total())
         }

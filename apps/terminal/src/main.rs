@@ -8271,6 +8271,22 @@ fn z85_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Read exactly `buf.len()` bytes at absolute offset `off` — a userspace
+/// pread. Returns false on short/error reads (device EOF etc.).
+fn pread_all(fd: i64, off: u64, buf: &mut [u8]) -> bool {
+    if ustd::seek(fd, off, 0).is_err() {
+        return false;
+    }
+    let mut got = 0usize;
+    while got < buf.len() {
+        match ustd::read(fd, &mut buf[got..]) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => got += n,
+        }
+    }
+    true
+}
+
 fn fmt_fixed(millionths: u64) -> String {
     // millionths -> "i.frac" with trailing zeros trimmed
     let i = millionths / 1_000_000;
@@ -12066,7 +12082,8 @@ impl Term {
             "show", "tar", "md5sum", "uuencode", "uudecode", "grep", "find", "file",
             "sha1sum", "cksum", "comm", "zgrep", "zip", "unzip", "chmod", "touch",
             "basenc", "addr2line", "elfedit", "tcpdump", "msgfmt",
-            "mkfs", "mkfs.vfat", "blkid", "vol",
+            "mkfs", "mkfs.vfat", "blkid", "vol", "fsck", "fsck.vfat",
+            "wipefs", "isosize", "losetup",
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look", "fmt",
         "pwck", "grpck", "pathchk", "nslookup", "b2sum",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
@@ -30223,6 +30240,438 @@ impl Term {
                     }
                 }
             }
+            "losetup" => {
+                // losetup [-a] | -f | -d /dev/loopN | /dev/loopN <file>
+                match args.first() {
+                    None | Some(&"-a") => {
+                        let t = ustd::read_all("/dev/loopctl")
+                            .unwrap_or_default();
+                        let s = String::from_utf8_lossy(&t);
+                        if s.trim().is_empty() {
+                            self.emit("no loop devices bound");
+                        } else {
+                            for l in s.lines() {
+                                let f: Vec<&str> =
+                                    l.splitn(3, ' ').collect();
+                                if f.len() == 3 {
+                                    self.emit(&alloc::format!(
+                                        "/dev/loop{}: {} bytes, backing {}",
+                                        f[0], f[1], f[2]
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Some(&"-f") => {
+                        let t = ustd::read_all("/dev/loopctl")
+                            .unwrap_or_default();
+                        let s = String::from_utf8_lossy(&t);
+                        let used: Vec<u32> = s
+                            .lines()
+                            .filter_map(|l| l.split(' ').next()?.parse().ok())
+                            .collect();
+                        match (0..4u32).find(|n| !used.contains(n)) {
+                            Some(n) => self.emit(&alloc::format!(
+                                "/dev/loop{}",
+                                n
+                            )),
+                            None => self.fail("losetup: no free loop device"),
+                        }
+                    }
+                    Some(&"-d") => match args.get(1) {
+                        Some(d) if d.starts_with("/dev/loop") => {
+                            let n = &d[9..];
+                            match ustd::open("/dev/loopctl", ustd::O_WRONLY) {
+                                Ok(fd) => {
+                                    let _ = ustd::write(
+                                        fd,
+                                        alloc::format!("clear {}\n", n)
+                                            .as_bytes(),
+                                    );
+                                    ustd::close(fd);
+                                    self.emit(&alloc::format!(
+                                        "detached {}",
+                                        d
+                                    ));
+                                }
+                                Err(e) => self.fail(&alloc::format!(
+                                    "losetup: err {}",
+                                    e
+                                )),
+                            }
+                        }
+                        _ => self.fail("usage: losetup -d /dev/loopN"),
+                    },
+                    Some(d) => {
+                        if !d.starts_with("/dev/loop") || args.get(1).is_none()
+                        {
+                            self.fail("usage: losetup [-a] | -f | -d /dev/loopN | /dev/loopN <file>");
+                        } else {
+                            let n = &d[9..];
+                            let file = String::from(args[1]);
+                            match ustd::open("/dev/loopctl", ustd::O_WRONLY) {
+                                Ok(fd) => {
+                                    let w = ustd::write(
+                                        fd,
+                                        alloc::format!(
+                                            "bind {} {}\n",
+                                            n, file
+                                        )
+                                        .as_bytes(),
+                                    );
+                                    ustd::close(fd);
+                                    match w {
+                                        Err(e) => self.fail(&alloc::format!(
+                                            "losetup: bind failed err {}",
+                                            e
+                                        )),
+                                        Ok(_) => self.emit(&alloc::format!(
+                                            "{} bound to {}",
+                                            d, file
+                                        )),
+                                    }
+                                }
+                                Err(e) => self.fail(&alloc::format!(
+                                    "losetup: err {}",
+                                    e
+                                )),
+                            }
+                        }
+                    }
+                }
+            }
+            "fsck" | "fsck.vfat" | "fsck.fat" | "dosfsck" => {
+                // real FAT32 structural check: BPB fields, FSInfo
+                // signatures, free-cluster count vs recorded count.
+                let img = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| String::from("/dev/vda"));
+                let fd = match ustd::open(&img, ustd::O_RDONLY) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        self.fail(&alloc::format!(
+                            "fsck: {}: err {}",
+                            img, e
+                        ));
+                        return;
+                    }
+                };
+                let mut bpb = [0u8; 512];
+                if !pread_all(fd, 0, &mut bpb) {
+                    ustd::close(fd);
+                    self.fail(&alloc::format!("fsck: {}: unreadable", img));
+                    return;
+                }
+                self.emit(&alloc::format!("fsck.vfat {}", img));
+                let mut ok = true;
+                if bpb[510] != 0x55 || bpb[511] != 0xAA {
+                    self.emit("FAIL: boot signature 55AA missing");
+                    ok = false;
+                }
+                let bps = u16::from_le_bytes([bpb[11], bpb[12]]) as u64;
+                let spc = bpb[13] as u64;
+                let resv = u16::from_le_bytes([bpb[14], bpb[15]]) as u64;
+                let nfats = bpb[16] as u64;
+                let tot = u32::from_le_bytes([
+                    bpb[32], bpb[33], bpb[34], bpb[35],
+                ]) as u64;
+                let spf = u32::from_le_bytes([
+                    bpb[36], bpb[37], bpb[38], bpb[39],
+                ]) as u64;
+                let fsinfo_sec = u16::from_le_bytes([bpb[48], bpb[49]]) as u64;
+                let is32 = &bpb[82..90] == b"FAT32   ";
+                if !is32 || bps != 512 || spc == 0 || nfats == 0 || spf == 0
+                {
+                    self.emit("FAIL: not a sane FAT32 BPB");
+                    ustd::close(fd);
+                    if !is32 {
+                        self.fail("fsck: not FAT32");
+                        return;
+                    }
+                }
+                self.emit(&alloc::format!(
+                    "BPB ok: bps={} spc={} resv={} nfats={} totsec={} spf={}",
+                    bps, spc, resv, nfats, tot, spf
+                ));
+                // FSInfo
+                let mut fi = [0u8; 512];
+                let (fi_free, fi_next) = if fsinfo_sec > 0
+                    && fsinfo_sec < resv
+                    && pread_all(fd, fsinfo_sec * bps, &mut fi)
+                    && u32::from_le_bytes([fi[0], fi[1], fi[2], fi[3]])
+                        == 0x41615252
+                    && u32::from_le_bytes([fi[484], fi[485], fi[486], fi[487]])
+                        == 0x61417272
+                {
+                    (
+                        u32::from_le_bytes([fi[488], fi[489], fi[490], fi[491]])
+                            as u64,
+                        u32::from_le_bytes([fi[492], fi[493], fi[494], fi[495]])
+                            as u64,
+                    )
+                } else {
+                    self.emit("WARN: FSInfo missing or bad signatures");
+                    (u64::MAX, u64::MAX)
+                };
+                // walk FAT1 counting free/eoc/bad
+                let ncl = (tot - resv - nfats * spf) / spc.max(1);
+                let mut free = 0u64;
+                let mut eoc = 0u64;
+                let mut bad = 0u64;
+                let mut sec = alloc::vec![0u8; 512];
+                for s_i in 0..spf {
+                    if !pread_all(fd, (resv + s_i) * bps, &mut sec) {
+                        self.emit(&alloc::format!(
+                            "FAIL: FAT truncated at sector {}",
+                            s_i
+                        ));
+                        ok = false;
+                        break;
+                    }
+                    for c in 0..128u64 {
+                        let e =
+                            u32::from_le_bytes([
+                                sec[(c * 4) as usize],
+                                sec[(c * 4) as usize + 1],
+                                sec[(c * 4) as usize + 2],
+                                sec[(c * 4) as usize + 3],
+                            ]) & 0x0FFF_FFFF;
+                        let idx = s_i * 128 + c;
+                        if idx < 2 || idx > ncl + 1 {
+                            continue;
+                        }
+                        if e == 0 {
+                            free += 1;
+                        } else if e >= 0x0FFF_FFF8 {
+                            eoc += 1;
+                        } else if e == 0x0FFF_FFF7 {
+                            bad += 1;
+                        }
+                    }
+                }
+                self.emit(&alloc::format!(
+                    "FAT: {} data clusters, {} free, {} EOC, {} bad",
+                    ncl, free, eoc, bad
+                ));
+                if fi_free != u64::MAX {
+                    if fi_free == free {
+                        self.emit(&alloc::format!(
+                            "FSInfo free={} matches FAT count",
+                            fi_free
+                        ));
+                    } else {
+                        self.emit(&alloc::format!(
+                            "CORRUPT: FSInfo free={} but FAT counts {}",
+                            fi_free, free
+                        ));
+                        ok = false;
+                    }
+                    if fi_next > ncl + 2 {
+                        self.emit(&alloc::format!(
+                            "CORRUPT: FSInfo next={} beyond {} clusters",
+                            fi_next, ncl
+                        ));
+                        ok = false;
+                    }
+                }
+                self.emit(&alloc::format!(
+                    "{}: {}",
+                    img,
+                    if ok { "clean" } else { "ERRORS FOUND" }
+                ));
+                ustd::close(fd);
+                if !ok {
+                    self.last_ok = false;
+                }
+            }
+            "wipefs" => {
+                // wipefs [-a|-n] <img>: list or erase filesystem signatures
+                let mut all = false;
+                let mut img = "";
+                for a in args.iter() {
+                    match *a {
+                        "-a" => all = true,
+                        "-n" | "--no-act" => {}
+                        _ if !a.starts_with('-') => img = a,
+                        _ => {}
+                    }
+                }
+                if img.is_empty() {
+                    self.fail("usage: wipefs [-a|-n] <image>");
+                    return;
+                }
+                let fd = match ustd::open(
+                    img,
+                    if all { ustd::O_RDWR } else { ustd::O_RDONLY },
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        self.fail(&alloc::format!(
+                            "wipefs: {}: err {}",
+                            img, e
+                        ));
+                        return;
+                    }
+                };
+                let mut sec = alloc::vec![0u8; 64 * 1024];
+                // signature scan needs bytes 0..0x2100 (ISO PVD @0x8000)
+                let mut got = 0usize;
+                let _ = ustd::seek(fd, 0, 0);
+                while got < sec.len() {
+                    match ustd::read(fd, &mut sec[got..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got += n,
+                    }
+                }
+                let mut sigs: Vec<(u64, &str)> = Vec::new();
+                if sec.len() >= 90 && &sec[82..90] == b"FAT32   " {
+                    sigs.push((0x52, "vfat"));
+                }
+                if sec.len() >= 62
+                    && (&sec[54..62] == b"FAT16   "
+                        || &sec[54..62] == b"FAT12   ")
+                {
+                    sigs.push((0x36, "vfat"));
+                }
+                if got >= 0x8006 && &sec[0x8001..0x8006] == b"CD001" {
+                    sigs.push((0x8000, "iso9660"));
+                }
+                if got >= 0x43A
+                    && u16::from_le_bytes([sec[0x438], sec[0x439]])
+                        == 0x53EF
+                {
+                    sigs.push((0x438, "ext"));
+                }
+                if sigs.is_empty() {
+                    self.emit(&alloc::format!(
+                        "{}: no signatures found",
+                        img
+                    ));
+                } else {
+                    self.emit("offset    type");
+                    for (o, t) in &sigs {
+                        self.emit(&alloc::format!("0x{:04x}    {}", o, t));
+                    }
+                    if all {
+                        for (o, _) in &sigs {
+                            let _ = ustd::seek(fd, *o, 0);
+                            let z = [0u8; 512];
+                            let _ = ustd::write(fd, &z);
+                        }
+                        self.emit(&alloc::format!(
+                            "{}: {} signature(s) erased",
+                            img,
+                            sigs.len()
+                        ));
+                    }
+                }
+                ustd::close(fd);
+            }
+            "isosize" => {
+                let img = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .copied()
+                    .unwrap_or("/dev/vda");
+                let fd = match ustd::open(img, ustd::O_RDONLY) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        self.fail(&alloc::format!(
+                            "isosize: {}: err {}",
+                            img, e
+                        ));
+                        return;
+                    }
+                };
+                let mut pvd = [0u8; 2048];
+                if !pread_all(fd, 0x8000, &mut pvd)
+                    || pvd[0] != 1
+                    || &pvd[1..6] != b"CD001"
+                {
+                    ustd::close(fd);
+                    self.fail(&alloc::format!(
+                        "isosize: {}: not ISO9660",
+                        img
+                    ));
+                    return;
+                }
+                let blocks = u32::from_le_bytes([
+                    pvd[80], pvd[81], pvd[82], pvd[83],
+                ]) as u64;
+                ustd::close(fd);
+                self.emit(&alloc::format!(
+                    "{}: {} blocks ({} bytes)",
+                    img,
+                    blocks,
+                    blocks * 2048
+                ));
+            }
+            "sar" => {
+                // sar [interval_s [count]]: real CPU utilisation from
+                // /proc/stat ticks
+                let nums: Vec<u64> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .filter_map(|a| a.parse().ok())
+                    .collect();
+                let itv = nums.first().copied().unwrap_or(1).max(1);
+                let cnt = nums.get(1).copied().unwrap_or(1).max(1).min(60);
+                let stat_ticks = || -> (u64, u64, u64) {
+                    let d = ustd::read_all("/proc/stat").unwrap_or_default();
+                    let l = String::from_utf8_lossy(&d);
+                    let f: Vec<u64> = l
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .skip(1)
+                        .filter_map(|v| v.parse().ok())
+                        .collect();
+                    // "cpu  user nice system idle ..."
+                    (
+                        *f.first().unwrap_or(&0) + *f.get(1).unwrap_or(&0),
+                        *f.get(2).unwrap_or(&0),
+                        *f.get(3).unwrap_or(&0),
+                    )
+                };
+                self.emit("      %usr   %system    %idle");
+                for _ in 0..cnt {
+                    let (u0, s0, i0) = stat_ticks();
+                    ustd::sleep_ms(itv * 1000);
+                    let (u1, s1, i1) = stat_ticks();
+                    let du = u1 - u0;
+                    let ds = s1 - s0;
+                    let di = i1 - i0;
+                    let tot = (du + ds + di).max(1);
+                    self.emit(&alloc::format!(
+                        "   {:>6}.{:02} {:>8}.{:02} {:>7}.{:02}",
+                        du * 100 / tot,
+                        (du * 10000 / tot) % 100,
+                        ds * 100 / tot,
+                        (ds * 10000 / tot) % 100,
+                        di * 100 / tot,
+                        (di * 10000 / tot) % 100,
+                    ));
+                }
+            }
+            "swaps" => {
+                let d = ustd::read_all("/proc/swaps").unwrap_or_default();
+                let s = String::from_utf8_lossy(&d);
+                let body: Vec<&str> = s
+                    .lines()
+                    .skip(1)
+                    .filter(|l| !l.trim().is_empty())
+                    .collect();
+                if body.is_empty() {
+                    self.emit("no active swap areas");
+                } else {
+                    for l in s.lines() {
+                        self.emit(l);
+                    }
+                }
+            }
             "halt" => ustd::poweroff(),
             "tput" => match args.first() {
                 Some(&"cols") => self.emit(&alloc::format!("{}", COLS)),
@@ -34536,6 +34985,8 @@ impl Term {
         "bunzip2", "bzcat", "bzip2", "zmore", "zless", "zegrep", "zfgrep",
         "zdiff", "zcmp", "wall", "mesg",
         "lz4", "unlz4", "lz4cat", "scriptreplay", "run-parts", "chpasswd", "less",
+        "losetup", "fsck", "fsck.vfat", "fsck.fat", "dosfsck", "wipefs",
+        "isosize", "sar", "swaps",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
@@ -34602,6 +35053,7 @@ impl Term {
                     "          pwck [file]  grpck [file]  strings -n N -f",
                     "          b2sum [-c] <file..>  pathchk -p/-P  nslookup <name>",
                     "          setsid <cmd>  dir/vdir  mkdir -m  df -P  stat -t  chown -R",
+                    "          mkfs.vfat/fsck/wipefs/isosize  losetup -a/-f/-d  sar/swaps",
                     "          <binary>  - run /bin/<name> (e.g. cosmos-demo)",
     ];
 
