@@ -691,7 +691,11 @@ pub struct TcpSock {
 impl TcpSock {
     /// Connect local port `lport` to `ip:rport` (real 3-way handshake).
     pub fn connect(lport: u16, ip: [u8; 4], rport: u16) -> Option<Self> {
-        if sc3(shared::SYS_NET_TCP_OPEN, lport as u64, u32::from_be_bytes(ip) as u64, rport as u64) == shared::SYS_ERR {
+        Self::connect_timeout(lport, ip, rport, 0)
+    }
+    /// `timeout_ms` bounds the SYN wait (0 = kernel default 4s).
+    pub fn connect_timeout(lport: u16, ip: [u8; 4], rport: u16, timeout_ms: u64) -> Option<Self> {
+        if sc4(shared::SYS_NET_TCP_OPEN, lport as u64, u32::from_be_bytes(ip) as u64, rport as u64, timeout_ms) == shared::SYS_ERR {
             None
         } else {
             Some(Self { lport })

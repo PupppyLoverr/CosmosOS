@@ -1051,7 +1051,9 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_NET_DHCP => net::dhcp().map(|ip| u32::from_be_bytes(ip) as u64).unwrap_or(ERR),
         shared::SYS_NET_TCP_OPEN => {
             let ip = [(a2>>24) as u8,(a2>>16) as u8,(a2>>8) as u8,a2 as u8];
-            net::tcp_open(a1 as u16, ip, a3 as u16, 4000).map(|_|0).unwrap_or(ERR)
+            // a4 = caller's connect timeout in ms; 0 keeps the 4s default
+            let t = if a4 == 0 { 4000 } else { a4 };
+            net::tcp_open(a1 as u16, ip, a3 as u16, t).map(|_|0).unwrap_or(ERR)
         }
         shared::SYS_NET_TCP_SEND => match copy_in(a2, a3.min(1400)) {
             Some(d) => net::tcp_send(a1 as u16, &d, 5000).map(|_|0).unwrap_or(ERR),

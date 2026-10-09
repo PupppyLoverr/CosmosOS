@@ -8031,6 +8031,7 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut src = String::new();
     let mut dport = 0u16;
     let mut dports = String::new();
+    let mut src_range = String::new();
     let mut state = String::new();
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
@@ -8066,6 +8067,14 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             "--dports" | "--destination-ports" => {
                 dports = String::from(args.get(i + 1).copied().unwrap_or(""));
                 i += 1;
+            }
+            // `-m iprange --src-range a-b` — real source-range match
+            "--src-range" | "--source-range" => {
+                src_range = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
+            "--dst-range" | "--destination-range" => {
+                return None; // dst-range match isn't a real gate here
             }
             "-j" | "--jump" => {
                 let t = args.get(i + 1).copied().unwrap_or("DROP");
@@ -8145,6 +8154,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !dports.is_empty() {
         line.push_str(&alloc::format!(" multiport {}", dports));
+    }
+    if !src_range.is_empty() {
+        line.push_str(&alloc::format!(" range {}", src_range));
     }
     if !src.is_empty() {
         line.push_str(&alloc::format!(" src {}", src));
@@ -23535,11 +23547,32 @@ impl Term {
                 let listen = args
                     .iter()
                     .any(|a| a == &"-l" || a == &"-lu" || a == &"-ul");
-                let pos: Vec<&str> = args
+                // `nc -w N` — real connect() timeout (seconds → ms);
+                // strip the flag AND its value out of the positionals.
+                let w_ms: u64 = args
                     .iter()
-                    .filter(|a| !a.starts_with('-'))
-                    .cloned()
-                    .collect();
+                    .position(|a| *a == "-w")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    .saturating_mul(1000);
+                let pos: Vec<&str> = {
+                    let mut skip = false;
+                    args.iter()
+                        .filter(|a| {
+                            if skip {
+                                skip = false;
+                                return false;
+                            }
+                            if **a == "-w" {
+                                skip = true;
+                                return false;
+                            }
+                            !a.starts_with('-')
+                        })
+                        .cloned()
+                        .collect()
+                };
                 if zmode {
                     // nc -z host port[-port]: real connect() per port —
                     // open when the handshake completes, closed when the
@@ -23560,7 +23593,7 @@ impl Term {
                             let mut any = false;
                             for port in lo..=hi {
                                 let lport = 40000u16 + (port % 3000);
-                                match ustd::TcpSock::connect(lport, ip, port) {
+                                match ustd::TcpSock::connect_timeout(lport, ip, port, w_ms) {
                                     Some(s) => {
                                         drop(s);
                                         any = true;
@@ -23637,12 +23670,12 @@ impl Term {
                     }
                 } else {
                     match (
-                        args.first().and_then(|s| host_arg(s)),
-                        args.get(1).and_then(|s| s.parse::<u16>().ok()),
+                        pos.first().and_then(|s| host_arg(s)),
+                        pos.get(1).and_then(|s| s.parse::<u16>().ok()),
                     ) {
                         (Some(ip), Some(port)) => {
                             let lport = 40000u16 + (ustd::uptime_ms() % 2000) as u16;
-                            match ustd::TcpSock::connect(lport, ip, port) {
+                            match ustd::TcpSock::connect_timeout(lport, ip, port, w_ms) {
                                 Some(s) => {
                                     self.emit(&alloc::format!(
                                         "nc: connected to {}.{}.{}.{}:{} -- keystrokes send, Esc closes",
@@ -23653,7 +23686,7 @@ impl Term {
                                 None => self.fail(&alloc::format!("nc: connect to :{} failed", port)),
                             }
                         }
-                        _ => self.fail("usage: nc <host|a.b.c.d> <port>  |  nc -l <port>  (Esc closes)"),
+                        _ => self.fail("usage: nc <host|a.b.c.d> <port>  |  nc -l [-k] <port>  |  nc -w N <host> <port>  (Esc closes)"),
                     }
                 }
             }
@@ -34715,6 +34748,12 @@ impl Term {
                                     ln.push_str(&alloc::format!(
                                         " -m multiport --dports {}",
                                         dp
+                                    ));
+                                }
+                                if let Some(rg) = w.strip_prefix("src-range:") {
+                                    ln.push_str(&alloc::format!(
+                                        " -m iprange --src-range {}",
+                                        rg
                                     ));
                                 }
                             }

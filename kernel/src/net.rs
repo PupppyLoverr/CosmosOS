@@ -289,6 +289,7 @@ struct FwRule {
     dports: Vec<u16>,     // `-m multiport --dports a,b,..` — empty = not used
     src: [u8; 4],         // [0;4] = anywhere
     smask: [u8; 4],
+    src_range: Option<(u32, u32)>, // `-m iprange --src-range a-b` (be u32 bounds)
     state: u8,            // 0 = any; bit0 = NEW, bit1 = ESTABLISHED
     limit_pps: u16,       // 0 = unlimited; `-m limit --limit N/s` cap on rule hits
     limit_burst: u16,     // bucket depth (real iptables default 5)
@@ -326,12 +327,37 @@ struct CtEnt {
 }
 static CT: Mutex<Vec<CtEnt>> = Mutex::new(Vec::new());
 
+/// Per-flow idle lifetime, like conntrack's per-protocol timeouts.
+/// Entries past their lifetime are real evictions — the flow forgets
+/// its state and the next packet is NEW again.
+fn ct_timeout(e: &CtEnt) -> u64 {
+    match e.proto {
+        1 => 60_000,
+        17 => 120_000,
+        6 => {
+            if e.seen_reply {
+                300_000
+            } else {
+                120_000
+            }
+        }
+        _ => 120_000,
+    }
+}
+
+/// Drop every flow past its idle timeout.
+fn ct_expire(ct: &mut Vec<CtEnt>) {
+    let now = now_ms();
+    ct.retain(|e| now - e.last_ms < ct_timeout(e));
+}
+
 /// Update the flow table for one packet and return its state bits
 /// (1 = NEW, 2 = ESTABLISHED). `sport/dport` are the packet's transport
 /// ports (0 when absent; ICMP uses the echo id as both ports).
 fn ct_update(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, proto: u8) -> u8 {
     let now = now_ms();
     let mut ct = CT.lock();
+    ct_expire(&mut *ct);
     for e in ct.iter_mut() {
         if e.proto != proto {
             continue;
@@ -441,6 +467,13 @@ fn fw_verdict(
             let m = u32::from_be_bytes(src) & u32::from_be_bytes(r.smask)
                 == u32::from_be_bytes(r.src) & u32::from_be_bytes(r.smask);
             if !m {
+                continue;
+            }
+        }
+        // `-m iprange --src-range a-b`: real range containment check
+        if let Some((lo, hi)) = r.src_range {
+            let s = u32::from_be_bytes(src);
+            if s < lo || s > hi {
                 continue;
             }
         }
@@ -588,6 +621,17 @@ fn fmt_fw_chain(
             }
             extra.push_str(&alloc::format!(" multiport dpts:{}", csv));
         }
+        if let Some((lo, hi)) = r.src_range {
+            let fmt = |v: u32| {
+                let b = v.to_be_bytes();
+                alloc::format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+            };
+            extra.push_str(&alloc::format!(
+                " iprange src-range:{}-{}",
+                fmt(lo),
+                fmt(hi)
+            ));
+        }
         if r.state != 0 {
             extra.push_str(&alloc::format!(
                 "  state {}",
@@ -653,7 +697,10 @@ pub fn net_snmp() -> String {
 /// the same table `-m state` matches against.
 pub fn net_conntrack() -> String {
     let mut out = String::new();
-    let ct = CT.lock();
+    let mut ct = CT.lock();
+    // a read is a real expiry pass too, like conntrack's lazy gc
+    ct_expire(&mut *ct);
+    let now = now_ms();
     for e in ct.iter() {
         let pname = match e.proto {
             1 => "icmp",
@@ -664,9 +711,10 @@ pub fn net_conntrack() -> String {
         let a = alloc::format!("{}.{}.{}.{}", e.a_ip[0], e.a_ip[1], e.a_ip[2], e.a_ip[3]);
         let b = alloc::format!("{}.{}.{}.{}", e.b_ip[0], e.b_ip[1], e.b_ip[2], e.b_ip[3]);
         out.push_str(&alloc::format!(
-            "{:<8} {:<2} {:<11} src={} dst={} sport={} dport={} src={} dst={} sport={} dport={}{}\n",
+            "{:<8} {:<2} {:<11} timeout={} src={} dst={} sport={} dport={} src={} dst={} sport={} dport={}{}\n",
             pname, e.proto,
             if e.seen_reply { "ESTABLISHED" } else { "NEW" },
+            (ct_timeout(e) - (now - e.last_ms)) / 1000,
             a, b, e.a_port, e.b_port,
             b, a, e.b_port, e.a_port,
             if e.seen_reply { "" } else { " [UNREPLIED]" },
@@ -903,7 +951,8 @@ pub fn iptables_ctl(line: &str) -> bool {
                 None => return false,
             };
             let mut r = FwRule {
-                proto, dport: 0, dports: Vec::new(), src: [0; 4], smask: [0; 4], state: 0,
+                proto, dport: 0, dports: Vec::new(), src: [0; 4], smask: [0; 4],
+                src_range: None, state: 0,
                 limit_pps: 0, limit_burst: 5, lim_tokens: 5, lim_ms: 0,
                 target: 0, hits: 0, bytes: 0,
             };
@@ -914,6 +963,29 @@ pub fn iptables_ctl(line: &str) -> bool {
                         r.dport = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                         if r.dport == 0 {
                             ok = false;
+                        }
+                    }
+                    // `-m iprange --src-range <a>-<b>`
+                    "range" => {
+                        let spec = f.next().unwrap_or("");
+                        match spec.split_once('-') {
+                            Some((a, b)) => {
+                                match (parse_ip(a), parse_ip(b)) {
+                                    (Some(lo), Some(hi)) => {
+                                        let (lo, hi) = (
+                                            u32::from_be_bytes(lo),
+                                            u32::from_be_bytes(hi),
+                                        );
+                                        if lo <= hi {
+                                            r.src_range = Some((lo, hi));
+                                        } else {
+                                            ok = false;
+                                        }
+                                    }
+                                    _ => ok = false,
+                                }
+                            }
+                            None => ok = false,
                         }
                     }
                     // `-m multiport --dports a,b,..` (15 max, like Linux)
