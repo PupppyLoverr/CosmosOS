@@ -8107,6 +8107,7 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut time_hi = 0u64;
     let mut time_armed = false;
     let mut connl_n = String::new();
+    let mut connb_spec = String::new();
     let mut connl_mask = String::from("32");
     let mut snat_ip = String::new();
     let mut limit_pps = 0u64;
@@ -8329,6 +8330,11 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             }
             "--connlimit-mask" => {
                 connl_mask = String::from(args.get(i + 1).copied().unwrap_or("32"));
+                i += 1;
+            }
+            // `-m connbytes --connbytes N[:M]` — flow byte-total window.
+            "--connbytes" => {
+                connb_spec = String::from(args.get(i + 1).copied().unwrap_or("0"));
                 i += 1;
             }
             // `-m icmp --icmp-type <name|n>` — real ICMP-type match;
@@ -8603,6 +8609,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !state.is_empty() {
         line.push_str(&alloc::format!(" state {}", state));
+    }
+    if !connb_spec.is_empty() {
+        line.push_str(&alloc::format!(" connbytes {}", connb_spec));
     }
     if limit_pps != 0 {
         line.push_str(&alloc::format!(" limit {}", limit_pps));
@@ -37368,10 +37377,10 @@ impl Term {
                 // `sysctl -p [file]` — real config load: parse
                 // `key = value` lines (comments `#`/`;`, blanks ok) and
                 // apply each through the same proc write path -w uses.
-                if args.iter().any(|a| *a == "-p" || *a == "--load") {
+                if args.iter().any(|a| *a == "-p" || *a == "--load" || *a == "--system") {
                     let path = args
                         .iter()
-                        .position(|a| *a == "-p" || *a == "--load")
+                        .position(|a| *a == "-p" || *a == "--load" || *a == "--system")
                         .and_then(|i| args.get(i + 1))
                         .copied()
                         .unwrap_or("/etc/sysctl.conf");
@@ -40796,6 +40805,9 @@ impl Term {
                 // -i/--info: internal tcp state per conn — rtt/rto/
                 // retransmits from the kernel estimator (tcpinfo dump).
                 let want_i = args.iter().any(|a| *a == "-i" || *a == "--info");
+                // -o/--options: real ss flag — the socket's armed
+                // timers; TCP exposes its live retrans countdown.
+                let want_o = args.iter().any(|a| *a == "-o" || *a == "--options");
                 // -m/--memory: real ss flag — per-socket queue memory,
                 // from the real tx_queue/rx_queue columns.
                 let want_m = args.iter().any(|a| *a == "-m" || *a == "--memory");
@@ -40811,12 +40823,12 @@ impl Term {
                 };
                 let mut tinfo: alloc::collections::BTreeMap<u64, Vec<String>> =
                     Default::default();
-                if want_i {
+                if want_i || want_o {
                     if let Ok(d) = ustd::read_all("/proc/net/tcpinfo") {
                         for l in String::from_utf8_lossy(&d).lines().skip(1) {
                             let f: Vec<String> =
                                 l.split_whitespace().map(String::from).collect();
-                            if f.len() >= 9 {
+                            if f.len() >= 10 {
                                 if let Ok(lp) = f[0].parse::<u64>() {
                                     tinfo.insert(lp, f);
                                 }
@@ -40888,6 +40900,23 @@ impl Term {
                                     continue;
                                 }
                             }
+                            let timer = if want_o {
+                                let lp = l
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .and_then(|a| a.rsplit(':').next())
+                                    .and_then(|h| u64::from_str_radix(h, 16).ok());
+                                match lp
+                                    .and_then(|p| tinfo.get(&p))
+                                    .and_then(|f| f[9].parse::<u64>().ok())
+                                {
+                                    Some(ms) if ms > 0 => alloc::format!(
+                                        "  timer:(retrans,{}ms)", ms),
+                                    _ => String::new(),
+                                }
+                            } else {
+                                String::new()
+                            };
                             let mem = if want_m {
                                 // fields: sl local rem st txq rxq ...
                                 let f: Vec<&str> =
@@ -40901,9 +40930,10 @@ impl Term {
                                 String::new()
                             };
                             self.emit(&alloc::format!(
-                                "tcp  {}{}{}{}",
+                                "tcp  {}{}{}{}{}",
                                 l.trim(),
                                 mem,
+                                timer,
                                 owner_field(l),
                                 ino_field(l)
                             ));
