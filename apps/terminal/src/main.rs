@@ -25539,6 +25539,23 @@ impl Term {
             "arp" => {
                 // arp [-d <ip>] [ip]: dump cache, delete an entry, or query one
                 match args.first() {
+                    Some(&"-s") => {
+                        // arp -s <ip> <mac>: install a PERMANENT entry via
+                        // the proc write grammar (survives wire refresh)
+                        match (args.get(1), args.get(2)) {
+                            (Some(ip), Some(mac)) => {
+                                let line = alloc::format!("add {} {}", ip, mac);
+                                if ustd::write_all("/proc/net/arp", line.as_bytes()).is_ok() {
+                                    self.emit(&alloc::format!("{} -> {} (PERM)", ip, mac));
+                                } else {
+                                    self.fail(&alloc::format!(
+                                        "arp: bad spec '{} {}'", ip, mac
+                                    ));
+                                }
+                            }
+                            _ => self.fail("usage: arp -s <ip> <mac>"),
+                        }
+                    }
                     Some(&"-d") => match args.get(1) {
                         Some(ip) => {
                             let oct: Vec<u8> = ip
@@ -38200,7 +38217,45 @@ impl Term {
                     }
                 }
                 Some("n") | Some("neigh") | Some("neighbour") => {
-                    self.run(&String::from("arp"));
+                    // ip neigh [add <ip> lladdr <mac> dev eth0] [del <ip>]
+                    // [flush [dev eth0]] — real ops through /proc/net/arp
+                    match args.get(1).copied() {
+                        Some("add") => {
+                            // ip neigh add <ip> lladdr <mac> [dev eth0]
+                            let (Some(ip), _) = (args.get(2).copied(), 0) else {
+                                self.fail("usage: ip neigh add <ip> lladdr <mac>");
+                                return;
+                            };
+                            let mac = args
+                                .iter()
+                                .position(|a| *a == "lladdr")
+                                .and_then(|i| args.get(i + 1))
+                                .copied()
+                                .unwrap_or("");
+                            let line = alloc::format!("add {} {}", ip, mac);
+                            if ustd::write_all("/proc/net/arp", line.as_bytes()).is_ok() {
+                                self.emit(&alloc::format!("{} -> {} PERMANENT", ip, mac));
+                            } else {
+                                self.fail("ip: bad neigh spec");
+                            }
+                        }
+                        Some("del") | Some("delete") => {
+                            let Some(ip) = args.get(2).copied() else {
+                                self.fail("usage: ip neigh del <ip>");
+                                return;
+                            };
+                            let line = alloc::format!("del {}", ip);
+                            if ustd::write_all("/proc/net/arp", line.as_bytes()).is_err() {
+                                self.fail(&alloc::format!("ip: no entry for {}", ip));
+                            }
+                        }
+                        Some("flush") => {
+                            if ustd::write_all("/proc/net/arp", b"flush").is_err() {
+                                self.fail("ip: arp flush failed");
+                            }
+                        }
+                        _ => self.run(&String::from("arp")),
+                    }
                 }
                 _ => self.fail("usage: ip a|addr | ip l|link [set eth0 up|down] | ip r|route [add|del ...] | ip n|neigh"),
             },

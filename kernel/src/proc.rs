@@ -559,6 +559,19 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
         }
         return ok.then_some(buf.len());
     }
+    if path == "/proc/net/arp" {
+        // 'add <ip> <mac>' / 'del <ip>' / 'flush' per line
+        let text = String::from(String::from_utf8_lossy(buf));
+        let mut ok = true;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            ok &= net::arp_ctl(line);
+        }
+        return ok.then_some(buf.len());
+    }
     if path == "/proc/net/iptables" {
         // 'A <proto> [dport N] [src ip/plen]' / 'D <n>' / 'F' / 'P <verdict>'
         let text = String::from(String::from_utf8_lossy(buf));

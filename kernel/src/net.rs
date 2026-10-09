@@ -72,7 +72,10 @@ pub fn our_ip() -> [u8; 4] {
     *CUR_IP.lock()
 }
 
-static ARP_CACHE: Mutex<Vec<([u8; 4], [u8; 6])>> = Mutex::new(Vec::new());
+/// (ip, mac, permanent) — wire-learned entries are dynamic; `arp -s`/
+/// `/proc/net/arp` `add` installs permanent ones that traffic doesn't
+/// refresh.
+static ARP_CACHE: Mutex<Vec<([u8; 4], [u8; 6], bool)>> = Mutex::new(Vec::new());
 
 /// Loopback (`lo`): 127.0.0.0/8 and our own address deliver back into the
 /// stack instead of the wire. Queued, not dispatched inline — TX paths may
@@ -379,10 +382,11 @@ pub fn net_arp() -> String {
     let mut s = String::from(
         "IP address       HW type     Flags       HW address            Mask     Device\n",
     );
-    for (ip, mac) in ARP_CACHE.lock().iter() {
+    for (ip, mac, perm) in ARP_CACHE.lock().iter() {
         s.push_str(&alloc::format!(
-            "{:<17}0x1         0x2         {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}     *        eth0\n",
+            "{:<17}0x1         0x{:<2}        {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}     *        eth0\n",
             alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
+            if *perm { 6 } else { 2 }, // ATF_COM|ATF_PERM vs ATF_COM
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
         ));
     }
@@ -960,12 +964,14 @@ fn handle_frame(f: &[u8]) -> Option<([u8; 4], u8, Vec<u8>)> {
             let sender_mac: [u8; 6] = p[8..14].try_into().ok()?;
             let sender_ip: [u8; 4] = p[14..18].try_into().ok()?;
             let target_ip: [u8; 4] = p[24..28].try_into().ok()?;
-            // cache the sender
+            // cache the sender (dynamic entries refresh; static ones hold)
             let mut c = ARP_CACHE.lock();
             if let Some(e) = c.iter_mut().find(|e| e.0 == sender_ip) {
-                e.1 = sender_mac;
+                if !e.2 {
+                    e.1 = sender_mac;
+                }
             } else {
-                c.push((sender_ip, sender_mac));
+                c.push((sender_ip, sender_mac, false));
             }
             drop(c);
             if op == 1 && target_ip == our_ip() {
@@ -1028,18 +1034,57 @@ fn arp_resolve(ip: [u8; 4], ms: u64) -> Option<[u8; 6]> {
 pub fn arp_del(ip: [u8; 4]) -> bool {
     let mut c = ARP_CACHE.lock();
     let n = c.len();
-    c.retain(|(i, _)| *i != ip);
+    c.retain(|e| e.0 != ip);
     c.len() != n
+}
+
+/// `/proc/net/arp` write grammar (same convention as /proc/net/route):
+///   "add <ip> <mac>"  installs a PERMANENT entry (arp -s)
+///   "del <ip>"        drops an entry (arp -d / ip neigh del)
+///   "flush"           empties the cache (ip neigh flush)
+pub fn arp_ctl(line: &str) -> bool {
+    let mut f = line.split_whitespace();
+    match f.next() {
+        Some("add") => {
+            let (Some(ip), Some(macs)) = (f.next(), f.next()) else {
+                return false;
+            };
+            let Some(ip) = parse_ip(ip) else { return false };
+            let o: Vec<u8> = macs
+                .split(':')
+                .filter_map(|h| u8::from_str_radix(h, 16).ok())
+                .collect();
+            if o.len() != 6 {
+                return false;
+            }
+            let mac: [u8; 6] = [o[0], o[1], o[2], o[3], o[4], o[5]];
+            let mut c = ARP_CACHE.lock();
+            if let Some(e) = c.iter_mut().find(|e| e.0 == ip) {
+                e.1 = mac;
+                e.2 = true;
+            } else {
+                c.push((ip, mac, true));
+            }
+            true
+        }
+        Some("del") => f.next().and_then(parse_ip).map(arp_del).unwrap_or(false),
+        Some("flush") => {
+            ARP_CACHE.lock().clear();
+            true
+        }
+        _ => false,
+    }
 }
 
 pub fn arp_stat() -> String {
     let c = ARP_CACHE.lock();
     let mut s = String::from("ip              mac\n");
-    for (ip, mac) in c.iter() {
+    for (ip, mac, perm) in c.iter() {
         s.push_str(&alloc::format!(
-            "{}.{}.{}.{}\t{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+            "{}.{}.{}.{}\t{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}{}\n",
             ip[0], ip[1], ip[2], ip[3],
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            if *perm { "\tPERM" } else { "" }
         ));
     }
     if c.is_empty() {
