@@ -2320,6 +2320,28 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             }
             && ustd::write_all("/proc/sys/user/max_user_namespaces", b"0").is_ok()
     });
+    check("ns-max", {
+        // user.max_{uts,ipc,time,pid,mnt}_namespaces: per-creator
+        // live-namespace caps — at 1 a root child's second unshare of
+        // each kind is EPERM while the first succeeds.
+        let arm = ustd::write_all("/proc/sys/user/max_uts_namespaces", b"1").is_ok()
+            && ustd::write_all("/proc/sys/user/max_ipc_namespaces", b"1").is_ok();
+        let ran = arm
+            && match ustd::fork() {
+                0 => {
+                    let uts1 = ustd::unshare(0x0400_0000) == 0; // CLONE_NEWUTS
+                    let uts2 = ustd::unshare(0x0400_0000) == -1;
+                    let ipc1 = ustd::unshare(0x0800_0000) == 0; // CLONE_NEWIPC
+                    let ipc2 = ustd::unshare(0x0800_0000) == -1;
+                    ustd::exit(if uts1 && uts2 && ipc1 && ipc2 { 0 } else { 1 });
+                }
+                p if p > 0 => ustd::waitpid(p as u32, 5000).unwrap_or(-1) == 0,
+                _ => false,
+            };
+        ran
+            && ustd::write_all("/proc/sys/user/max_uts_namespaces", b"0").is_ok()
+            && ustd::write_all("/proc/sys/user/max_ipc_namespaces", b"0").is_ok()
+    });
     check("dev-mem", {
         ustd::open("/dev/mem", 0)
             .map(|fd| {

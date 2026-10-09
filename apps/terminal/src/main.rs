@@ -38299,6 +38299,13 @@ impl Term {
                     "/proc/sys/net/ipv4/ip_unprivileged_port_start",
                     "/proc/sys/net/ipv4/icmp_echo_ignore_broadcasts",
                     "/proc/sys/net/ipv4/ip_forward",
+                    "/proc/sys/net/core/somaxconn",
+                    "/proc/sys/user/max_user_namespaces",
+                    "/proc/sys/user/max_mnt_namespaces",
+                    "/proc/sys/user/max_uts_namespaces",
+                    "/proc/sys/user/max_pid_namespaces",
+                    "/proc/sys/user/max_ipc_namespaces",
+                    "/proc/sys/user/max_time_namespaces",
                 ];
                 // `-N` prints names only, `-n`/`--values` values only —
                 // real sysctl output modes over the same key dump.

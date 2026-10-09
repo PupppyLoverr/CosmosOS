@@ -3898,6 +3898,20 @@ fn sys_unshare(flags: u64) -> u64 {
             return (-1i64) as u64; // EPERM
         }
     }
+    // user.max_{mnt,uts,pid,ipc,time}_namespaces — the same ucounts
+    // cap as max_user_namespaces, one knob per kind.
+    let euid = task::cred().0;
+    for (flag, kind, max) in [
+        (shared::CLONE_NEWNS, task::NsKind::Mnt, crate::sysctl::max_mnt_namespaces()),
+        (shared::CLONE_NEWUTS, task::NsKind::Uts, crate::sysctl::max_uts_namespaces()),
+        (shared::CLONE_NEWPID, task::NsKind::Pid, crate::sysctl::max_pid_namespaces()),
+        (shared::CLONE_NEWIPC, task::NsKind::Ipc, crate::sysctl::max_ipc_namespaces()),
+        (shared::CLONE_NEWTIME, task::NsKind::Time, crate::sysctl::max_time_namespaces()),
+    ] {
+        if flags & flag != 0 && max != 0 && task::ns_count_by(kind, euid) >= max as usize {
+            return (-1i64) as u64; // EPERM
+        }
+    }
     if flags & shared::CLONE_NEWNS != 0 {
         task::unshare_ns();
     }
