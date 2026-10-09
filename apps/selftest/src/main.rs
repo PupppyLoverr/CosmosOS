@@ -6052,6 +6052,33 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         a1 && dly >= base + 100 && a2 && dead && back
     });
+    // --- ip-monitor: rtnl-style event stream ---
+    // Mutations (neigh add/del, route add/del) push real events into the
+    // kernel NET_EV ring; /proc/net/ipmonitor drains them like netlink.
+    let ok = {
+        let _ = ustd::read_all("/proc/net/ipmonitor"); // drain stale events
+        let ok_a = ustd::write_all("/proc/net/arp", b"add 10.0.2.9 52:54:00:aa:bb:cc")
+            .is_ok();
+        let ok_r = ustd::write_all("/proc/net/route", b"add 192.0.2.0/24 10.0.2.2")
+            .is_ok();
+        let _ = ustd::write_all("/proc/net/arp", b"del 10.0.2.9");
+        let _ = ustd::write_all("/proc/net/route", b"del 192.0.2.0/24");
+        let mon = ustd::read_all("/proc/net/ipmonitor")
+            .map(|d| String::from_utf8_lossy(&d).into_owned())
+            .unwrap_or_default();
+        let ok = ok_a
+            && ok_r
+            && mon.contains("NEIGH 10.0.2.9 lladdr 52:54:00:aa:bb:cc REACHABLE")
+            && mon.contains("Deleted NEIGH 10.0.2.9")
+            && mon.contains("ROUTE 192.0.2.0/24 via 10.0.2.2")
+            && mon.contains("Deleted ROUTE 192.0.2.0/24");
+        if !ok {
+            println!("[dbg] ip-monitor a={} r={} mon={:?}", ok_a, ok_r, mon);
+        }
+        ok
+    };
+    check("ip-monitor", ok);
+
     check("ipt-rpfilter", {
         // `-m rpfilter`: while a route back to the gw exists the rule
         // matches and drops; with the subnet route gone there's no

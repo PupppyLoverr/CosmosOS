@@ -1952,6 +1952,25 @@ fn inotify_mask_name(mask: u64) -> String {
     out
 }
 
+/// Thread-group map: task tid -> tgid (min tid among the group that
+/// shares its address space, via /proc/<pid>/task). Real `ps`/`top`
+/// show only group leaders by default; -L/-H reveal every thread.
+fn tgid_map(procs: &[shared::ProcInfo]) -> alloc::collections::BTreeMap<u32, u32> {
+    let mut m = alloc::collections::BTreeMap::new();
+    for p in procs {
+        let tids: Vec<u32> = ustd::read_all(&alloc::format!("/proc/{}/task", p.pid))
+            .map(|d| {
+                String::from_utf8_lossy(&d)
+                    .split_whitespace()
+                    .filter_map(|t| t.parse::<u32>().ok())
+                    .collect()
+            })
+            .unwrap_or_else(|_| alloc::vec![p.pid]);
+        m.insert(p.pid, tids.iter().copied().min().unwrap_or(p.pid));
+    }
+    m
+}
+
 /// Parse a klog record's `[ secs.usecs ]` stamp -> (ms_since_boot, rest).
 fn klog_ts(l: &str) -> Option<(u64, &str)> {
     let l = l.trim_start();
@@ -9943,6 +9962,7 @@ struct Term {
     // `inotifywait`/`inotifywatch`: (ifd, deadline_ms or MAX, counts, monitor)
     inotw: Option<(i64, u64, alloc::collections::BTreeMap<String, u64>, bool)>,
     top: Option<u64>,           // top mode: refresh interval ms
+    top_h: bool,                // top -H: show every thread, not just leaders
     jobs: Vec<(u32, String)>,   // tracked spawned processes (jobs/fg/disown/$!)
     last_spawn: u32,            // pid of the most recent spawned process ($!)
     strace_p: Option<u32>,      // pid being syscall-traced (strace -p, modal)
@@ -17431,7 +17451,12 @@ impl Term {
             "clear" => self.lines.clear(),
             "ps" => {
                 // real /proc-backed table; -o cols picks fields:
-                // pid,ni,stat,vsz,cpu,cmd (name) — comma separated
+                // pid,ni,stat,vsz,cpu,cmd (name) — comma separated.
+                // -L: real thread view — one row per LWP with the group's
+                // tgid in PID (Linux semantics: default lists leaders).
+                let show_threads = args
+                    .iter()
+                    .any(|a| *a == "-L" || *a == "-eLf" || *a == "-Lf");
                 let cols: Vec<String> = match args.iter().position(|a| a == &"-o") {
                     Some(i) => args
                         .get(i + 1)
@@ -17451,7 +17476,8 @@ impl Term {
                     }
                 }
                 self.emit(&alloc::format!(
-                    "  {}",
+                    "  {}{}",
+                    if show_threads { "    PID    LWP " } else { "" },
                     cols.iter()
                         .map(|c| alloc::format!("{:>7}", c.to_uppercase()))
                         .collect::<Vec<_>>()
@@ -17459,6 +17485,11 @@ impl Term {
                 ));
                 // -p PID[,PID]...: restrict to the given pids (GNU)
                 let pi = args.iter().position(|a| a == &"-p");
+                let tgid_of = if pi.is_none() {
+                    tgid_map(&ustd::proclist(64))
+                } else {
+                    Default::default()
+                };
                 let want: Vec<u64> = pi
                     .and_then(|i| args.get(i + 1))
                     .map(|c| {
@@ -17470,6 +17501,10 @@ impl Term {
                 for p in ustd::proclist(64) {
                     if pi.is_some() && !want.contains(&(p.pid as u64)) {
                         continue;
+                    }
+                    let tg = tgid_of.get(&p.pid).copied().unwrap_or(p.pid);
+                    if pi.is_none() && !show_threads && tg != p.pid {
+                        continue; // non-leader thread hidden (ps default)
                     }
                     let name = core::str::from_utf8(&p.name)
                         .unwrap_or("?")
@@ -17487,6 +17522,10 @@ impl Term {
                         }
                     }
                     let mut row: Vec<String> = Vec::new();
+                    if show_threads {
+                        row.push(alloc::format!("{}", tg));
+                        row.push(alloc::format!("{}", p.pid));
+                    }
                     for c in &cols {
                         row.push(match c.as_str() {
                             "pid" => alloc::format!("{}", p.pid),
@@ -17655,17 +17694,28 @@ impl Term {
             }
             "top" => {
                 // top [-b] [-n1] [ms]: -b batch mode prints once and exits;
-                // default is the live view (Esc/Enter/q stops)
+                // default is the live view (Esc/Enter/q stops).
+                // -H: real thread mode — every LWP row, like `top -H`.
+                let threads = args.iter().any(|a| a == &"-H");
                 let batch = args.iter().any(|a| a == &"-b" || a == &"-n1");
                 if batch {
                     let procs = ustd::proclist(64);
+                    let tgm = tgid_map(&procs);
+                    let procs: Vec<shared::ProcInfo> = procs
+                        .into_iter()
+                        .filter(|p| threads || tgm.get(&p.pid).copied().unwrap_or(p.pid) == p.pid)
+                        .collect();
                     let mi = ustd::meminfo();
                     self.emit(&alloc::format!(
                         "top - {} procs, mem {}% used",
                         procs.len(),
                         if mi.total_kb > 0 { mi.used_kb * 100 / mi.total_kb } else { 0 }
                     ));
-                    self.emit("  PID   NI  CPU_ms  VSZ_kB  STATE  NAME");
+                    if threads {
+                        self.emit("  TGID   LWP   NI  CPU_ms  VSZ_kB  STATE  NAME");
+                    } else {
+                        self.emit("  PID   NI  CPU_ms  VSZ_kB  STATE  NAME");
+                    }
                     for p in &procs {
                         let name = core::str::from_utf8(&p.name)
                             .unwrap_or("?")
@@ -17682,10 +17732,18 @@ impl Term {
                                 }
                             }
                         }
-                        self.emit(&alloc::format!(
-                            "  {:>3}  {:>2}  {:>6}  {:>7}  {:<5}  {}",
-                            p.pid, ni, p.cpu_ticks * 10, p.mem_kb, st, name
-                        ));
+                        if threads {
+                            self.emit(&alloc::format!(
+                                "  {:>4}  {:>4}  {:>2}  {:>6}  {:>7}  {:<5}  {}",
+                                tgm.get(&p.pid).copied().unwrap_or(p.pid),
+                                p.pid, ni, p.cpu_ticks * 10, p.mem_kb, st, name
+                            ));
+                        } else {
+                            self.emit(&alloc::format!(
+                                "  {:>3}  {:>2}  {:>6}  {:>7}  {:<5}  {}",
+                                p.pid, ni, p.cpu_ticks * 10, p.mem_kb, st, name
+                            ));
+                        }
                     }
                     return;
                 }
@@ -17697,6 +17755,7 @@ impl Term {
                 self.top = Some(ms);
                 self.top_last = 0;
                 self.top_prev.clear();
+                self.top_h = threads;
             }
             "dc" => {
                 // dc: real RPN desk calculator. tokens: nums, + - * / % p n d r c f
@@ -17776,7 +17835,46 @@ impl Term {
                 }
             }
             "vmstat" => {
-                // real snapshot: procs/memory/cpu from kernel counters
+                // real snapshot: procs/memory/cpu from kernel counters.
+                // `vmstat <delay> [count]` — GNU sampling mode: repeat
+                // the snapshot every delay secs, count times (or forever).
+                let nums: Vec<u64> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .filter_map(|a| a.parse::<u64>().ok())
+                    .collect();
+                let delay = nums.first().copied().unwrap_or(0);
+                let count = nums.get(1).copied().unwrap_or(0);
+                if delay > 0 {
+                    if count == 0 {
+                        // unbounded: ride the watch machinery (Esc stops)
+                        self.watch =
+                            Some((String::from("vmstat"), delay * 1000, 0));
+                        self.emit(&alloc::format!(
+                            "watching every {}s -- Esc/Enter to stop",
+                            delay
+                        ));
+                        return;
+                    }
+                    self.emit("procs ---memory(KB)--- --cpu--");
+                    for _ in 0..count {
+                        let mi = ustd::meminfo();
+                        let procs = ustd::proclist(64);
+                        let total: u64 = procs.iter().map(|p| p.cpu_ticks).sum();
+                        let user_ticks: u64 = procs
+                            .iter()
+                            .filter(|p| p.is_user != 0)
+                            .map(|p| p.cpu_ticks)
+                            .sum();
+                        let busy = if total > 0 { user_ticks * 100 / total } else { 0 };
+                        self.emit(&alloc::format!(
+                            "  {:>3}  {:>9} {:>9}  {:>3}% {:>3}%",
+                            procs.len(), mi.used_kb, mi.total_kb - mi.used_kb, busy, 100 - busy
+                        ));
+                        ustd::sleep_ms(delay * 1000);
+                    }
+                    return;
+                }
                 let mi = ustd::meminfo();
                 let procs = ustd::proclist(64);
                 let total: u64 = procs.iter().map(|p| p.cpu_ticks).sum();
@@ -17808,6 +17906,20 @@ impl Term {
                 }
             }
             "free" => {
+                // -s N: real repeat-every-N-seconds mode (Esc stops)
+                if let Some(si) = args.iter().position(|a| *a == "-s" || *a == "--seconds") {
+                    let n = args
+                        .get(si + 1)
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(1)
+                        .max(1);
+                    self.watch = Some((String::from("free"), n * 1000, 0));
+                    self.emit(&alloc::format!(
+                        "watching every {}s -- Esc/Enter to stop",
+                        n
+                    ));
+                    return;
+                }
                 let mi = ustd::meminfo();
                 self.emit("           total       used       free");
                 self.emit(&alloc::format!(
@@ -40833,6 +40945,11 @@ impl Term {
                 let brief = args.iter().any(|a| {
                     *a == "-br" || *a == "--brief" || *a == "-o" || *a == "--oneline"
                 });
+                // `-ts/--timestamp`: real iproute2 flag — monitor events
+                // get an uptime timestamp prefix.
+                let ts_flag = args
+                    .iter()
+                    .any(|a| *a == "-ts" || *a == "-t" || *a == "--timestamp");
                 let mut skip_f = false;
                 let args: Vec<&str> = args
                     .iter()
@@ -40846,7 +40963,7 @@ impl Term {
                             skip_f = true;
                             return false;
                         }
-                        *a != "-4" && *a != "-inet" && *a != "-br" && *a != "--brief" && *a != "-o" && *a != "--oneline"
+                        *a != "-4" && *a != "-inet" && *a != "-br" && *a != "--brief" && *a != "-o" && *a != "--oneline" && *a != "-ts" && *a != "-t" && *a != "--timestamp"
                     })
                     .collect();
                 let args: &[&str] = &args;
@@ -40879,6 +40996,41 @@ impl Term {
                     return;
                 }
                 match args.first().copied() {
+                // `ip monitor`: real RTM-style event stream — the kernel
+                // queues NEIGH/ROUTE/LINK events on every real mutation;
+                // `monq` is the quiet per-tick drain the watch rides.
+                Some("monitor") => {
+                    self.watch = Some((
+                        alloc::format!("ip {}monq", if ts_flag { "-ts " } else { "" }),
+                        500,
+                        0,
+                    ));
+                    self.emit(&alloc::format!(
+                        "watching events (500ms drain) -- Esc/Enter to stop{}",
+                        if ts_flag { " [timestamps]" } else { "" }
+                    ));
+                    return;
+                }
+                Some("monq") => {
+                    if let Ok(d) = ustd::read_all("/proc/net/ipmonitor") {
+                        let t = String::from_utf8_lossy(&d);
+                        if !t.is_empty() {
+                            for l in t.lines() {
+                                if ts_flag {
+                                    self.emit(&alloc::format!(
+                                        "[{:>5}.{:03}] {}",
+                                        ustd::uptime_ms() / 1000,
+                                        ustd::uptime_ms() % 1000,
+                                        l
+                                    ));
+                                } else {
+                                    self.emit(l);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
                 // `ip -s link` — per-iface RX/TX stats in iproute2 layout
                 Some("-s") | Some("--stats") => {
                     // `ip -s neigh` — stats form keeps the real ` used N`
@@ -41154,6 +41306,13 @@ impl Term {
                 }
             }
             "ss" => {
+                // -4/-6: address family — all sockets are inet here, so
+                // -4 is a real pass-through filter and -6 honestly
+                // reports the missing family (like `ip -6`).
+                if args.iter().any(|a| *a == "-6" || *a == "--inet6") {
+                    self.fail("ss: inet6 sockets not supported");
+                    return;
+                }
                 // -s: socket summary — real counts over /proc/net dumps
                 if args.iter().any(|a| *a == "-s" || *a == "--summary") {
                     let rows = |p: &str| -> usize {
@@ -41656,6 +41815,67 @@ impl Term {
                         self.emit(&alloc::format!("{:08x}", h));
                     }
                     None => self.emit("00000000"),
+                }
+            }
+            "lastlog" => {
+                // real per-user last login: /etc/passwd users x /utmp
+                // records — `**Never logged in**` for users with none.
+                let recs: Vec<(u32, String, u64)> = ustd::read_all("/utmp")
+                    .map(|d| {
+                        String::from_utf8_lossy(&d)
+                            .lines()
+                            .filter_map(|l| {
+                                let mut it = l.split_whitespace();
+                                match (it.next(), it.next(), it.next()) {
+                                    (Some(p), Some(x), Some(t)) => Some((
+                                        p.parse().unwrap_or(0),
+                                        String::from(x),
+                                        t.parse().unwrap_or(0),
+                                    )),
+                                    _ => None,
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let users: Vec<String> = ustd::read_all("/etc/passwd")
+                    .map(|d| {
+                        String::from_utf8_lossy(&d)
+                            .lines()
+                            .filter_map(|l| l.split(':').next().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_else(|_| alloc::vec![String::from("root")]);
+                self.emit("Username         Port     From             Latest");
+                for u in &users {
+                    // utmp records carry pid+exe+epoch (no tty/user field
+                    // in this world — the system is single-user root)
+                    let last = recs.iter().map(|(_, _, t)| *t).max();
+                    match (u.as_str(), last) {
+                        ("root", Some(t)) => {
+                            let (y, mo, d, h, mi, _s) = epoch_to_dt(t);
+                            self.emit(&alloc::format!(
+                                "root             tty1                         {} {} {:2} {:02}:{:02}:00 +0000 {}",
+                                ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]
+                                    [((cal_days(y, mo, d) + 4) % 7) as usize],
+                                ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+                                    [(mo - 1) as usize],
+                                d, h, mi, y
+                            ));
+                        }
+                        (u, None) => {
+                            self.emit(&alloc::format!(
+                                "{:<16}                          **Never logged in**",
+                                u
+                            ));
+                        }
+                        (u, _) => {
+                            self.emit(&alloc::format!(
+                                "{:<16}                          **Never logged in**",
+                                u
+                            ));
+                        }
+                    }
                 }
             }
             "who" | "w" | "users" | "last" => {
@@ -44296,6 +44516,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         top: None,
         top_last: 0,
         top_prev: Vec::new(),
+        top_h: false,
         tailf_last: 0,
         at_q: Vec::new(),
         cron_q: Vec::new(),
@@ -44812,6 +45033,11 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             if now - t.top_last >= ms {
                 t.top_last = now;
                 let procs = ustd::proclist(64);
+                let tgm = tgid_map(&procs);
+                let procs: Vec<shared::ProcInfo> = procs
+                    .into_iter()
+                    .filter(|p| t.top_h || tgm.get(&p.pid).copied().unwrap_or(p.pid) == p.pid)
+                    .collect();
                 // delta vs previous snapshot -> %CPU
                 let mut dsum = 0u64;
                 let mut delta: Vec<(u32, u64)> = Vec::new();
@@ -44836,7 +45062,11 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                     procs.len(),
                     if mi.total_kb > 0 { mi.used_kb * 100 / mi.total_kb } else { 0 }
                 ));
-                t.push_line("  PID   NI  %CPU   VSZ_kB  STATE  NAME");
+                if t.top_h {
+                    t.push_line("  TGID   LWP   NI  %CPU   VSZ_kB  STATE  NAME");
+                } else {
+                    t.push_line("  PID   NI  %CPU   VSZ_kB  STATE  NAME");
+                }
                 let mut scored: Vec<(u64, u32, u64, String, String, String)> = procs
                     .iter()
                     .map(|p| {
@@ -44861,10 +45091,18 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 for (d, pid, mem, ni, st, name) in scored.iter().take(20) {
                     let st: &str = st;
                     let pct = if dsum > 0 { d * 100 / dsum } else { 0 };
-                    t.push_line(&alloc::format!(
-                        "  {:>3} {:>3}  {:>3}%  {:>7}  {:<5}  {}",
-                        pid, ni, pct, mem, st, name
-                    ));
+                    if t.top_h {
+                        t.push_line(&alloc::format!(
+                            "  {:>4} {:>4}  {:>3}  {:>3}%  {:>7}  {:<5}  {}",
+                            tgm.get(pid).copied().unwrap_or(*pid),
+                            pid, ni, pct, mem, st, name
+                        ));
+                    } else {
+                        t.push_line(&alloc::format!(
+                            "  {:>3} {:>3}  {:>3}%  {:>7}  {:<5}  {}",
+                            pid, ni, pct, mem, st, name
+                        ));
+                    }
                 }
                 t.dirty_all = true;
             }

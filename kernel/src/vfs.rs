@@ -580,6 +580,11 @@ pub fn read(fd: i64, buf: &mut [u8]) -> Result<i64, i64> {
         let data = crate::proc::read_file(&path).ok_or(-3i64)?;
         let avail = if pos as usize >= data.len() { 0 } else { data.len() - pos as usize };
         let n = avail.min(buf.len());
+        if n == 0 {
+            // empty file (or read past EOF): data[pos..pos] is out of
+            // range when pos > 0 — return a clean EOF instead.
+            return Ok(0);
+        }
         buf[..n].copy_from_slice(&data[pos as usize..pos as usize + n]);
         task::with_current(|t| {
             if let Some(Some(f)) = t.fds.get_mut(fd as usize) {

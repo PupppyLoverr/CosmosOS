@@ -83,6 +83,13 @@ pub fn net_def_ttl() -> String {
 /// rx pump drops every frame and transmit requests fail — a real carrier
 /// flag, not cosmetic.
 pub fn set_up(up: bool) {
+    let was = IFACE_UP.swap(up as u64, Ordering::Relaxed) != 0;
+    if was != up {
+        net_ev(alloc::format!(
+            "LINK eth0 {}",
+            if up { "UP" } else { "DOWN" }
+        ));
+    }
     IFACE_UP.store(up as u64, Ordering::Relaxed);
 }
 
@@ -281,6 +288,7 @@ pub fn route_ctl(line: &str) -> bool {
         // same effect as `ip route flush` on an unpopulated box.
         Some("flush") => {
             *ROUTES.lock() = Some(default_routes());
+            net_ev(String::from("ROUTE table flushed"));
             return true;
         }
         _ => return false,
@@ -309,6 +317,15 @@ pub fn route_ctl(line: &str) -> bool {
     let mask_b = mask.to_be_bytes();
     r.retain(|rt| !(rt.dest == dest && rt.mask == mask_b));
     r.push(Route { dest, mask: mask_b, gw, dev: "eth0" });
+    let gw_s = if gw == [0; 4] {
+        String::from("*")
+    } else {
+        alloc::format!("{}.{}.{}.{}", gw[0], gw[1], gw[2], gw[3])
+    };
+    net_ev(alloc::format!(
+        "ROUTE {}.{}.{}.{}/{} via {}",
+        dest[0], dest[1], dest[2], dest[3], plen, gw_s
+    ));
     true
 }
 
@@ -323,7 +340,15 @@ fn route_del(spec: &str) -> bool {
     let r = g.get_or_insert_with(default_routes);
     let before = r.len();
     r.retain(|rt| !(rt.dest == dest && rt.mask == mask.to_be_bytes()));
-    r.len() != before
+    if r.len() != before {
+        net_ev(alloc::format!(
+            "Deleted ROUTE {}.{}.{}.{}/{}",
+            dest[0], dest[1], dest[2], dest[3], plen
+        ));
+        true
+    } else {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1893,6 +1918,31 @@ pub fn net_snmp() -> String {
 /// the real userspace object that must exist before the rule does).
 static NFACCT: Mutex<alloc::collections::BTreeMap<String, (u64, u64)>> =
     Mutex::new(alloc::collections::BTreeMap::new());
+
+/// `ip monitor` — RTMGRP-style event queue. Every real mutation of the
+/// neighbour cache, routing table, or link state pushes one event line;
+/// readers of `/proc/net/ipmonitor` drain it (like an rtnl socket).
+static NET_EV: Mutex<alloc::collections::VecDeque<String>> =
+    Mutex::new(alloc::collections::VecDeque::new());
+
+fn net_ev(msg: String) {
+    let mut q = NET_EV.lock();
+    if q.len() >= 128 {
+        q.pop_front(); // ring overrun: drop the oldest (nl ENOBUFS)
+    }
+    q.push_back(msg);
+}
+
+/// `/proc/net/ipmonitor` read: drain every queued event.
+pub fn net_monitor() -> String {
+    let mut s = String::new();
+    let mut q = NET_EV.lock();
+    while let Some(e) = q.pop_front() {
+        s.push_str(&e);
+        s.push('\n');
+    }
+    s
+}
 
 /// `/proc/net/mac` — the interface's real device MAC (read once from the
 /// virtio-net PCI config space at driver init).
@@ -4161,6 +4211,12 @@ fn handle_frame(f: &[u8]) -> Option<([u8; 4], u8, Vec<u8>, u64)> {
                     perm: false,
                     learned_ms: now_ms(),
                 });
+                net_ev(alloc::format!(
+                    "NEIGH {}.{}.{}.{} lladdr {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} STALE",
+                    sender_ip[0], sender_ip[1], sender_ip[2], sender_ip[3],
+                    sender_mac[0], sender_mac[1], sender_mac[2],
+                    sender_mac[3], sender_mac[4], sender_mac[5]
+                ));
             }
             drop(c);
             if op == 1 && target_ip == our_ip() {
@@ -4264,11 +4320,28 @@ pub fn arp_ctl(line: &str) -> bool {
                     learned_ms: now_ms(),
                 });
             }
+            net_ev(alloc::format!(
+                "NEIGH {}.{}.{}.{} lladdr {} REACHABLE",
+                ip[0], ip[1], ip[2], ip[3], macs
+            ));
             true
         }
-        Some("del") => f.next().and_then(parse_ip).map(arp_del).unwrap_or(false),
+        Some("del") => {
+            let ip = f.next().and_then(parse_ip);
+            match ip {
+                Some(ip) if arp_del(ip) => {
+                    net_ev(alloc::format!(
+                        "Deleted NEIGH {}.{}.{}.{}",
+                        ip[0], ip[1], ip[2], ip[3]
+                    ));
+                    true
+                }
+                _ => false,
+            }
+        }
         Some("flush") => {
             ARP_CACHE.lock().clear();
+            net_ev(String::from("NEIGH cache flushed"));
             true
         }
         // "announce" — emit a gratuitous ARP reply for our own address
