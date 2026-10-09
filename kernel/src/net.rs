@@ -387,6 +387,8 @@ struct FwRule {
     ctdir: u8,            // `-m conntrack --ctdir` (1 ORIGINAL / 2 REPLY)
     cpu: u8,              // `-m cpu --cpu N` (0xff = unset; only cpu 0 exists)
     nfacct: String,       // `-m nfacct --nfacct-name` — named acct object
+    set_name: String,     // `-m set --match-set` — named ipset object
+    set_dir: u8,          // match flags: bit0 src, bit1 dst
     atype_dst: u8,        // `-m addrtype --dst-type` (0 any,1 UNICAST,2 LOCAL,3 BROADCAST,4 MULTICAST)
     atype_src: u8,        // `--src-type` same map
     rpfilter: bool,       // `-m rpfilter` — a real route back to src exists
@@ -924,6 +926,15 @@ fn fw_eval(
             continue;
         }
         if r.ctdir != 0 && ct_dir(src, dst, sport, dport, proto) != r.ctdir {
+            continue;
+        }
+        // `-m set --match-set name src[,dst]`: the packet's flagged
+        // tuple must be a member of the named kernel set — ANY flagged
+        // dimension matching is a hit (real ipset semantics on a
+        // single-dimension set).
+        if !r.set_name.is_empty()
+            && !ipset_match(&r.set_name, r.set_dir, src, dst, sport, dport)
+        {
             continue;
         }
         if r.msocket {
@@ -1609,6 +1620,14 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
     if !r.nfacct.is_empty() {
         out.push_str(&alloc::format!(" -m nfacct --nfacct-name {}", r.nfacct));
     }
+    if !r.set_name.is_empty() {
+        let d = match r.set_dir {
+            2 => "dst",
+            3 => "src,dst",
+            _ => "src",
+        };
+        out.push_str(&alloc::format!(" -m set --match-set {} {}", r.set_name, d));
+    }
     if r.limit_pps != 0 {
         out.push_str(&alloc::format!(" -m limit --limit {}/s", r.limit_pps));
         if r.limit_burst != 5 {
@@ -1918,6 +1937,170 @@ pub fn net_nfacct_ctl(t: &str) -> bool {
     }
 }
 
+/// Named ipset objects (`hash:ip` / `hash:ip,port` / `hash:net`) — the
+/// kernel sets `-m set --match-set` tests against. Entries are stored
+/// normalized: hash:ip as (ip_u32be, 0), hash:ip,port as (ip, port),
+/// hash:net as (masked_net_u32be, plen).
+struct IpSet {
+    kind: u8, // 0 hash:ip, 1 hash:ip,port, 2 hash:net
+    ents: alloc::collections::BTreeSet<(u32, u16)>,
+}
+static IPSETS: Mutex<alloc::collections::BTreeMap<String, IpSet>> =
+    Mutex::new(alloc::collections::BTreeMap::new());
+
+fn ip_be(ip: [u8; 4]) -> u32 {
+    u32::from_be_bytes(ip)
+}
+
+/// Parse `10.0.2.2` / `10.0.2.2,80` / `10.0.2.0/24` for the given set
+/// kind; returns the normalized (key, aux) pair or None.
+fn ipset_item(item: &str, kind: u8) -> Option<(u32, u16)> {
+    let mut host = item;
+    let mut port = 0u16;
+    let mut plen: Option<u16> = None;
+    if let Some((h, p)) = item.split_once(',') {
+        host = h;
+        port = p.parse().ok()?;
+    }
+    if let Some((h, l)) = host.split_once('/') {
+        host = h;
+        plen = Some(l.parse().ok()?);
+    }
+    let ip = ip_be(parse_ip(host)?);
+    match kind {
+        0 if port == 0 && plen.is_none() => Some((ip, 0)),
+        1 if plen.is_none() => Some((ip, port)),
+        2 if port == 0 => {
+            let l = plen.unwrap_or(32);
+            if l > 32 {
+                return None;
+            }
+            let m = if l == 0 { 0 } else { !0u32 << (32 - l) };
+            Some((ip & m, l))
+        }
+        _ => None,
+    }
+}
+
+fn ipset_member(e: &IpSet, ip: u32, port: u16) -> bool {
+    match e.kind {
+        0 => e.ents.contains(&(ip, 0)),
+        1 => e.ents.contains(&(ip, port)),
+        _ => e.ents.iter().any(|&(net, l)| {
+            let m = if l == 0 { 0 } else { !0u32 << (32 - l) };
+            (ip & m) == net
+        }),
+    }
+}
+
+/// Packet test for `-m set`: ANY flagged dimension matching is a hit.
+fn ipset_match(name: &str, dir: u8, src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16) -> bool {
+    let sets = IPSETS.lock();
+    let Some(e) = sets.get(name) else {
+        return false;
+    };
+    let d = if dir == 0 { 1 } else { dir };
+    (d & 1 != 0 && ipset_member(e, ip_be(src), sport))
+        || (d & 2 != 0 && ipset_member(e, ip_be(dst), dport))
+}
+
+/// `/proc/net/ipset` — ipset-save-format dump of every set.
+pub fn net_ipset() -> String {
+    let mut s = String::new();
+    for (n, e) in IPSETS.lock().iter() {
+        let k = match e.kind {
+            0 => "hash:ip",
+            1 => "hash:ip,port",
+            _ => "hash:net",
+        };
+        s.push_str(&alloc::format!(
+            "create {} {} family inet hashsize 1024 maxelem 65536
+",
+            n, k
+        ));
+        for &(a, b) in e.ents.iter() {
+            let ip = a.to_be_bytes();
+            let item = match e.kind {
+                0 => alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
+                1 => alloc::format!("{}.{}.{}.{},{}", ip[0], ip[1], ip[2], ip[3], b),
+                _ => alloc::format!("{}.{}.{}.{}/{}", ip[0], ip[1], ip[2], ip[3], b),
+            };
+            s.push_str(&alloc::format!("add {} {}
+", n, item));
+        }
+    }
+    s
+}
+
+/// `/proc/net/ipset` control grammar (the `ipset` tool's ops):
+///   "C <name> <hash:ip|hash:ip,port|hash:net>"  create (EEXIST if taken)
+///   "A <name> <item>"    add entry (ip / ip,port / ip/plen by kind)
+///   "D <name> <item>"    delete entry
+///   "T <name> <item>"    membership test (false = not a member)
+///   "F [name]"           flush entries (one set, or all)
+///   "X <name>"           destroy the set
+pub fn ipset_ctl(t: &str) -> bool {
+    let mut f = t.split_whitespace();
+    match f.next() {
+        Some("C") => {
+            let n = String::from(f.next().unwrap_or(""));
+            let k = match f.next().unwrap_or("") {
+                "hash:ip" => 0,
+                "hash:ip,port" => 1,
+                "hash:net" => 2,
+                _ => return false,
+            };
+            if n.is_empty() {
+                return false;
+            }
+            IPSETS
+                .lock()
+                .insert(n, IpSet { kind: k, ents: Default::default() })
+                .is_none()
+        }
+        Some("A") | Some("D") | Some("T") => {
+            let op = t.split_whitespace().next().unwrap_or("");
+            let n = f.next().unwrap_or("");
+            let item = f.next().unwrap_or("");
+            let mut sets = IPSETS.lock();
+            let Some(e) = sets.get_mut(n) else {
+                return false;
+            };
+            let Some(k) = ipset_item(item, e.kind) else {
+                return false;
+            };
+            match op {
+                "A" => e.ents.insert(k),
+                "D" => e.ents.remove(&k),
+                _ => ipset_member(e, k.0, k.1),
+            }
+        }
+        Some("F") => {
+            let mut sets = IPSETS.lock();
+            match f.next() {
+                Some(n) => match sets.get_mut(n) {
+                    Some(e) => {
+                        e.ents.clear();
+                        true
+                    }
+                    None => false,
+                },
+                None => {
+                    for e in sets.values_mut() {
+                        e.ents.clear();
+                    }
+                    true
+                }
+            }
+        }
+        Some("X") => {
+            let n = f.next().unwrap_or("");
+            IPSETS.lock().remove(n).is_some()
+        }
+        _ => false,
+    }
+}
+
 /// `/proc/net/nf_conntrack` — the REAL conntrack flow table (CT),
 /// Linux two-tuple format: orig direction then reply direction,
 /// `[UNREPLIED]` when the flow never saw a return packet. Entries are
@@ -2130,7 +2313,7 @@ fn fw_name_ok(n: &str) -> bool {
         "dscp", "icmpt", "syn", "rset", "rchk", "rupd", "rrem", "rhitc", "sports", "dstrange",
         "string", "u32", "statnth", "tflags", "quota", "time", "connl", "ctstate", "connbytes", "ouid", "ogid",
         "pkttype", "hlimit", "msocket", "addrtype", "rpfilter", "ctdir", "cpu",
-        "nfacct",
+        "nfacct", "set",
         "snat", "masq",
     ];
     !n.is_empty()
@@ -2563,6 +2746,8 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         ctdir: 0,
         cpu: u8::MAX,
         nfacct: String::new(),
+        set_name: String::new(),
+        set_dir: 0,
         atype_dst: 0,
         atype_src: 0,
         rpfilter: false,
@@ -2974,6 +3159,15 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
             }
             "nfacct" => {
                 r.nfacct = String::from(f.next().unwrap_or(""));
+            }
+            "set" => {
+                // `set <name> <src|dst|src,dst>`
+                r.set_name = String::from(f.next().unwrap_or(""));
+                r.set_dir = match f.next().unwrap_or("src") {
+                    "dst" => 2,
+                    "src,dst" | "dst,src" => 3,
+                    _ => 1,
+                };
             }
             "addrtype" => {
                 // `addrtype <src|dst> <UNICAST|LOCAL|BROADCAST|MULTICAST>`
