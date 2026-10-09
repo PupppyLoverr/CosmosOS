@@ -3858,11 +3858,60 @@ struct Tbf {
     bytes: u64,
     drops: u64,
 }
-static TC_QDISC: Mutex<Option<Tbf>> = Mutex::new(None);
+/// `netem` — the delay/jitter/loss qdisc: every egress frame waits
+/// delay±jitter ms inside the qdisc and is dropped with probability
+/// `loss_ppm`/1e6 (real netem semantics: loss evaluated per packet,
+/// delay applied to the packet's residence time).
+struct Netem {
+    delay_ms: u64,
+    jitter_ms: u64,
+    loss_ppm: u32,
+    pkts: u64,
+    bytes: u64,
+    drops: u64,
+}
+enum Qdisc {
+    Tbf(Tbf),
+    Netem(Netem),
+}
+static TC_QDISC: Mutex<Option<Qdisc>> = Mutex::new(None);
+static NETEM_RNG: AtomicU64 = AtomicU64::new(0x9e3779b97f4a7c15);
+
+fn netem_rand() -> u64 {
+    let mut x = NETEM_RNG
+        .fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed)
+        .wrapping_add(now_ms().rotate_left(17));
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    x
+}
 
 fn tc_shape(len: usize) -> bool {
     let mut g = TC_QDISC.lock();
-    let Some(t) = g.as_mut() else { return true };
+    let Some(q) = g.as_mut() else { return true };
+    if let Qdisc::Netem(n) = q {
+        if n.loss_ppm > 0 && (netem_rand() % 1_000_000) < n.loss_ppm as u64 {
+            n.drops += 1;
+            return false; // packet lost inside the qdisc — never sent
+        }
+        let mut d = n.delay_ms as i64;
+        if n.jitter_ms > 0 {
+            d += (netem_rand() % (2 * n.jitter_ms + 1)) as i64 - n.jitter_ms as i64;
+        }
+        if d > 0 {
+            let until = now_ms() + d as u64;
+            while now_ms() < until {
+                wait_irq(); // IF=0 syscall ctx: halt one tick (net wait pattern)
+            }
+        }
+        n.pkts += 1;
+        n.bytes += len as u64;
+        return true;
+    }
+    let Some(t) = (match q { Qdisc::Tbf(t) => Some(t), _ => None }) else {
+        return true;
+    };
     let mut now = now_ms();
     let burst = t.rate_bps.max(1514); // ~1s of credits, at least one MTU
     t.tokens = (t.tokens + (now - t.last_ms) * t.rate_bps / 1000).min(burst);
@@ -3899,9 +3948,19 @@ fn tc_shape(len: usize) -> bool {
 pub fn tc_show() -> String {
     let g = TC_QDISC.lock();
     match g.as_ref() {
-        Some(t) => alloc::format!(
+        Some(Qdisc::Tbf(t)) => alloc::format!(
             "qdisc tbf root dev eth0 rate {}bps burst {}b\n  Sent {} bytes {} pkt (dropped {}, overlimits 0)\n",
             t.rate_bps, t.rate_bps.max(1514), t.bytes, t.pkts, t.drops
+        ),
+        Some(Qdisc::Netem(n)) => alloc::format!(
+            "qdisc netem root dev eth0 delay {}ms jitter {}ms loss {}.{:02}%\n  Sent {} bytes {} pkt (dropped {}, overlimits 0)\n",
+            n.delay_ms,
+            n.jitter_ms,
+            n.loss_ppm / 10000,
+            (n.loss_ppm % 10000) / 100,
+            n.bytes,
+            n.pkts,
+            n.drops
         ),
         None => String::from("qdisc noqueue dev eth0 (no shaping configured)\n"),
     }
@@ -3914,6 +3973,47 @@ pub fn tc_ctl(line: &str) -> bool {
     match f.as_slice() {
         ["del"] | ["clear"] => {
             *TC_QDISC.lock() = None;
+            true
+        }
+        ["add", "qdisc", "netem", rest @ ..] => {
+            // `delay <ms>[ms] [jitter <ms>[ms]] [loss <pct>[%]]`
+            let mut delay = None;
+            let mut jitter = 0u64;
+            let mut loss = 0u32;
+            let mut i = 0usize;
+            let ms = |v: &str| v.trim_end_matches("ms").parse::<u64>().ok();
+            while i < rest.len() {
+                match rest[i] {
+                    "delay" => {
+                        delay = rest.get(i + 1).and_then(|v| ms(v));
+                        i += 1;
+                    }
+                    "jitter" => {
+                        jitter = rest.get(i + 1).and_then(|v| ms(v)).unwrap_or(0);
+                        i += 1;
+                    }
+                    "loss" => {
+                        let v = rest.get(i + 1).unwrap_or(&"0");
+                        let v = v.trim_end_matches('%');
+                        loss = (v.parse::<f64>().unwrap_or(0.0) * 10000.0) as u32;
+                        i += 1;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let Some(delay) = delay else { return false };
+            if loss > 1_000_000 {
+                return false;
+            }
+            *TC_QDISC.lock() = Some(Qdisc::Netem(Netem {
+                delay_ms: delay,
+                jitter_ms: jitter,
+                loss_ppm: loss,
+                pkts: 0,
+                bytes: 0,
+                drops: 0,
+            }));
             true
         }
         ["add", "qdisc", "tbf", "rate", rate] => {
@@ -3929,14 +4029,14 @@ pub fn tc_ctl(line: &str) -> bool {
             if rate_bps == 0 {
                 return false;
             }
-            *TC_QDISC.lock() = Some(Tbf {
+            *TC_QDISC.lock() = Some(Qdisc::Tbf(Tbf {
                 rate_bps,
                 tokens: rate_bps.max(1514),
                 last_ms: now_ms(),
                 pkts: 0,
                 bytes: 0,
                 drops: 0,
-            });
+            }));
             true
         }
         _ => false,

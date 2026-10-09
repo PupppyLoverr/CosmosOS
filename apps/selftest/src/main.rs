@@ -6031,6 +6031,27 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             })
             .unwrap_or(false)
     });
+    check("tc-netem", {
+        // real netem qdisc: egress frames are held delay ms inside the
+        // qdisc and dropped per the loss rate — ping rtt jumps by the
+        // delay and 100% loss kills the ping entirely.
+        let tc = "/proc/net/tc";
+        let _ = ustd::write_all(tc, b"del\n");
+        let base = ustd::net_ping(0x0A00_0202, 1500).unwrap_or(0);
+        let a1 = ustd::write_all(tc, b"add qdisc netem delay 120\n").is_ok();
+        let dly = ustd::net_ping(0x0A00_0202, 3000).unwrap_or(0);
+        let a2 = ustd::write_all(tc, b"add qdisc netem delay 0 loss 100%\n").is_ok();
+        let dead = ustd::net_ping(0x0A00_0202, 1500).is_none();
+        let _ = ustd::write_all(tc, b"del\n");
+        let back = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        if !(a1 && dly >= base + 100 && a2 && dead && back) {
+            println!(
+                "[dbg] netem a1={} base={} dly={} a2={} dead={} back={}",
+                a1, base, dly, a2, dead, back
+            );
+        }
+        a1 && dly >= base + 100 && a2 && dead && back
+    });
     check("ipt-rpfilter", {
         // `-m rpfilter`: while a route back to the gw exists the rule
         // matches and drops; with the subnet route gone there's no
