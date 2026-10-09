@@ -30,7 +30,7 @@ const FILES: &[&str] = &[
 /// files under /proc/net
 const NET_FILES: &[&str] = &[
     "tcp", "udp", "unix", "dev", "operstate", "owners", "route", "iptables",
-    "snmp", "nf_conntrack", "arp",
+    "snmp", "nf_conntrack", "arp", "fib_trie",
 ];
 
 /// files under /proc/sys/kernel
@@ -333,6 +333,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/net/snmp" => net::net_snmp(),
         "/proc/net/nf_conntrack" => net::net_conntrack(),
         "/proc/net/arp" => net::net_arp(),
+        "/proc/net/fib_trie" => net::net_fib_trie(),
         "/proc/net/operstate" => alloc::format!(
             "{}\n",
             if net::is_up() { "up" } else { "down" }
