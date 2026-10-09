@@ -28,6 +28,22 @@ pub fn set_hostname(s: String) {
     task::uts_of().lock().hostname = s.chars().take(64).collect();
 }
 
+/// NIS/YP domainname — read via /proc/sys/kernel/domainname and the
+/// `domainname` builtin; lives in the task's UTS namespace like the
+/// nodename. Empty reads print "(none)", same as Linux.
+pub fn domainname() -> String {
+    let g = task::uts_of().lock().domainname.clone();
+    if g.is_empty() {
+        return String::from("(none)");
+    }
+    g
+}
+
+/// Set the NIS domainname (also writable via /proc/sys/kernel/domainname).
+pub fn set_domainname(s: String) {
+    task::uts_of().lock().domainname = s.chars().take(64).collect();
+}
+
 /// Copy `len` bytes from user buffer `ptr` (current task's address space).
 fn copy_in(ptr: u64, len: u64) -> Option<Vec<u8>> {
     if len > 1 << 20 {

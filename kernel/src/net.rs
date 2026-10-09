@@ -538,6 +538,11 @@ fn ct_update(
             return if e.seen_reply { 2 } else { 1 };
         }
     }
+    // net.netfilter.nf_conntrack_max: a full table refuses new flows
+    // (Linux logs "table full, dropping packet" — we just don't track).
+    if ct.len() >= crate::sysctl::nf_conntrack_max() as usize {
+        return 0;
+    }
     ct.push(CtEnt {
         proto,
         a_ip: src,
@@ -5911,7 +5916,9 @@ pub fn tcp_send(lport: u16, data: &[u8], timeout_ms: u64) -> Result<(), i64> {
             if k.state == TcpState::Closed {
                 return Err(-2);
             }
-            if k.unacked.len() < 32 {
+            // send window full = queue slots OR net.ipv4.tcp_wmem[2]
+            // unacked bytes — real backpressure, not just a seg count.
+            if k.unacked.len() < 32 && unacked_bytes(k) < wmem_max() {
                 k.unacked.push_back(UnAck {
                     seq: seq_at_send,
                     flags: TCP_ACK | TCP_PSH,
@@ -6078,6 +6085,16 @@ pub fn tcp_accept_ready(lport: u16) -> bool {
 
 /// Fire a single data segment and return without waiting for the ack — the
 /// O_NONBLOCK write path for socket fds. Err(-1) no conn, Err(-2) closed.
+/// Real bytes outstanding in the retransmit queue (unacked payload).
+fn unacked_bytes(k: &TcpSock) -> usize {
+    k.unacked.iter().map(|u| u.payload.len()).sum()
+}
+
+/// net.ipv4.tcp_wmem[2]: the send-buffer byte ceiling.
+fn wmem_max() -> usize {
+    crate::sysctl::tcp_wmem().2 as usize
+}
+
 pub fn tcp_send_nowait(cid: u16, data: &[u8]) -> Result<usize, i64> {
     let (seq, mac, rip, lport, rport, ack, win) = {
         let mut t = TCP_SOCKS.lock();
@@ -6085,7 +6102,7 @@ pub fn tcp_send_nowait(cid: u16, data: &[u8]) -> Result<usize, i64> {
         if k.state != TcpState::Open {
             return Err(-2);
         }
-        if k.unacked.len() >= 32 {
+        if k.unacked.len() >= 32 || unacked_bytes(k) >= wmem_max() {
             return Err(-11); // send window full — EAGAIN
         }
         (k.snd_nxt, k.mac, k.rip, k.lport, k.rport, k.rcv_nxt, rx_win(k))

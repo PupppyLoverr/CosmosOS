@@ -2342,6 +2342,61 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             && ustd::write_all("/proc/sys/user/max_uts_namespaces", b"0").is_ok()
             && ustd::write_all("/proc/sys/user/max_ipc_namespaces", b"0").is_ok()
     });
+    check("tcp-wmem", {
+        // net.ipv4.tcp_wmem[2]: the real unacked-byte ceiling — cap it
+        // at 2800 and a third back-to-back 1400B send is EAGAIN (ACKs
+        // can't drain the queue between nonblocking writes on lo).
+        let mut ok = ustd::write_all("/proc/sys/net/ipv4/tcp_wmem", b"1400 1400 2800").is_ok();
+        let l = ustd::TcpFd::listen(19091);
+        if ok && l.is_ok() {
+            let l = l.unwrap();
+            let c = ustd::TcpFd::connect([127, 0, 0, 1], 19091);
+            ok = c.is_ok() && l.accept().is_ok();
+            if let Ok(fd) = c {
+                ustd::fcntl(fd.0, ustd::F_SETFL, ustd::O_NONBLOCK);
+                let big = [7u8; 1400];
+                ok = ok && fd.write(&big).is_ok() && fd.write(&big).is_ok()
+                    && fd.write(&big).is_err();
+            }
+        }
+        ok && ustd::write_all("/proc/sys/net/ipv4/tcp_wmem", b"4096 16384 4194304").is_ok()
+    });
+    check("domainname-sysctl", {
+        // kernel.domainname: a real UTS-scoped string sysctl — round
+        // trip through the proc file; empty restores the "(none)" value.
+        ustd::write_all("/proc/sys/kernel/domainname", b"nis-x").is_ok()
+            && ustd::read_all("/proc/sys/kernel/domainname")
+                .map(|d| String::from_utf8_lossy(&d).trim() == "nis-x")
+                .unwrap_or(false)
+            && ustd::write_all("/proc/sys/kernel/domainname", b"(none)").is_ok()
+            && ustd::read_all("/proc/sys/kernel/domainname")
+                .map(|d| String::from_utf8_lossy(&d).trim() == "(none)")
+                .unwrap_or(false)
+    });
+    check("nf-ct-max", {
+        // net.netfilter.nf_conntrack_max: a full flow table refuses new
+        // entries — arm it to live+1, fire 3 fresh flows at slirp, the
+        // table grows by at most 1.
+        let before = ustd::read_all("/proc/net/nf_conntrack")
+            .map(|d| String::from_utf8_lossy(&d).matches("packets=").count())
+            .unwrap_or(0);
+        let cap = alloc::format!("{}", before + 1);
+        let fd = ustd::socket(ustd::SOCK_DGRAM);
+        let mut ok = ustd::write_all("/proc/sys/net/netfilter/nf_conntrack_max", cap.as_bytes()).is_ok();
+        if fd >= 0 {
+            for p in [45001u16, 45002, 45003] {
+                let _ = ustd::sendto(fd, b"x", [10, 0, 2, 2], p);
+            }
+            ustd::close(fd);
+            let after = ustd::read_all("/proc/net/nf_conntrack")
+                .map(|d| String::from_utf8_lossy(&d).matches("packets=").count())
+                .unwrap_or(0);
+            ok = ok && after <= before + 1;
+        } else {
+            ok = false;
+        }
+        ok && ustd::write_all("/proc/sys/net/netfilter/nf_conntrack_max", b"65536").is_ok()
+    });
     check("dev-mem", {
         ustd::open("/dev/mem", 0)
             .map(|fd| {
