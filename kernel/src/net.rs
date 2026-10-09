@@ -486,38 +486,66 @@ pub fn net_snmp() -> String {
     )
 }
 
-/// `/proc/net/nf_conntrack` — live flow table: every TCP conn (state, addrs),
-/// every LISTEN port, every bound UDP socket.
+/// `/proc/net/nf_conntrack` — the REAL conntrack flow table (CT),
+/// Linux two-tuple format: orig direction then reply direction,
+/// `[UNREPLIED]` when the flow never saw a return packet. Entries are
+/// born on the first packet of a flow in either direction — this is
+/// the same table `-m state` matches against.
 pub fn net_conntrack() -> String {
     let mut out = String::new();
-    for k in TCP_SOCKS.lock().values() {
-        let st = match k.state {
-            TcpState::SynSent => "SYN_SENT",
-            TcpState::SynRecv => "SYN_RECV",
-            TcpState::Open => "ESTABLISHED",
-            TcpState::Closed => "CLOSE",
+    let ct = CT.lock();
+    for e in ct.iter() {
+        let pname = match e.proto {
+            1 => "icmp",
+            6 => "tcp",
+            17 => "udp",
+            _ => "ip",
         };
+        let a = alloc::format!("{}.{}.{}.{}", e.a_ip[0], e.a_ip[1], e.a_ip[2], e.a_ip[3]);
+        let b = alloc::format!("{}.{}.{}.{}", e.b_ip[0], e.b_ip[1], e.b_ip[2], e.b_ip[3]);
         out.push_str(&alloc::format!(
-            "tcp      6 {} src={}.{}.{}.{} dst={}.{}.{}.{} sport={} dport={}\n",
-            st,
-            our_ip()[0], our_ip()[1], our_ip()[2], our_ip()[3],
-            k.rip[0], k.rip[1], k.rip[2], k.rip[3],
-            k.lport, k.rport,
-        ));
-    }
-    for p in LISTENERS.lock().iter() {
-        out.push_str(&alloc::format!(
-            "tcp      6 LISTEN src={}.{}.{}.{} dst=0.0.0.0 sport={} dport=0\n",
-            our_ip()[0], our_ip()[1], our_ip()[2], our_ip()[3], p,
-        ));
-    }
-    for p in SOCKS.lock().keys() {
-        out.push_str(&alloc::format!(
-            "udp      17 UNREPLIED src={}.{}.{}.{} dst=0.0.0.0 sport={} dport=0\n",
-            our_ip()[0], our_ip()[1], our_ip()[2], our_ip()[3], p,
+            "{:<8} {:<2} {:<11} src={} dst={} sport={} dport={} src={} dst={} sport={} dport={}{}\n",
+            pname, e.proto,
+            if e.seen_reply { "ESTABLISHED" } else { "NEW" },
+            a, b, e.a_port, e.b_port,
+            b, a, e.b_port, e.a_port,
+            if e.seen_reply { "" } else { " [UNREPLIED]" },
         ));
     }
     out
+}
+
+/// `/proc/net/nf_conntrack` write grammar (the `conntrack` tool's ops):
+///   "F"  flush the whole table
+///   "D <proto> <src> <dst> <sport> <dport>"  delete one flow (orig tuple)
+pub fn ct_ctl(line: &str) -> bool {
+    let mut f = line.split_whitespace();
+    match f.next() {
+        Some("F") => {
+            CT.lock().clear();
+            true
+        }
+        Some("D") => {
+            let proto: u8 = match f.next().unwrap_or("") {
+                "tcp" => 6,
+                "udp" => 17,
+                "icmp" => 1,
+                s => s.parse().unwrap_or(255),
+            };
+            let (Some(src), Some(dst)) = (f.next().and_then(parse_ip), f.next().and_then(parse_ip))
+            else {
+                return false;
+            };
+            let sport: u16 = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let dport: u16 = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let mut ct = CT.lock();
+            let before = ct.len();
+            ct.retain(|e| !(e.proto == proto && e.a_ip == src && e.b_ip == dst
+                && e.a_port == sport && e.b_port == dport));
+            ct.len() != before
+        }
+        _ => false,
+    }
 }
 
 /// `/proc/net/arp` — Linux-format ARP cache (type 0x1 ether, flags 0x2

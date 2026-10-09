@@ -22514,6 +22514,7 @@ impl Term {
                 let mut wto = 2000u64;
                 let mut quiet = false;
                 let mut ttl = 0u8;
+                let mut audible = false;
                 let mut target: Option<&str> = None;
                 let mut i = 0usize;
                 while i < args.len() {
@@ -22539,6 +22540,20 @@ impl Term {
                                 .and_then(|x| x.parse().ok())
                                 .unwrap_or(2000);
                             i += 2;
+                        }
+                        "-W" => {
+                            // -W secs: per-reply wait (real iputils flag)
+                            wto = args
+                                .get(i + 1)
+                                .and_then(|x| x.parse::<f64>().ok())
+                                .map(|s| (s * 1000.0) as u64)
+                                .unwrap_or(2000)
+                                .max(50);
+                            i += 2;
+                        }
+                        "-a" | "--audible" => {
+                            audible = true;
+                            i += 1;
                         }
                         "-t" => {
                             // -t N: stamp the echo request's IPv4 TTL
@@ -22572,6 +22587,9 @@ impl Term {
                             match ustd::net_ping_ttl(packed, wto, ttl) {
                                 Some(rtt) => {
                                     got += 1;
+                                    if audible {
+                                        ustd::beep(880, 40); // real beep per reply
+                                    }
                                     if !quiet {
                                         self.emit(&alloc::format!(
                                             "reply from {}.{}.{}.{}: seq={} time={}ms",
@@ -25456,8 +25474,9 @@ impl Term {
                 }
             }
             "conntrack" => {
-                // conntrack -L / --dump: live kernel flow table from
-                // /proc/net/nf_conntrack (real conn states + bound sockets).
+                // conntrack -L / -F / -D: real ops on the kernel CT flow
+                // table through /proc/net/nf_conntrack (same table
+                // `iptables -m state` matches against).
                 let first = args.first().copied().unwrap_or("-L");
                 match first {
                     "-L" | "--dump" | "-S" | "--stats" => {
@@ -25469,6 +25488,35 @@ impl Term {
                             }
                             Err(e) => self.fail(&alloc::format!(
                                 "conntrack: err {}", e)),
+                        }
+                    }
+                    "-F" | "--flush" => {
+                        match ustd::write_all("/proc/net/nf_conntrack", b"F\n") {
+                            Ok(_) => self.emit("conntrack: table flushed"),
+                            Err(e) => self.fail(&alloc::format!("conntrack: {}", e)),
+                        }
+                    }
+                    "-D" | "--delete" => {
+                        // conntrack -D -p tcp -s <src> -d <dst> [--sport N] [--dport N]
+                        let getv = |flag: &str| -> Option<String> {
+                            args.iter()
+                                .position(|a| *a == flag)
+                                .and_then(|i| args.get(i + 1))
+                                .map(|s| String::from(*s))
+                        };
+                        let proto = getv("-p").unwrap_or_else(|| String::from("tcp"));
+                        let src = getv("-s").unwrap_or_default();
+                        let dst = getv("-d").unwrap_or_default();
+                        let sport = getv("--sport").unwrap_or_else(|| String::from("0"));
+                        let dport = getv("--dport").unwrap_or_else(|| String::from("0"));
+                        if src.is_empty() || dst.is_empty() {
+                            self.fail("usage: conntrack -D -p <proto> -s <src> -d <dst> [--sport N] [--dport N]");
+                            return;
+                        }
+                        let line = alloc::format!("D {} {} {} {} {}\n", proto, src, dst, sport, dport);
+                        match ustd::write_all("/proc/net/nf_conntrack", line.as_bytes()) {
+                            Ok(_) => self.emit(&alloc::format!("conntrack: {} {}:{} -> {}:{} deleted", proto, src, sport, dst, dport)),
+                            Err(e) => self.fail(&alloc::format!("conntrack: {}", e)),
                         }
                     }
                     _ => self.fail(&alloc::format!(

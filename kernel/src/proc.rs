@@ -586,6 +586,20 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
         }
         return ok.then_some(buf.len());
     }
+    if path == "/proc/net/nf_conntrack" {
+        // 'F' flush / 'D <proto> <src> <dst> <sport> <dport>' delete —
+        // the `conntrack` tool's real ops on the kernel flow table.
+        let text = String::from(String::from_utf8_lossy(buf));
+        let mut ok = true;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            ok &= net::ct_ctl(line);
+        }
+        return ok.then_some(buf.len());
+    }
     if path == "/proc/sys/net/ipv4/icmp_echo_ignore_all" {
         let s = String::from(String::from_utf8_lossy(buf).trim());
         match s.as_str() {
