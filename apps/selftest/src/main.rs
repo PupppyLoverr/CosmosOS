@@ -3410,6 +3410,29 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         ustd::close(ep);
         ok
     });
+    check("epoll-et-sock", {
+        // EPOLLET on a socketpair edge-keys on the pair's transition
+        // epoch: a drain+rewrite between waits is a real new edge.
+        let mut ok = true;
+        let (a, b) = ustd::socketpair().unwrap_or((-1, -1));
+        let ep = ustd::epoll_create();
+        ok = ok && a >= 0 && b >= 0 && ep >= 0;
+        ok = ok && ustd::epoll_ctl(ep, ustd::EPOLL_CTL_ADD, a, ustd::EPOLLIN | ustd::EPOLLET) == 0;
+        let _ = ustd::write(b, b"1");
+        let mut evs = [(0u32, 0u32); 4];
+        ok = ok && ustd::epoll_wait(ep, &mut evs, 0) == 1;
+        ok = ok && ustd::epoll_wait(ep, &mut evs, 0) == 0; // same level
+        let mut bb = [0u8; 8];
+        let _ = ustd::read(a, &mut bb); // drain -> then refill
+        let _ = ustd::write(b, b"2");
+        ok = ok && ustd::epoll_wait(ep, &mut evs, 0) == 1; // epoch advanced
+        let _ = ustd::read(a, &mut bb);
+        ustd::close(b); // peer close = EOF edge
+        ok = ok && ustd::epoll_wait(ep, &mut evs, 0) == 1;
+        ustd::close(a);
+        ustd::close(ep);
+        ok
+    });
     check("epoll-timerfd", {
         // a timerfd interest fires once its armed timer expires
         let (tfd, ep) = (ustd::timerfd_create(), ustd::epoll_create());

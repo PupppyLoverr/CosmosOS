@@ -20,6 +20,10 @@ struct Spair {
     wr_b: bool,
     rd_a: bool, // side 0 shutdown(SHUT_RD): its reads return EOF
     rd_b: bool,
+    /// readiness-transition epoch (same model as pipes::rise_gen):
+    /// bumped on empty->non-empty data/ctrl queues and peer-close edges —
+    /// epoll ET keys off it.
+    gen: u64,
 }
 
 static SP: Mutex<BTreeMap<u64, Spair>> = Mutex::new(BTreeMap::new());
@@ -52,12 +56,21 @@ pub fn create() -> Option<(String, String)> {
             wr_b: false,
             rd_a: false,
             rd_b: false,
+            gen: 0,
         },
     );
     Some((
         format!("/sockpair/{}/0", id),
         format!("/sockpair/{}/1", id),
     ))
+}
+
+/// readiness-transition epoch for epoll ET (u64::MAX when the pair is
+/// gone — always differs from a stored live gen, so removal is an edge).
+pub fn rise_gen(path: &str) -> u64 {
+    parse(path)
+        .and_then(|(id, _)| SP.lock().get(&id).map(|s| s.gen))
+        .unwrap_or(u64::MAX)
 }
 
 /// Readiness for `sys_poll`/`epoll`: readable when own inbox has data or the
@@ -158,8 +171,12 @@ pub fn try_write(path: &str, buf: &[u8]) -> Result<usize, i64> {
         }
     }
     let n = buf.len().min(CAP - out.len());
+    let was_empty = out.is_empty();
     for b in buf.iter().take(n) {
         out.push_back(*b);
+    }
+    if was_empty && n > 0 {
+        s.gen += 1;
     }
     Ok(n)
 }
@@ -186,11 +203,18 @@ pub fn send_msg(path: &str, data: &[u8], pass: Option<String>) -> Result<usize, 
         return Err(-11);
     }
     let n = data.len().min(CAP - out.len());
+    let was_empty = out.is_empty();
     for b in data.iter().take(n) {
         out.push_back(*b);
     }
+    if was_empty && n > 0 {
+        s.gen += 1;
+    }
     if let Some(p) = pass {
         let cq = if side == 0 { &mut s.ca2b } else { &mut s.cb2a };
+        if cq.is_empty() {
+            s.gen += 1; // ancillary-only message also wakes the reader
+        }
         cq.push_back(p);
     }
     Ok(n)
@@ -256,8 +280,14 @@ pub fn close_obj(path: &str) {
         Some(s) => {
             if side == 0 {
                 s.open_a = s.open_a.saturating_sub(1);
+                if s.open_a == 0 {
+                    s.gen += 1; // side0 gone: side1 sees EOF
+                }
             } else {
                 s.open_b = s.open_b.saturating_sub(1);
+                if s.open_b == 0 {
+                    s.gen += 1;
+                }
             }
             s.open_a == 0 && s.open_b == 0
         }

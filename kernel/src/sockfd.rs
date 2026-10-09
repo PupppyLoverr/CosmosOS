@@ -59,6 +59,8 @@ struct UListener {
     backlog: usize,
     queue: VecDeque<(String, u32)>,
     owner_pid: u32,
+    /// accept-queue readiness epoch (empty->non-empty) — epoll ET.
+    gen: u64,
 }
 
 static NEXT: Mutex<u64> = Mutex::new(1);
@@ -259,6 +261,7 @@ fn bind_unix(id: u64, name: &[u8]) -> i64 {
             listening: false,
             backlog: 0,
             queue: VecDeque::new(),
+            gen: 0,
             owner_pid: 0,
         },
     );
@@ -386,6 +389,9 @@ fn connect_unix(id: u64, name: &[u8]) -> i64 {
         return -24;
     };
     let lpid = l.owner_pid;
+    if l.queue.is_empty() {
+        l.gen += 1; // pending-conn edge for accept() waiters
+    }
     l.queue.push_back((side1, crate::task::current_id()));
     let mut m = SOCKS.lock();
     if let Some(s) = m.get_mut(&id) {
@@ -1107,6 +1113,45 @@ pub fn poll_revents(path: &str) -> u32 {
         }
     }
     rv
+}
+
+/// readiness-transition epoch per socket kind — epoll ET keys off the
+/// object that owns the readiness state (same model as pipes::rise_gen):
+/// UDP rx queue / TCP conn / listener acceptq / unix chan sockpair /
+/// dgram mailbox / unix listener queue. u64::MAX = dead object (edge).
+pub fn rise_gen(path: &str) -> u64 {
+    let Some(id) = parse(path) else {
+        return 0;
+    };
+    let Some(s) = fields(id) else {
+        return u64::MAX;
+    };
+    match s.kind {
+        Kind::Udp => crate::net::udp_edge_gen(s.lport),
+        Kind::Tcp => crate::net::tcp_gen(s.cid),
+        Kind::TcpListener => crate::net::accept_gen(s.lport),
+        Kind::Unix => s
+            .chan
+            .as_deref()
+            .map(crate::sockpair::rise_gen)
+            .unwrap_or(0),
+        Kind::UnixListener => s
+            .uname
+            .as_deref()
+            .map(|n| {
+                UNIX_NAMES
+                    .lock()
+                    .get(n)
+                    .map(|l| l.gen)
+                    .unwrap_or(u64::MAX)
+            })
+            .unwrap_or(0),
+        Kind::UnixDgram => s
+            .uname
+            .as_deref()
+            .map(crate::udgram::rise_gen)
+            .unwrap_or(0),
+    }
 }
 
 /// getpeername: remote address of a connected socket.
