@@ -5014,6 +5014,17 @@ fn sys_sigaltstack(sp: u64, size: u64, flags: u64, old_ptr: u64) -> u64 {
                 t.sig.sigstack_flags = flags;
             }
         });
+        // Pre-fault the whole registered region NOW: signal delivery
+        // runs under SCHED and cannot demand-page — an untouched
+        // demand-mapped buffer (.bss/anon) would be an instant SIGSEGV.
+        if flags & shared::SS_DISABLE == 0 && size >= 2048 {
+            let mut p = sp & !0xFFF;
+            let end = sp + size;
+            while p < end {
+                task::demand_page(p);
+                p += 0x1000;
+            }
+        }
     }
     0
 }

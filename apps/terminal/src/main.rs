@@ -31657,16 +31657,39 @@ impl Term {
             "dig" => {
                 // dig <name> [A|MX|NS|TXT|CNAME|AAAA|ANY] — raw DNS over UDP/53
                 // `+short` (and other +opts) aren't positional args
+                // `-x <ip>` is a real in-addr.arpa PTR query (dig -x).
+                let xpos = args.iter().position(|a| *a == "-x");
+                let rev = xpos.and_then(|i| args.get(i + 1));
                 let pargs: Vec<&str> = args
                     .iter()
-                    .filter(|a| !a.starts_with('+'))
-                    .copied()
+                    .enumerate()
+                    .filter(|(i, a)| {
+                        !a.starts_with('+')
+                            && Some(*i) != xpos
+                            && Some(*i) != xpos.map(|x| x + 1)
+                    })
+                    .map(|(_, a)| *a)
                     .collect();
-                let Some(name) = pargs.first() else {
-                    self.fail("usage: dig <name> [type] [+short]");
+                let Some(name_or_rev) = pargs.first().copied().or(rev.copied()) else {
+                    self.fail("usage: dig <name> [type] [+short] | dig -x <ip>");
                     return;
                 };
-                let qt = match pargs.get(1).map(|s| s.to_uppercase()).as_deref() {
+                let name_owned;
+                let name: &str = match rev {
+                    Some(ip) => {
+                        // reverse the octets → in-addr.arpa
+                        let mut parts: Vec<&str> = ip.split('.').collect();
+                        if parts.len() != 4 || parts.iter().any(|o| o.parse::<u8>().is_err()) {
+                            self.fail(&alloc::format!("dig: bad ip '{}'", ip));
+                            return;
+                        }
+                        parts.reverse();
+                        name_owned = alloc::format!("{}.in-addr.arpa", parts.join("."));
+                        &name_owned
+                    }
+                    None => name_or_rev,
+                };
+                let qt = if rev.is_some() { 12u16 } else { match pargs.get(1).map(|s| s.to_uppercase()).as_deref() {
                     None | Some("A") => 1u16,
                     Some("NS") => 2,
                     Some("CNAME") => 5,
@@ -31680,7 +31703,7 @@ impl Term {
                         self.fail(&alloc::format!("dig: unknown type '{}'", t));
                         return;
                     }
-                };
+                } };
                 let short = args.iter().any(|a| *a == "+short");
                 // `+tcp`: real dig option — the query goes over TCP/53
                 // (RFC 1035 2-byte length-prefixed stream).
@@ -36025,7 +36048,27 @@ impl Term {
                 } else if first.is_empty()
                     || matches!(first, "-L" | "--list" | "-n" | "-v" | "-nv" | "-vn")
                 {
-                    match ustd::read_all(fwfile) {
+                    // `-L <chain>` is a real selective listing, backed
+                    // by /proc/net/iptables/<chain> — not a text filter.
+                    let file = match args.get(1) {
+                        Some(c) if !c.starts_with('-') => {
+                            if nat_tbl {
+                                if *c == "POSTROUTING" {
+                                    String::from("/proc/net/nat")
+                                } else {
+                                    self.fail(&alloc::format!(
+                                        "iptables: can't initialize iptables table `nat': chain `{}' does not exist",
+                                        c
+                                    ));
+                                    return;
+                                }
+                            } else {
+                                alloc::format!("/proc/net/iptables/{}", c)
+                            }
+                        }
+                        _ => String::from(fwfile),
+                    };
+                    match ustd::read_all(&file) {
                         Ok(b) => self.emit_bin(&b),
                         Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                     }
@@ -37306,6 +37349,83 @@ impl Term {
                 let vals_only = args
                     .iter()
                     .any(|a| *a == "-n" || *a == "--values" || *a == "-q");
+                // `sysctl -p [file]` — real config load: parse
+                // `key = value` lines (comments `#`/`;`, blanks ok) and
+                // apply each through the same proc write path -w uses.
+                if args.iter().any(|a| *a == "-p" || *a == "--load") {
+                    let path = args
+                        .iter()
+                        .position(|a| *a == "-p" || *a == "--load")
+                        .and_then(|i| args.get(i + 1))
+                        .copied()
+                        .unwrap_or("/etc/sysctl.conf");
+                    let text = match ustd::read_all(path) {
+                        Ok(b) => String::from_utf8_lossy(&b).to_string(),
+                        Err(e) => {
+                            self.fail(&alloc::format!(
+                                "sysctl: cannot open file \"{}\" ({})",
+                                path, e
+                            ));
+                            return;
+                        }
+                    };
+                    let mut applied = 0u32;
+                    for l in text.lines() {
+                        let l = l.trim();
+                        if l.is_empty() || l.starts_with('#') || l.starts_with(';') {
+                            continue;
+                        }
+                        let mut it = l.splitn(2, '=');
+                        let (key, val) = (
+                            it.next().unwrap_or("").trim(),
+                            it.next().unwrap_or("").trim(),
+                        );
+                        if key.is_empty() {
+                            continue;
+                        }
+                        match key {
+                            "kernel.hostname" | "hostname" => {
+                                if ustd::write_all(
+                                    "/proc/sys/kernel/hostname",
+                                    val.as_bytes(),
+                                )
+                                .is_ok()
+                                {
+                                    self.host = String::from(val);
+                                    self.vars.insert(
+                                        String::from("HOSTNAME"),
+                                        self.host.clone(),
+                                    );
+                                    self.emit(&alloc::format!("{} = {}", key, val));
+                                    applied += 1;
+                                }
+                            }
+                            _ => {
+                                if let Some(p) = sysfile(key) {
+                                    if ustd::write_all(&p, val.as_bytes()).is_ok() {
+                                        self.emit(&alloc::format!(
+                                            "{} = {}", key, val));
+                                        applied += 1;
+                                    } else {
+                                        self.emit(&alloc::format!(
+                                            "sysctl: cannot stat {}: write failed",
+                                            p
+                                        ));
+                                    }
+                                } else {
+                                    self.emit(&alloc::format!(
+                                        "sysctl: cannot stat /proc/sys/{}: unknown key",
+                                        key.replace('.', "/")
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if applied == 0 {
+                        self.emit("sysctl: no settings applied");
+                    }
+                    return;
+                }
                 let pos: Vec<&str> = args
                     .iter()
                     .filter(|a| !a.starts_with('-'))
@@ -40248,6 +40368,18 @@ impl Term {
                 self.emit(&alloc::format!("\tTX: {} packets {} bytes", txp, txb));
             }
             "ip" => {
+                // `-br/--brief`/`-o/--oneline`: one line per object.
+                let brief = args.iter().any(|a| {
+                    *a == "-br" || *a == "--brief" || *a == "-o" || *a == "--oneline"
+                });
+                let args: Vec<&str> = args
+                    .iter()
+                    .copied()
+                    .filter(|a| {
+                        *a != "-br" && *a != "--brief" && *a != "-o" && *a != "--oneline"
+                    })
+                    .collect();
+                let args: &[&str] = &args;
                 if matches!(args.first().copied(), Some("-b") | Some("--batch")) {
                     // `ip -b <file>` — real iproute2 batch mode: each
                     // line runs as an `ip` command, first failure stops.
@@ -40361,6 +40493,20 @@ impl Term {
                     return;
                 }
                 Some("a") | Some("addr") | Some("address") => {
+                    if brief {
+                        // `ip -br a`: `dev STATE inet` one line each.
+                        let up = ustd::read_all("/proc/net/operstate")
+                            .map(|d| String::from_utf8_lossy(&d).trim().to_string())
+                            .unwrap_or_else(|_| String::from("down"));
+                        if let Some((_, ip)) = ustd::net_info() {
+                            self.emit(&alloc::format!(
+                                "eth0  {}  {}.{}.{}.{}/24",
+                                up.to_uppercase(), ip[0], ip[1], ip[2], ip[3]
+                            ));
+                        }
+                        self.emit("lo  UNKNOWN  127.0.0.1/8");
+                        return;
+                    }
                     self.run(&String::from("ifconfig"));
                 }
                 Some("l") | Some("link") => {
@@ -40383,6 +40529,19 @@ impl Term {
                         } else {
                             self.run(&alloc::format!("ifconfig {} {}", dev, key));
                         }
+                    } else if brief {
+                        // `ip -br link`: `dev STATE lladdr` one line each.
+                        let up = ustd::read_all("/proc/net/operstate")
+                            .map(|d| String::from_utf8_lossy(&d).trim().to_string())
+                            .unwrap_or_else(|_| String::from("down"));
+                        if let Some((mac, _)) = ustd::net_info() {
+                            self.emit(&alloc::format!(
+                                "eth0  {}  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                up.to_uppercase(),
+                                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                            ));
+                        }
+                        self.emit("lo  UNKNOWN  00:00:00:00:00:00");
                     } else {
                         let up = ustd::read_all("/proc/net/operstate")
                             .map(|d| String::from_utf8_lossy(&d).trim().to_string())
