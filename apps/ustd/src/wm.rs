@@ -49,6 +49,11 @@ fn mgmt_call(kind: u16, payload: &[u8], want_reply: bool) -> Option<(u16, Vec<u8
     r
 }
 
+/// Switch the active workspace (chvt).
+pub fn switch_ws(ws: u32) -> bool {
+    mgmt_call(REQ_SWITCH_WS, &ws.to_le_bytes(), false).is_some()
+}
+
 /// All windows in z-order (bottom first). Each row is a `WinInfo`.
 pub fn list_windows() -> Option<Vec<WinInfo>> {
     let (k, pl) = mgmt_call(REQ_LIST_WINS, &[], true)?;

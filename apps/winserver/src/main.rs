@@ -1293,6 +1293,17 @@ fn handle_req(s: &mut S, msg: &[u8]) {
                 }
             }
         }
+        REQ_SWITCH_WS => {
+            // chvt: same transition as the F1/F2 workspace keys
+            if pl.len() >= 4 {
+                let ws = u32::from_le_bytes([pl[0], pl[1], pl[2], pl[3]]);
+                if ws < 2 && ws != s.workspace {
+                    s.workspace = ws;
+                    s.focus = top_id(s);
+                    s.dirty = true;
+                }
+            }
+        }
         _ => {}
     }
 }
