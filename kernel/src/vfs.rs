@@ -191,6 +191,29 @@ pub fn read_range(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64>
     }
 }
 
+/// Path-based ranged write — loop backing files and kernel-internal
+/// writers. Ranged on every FS (fat32::write_at / tmpfs::write_range).
+pub fn write_range_path(path: &str, offset: u64, buf: &[u8]) -> Result<usize, i64> {
+    if crate::tmpfs::handles(path) {
+        return crate::tmpfs::write_range(path, offset, buf);
+    }
+    if crate::pipes::handles(path)
+        || crate::dev::handles(path)
+        || crate::proc::handles(path)
+        || crate::cgroup::handles(path)
+    {
+        return Err(-22);
+    }
+    let mut g = FS.lock();
+    match g.as_mut() {
+        Some(fs) => fs
+            .write_at(path, offset, buf)
+            .map(|_| buf.len())
+            .map_err(err_to_i64),
+        None => Err(-1),
+    }
+}
+
 /// Demand-paging read for the #PF path. Same read, but the FS lock is
 /// taken with try_lock+wait_irq: the holder may be a preempted task, and
 /// spinning here would deadlock the fault handler — rescheduling it
