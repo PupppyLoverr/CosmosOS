@@ -8037,6 +8037,7 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut iif = "";
     let mut oif = "";
     let mut state = String::new();
+    let mut comment = String::new();
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
     let mut jump = "DROP";
@@ -8093,6 +8094,13 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             // `-m length --length a[:b]` — real payload-length match
             "--length" => {
                 length = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
+            // `-m comment --comment <text>` — stored on the rule like
+            // real iptables (shows in -L/-S, never matched).
+            "--comment" => {
+                comment = String::from(args.get(i + 1).copied().unwrap_or(""))
+                    .replace(' ', "_");
                 i += 1;
             }
             "--dst-range" | "--destination-range" => {
@@ -8226,6 +8234,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !length.is_empty() {
         line.push_str(&alloc::format!(" length {}", length));
+    }
+    if !comment.is_empty() {
+        line.push_str(&alloc::format!(" comment {}", comment));
     }
     if !iif.is_empty() {
         line.push_str(&alloc::format!(" iif {}", iif));
@@ -20692,6 +20703,8 @@ impl Term {
                 let mut xhdrs: Vec<String> = Vec::new();
                 let mut wout: Option<String> = None;
                 let mut max_ms: u64 = 15_000;
+                let mut follow = false;
+                let mut max_redirs = 50u32;
                 let mut i = 0usize;
                 while i < args.len() {
                     let a = args[i];
@@ -20699,6 +20712,14 @@ impl Term {
                         "-s" | "--silent" => silent = true,
                         "-i" | "--include" => include_hdr = true,
                         "-I" | "--head" => head_only = true,
+                        "-L" | "--location" => follow = true,
+                        "--max-redirs" => {
+                            max_redirs = args
+                                .get(i + 1)
+                                .and_then(|s| s.parse::<u32>().ok())
+                                .unwrap_or(50);
+                            i += 1;
+                        }
                         "-O" | "--remote-name" => remote_name = true,
                         "-o" | "--output" => {
                             outfile = args.get(i + 1).map(|s| String::from(*s));
@@ -20758,99 +20779,148 @@ impl Term {
                     self.fail("curl: https not supported (no TLS)");
                     return;
                 }
-                let u = url.strip_prefix("http://").unwrap_or(url);
-                let (authority, path) = match u.find('/') {
-                    Some(i) => (&u[..i], &u[i..]),
-                    None => (u, "/"),
-                };
-                let (host, port) = match authority.find(':') {
-                    Some(i) => (
-                        &authority[..i],
-                        authority[i + 1..].parse::<u16>().unwrap_or(80),
-                    ),
-                    None => (authority, 80u16),
-                };
-                let Some(ip) = parse_ipv4(host).or_else(|| ustd::net_dns(host))
-                else {
-                    self.last_ok = false;
-                    if !silent {
-                        self.emit(&alloc::format!(
-                            "curl: could not resolve host: {}",
-                            host
-                        ));
-                    }
-                    return;
-                };
-                let m = method.clone().unwrap_or_else(|| {
-                    String::from(if ddata.is_some() {
-                        "POST"
-                    } else if head_only {
-                        "HEAD"
-                    } else {
-                        "GET"
-                    })
-                });
-                let mut req = alloc::format!(
-                    "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: cosmos-curl/1.0\r\nAccept: */*\r\nConnection: close\r\n",
-                    m,
-                    path,
-                    authority
-                );
-                for h in &xhdrs {
-                    req.push_str(h);
-                    req.push_str("\r\n");
-                }
-                if let Some(d) = &ddata {
-                    req.push_str(&alloc::format!(
-                        "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n",
-                        d.len()
-                    ));
-                }
-                req.push_str("\r\n");
-                if let Some(d) = &ddata {
-                    req.push_str(d);
-                }
-                let t0 = ustd::uptime_ms();
-                let Some(sock) = (40000..40400)
-                    .find_map(|lp| ustd::TcpSock::connect(lp, ip, port))
-                else {
-                    self.last_ok = false;
-                    if !silent {
-                        self.emit("curl: connection failed");
-                    }
-                    return;
-                };
-                let rb = req.as_bytes();
-                let mut off = 0usize;
-                while off < rb.len() {
-                    let n = (rb.len() - off).min(1400);
-                    if sock.send(&rb[off..off + n]).is_none() {
-                        break;
-                    }
-                    off += n;
-                }
-                let mut resp: Vec<u8> = Vec::new();
-                while let Some(chunk) = sock.recv(4000) {
-                    resp.extend_from_slice(&chunk);
-                    if ustd::uptime_ms() - t0 > max_ms || resp.len() > 1_000_000 {
-                        break;
-                    }
-                }
+                // `-L`/`--location`: real redirect following — re-issues
+                // the request against each `Location:` (301/302/303/307/
+                // 308; 303 drops to GET), `--max-redirs` caps the chain.
+                let mut cur: String = String::from(url);
+                let mut redirects = 0u32;
                 let mut code = 0u32;
-                if let Some(le) = resp.iter().position(|b| *b == b'\n') {
-                    let sl = String::from_utf8_lossy(&resp[..le]);
-                    code = sl
-                        .split(' ')
-                        .nth(1)
-                        .and_then(|s| s.parse().ok())
+                let mut head_v: Vec<u8> = Vec::new();
+                let mut body_v: Vec<u8> = Vec::new();
+                let mut last_path: String = String::new();
+                let mut t0 = ustd::uptime_ms();
+                loop {
+                    let u = cur.strip_prefix("http://").unwrap_or(&cur);
+                    let (authority, path) = match u.find('/') {
+                        Some(i) => (&u[..i], &u[i..]),
+                        None => (u, "/"),
+                    };
+                    let (host, port) = match authority.find(':') {
+                        Some(i) => (
+                            &authority[..i],
+                            authority[i + 1..].parse::<u16>().unwrap_or(80),
+                        ),
+                        None => (authority, 80u16),
+                    };
+                    let Some(ip) = parse_ipv4(host).or_else(|| ustd::net_dns(host))
+                    else {
+                        self.last_ok = false;
+                        if !silent {
+                            self.emit(&alloc::format!(
+                                "curl: could not resolve host: {}",
+                                host
+                            ));
+                        }
+                        return;
+                    };
+                    // 303 → GET on the redirected request (real -L).
+                    let m = method.clone().unwrap_or_else(|| {
+                        String::from(if ddata.is_some() && redirects == 0 {
+                            "POST"
+                        } else if head_only {
+                            "HEAD"
+                        } else {
+                            "GET"
+                        })
+                    });
+                    let mut req = alloc::format!(
+                        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: cosmos-curl/1.0\r\nAccept: */*\r\nConnection: close\r\n",
+                        m,
+                        path,
+                        authority
+                    );
+                    for h in &xhdrs {
+                        req.push_str(h);
+                        req.push_str("\r\n");
+                    }
+                    if let Some(d) = &ddata {
+                        if m == "POST" {
+                            req.push_str(&alloc::format!(
+                                "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n",
+                                d.len()
+                            ));
+                        }
+                    }
+                    req.push_str("\r\n");
+                    if m == "POST" {
+                        if let Some(d) = &ddata {
+                            req.push_str(d);
+                        }
+                    }
+                    t0 = ustd::uptime_ms();
+                    let Some(sock) = (40000..40400)
+                        .find_map(|lp| ustd::TcpSock::connect(lp, ip, port))
+                    else {
+                        self.last_ok = false;
+                        if !silent {
+                            self.emit("curl: connection failed");
+                        }
+                        return;
+                    };
+                    let rb = req.as_bytes();
+                    let mut off = 0usize;
+                    while off < rb.len() {
+                        let n = (rb.len() - off).min(1400);
+                        if sock.send(&rb[off..off + n]).is_none() {
+                            break;
+                        }
+                        off += n;
+                    }
+                    let mut resp: Vec<u8> = Vec::new();
+                    while let Some(chunk) = sock.recv(4000) {
+                        resp.extend_from_slice(&chunk);
+                        if ustd::uptime_ms() - t0 > max_ms || resp.len() > 1_000_000 {
+                            break;
+                        }
+                    }
+                    code = 0;
+                    if let Some(le) = resp.iter().position(|b| *b == b'\n') {
+                        let sl = String::from_utf8_lossy(&resp[..le]);
+                        code = sl
+                            .split(' ')
+                            .nth(1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                    }
+                    let split = resp
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|i| i + 4)
                         .unwrap_or(0);
+                    let mut loc: Option<String> = None;
+                    if follow
+                        && matches!(code, 301 | 302 | 303 | 307 | 308)
+                        && redirects < max_redirs
+                    {
+                        let hh = String::from_utf8_lossy(&resp[..split]);
+                        for l in hh.lines() {
+                            if l.len() > 9 && l[..9].eq_ignore_ascii_case("location:") {
+                                loc = Some(String::from(l[9..].trim()));
+                            }
+                        }
+                    }
+                    match loc {
+                        Some(l) if !l.is_empty() => {
+                            // absolute or site-relative Location (real -L)
+                            cur = if l.starts_with("http://") {
+                                l
+                            } else if l.starts_with('/') {
+                                alloc::format!("http://{}{}", authority, l)
+                            } else {
+                                alloc::format!("http://{}/{}", authority, l)
+                            };
+                            redirects += 1;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    last_path = String::from(path);
+                    head_v = resp[..split].to_vec();
+                    body_v = resp[split..].to_vec();
+                    break;
                 }
-                let split = resp
-                    .windows(4)
-                    .position(|w| w == b"\r\n\r\n")
-                    .map(|i| i + 4)
-                    .unwrap_or(0);
-                let (head_b, body_b) = (&resp[..split], &resp[split..]);
+                let (head_b, body_b) = (head_v.as_slice(), body_v.as_slice());
+                let path: &str = &last_path;
                 if head_only {
                     let h = String::from_utf8_lossy(head_b);
                     for l in h.lines() {
@@ -22783,6 +22853,8 @@ impl Term {
                 let mut wto = 2000u64;
                 let mut quiet = false;
                 let mut one_reply = false;
+                let mut bcast = false;
+                let mut flood = false;
                 let mut ttl = 0u8;
                 let mut audible = false;
                 let mut size = 0u64;
@@ -22872,6 +22944,18 @@ impl Term {
                             one_reply = true;
                             i += 1;
                         }
+                        "-b" => {
+                            // -b: allow a broadcast destination — real
+                            // iputils refuses without it.
+                            bcast = true;
+                            i += 1;
+                        }
+                        "-f" => {
+                            // -f: real flood — no inter-packet gap,
+                            // minimal per-packet output.
+                            flood = true;
+                            i += 1;
+                        }
                         a => {
                             target = Some(a);
                             i += 1;
@@ -22884,6 +22968,16 @@ impl Term {
                 };
                 match host_arg(s) {
                     Some(ip) => {
+                        // Real iputils refuses a broadcast destination
+                        // without -b; flooding implies flood pacing.
+                        if ip == [255, 255, 255, 255] && !bcast {
+                            self.fail("Do you want to ping broadcast? Then -b. If not, check your local firewall rules.");
+                            return;
+                        }
+                        if flood {
+                            gap = 0;
+                            quiet = true; // -f suppresses per-packet lines
+                        }
                         let (a, b, c, d) = (ip[0], ip[1], ip[2], ip[3]);
                         let packed = ((a as u32) << 24) | ((b as u32) << 16)
                             | ((c as u32) << 8) | d as u32;
@@ -22918,7 +23012,7 @@ impl Term {
                                     }
                                 }
                             }
-                            if n + 1 < cnt {
+                            if n + 1 < cnt && gap != 0 {
                                 ustd::sleep_ms(gap);
                             }
                             if one_reply && got != 0 {
@@ -23726,6 +23820,15 @@ impl Term {
                     .position(|a| *a == "-p")
                     .and_then(|i| args.get(i + 1))
                     .and_then(|s| s.parse::<u16>().ok());
+                // `nc -s <ip>` — real bind() source-address gate: only
+                // owned addresses bind (EADDRNOTAVAIL otherwise); a 127/8
+                // bind connecting to a non-loopback peer fails EINVAL,
+                // same as Linux.
+                let src_ip: Option<[u8; 4]> = args
+                    .iter()
+                    .position(|a| *a == "-s")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|s| host_arg(s));
                 let pos: Vec<&str> = {
                     let mut skip = false;
                     args.iter()
@@ -23734,7 +23837,7 @@ impl Term {
                                 skip = false;
                                 return false;
                             }
-                            if **a == "-w" || **a == "-p" {
+                            if **a == "-w" || **a == "-p" || **a == "-s" {
                                 skip = true;
                                 return false;
                             }
@@ -23844,6 +23947,27 @@ impl Term {
                         pos.get(1).and_then(|s| s.parse::<u16>().ok()),
                     ) {
                         (Some(ip), Some(port)) => {
+                            let me = ustd::net_info().map(|(_, i)| i).unwrap_or([0; 4]);
+                            let mut bind_ok = true;
+                            if let Some(s) = src_ip {
+                                if s != me && s[0] != 127 {
+                                    self.fail(&alloc::format!(
+                                        "nc: connect to {}.{}.{}.{} port {}: Can't assign requested address",
+                                        ip[0], ip[1], ip[2], ip[3], port
+                                    ));
+                                    bind_ok = false;
+                                } else if s[0] == 127 && ip[0] != 127 {
+                                    // bind(127/8) ok, connect(127->remote) EINVAL — real linux
+                                    self.fail(&alloc::format!(
+                                        "nc: connect to {}.{}.{}.{} port {}: Invalid argument",
+                                        ip[0], ip[1], ip[2], ip[3], port
+                                    ));
+                                    bind_ok = false;
+                                }
+                            }
+                            if !bind_ok {
+                                return;
+                            }
                             let lport = src_port.unwrap_or(
                                 40000u16 + (ustd::uptime_ms() % 2000) as u16,
                             );
@@ -23858,7 +23982,7 @@ impl Term {
                                 None => self.fail(&alloc::format!("nc: connect to :{} failed", port)),
                             }
                         }
-                        _ => self.fail("usage: nc <host|a.b.c.d> <port>  |  nc -p <lport> <host> <port>  |  nc -l [-k] <port>  |  nc -w N <host> <port>  (Esc closes)"),
+                        _ => self.fail("usage: nc <host|a.b.c.d> <port>  |  nc -p <lport> -s <lip> <host> <port>  |  nc -l [-k] <port>  |  nc -w N <host> <port>  (Esc closes)"),
                     }
                 }
             }

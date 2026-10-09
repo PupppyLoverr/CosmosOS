@@ -326,6 +326,7 @@ struct FwRule {
     oiface: u8,           // `-o` out-interface: same encoding
     state: u8,            // 0 = any; bit0 = NEW, bit1 = ESTABLISHED
     limit_pps: u16,       // 0 = unlimited; `-m limit --limit N/s` cap on rule hits
+    comment: String,      // `-m comment --comment` — real per-rule annotation
     limit_burst: u16,     // bucket depth (real iptables default 5)
     lim_tokens: u16,      // match-time bucket (packet units)
     lim_ms: u64,          // last bucket refill
@@ -836,6 +837,9 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
             out.push_str(&alloc::format!(" --limit-burst {}", r.limit_burst));
         }
     }
+    if !r.comment.is_empty() {
+        out.push_str(&alloc::format!(" -m comment --comment \"{}\"", r.comment));
+    }
     out.push_str(&alloc::format!(
         " -j {}",
         if !r.jump.is_empty() {
@@ -951,6 +955,9 @@ fn fmt_fw_rule(out: &mut String, i: usize, r: &FwRule) {
             "  limit: avg {}/sec burst {}",
             r.limit_pps, r.limit_burst
         ));
+    }
+    if !r.comment.is_empty() {
+        extra.push_str(&alloc::format!(" /* {} */", r.comment));
     }
     out.push_str(&alloc::format!(
         "{:<4} {:<5} {:<6} {:<8} {:<6} {:<12} 0.0.0.0/0{}\n",
@@ -1199,7 +1206,7 @@ fn fw_name_ok(n: &str) -> bool {
         "IN", "OUT", "INPUT", "OUTPUT", "FORWARD", "PREROUTING", "POSTROUTING",
         "icmp", "tcp", "udp", "all", "*", "dport", "multiport", "range", "src",
         "state", "limit", "lburst", "log", "reject", "accept", "return", "drop",
-        "iif", "oif", "sport", "length",
+        "iif", "oif", "sport", "length", "comment",
     ];
     !n.is_empty()
         && n.len() <= 28
@@ -1581,6 +1588,7 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         oiface: 0,
         state: 0,
         limit_pps: 0,
+        comment: String::new(),
         limit_burst: 5,
         lim_tokens: 5,
         lim_ms: 0,
@@ -1711,6 +1719,11 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
                     r.limit_pps = v;
                 }
             }
+            // `-m comment --comment` — stored on the rule like real
+            // iptables (shows in -L/-S, ignored by the matcher).
+            "comment" => {
+                r.comment = String::from(f.next().unwrap_or(""));
+            }
             "lburst" => {
                 let v = f.next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
                 if v == 0 {
@@ -1749,6 +1762,7 @@ fn fw_rule_eq(a: &FwRule, b: &FwRule) -> bool {
         && a.oiface == b.oiface
         && a.state == b.state
         && a.limit_pps == b.limit_pps
+        && a.comment == b.comment
         && a.limit_burst == b.limit_burst
         && a.target == b.target
         && a.jump == b.jump
@@ -2591,7 +2605,13 @@ pub fn ping_ttl_if(ip: [u8; 4], timeout_ms: u64, ttl: u8, size: usize, iface: u8
     let me = our_ip();
     let on_net = ip[0] == me[0] && ip[1] == me[1] && ip[2] == me[2];
     let arp_for = if on_net { ip } else { GW_IP };
-    let dst_mac = arp_resolve(arp_for, 1500)?;
+    // Broadcast ping (`ping -b`): the echo request leaves on the
+    // broadcast MAC — no ARP lookup (there's nothing to resolve).
+    let dst_mac = if ip == [255; 4] {
+        [0xFFu8; 6]
+    } else {
+        arp_resolve(arp_for, 1500)?
+    };
     sprintln!(
         "[net] arp {}.{}.{}.{} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         arp_for[0], arp_for[1], arp_for[2], arp_for[3],
