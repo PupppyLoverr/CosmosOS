@@ -8033,6 +8033,7 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut sport = 0u16;
     let mut dports = String::new();
     let mut src_range = String::new();
+    let mut length = String::new();
     let mut iif = "";
     let mut oif = "";
     let mut state = String::new();
@@ -8087,6 +8088,11 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             // `-m iprange --src-range a-b` — real source-range match
             "--src-range" | "--source-range" => {
                 src_range = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
+            // `-m length --length a[:b]` — real payload-length match
+            "--length" => {
+                length = String::from(args.get(i + 1).copied().unwrap_or(""));
                 i += 1;
             }
             "--dst-range" | "--destination-range" => {
@@ -8217,6 +8223,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !src_range.is_empty() {
         line.push_str(&alloc::format!(" range {}", src_range));
+    }
+    if !length.is_empty() {
+        line.push_str(&alloc::format!(" length {}", length));
     }
     if !iif.is_empty() {
         line.push_str(&alloc::format!(" iif {}", iif));
@@ -22773,6 +22782,7 @@ impl Term {
                 let mut gap = 800u64;
                 let mut wto = 2000u64;
                 let mut quiet = false;
+                let mut one_reply = false;
                 let mut ttl = 0u8;
                 let mut audible = false;
                 let mut size = 0u64;
@@ -22856,6 +22866,12 @@ impl Term {
                             quiet = args[i] == "-q";
                             i += 1;
                         }
+                        "-o" => {
+                            // -o: real iputils flag — exit after the
+                            // first reply (or after `cnt` timeouts).
+                            one_reply = true;
+                            i += 1;
+                        }
                         a => {
                             target = Some(a);
                             i += 1;
@@ -22905,6 +22921,9 @@ impl Term {
                             if n + 1 < cnt {
                                 ustd::sleep_ms(gap);
                             }
+                            if one_reply && got != 0 {
+                                break; // -o: first reply ends the run
+                            }
                         }
                         if cnt > 1 || quiet {
                             self.emit(&alloc::format!(
@@ -22929,6 +22948,7 @@ impl Term {
                 let mut first = 1u8;
                 let mut basep = 0u16;
                 let mut wait_ms = 0u64;
+                let mut probes = 1u8;
                 let mut icmp = false;
                 let mut target: Option<&str> = None;
                 let mut i = 0usize;
@@ -22969,6 +22989,16 @@ impl Term {
                                 .min(30_000);
                             i += 2;
                         }
+                        "-q" | "--queries" => {
+                            // -q N: real probes-per-hop — N datagrams
+                            // leave per ttl, first answer reports.
+                            probes = args
+                                .get(i + 1)
+                                .and_then(|x| x.parse().ok())
+                                .unwrap_or(1)
+                                .clamp(1, 10);
+                            i += 2;
+                        }
                         "-I" | "--icmp" => {
                             icmp = true;
                             i += 1;
@@ -22996,8 +23026,9 @@ impl Term {
                             s, ip[0], ip[1], ip[2], ip[3], maxh
                         ));
                         let mut ok = false;
-                        let hops =
-                            ustd::net_trace_opts(packed, icmp, first, maxh, basep, wait_ms);
+                        let hops = ustd::net_trace_opts(
+                            packed, icmp, first, maxh, basep, wait_ms, probes,
+                        );
                         for (ttl, hop, reached) in hops {
                             match hop {
                                 Some((hip, ms)) => {

@@ -5140,15 +5140,50 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
     // `traceroute -f N` starts the TTL walk at N — the first reported
     // hop carries ttl N, none below.
     check("trace-first-hop", {
-        let hops = ustd::net_trace_opts(0x0A00_0202, false, 3, 4, 0, 300);
+        let hops = ustd::net_trace_opts(0x0A00_0202, false, 3, 4, 0, 300, 1);
         !hops.is_empty() && hops.iter().all(|(t, _, _)| *t >= 3)
     });
     // `traceroute -p` is a real base port: the hop-1 gateway still
     // answers ICMP 11 quoting dport base+1 — the probe matcher keys
     // on the quoted port, so a non-default base proves the plumbing.
     check("trace-base-port", {
-        let hops = ustd::net_trace_opts(0x0A00_0202, false, 1, 2, 40000, 400);
+        let hops = ustd::net_trace_opts(0x0A00_0202, false, 1, 2, 40000, 400, 1);
         hops.first().map(|(_, h, _)| h.is_some()).unwrap_or(false)
+    });
+    // `iptables -m length --length` matches the transport payload
+    // length: the 44-byte ICMP messages the lo ping uses die inside
+    // 40:60 and pass inside 1:20.
+    check("ipt-length", {
+        let fw = |l: &str| ustd::write_all("/proc/net/iptables", l.as_bytes()).is_ok();
+        let blocked =
+            fw("A IN 0 length 40:60 drop\n") && ustd::net_ping(0x7F00_0001, 1500).is_none();
+        let _ = fw("F IN\n");
+        let passed =
+            fw("A IN 0 length 1:20 drop\n") && ustd::net_ping(0x7F00_0001, 1500).is_some();
+        let _ = fw("F IN\n");
+        blocked && passed
+    });
+    // `traceroute -q N` sends N real datagrams per hop — the kernel
+    // TX counter (/proc/net/dev) must bump by at least that many.
+    check("trace-probes", {
+        let tx = || -> u64 {
+            ustd::read_all("/proc/net/dev")
+                .ok()
+                .and_then(|d| {
+                    String::from_utf8_lossy(&d)
+                        .lines()
+                        .find(|l| l.trim_start().starts_with("eth0:"))
+                        .and_then(|l| l.split(':').nth(1).map(String::from))
+                })
+                .and_then(|t| {
+                    t.split_whitespace().nth(9).and_then(|v| v.parse().ok())
+                })
+                .unwrap_or(0)
+        };
+        let tx0 = tx();
+        let hops = ustd::net_trace_opts(0x0A00_0202, false, 1, 1, 0, 300, 3);
+        let delta = tx().saturating_sub(tx0);
+        hops.first().map(|(_, h, _)| h.is_some()).unwrap_or(false) && delta >= 3
     });
 
     // --- performance baseline: real durations (tick = 10ms resolution) ---
