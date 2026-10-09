@@ -2587,6 +2587,62 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    check("neigh-sysctls", {
+        // net.ipv4.neigh.default.*: gc_stale_time ages learned entries
+        // REACHABLE→STALE in /proc/net/neigh; gc_thresh3 caps dynamic
+        // ARP entries (a refused learn makes resolution fail for real);
+        // retrans_time_ms + mcast_solicit control how many ARP probes
+        // an unanswered resolve sends (counted via the TX pcap tap).
+        let neigh = "/proc/sys/net/ipv4/neigh/default";
+        let w = |p: &str, v: &[u8]| ustd::write_all(p, v).is_ok();
+        let fd = ustd::socket(ustd::SOCK_DGRAM);
+        let mut ok = fd >= 0;
+        if ok {
+            let u = ustd::UdpFd(fd);
+            let d = alloc::format!("{}/gc_stale_time", neigh);
+            // learn 10.0.2.2 fresh, then make it stale in ~1s
+            ok = ok && w("/proc/net/arp", b"flush")
+                && w(&d, b"1000")
+                && u.sendto(b"x", [10, 0, 2, 2], 9) >= 0;
+            ustd::sleep_ms(1300);
+            let st = ustd::read_all("/proc/net/neigh")
+                .map(|b| String::from_utf8_lossy(&b).contains("STALE"))
+                .unwrap_or(false);
+            let d3 = alloc::format!("{}/gc_thresh3", neigh);
+            // cap 0 → the gateway's ARP reply is refused → resolve fails
+            ok = ok && st
+                && w(&d, b"60000")
+                && w(&d3, b"0")
+                && w("/proc/net/arp", b"flush");
+            let refused = u.sendto(b"x", [10, 0, 2, 2], 9) < 0;
+            ok = ok && refused && w(&d3, b"1024")
+                && u.sendto(b"x", [10, 0, 2, 2], 9) >= 0;
+            // probe cadence: mcast_solicit probes per resolve, retrans
+            // apart — count TX frames while a dead resolve runs.
+            let pcap_pkts = || {
+                let mut b = [0u8; 1];
+                (ustd::pcap(2, &mut b) as u64) >> 32
+            };
+            let _ = ustd::pcap(1, &mut [0u8; 1]);
+            let _ = ustd::pcap(0, &mut [0u8; 1]); // start clean
+            let dr = alloc::format!("{}/retrans_time_ms", neigh);
+            let dm = alloc::format!("{}/mcast_solicit", neigh);
+            ok = ok && w(&dr, b"60") && w(&dm, b"12");
+            let _ = u.sendto(b"x", [10, 0, 2, 99], 9); // dead ip: full probe train
+            let hi = pcap_pkts();
+            ok = ok && w(&dm, b"2");
+            let p0 = pcap_pkts();
+            let _ = u.sendto(b"x", [10, 0, 2, 98], 9);
+            let lo = pcap_pkts() - p0;
+            if !(hi >= 6 && lo <= 4) {
+                println!("[dbg neigh] hi={} lo={}", hi, lo);
+            }
+            let _ = ustd::pcap(1, &mut [0u8; 1]);
+            ok = ok && hi >= 6 && lo <= 4
+                && w(&dr, b"1000") && w(&dm, b"3");
+        }
+        ok
+    });
     check("domainname-sysctl", {
         // kernel.domainname: a real UTS-scoped string sysctl — round
         // trip through the proc file; empty restores the "(none)" value.

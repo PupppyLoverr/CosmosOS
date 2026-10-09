@@ -250,6 +250,10 @@ static ICMP_RATELIMIT: AtomicU64 = AtomicU64::new(1000);
 static ICMP_RATEMASK: AtomicU64 = AtomicU64::new(0x1818);
 static ICMP_MSGS_PER_SEC: AtomicU64 = AtomicU64::new(1000);
 static ICMP_MSGS_BURST: AtomicU64 = AtomicU64::new(50);
+static NEIGH_STALE_MS: AtomicU64 = AtomicU64::new(60_000);
+static NEIGH_THRESH3: AtomicU64 = AtomicU64::new(1024);
+static NEIGH_RETRANS_MS: AtomicU64 = AtomicU64::new(1000);
+static NEIGH_MCAST_SOLICIT: AtomicU64 = AtomicU64::new(3);
 
 /// net.ipv4.tcp_syn_retries — SYN re-send cap during connect()
 /// (Linux default 6); the connect loop gives up ETIMEDOUT after
@@ -323,6 +327,27 @@ pub fn icmp_msgs_per_sec() -> u64 {
 /// net.ipv4.icmp_msgs_burst — token-bucket depth (Linux default 50).
 pub fn icmp_msgs_burst() -> u64 {
     ICMP_MSGS_BURST.load(Ordering::Relaxed)
+}
+/// net.ipv4.neigh.default.gc_stale_time — ms a learned neighbour
+/// entry stays REACHABLE before it ages to STALE (Linux default 60s).
+pub fn neigh_stale_ms() -> u64 {
+    NEIGH_STALE_MS.load(Ordering::Relaxed)
+}
+/// net.ipv4.neigh.default.gc_thresh3 — hard cap on dynamic neighbour
+/// entries; a new ARP-learned entry past the cap is refused (Linux
+/// default 1024).
+pub fn neigh_thresh3() -> u64 {
+    NEIGH_THRESH3.load(Ordering::Relaxed)
+}
+/// net.ipv4.neigh.default.retrans_time_ms — interval between ARP
+/// probes while a resolve waits for an answer (Linux default 1000ms).
+pub fn neigh_retrans_ms() -> u64 {
+    NEIGH_RETRANS_MS.load(Ordering::Relaxed)
+}
+/// net.ipv4.neigh.default.mcast_solicit — total broadcast ARP probes
+/// a resolve sends before giving up on retransmits (Linux default 3).
+pub fn neigh_mcast_solicit() -> u64 {
+    NEIGH_MCAST_SOLICIT.load(Ordering::Relaxed)
 }
 
 /// net.ipv4.conf.all.rp_filter — 0 off, 1 strict, 2 loose. Wire frames
@@ -450,6 +475,10 @@ pub fn get(name: &str) -> Option<u64> {
         "net/ipv4/icmp_ratemask" => ICMP_RATEMASK.load(Ordering::Relaxed),
         "net/ipv4/icmp_msgs_per_sec" => ICMP_MSGS_PER_SEC.load(Ordering::Relaxed),
         "net/ipv4/icmp_msgs_burst" => ICMP_MSGS_BURST.load(Ordering::Relaxed),
+        "net/ipv4/neigh/default/gc_stale_time" => NEIGH_STALE_MS.load(Ordering::Relaxed),
+        "net/ipv4/neigh/default/gc_thresh3" => NEIGH_THRESH3.load(Ordering::Relaxed),
+        "net/ipv4/neigh/default/retrans_time_ms" => NEIGH_RETRANS_MS.load(Ordering::Relaxed),
+        "net/ipv4/neigh/default/mcast_solicit" => NEIGH_MCAST_SOLICIT.load(Ordering::Relaxed),
 
         _ => return None,
     })
@@ -586,6 +615,18 @@ pub fn set(name: &str, v: u64) -> bool {
         }
         "net/ipv4/icmp_msgs_burst" if v <= 1_000_000 => {
             ICMP_MSGS_BURST.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/neigh/default/gc_stale_time" if v <= 3_600_000 => {
+            NEIGH_STALE_MS.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/neigh/default/gc_thresh3" if v <= 1 << 22 => {
+            NEIGH_THRESH3.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/neigh/default/retrans_time_ms" if v <= 60_000 => {
+            NEIGH_RETRANS_MS.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/neigh/default/mcast_solicit" if v <= 255 => {
+            NEIGH_MCAST_SOLICIT.store(v, Ordering::Relaxed)
         }
 
         _ => return false,

@@ -61,6 +61,10 @@ const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "tcp_wmem", "tcp_rmem",
 /// files under /proc/sys/net/ipv4/conf/all — a single-NIC box has one
 /// real per-interface sysctl set, surfaced as `all`.
 const NET_CONF_SYS_FILES: &[&str] = &["rp_filter", "log_martians"];
+/// files under /proc/sys/net/ipv4/neigh/default — neighbour-cache
+/// (ARP) tuning; resolved by the generic sysctl table like conf/*.
+const NEIGH_DEF_SYS_FILES: &[&str] =
+    &["gc_stale_time", "gc_thresh3", "retrans_time_ms", "mcast_solicit"];
 
 /// kernel.kptr_restrict: %pK-style addresses in /proc output —
 /// 0 = show, 1 = hide unless CAP_SYSLOG, 2 = hide for everyone.
@@ -116,6 +120,8 @@ pub fn is_dir(path: &str) -> bool {
         || path == "/proc/sys/net/ipv4"
         || path == "/proc/sys/net/ipv4/conf"
         || path == "/proc/sys/net/ipv4/conf/all"
+        || path == "/proc/sys/net/ipv4/neigh"
+        || path == "/proc/sys/net/ipv4/neigh/default"
         || path == "/proc/sys/net/unix"
         || path == "/proc/sys/net/core"
         || path == "/proc/sys/net/netfilter"
@@ -190,6 +196,9 @@ pub fn exists(path: &str) -> bool {
     }
     if let Some(f) = path.strip_prefix("/proc/sys/net/ipv4/conf/all/") {
         return NET_CONF_SYS_FILES.contains(&f);
+    }
+    if let Some(f) = path.strip_prefix("/proc/sys/net/ipv4/neigh/default/") {
+        return NEIGH_DEF_SYS_FILES.contains(&f);
     }
     if let Some(f) = path.strip_prefix("/proc/sys/net/ipv4/") {
         return NET_SYS_FILES.contains(&f);
@@ -390,12 +399,35 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         out.push(de);
         return out;
     }
+    if path == "/proc/sys/net/ipv4/neigh" {
+        let mut de = shared::DirEntry::default();
+        de.name[..7].copy_from_slice(b"default");
+        de.name_len = 7;
+        de.is_dir = 1;
+        out.push(de);
+        return out;
+    }
+    if path == "/proc/sys/net/ipv4/neigh/default" {
+        for name in NEIGH_DEF_SYS_FILES {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            out.push(de);
+        }
+        return out;
+    }
     if path == "/proc/sys/net/ipv4" {
         let mut cde = shared::DirEntry::default();
         cde.name[..4].copy_from_slice(b"conf");
         cde.name_len = 4;
         cde.is_dir = 1;
         out.push(cde);
+        let mut nde = shared::DirEntry::default();
+        nde.name[..5].copy_from_slice(b"neigh");
+        nde.name_len = 5;
+        nde.is_dir = 1;
+        out.push(nde);
         for name in NET_SYS_FILES {
             let mut de = shared::DirEntry::default();
             let nb = name.as_bytes();

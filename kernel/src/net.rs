@@ -143,7 +143,7 @@ static ARP_CACHE: Mutex<Vec<ArpEnt>> = Mutex::new(Vec::new());
 fn arp_state(e: &ArpEnt) -> &'static str {
     if e.perm {
         "PERMANENT"
-    } else if now_ms() - e.learned_ms < 30_000 {
+    } else if now_ms() - e.learned_ms < crate::sysctl::neigh_stale_ms() {
         "REACHABLE"
     } else {
         "STALE"
@@ -4428,7 +4428,11 @@ fn handle_frame(f: &[u8]) -> Option<([u8; 4], u8, Vec<u8>, u64)> {
                     e.mac = sender_mac;
                     e.learned_ms = now_ms();
                 }
-            } else {
+            } else if c.iter().filter(|e| !e.perm).count()
+                < crate::sysctl::neigh_thresh3() as usize
+            {
+                // gc_thresh3: past the cap a new dynamic entry is
+                // refused (Linux refuses table growth, not eviction).
                 c.push(ArpEnt {
                     ip: sender_ip,
                     mac: sender_mac,
@@ -4498,8 +4502,19 @@ fn arp_resolve(ip: [u8; 4], ms: u64) -> Option<[u8; 6]> {
         }
     }
     let deadline = now_ms() + ms;
-    send_arp_request(ip);
+    // neigh/default/retrans_time_ms + mcast_solicit: re-probe on the
+    // configured cadence until the solicit count is spent, then keep
+    // waiting silently for a late reply until the caller's deadline.
+    let mut probes = 0u64;
+    let mut next_probe = 0u64;
     loop {
+        if probes < crate::sysctl::neigh_mcast_solicit()
+            && (probes == 0 || now_ms() >= next_probe)
+        {
+            send_arp_request(ip);
+            probes += 1;
+            next_probe = now_ms() + crate::sysctl::neigh_retrans_ms();
+        }
         let _ = pump_rx();
         {
             let c = ARP_CACHE.lock();
