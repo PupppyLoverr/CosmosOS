@@ -1525,6 +1525,21 @@ pub fn arp_delete(ip: [u8; 4]) -> bool {
     sc1(shared::SYS_ARP_DEL, v) == 1
 }
 
+/// Send a real ARP who-has for `ip` and wait for the reply.
+/// Returns (mac, rtt_ms) on reply.
+pub fn net_arping(ip: [u8; 4], timeout_ms: u64) -> Option<([u8; 6], u64)> {
+    let v = ((ip[0] as u64) << 24) | ((ip[1] as u64) << 16) | ((ip[2] as u64) << 8) | ip[3] as u64;
+    let r = sc2(shared::SYS_ARPING, v, timeout_ms);
+    if r == shared::SYS_ERR {
+        return None;
+    }
+    let mac = [
+        (r >> 56) as u8, (r >> 48) as u8, (r >> 40) as u8,
+        (r >> 32) as u8, (r >> 24) as u8, (r >> 16) as u8,
+    ];
+    Some((mac, r & 0xFFFF))
+}
+
 /// Set the kernel nodename. Returns true on success.
 pub fn set_hostname(s: &str) -> bool {
     sc2(

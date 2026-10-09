@@ -272,6 +272,7 @@ struct FwRule {
     limit_burst: u16,     // bucket depth (real iptables default 5)
     lim_tokens: u16,      // match-time bucket (packet units)
     lim_ms: u64,          // last bucket refill
+    target: u8,           // 0 = DROP, 1 = LOG (audit + fall through)
     hits: u64,
     bytes: u64,
 }
@@ -424,6 +425,20 @@ fn fw_dropped(
         }
         r.hits += 1;
         r.bytes += plen;
+        if r.target == 1 {
+            // -j LOG: audit the packet into the kernel log and fall
+            // through to the next rule — the packet is NOT dropped.
+            let pname = match proto { 1 => "icmp", 6 => "tcp", 17 => "udp", n => {
+                sprintln!("[fw] IN= OUT= SRC={}.{}.{}.{} DST={}.{}.{}.{} LEN={} PROTO={}",
+                    src[0], src[1], src[2], src[3],
+                    our_ip()[0], our_ip()[1], our_ip()[2], our_ip()[3], plen, n);
+                continue;
+            }};
+            sprintln!("[fw] IN= OUT= SRC={}.{}.{}.{} DST={}.{}.{}.{} LEN={} PROTO={} DPT={}",
+                src[0], src[1], src[2], src[3],
+                our_ip()[0], our_ip()[1], our_ip()[2], our_ip()[3], plen, pname, dport);
+            continue;
+        }
         return true;
     }
     *FW_POLICY.lock()
@@ -474,7 +489,7 @@ pub fn net_iptables() -> String {
             i + 1,
             r.hits,
             r.bytes,
-            "DROP",
+            if r.target == 1 { "LOG" } else { "DROP" },
             proto,
             src,
             extra
@@ -712,7 +727,7 @@ pub fn iptables_ctl(line: &str) -> bool {
             let mut r = FwRule {
                 proto, dport: 0, src: [0; 4], smask: [0; 4], state: 0,
                 limit_pps: 0, limit_burst: 5, lim_tokens: 5, lim_ms: 0,
-                hits: 0, bytes: 0,
+                target: 0, hits: 0, bytes: 0,
             };
             let mut ok = true;
             while let Some(k) = f.next() {
@@ -779,6 +794,7 @@ pub fn iptables_ctl(line: &str) -> bool {
                             r.lim_tokens = v;
                         }
                     }
+                    "log" => r.target = 1, // "A ... log" marks -j LOG
                     _ => ok = false,
                 }
             }
@@ -1330,6 +1346,25 @@ fn send_arp_request(target: [u8; 4]) {
     p.extend_from_slice(&[0u8; 6]);
     p.extend_from_slice(&target);
     let _ = send_frame([0xFF; 6], 0x0806, &p);
+}
+
+/// `arping`: send a real ARP who-has for `dst` and wait for the reply.
+/// Returns (mac packed in the low 48 bits of u64, rtt_ms). The probe goes
+/// on the wire regardless of cache state — a real arping.
+pub fn net_arping(dst: [u8; 4], per_ms: u64) -> Option<(u64, u64)> {
+    let t0 = now_ms();
+    send_arp_request(dst);
+    while now_ms() - t0 < per_ms.max(50) {
+        let _ = pump_rx(); // drains the ring; ARP replies update ARP_CACHE
+        if let Some(e) = ARP_CACHE.lock().iter().find(|e| e.0 == dst) {
+            let m = e.1;
+            let mac = (m[0] as u64) << 40 | (m[1] as u64) << 32 | (m[2] as u64) << 24
+                | (m[3] as u64) << 16 | (m[4] as u64) << 8 | m[5] as u64;
+            return Some((mac, now_ms() - t0));
+        }
+        wait_irq();
+    }
+    None
 }
 
 fn send_arp_reply(dst_mac: [u8; 6], dst_ip: [u8; 4]) {

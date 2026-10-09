@@ -1130,6 +1130,18 @@ pub fn dispatch(ctx: &mut CpuContext) {
             ];
             net::arp_del(ip) as u64
         }
+        shared::SYS_ARPING => {
+            // (ip u32 BE, timeout_ms) -> mac48<<16 | rtt_ms | ERR
+            let ip = [
+                (a1 >> 24) as u8,
+                (a1 >> 16) as u8,
+                (a1 >> 8) as u8,
+                a1 as u8,
+            ];
+            net::net_arping(ip, a2.min(30_000))
+                .map(|(mac, rtt)| (mac << 16) | rtt.min(0xFFFF))
+                .unwrap_or(ERR)
+        }
         shared::SYS_UTIME => {
             let Some(path) = copy_str(a1, a2.min(4096)) else {
                 ctx.rax = ERR;
