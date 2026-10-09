@@ -5375,6 +5375,32 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         seen
     });
+    check("ipt-icmpt", {
+        // `-m icmp --icmp-type`: the real ICMP type byte. An OUTPUT
+        // drop on type 8 kills the echo request itself; type 0 doesn't
+        // match it.
+        let a = ustd::write_all("/proc/net/iptables", b"A OUT icmp icmpt 8 drop\n").is_ok();
+        let dropped = ustd::net_ping(0x7F00_0001, 350).is_none();
+        let _ = ustd::write_all("/proc/net/iptables", b"F OUT\n");
+        // Type 0 (echo-reply) on OUTPUT must not match the request —
+        // and a remote reply arrives via ingress anyway (ping the
+        // gateway: lo would locally generate a reply that egresses).
+        let b = ustd::write_all("/proc/net/iptables", b"A OUT icmp icmpt 0 drop\n").is_ok();
+        let passed = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        let _ = ustd::write_all("/proc/net/iptables", b"F OUT\n");
+        a && dropped && b && passed
+    });
+    check("ipt-dscp", {
+        // `-m dscp --dscp N`: DSCP = tos>>2 — a drop on 46 (EF) kills
+        // a -Q 0xb8 ping (0xb8>>2 == 46); tos 0 passes.
+        let a = ustd::write_all("/proc/net/iptables", b"A OUT 0 dscp 46 drop\n").is_ok();
+        let dropped = ustd::net_ping_qos(0x7F00_0001, 350, 0, 0, 0, 0xb8).is_none();
+        let _ = ustd::write_all("/proc/net/iptables", b"F OUT\n");
+        let b = ustd::write_all("/proc/net/iptables", b"A OUT 0 dscp 46 drop\n").is_ok();
+        let passed = ustd::net_ping_qos(0x7F00_0001, 600, 0, 0, 0, 0).is_some();
+        let _ = ustd::write_all("/proc/net/iptables", b"F OUT\n");
+        a && dropped && b && passed
+    });
 
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {
