@@ -5561,6 +5561,58 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         a && blocked && udp_ok && ok
     });
 
+    check("ipt-quota", {
+        // `-m quota --quota N`: a default echo reply is 44 bytes of
+        // ICMP on the wire — a 44-byte budget drops exactly one reply
+        // then lets the next through untouched.
+        let a = ustd::write_all("/proc/net/iptables", b"A IN icmp quota 44 drop\n")
+            .is_ok();
+        let p1 = ustd::net_ping(0x0A00_0202, 1200).is_none();
+        let p2 = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        let _ = ustd::write_all("/proc/net/iptables", b"F\n");
+        let ok = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        a && p1 && p2 && ok
+    });
+    check("ipt-time", {
+        // `-m time --datestart/--datestop`: a window that ended in
+        // 2001 never matches; a window open until 2100 always does.
+        let w1 = ustd::write_all(
+            "/proc/net/iptables",
+            b"A IN icmp time 1000000000 1000000001 drop\n",
+        )
+        .is_ok();
+        let open_ok = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        let _ = ustd::write_all("/proc/net/iptables", b"F\n");
+        let w2 = ustd::write_all(
+            "/proc/net/iptables",
+            b"A IN icmp time 0 4102444800 drop\n",
+        )
+        .is_ok();
+        let dropped = ustd::net_ping(0x0A00_0202, 1200).is_none();
+        let _ = ustd::write_all("/proc/net/iptables", b"F\n");
+        let ok = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        w1 && open_ok && w2 && dropped && ok
+    });
+    check("ipt-connlimit", {
+        // `-m connlimit --connlimit-above 0`: with one live TCP flow
+        // from this source, any further SYN's egress is dropped.
+        let _ = ustd::write_all("/proc/net/nf_conntrack", b"F\n");
+        let s1 = ustd::TcpSock::connect_timeout(15361, [10, 0, 2, 3], 53, 2500);
+        let s1_ok = s1.is_some();
+        let a = ustd::write_all(
+            "/proc/net/iptables",
+            b"A OUT tcp connl 0 32 drop\n",
+        )
+        .is_ok();
+        let blocked =
+            ustd::TcpSock::connect_timeout(15363, [10, 0, 2, 3], 53, 2500).is_none();
+        let _ = ustd::write_all("/proc/net/iptables", b"F\n");
+        let ok =
+            ustd::TcpSock::connect_timeout(15365, [10, 0, 2, 3], 53, 2500).is_some();
+        drop(s1);
+        s1_ok && a && blocked && ok
+    });
+
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {
         // 4 MiB through write_all (virtio-blk -> FAT32)
