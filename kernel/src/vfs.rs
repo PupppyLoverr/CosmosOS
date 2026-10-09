@@ -199,8 +199,15 @@ fn immutable(path: &str) -> bool {
     stat_path_nofollow(path).map(|s| s.attr & 0x80 != 0).unwrap_or(false)
 }
 
+/// Append-only attribute bit (0x08, `chattr +a` — the FS_APPEND_FL
+/// analogue): only O_APPEND write-opens are allowed; unlink, rename,
+/// truncate, and non-append writes all fail EPERM like Linux.
+fn append_only(path: &str) -> bool {
+    stat_path_nofollow(path).map(|s| s.attr & 0x08 != 0).unwrap_or(false)
+}
+
 pub fn write_range_path(path: &str, offset: u64, buf: &[u8]) -> Result<usize, i64> {
-    if immutable(path) {
+    if immutable(path) || append_only(path) {
         return Err(-1);
     }
     if crate::tmpfs::handles(path) {
@@ -524,6 +531,15 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     {
         return Err(-1); // EPERM: FS_IMMUTABLE_FL
     }
+    // FS_APPEND_FL: an `a`-marked file takes write opens only via O_APPEND
+    let is_app = exists && is_fat
+        && fs.stat(&full).map(|st| st.attr & 0x08 != 0).unwrap_or(false);
+    if is_app
+        && flags & (shared::O_WRONLY | shared::O_RDWR | O_TRUNC | O_APPEND) != 0
+        && flags & O_APPEND == 0
+    {
+        return Err(-1); // EPERM: FS_APPEND_FL
+    }
     if exists && flags & O_CREAT != 0 && flags & shared::O_EXCL != 0 {
         return Err(-17); // EEXIST
     }
@@ -734,7 +750,7 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
         }
     }
     if crate::tmpfs::handles(&path) {
-        if immutable(&path) {
+        if immutable(&path) || (append_only(&path) && flags & shared::O_APPEND == 0) {
             return Err(-1);
         }
         let sz = if flags & shared::O_APPEND != 0 {
@@ -752,7 +768,7 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
         task::io_charge(false, n);
         return Ok(n as i64);
     }
-    if immutable(&path) {
+    if immutable(&path) || (append_only(&path) && flags & shared::O_APPEND == 0) {
         return Err(-1);
     }
     const O_APPEND: u64 = shared::O_APPEND;
@@ -1153,7 +1169,7 @@ pub fn remove(path: &str) -> Result<(), i64> {
         return r;
     }
     if crate::tmpfs::handles(&full) {
-        if immutable(&full) {
+        if immutable(&full) || append_only(&full) {
             return Err(-1);
         }
         let r = crate::tmpfs::remove(&full);
@@ -1173,8 +1189,8 @@ pub fn remove(path: &str) -> Result<(), i64> {
     if task::cred().0 != 0 {
         return Err(-1);
     }
-    if immutable(&full) {
-        return Err(-1); // EPERM: FS_IMMUTABLE_FL
+    if immutable(&full) || append_only(&full) {
+        return Err(-1); // EPERM: FS_IMMUTABLE_FL / FS_APPEND_FL
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
@@ -1190,7 +1206,7 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
     let ft = crate::tmpfs::handles(&f);
     let tt = crate::tmpfs::handles(&t2);
     if ft && tt {
-        if immutable(&f) || immutable(&t2) {
+        if immutable(&f) || immutable(&t2) || append_only(&f) || append_only(&t2) {
             return Err(-1);
         }
         return crate::tmpfs::rename(&f, &t2);
@@ -1214,8 +1230,8 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
     if task::cred().0 != 0 {
         return Err(-1);
     }
-    if immutable(&f) || immutable(&t2) {
-        return Err(-1); // EPERM: FS_IMMUTABLE_FL
+    if immutable(&f) || immutable(&t2) || append_only(&f) || append_only(&t2) {
+        return Err(-1); // EPERM: FS_IMMUTABLE_FL / FS_APPEND_FL
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
@@ -1264,7 +1280,7 @@ pub fn truncate_path(path: &str, len: u64) -> Result<(), i64> {
     }
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
-    if immutable(&full) {
+    if immutable(&full) || append_only(&full) {
         return Err(-1);
     }
     if crate::tmpfs::handles(&full) {
@@ -1302,7 +1318,7 @@ pub fn truncate_path(path: &str, len: u64) -> Result<(), i64> {
 pub fn write_all_path(path: &str, data: &[u8]) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
-    if immutable(&full) {
+    if immutable(&full) || append_only(&full) {
         return Err(-1);
     }
     if crate::tmpfs::handles(&full) {

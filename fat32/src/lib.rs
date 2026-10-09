@@ -400,6 +400,11 @@ impl<D: BlockDevice> Fat32<D> {
                 u16::from_le_bytes([e[24], e[25]]),
                 u16::from_le_bytes([e[22], e[23]]),
             );
+            // Append-only (chattr +a / FS_APPEND_FL): persisted as bit 0x20
+            // of the NT-reserved dirent byte 12, surfaced as attr bit 0x08
+            // (0x08 in the FAT attr byte itself is the volume-label mark —
+            // setting it would hide the entry from dir scans above).
+            let attr = attr | if e[12] & 0x20 != 0 { 0x08 } else { 0 };
             out.push(RawEntry {
                 name,
                 attr,
@@ -539,6 +544,9 @@ impl<D: BlockDevice> Fat32<D> {
             // user-settable: 0x01 ro, 0x02 hidden, 0x04 sys + 0x40 symlink
             // + 0x80 immutable (chattr +i; enforced in kernel vfs)
             raw[11] = (raw[11] & 0x38) | (a & 0xC7);
+            // attr 0x08 append-only lives in NT-reserved byte 12 bit 0x20
+            // (see the read side — 0x08 in byte 11 is FAT volume-label)
+            raw[12] = (raw[12] & !0x20) | ((a & 0x08) << 2);
         }
         self.write_dir_entry(e.slot_cluster, e.slot_offset, &raw)
     }
