@@ -39,7 +39,7 @@ const NET_FILES: &[&str] = &[
 const SYS_FILES: &[&str] = &["hostname", "cow_pages", "pid_max", "threads-max"];
 
 /// files under /proc/sys/fs (fs/inotify/max_user_watches lives one deeper)
-const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size"];
+const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size", "file-max", "file-nr"];
 
 /// files under /proc/sys/net/ipv4
 const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "ip_default_ttl"];
@@ -81,6 +81,8 @@ pub fn is_dir(path: &str) -> bool {
         || path == "/proc/sys"
         || path == "/proc/sys/kernel"
         || path == "/proc/sys/kernel/yama"
+        || path == "/proc/sys/kernel/pty"
+        || path == "/proc/sys/vm"
         || path == "/proc/sys/fs"
         || path == "/proc/sys/fs/inotify"
         || path == "/proc/sys/net"
@@ -131,9 +133,15 @@ pub fn exists(path: &str) -> bool {
         }
         return FS_SYS_FILES.contains(&f);
     }
+    if let Some(f) = path.strip_prefix("/proc/sys/vm/") {
+        return f == "max_map_count";
+    }
     if let Some(f) = path.strip_prefix("/proc/sys/kernel/") {
         if let Some(n) = f.strip_prefix("yama/") {
             return n == "ptrace_scope";
+        }
+        if let Some(n) = f.strip_prefix("pty/") {
+            return n == "max" || n == "nr";
         }
         return SYS_FILES.contains(&f);
     }
@@ -184,10 +192,11 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         return out;
     }
     if path == "/proc/sys/kernel" {
-        {
+        for dname in ["yama", "pty"] {
             let mut de = shared::DirEntry::default();
-            de.name[..4].copy_from_slice(b"yama");
-            de.name_len = 4;
+            let nb = dname.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
             de.is_dir = 1;
             out.push(de);
         }
@@ -207,6 +216,29 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         let mut de = shared::DirEntry::default();
         de.name[..12].copy_from_slice(b"ptrace_scope");
         de.name_len = 12;
+        out.push(de);
+        return out;
+    }
+    if path == "/proc/sys/kernel/pty" {
+        for name in ["max", "nr"] {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            de.size = read_file(&alloc::format!("/proc/sys/kernel/pty/{}", name))
+                .map(|d| d.len() as u64)
+                .unwrap_or(0);
+            out.push(de);
+        }
+        return out;
+    }
+    if path == "/proc/sys/vm" {
+        let mut de = shared::DirEntry::default();
+        de.name[..13].copy_from_slice(b"max_map_count");
+        de.name_len = 13;
+        de.size = read_file("/proc/sys/vm/max_map_count")
+            .map(|d| d.len() as u64)
+            .unwrap_or(0);
         out.push(de);
         return out;
     }
@@ -238,7 +270,7 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         return out;
     }
     if path == "/proc/sys" {
-        for name in ["kernel", "fs", "net"] {
+        for name in ["kernel", "fs", "net", "vm"] {
             let mut de = shared::DirEntry::default();
             let nb = name.as_bytes();
             de.name[..nb.len()].copy_from_slice(nb);
@@ -331,6 +363,13 @@ fn cpu_brand() -> String {
 /// Render a /proc file's current contents. Generated fresh on every read so
 /// values like uptime and the task list are live.
 pub fn read_file(path: &str) -> Option<Vec<u8>> {
+    // /proc/sys/<a/b> resolved by the sysctl table (b195/196) — one
+    // dispatch covers every registered name, dotted or nested
+    if let Some(rel) = path.strip_prefix("/proc/sys/") {
+        if let Some(v) = crate::sysctl::get(rel) {
+            return Some(alloc::format!("{}\n", v).into_bytes());
+        }
+    }
     if let Some(p) = pid_of(path) {
         let file = path.rsplit('/').next().unwrap_or("");
         if path.matches('/').count() == 3 && PID_FILES.contains(&file) {
@@ -422,12 +461,6 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         ),
         "/proc/net/owners" => net::net_owners(),
         "/proc/sys/kernel/hostname" => alloc::format!("{}\n", crate::syscall::hostname()),
-        "/proc/sys/kernel/pid_max" => return Some(alloc::format!("{}\n", crate::sysctl::get("kernel/pid_max").unwrap_or(0)).into_bytes()),
-        "/proc/sys/kernel/threads-max" => return Some(alloc::format!("{}\n", crate::sysctl::get("kernel/threads-max").unwrap_or(0)).into_bytes()),
-        "/proc/sys/kernel/yama/ptrace_scope" => return Some(alloc::format!("{}\n", crate::sysctl::get("kernel/yama/ptrace_scope").unwrap_or(0)).into_bytes()),
-        "/proc/sys/fs/nr_open" => return Some(alloc::format!("{}\n", crate::sysctl::get("fs/nr_open").unwrap_or(0)).into_bytes()),
-        "/proc/sys/fs/pipe-max-size" => return Some(alloc::format!("{}\n", crate::sysctl::get("fs/pipe-max-size").unwrap_or(0)).into_bytes()),
-        "/proc/sys/fs/inotify/max_user_watches" => return Some(alloc::format!("{}\n", crate::sysctl::get("fs/inotify/max_user_watches").unwrap_or(0)).into_bytes()),
         "/proc/sys/net/ipv4/icmp_echo_ignore_all" => net::net_icmp_ignore_all(),
         "/proc/sys/net/ipv4/ip_default_ttl" => net::net_def_ttl(),
         "/proc/swaps" => {
@@ -791,12 +824,9 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
         net::set_def_ttl(v);
         return Some(buf.len());
     }
-    if let Some(rel) = path
-        .strip_prefix("/proc/sys/")
-        .filter(|p| p.starts_with("kernel/") || p.starts_with("fs/"))
-    {
-        // hostname is handled by its dedicated arm below
-        if rel != "kernel/hostname" {
+    if let Some(rel) = path.strip_prefix("/proc/sys/") {
+        // hostname is handled by its dedicated arm below; net/* above.
+        if rel != "kernel/hostname" && !rel.starts_with("net/") {
             let v = String::from(String::from_utf8_lossy(buf).trim());
             let Ok(n) = v.parse::<u64>() else { return None };
             return crate::sysctl::set(rel, n).then_some(buf.len());

@@ -967,6 +967,18 @@ fn alloc_pid(s: &mut Sched) -> Option<u32> {
     (1..=cap as u32).find(|c| !s.tasks.iter().any(|t| t.id == *c))
 }
 
+/// fs.file-nr: live open descriptors across every task — the number
+/// Linux reports as /proc/sys/fs/file-nr's first field.
+pub fn live_fd_count() -> u64 {
+    let g = SCHED.lock();
+    let Some(s) = g.as_ref() else { return 0 };
+    s.tasks
+        .iter()
+        .filter(|t| t.state != State::Dead)
+        .map(|t| t.fds.iter().flatten().count() as u64)
+        .sum()
+}
+
 /// Spawn a kernel-space thread.
 pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
     let mut g = SCHED.lock();
