@@ -8033,7 +8033,8 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut state = String::new();
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
-    let mut jump_log = false;
+    let mut jump = "DROP";
+    let mut insert_at: Option<usize> = None;
     let mut i = 0usize;
     while i < args.len() {
         match args[i] {
@@ -8061,11 +8062,10 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             }
             "-j" | "--jump" => {
                 let t = args.get(i + 1).copied().unwrap_or("DROP");
-                if t == "LOG" {
-                    jump_log = true;
-                } else if t != "DROP" {
-                    return None; // only DROP/LOG targets are real
-                }
+                jump = match t {
+                    "DROP" | "ACCEPT" | "REJECT" | "LOG" => t,
+                    _ => return None, // only real targets
+                };
                 i += 1;
             }
             "-m" | "--match" => {
@@ -8103,7 +8103,18 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 state = String::from(args.get(i + 1).copied().unwrap_or(""));
                 i += 1;
             }
-            "-A" | "-I" | "-D" | "INPUT" | "OUTPUT" | "FORWARD" | "-i" | "-o" => {
+            "-I" | "--insert" => {
+                // -I INPUT [rulenum]: INPUT is the next arg, then an
+                // optional 1-based insert position (default 1).
+                i += 1; // consume "INPUT"
+                if let Some(n) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                    insert_at = Some(n);
+                    i += 1;
+                } else {
+                    insert_at = Some(1);
+                }
+            }
+            "-A" | "-D" | "INPUT" | "OUTPUT" | "FORWARD" | "-i" | "-o" => {
                 if args[i] == "-i" || args[i] == "-o" {
                     i += 1; // interface arg — single nic, ignored
                 }
@@ -8112,7 +8123,10 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
         }
         i += 1;
     }
-    let mut line = alloc::format!("A {}", proto);
+    let mut line = match insert_at {
+        Some(n) => alloc::format!("I {} {}", n, proto),
+        None => alloc::format!("A {}", proto),
+    };
     if dport != 0 {
         line.push_str(&alloc::format!(" dport {}", dport));
     }
@@ -8128,8 +8142,11 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             line.push_str(&alloc::format!(" lburst {}", limit_burst));
         }
     }
-    if jump_log {
-        line.push_str(" log");
+    match jump {
+        "LOG" => line.push_str(" log"),
+        "REJECT" => line.push_str(" reject"),
+        "ACCEPT" => line.push_str(" accept"),
+        _ => {}
     }
     line.push('\n');
     Some(line)
@@ -34476,15 +34493,17 @@ impl Term {
                         }
                         None => self.fail("usage: iptables -D INPUT <rulenum>"),
                     }
-                } else if first == "-A" || first == "--append" || first == "-I" {
-                    match ipt_rule_from_args(&args[1..]) {
+                } else if first == "-A" || first == "--append" || first == "-I" || first == "--insert" {
+                    // pass args whole: -A/-I + chain + optional rulenum
+                    // are part of the rule grammar
+                    match ipt_rule_from_args(&args) {
                         Some(line) => {
                             match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
                                 Ok(_) => self.emit("rule added to INPUT"),
                                 Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                             }
                         }
-                        None => self.fail("iptables: only -j DROP targets are supported"),
+                        None => self.fail("iptables: only -j DROP|REJECT|LOG|ACCEPT targets are supported"),
                     }
                 } else {
                     self.fail(

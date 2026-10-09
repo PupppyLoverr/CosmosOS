@@ -377,18 +377,20 @@ fn ct_observe_tx(f: &[u8]) {
     let _ = ct_update(src, dst, sport, dport, proto);
 }
 
-/// true => drop this packet (a rule matched, or policy DROP).
+/// INPUT-chain verdict for this packet: 0 = let it through (no rule
+/// matched, ACCEPT target, or policy ACCEPT), 1 = drop, 2 = reject
+/// (caller sends the refusal: RST for TCP, ICMP 3/3 otherwise).
 /// `plen` is the IPv4 payload length — it feeds the real per-rule
 /// byte counter shown by `iptables -L -v`. `st` is the packet's
 /// conntrack state bits from `ct_update` (1 NEW / 2 ESTABLISHED).
-fn fw_dropped(
+fn fw_verdict(
     src: [u8; 4],
     proto: u8,
     _sport: u16,
     dport: u16,
     st: u8,
     plen: u64,
-) -> bool {
+) -> u8 {
     let mut fw = FW.lock();
     for r in fw.iter_mut() {
         if r.proto != 0 && r.proto != proto {
@@ -439,9 +441,12 @@ fn fw_dropped(
                 our_ip()[0], our_ip()[1], our_ip()[2], our_ip()[3], plen, pname, dport);
             continue;
         }
-        return true;
+        if r.target == 3 {
+            return 0; // -j ACCEPT: terminal — skips the rest of the chain
+        }
+        return if r.target == 2 { 2 } else { 1 };
     }
-    *FW_POLICY.lock()
+    if *FW_POLICY.lock() { 1 } else { 0 }
 }
 
 /// `/proc/net/iptables` — `iptables -L -n` listing (INPUT chain).
@@ -451,6 +456,12 @@ pub fn net_iptables() -> String {
         if *FW_POLICY.lock() { "DROP" } else { "ACCEPT" }
     );
     for (i, r) in FW.lock().iter().enumerate() {
+        let tgt = match r.target {
+            1 => "LOG",
+            2 => "REJECT",
+            3 => "ACCEPT",
+            _ => "DROP",
+        };
         let proto = match r.proto {
             1 => String::from("icmp"),
             6 => String::from("tcp"),
@@ -489,7 +500,7 @@ pub fn net_iptables() -> String {
             i + 1,
             r.hits,
             r.bytes,
-            if r.target == 1 { "LOG" } else { "DROP" },
+            tgt,
             proto,
             src,
             extra
@@ -715,7 +726,14 @@ pub fn iptables_ctl(line: &str) -> bool {
             }
             _ => false,
         },
-        Some("A") => {
+        // `A` appends, `I <n>` inserts at 1-based position n — real
+        // iptables -I INPUT <n> ordering semantics.
+        Some(op @ ("A" | "I")) => {
+            let ins: Option<usize> = if op == "I" {
+                Some(f.next().and_then(|s| s.parse().ok()).unwrap_or(1).max(1))
+            } else {
+                None
+            };
             let proto = match f.next() {
                 Some("*") | Some("all") => 0u8,
                 Some("icmp") => 1,
@@ -794,12 +812,21 @@ pub fn iptables_ctl(line: &str) -> bool {
                             r.lim_tokens = v;
                         }
                     }
-                    "log" => r.target = 1, // "A ... log" marks -j LOG
+                    "log" => r.target = 1,    // "... log" marks -j LOG
+                    "reject" => r.target = 2, // -j REJECT: refusal goes back
+                    "accept" => r.target = 3, // -j ACCEPT: terminal allow
                     _ => ok = false,
                 }
             }
             if ok {
-                FW.lock().push(r);
+                let mut fw = FW.lock();
+                match ins {
+                    Some(n) => {
+                        let pos = (n - 1).min(fw.len());
+                        fw.insert(pos, r);
+                    }
+                    None => fw.push(r),
+                }
             }
             ok
         }
@@ -944,7 +971,20 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
         // so loopback flows pair with their tx counterparts.
         let dst = if is_loopback(*src_ip) { LOOPBACK_IP } else { our_ip() };
         let st = ct_update(*src_ip, dst, sport, dport, *proto);
-        !fw_dropped(*src_ip, *proto, sport, dport, st, p.len() as u64)
+        let v = fw_verdict(*src_ip, *proto, sport, dport, st, p.len() as u64);
+        if v == 2 {
+            // -j REJECT: a real refusal goes back — TCP_RST for TCP
+            // (same wire shape as the unclaimed-port responder),
+            // ICMP 3/3 port-unreachable for everything else.
+            if *proto == 6 {
+                if let Some(s) = parse_tcp(p) {
+                    tcp_rst(*src_ip, &s);
+                }
+            } else {
+                icmp_port_unreach(*src_ip, p);
+            }
+        }
+        v == 0
     });
     IP_IN_DELIV.fetch_add(out.len() as u64, Ordering::Relaxed);
     // ICMP: answer echo requests like a real host — wire or loopback;
