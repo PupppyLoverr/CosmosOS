@@ -63,9 +63,14 @@ pub fn handles(path: &str) -> bool {
 /// `posix_openpt`: create a pair, return the master path. The slave node is
 /// `/dev/pts/{id}` — named in the Pty as created and openable at once
 /// (grantpt+unlockpt semantics folded in, matching the rest of our flat fs).
-pub fn create() -> String {
+pub fn create() -> Option<String> {
+    let mut pts = PTS.lock();
+    // kernel.pty.max: EIO when the pair table is full (Linux behavior)
+    if pts.len() as u64 >= crate::sysctl::pty_max() {
+        return None;
+    }
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    PTS.lock().insert(
+    pts.insert(
         id,
         Pty {
             master_open: 1,
@@ -74,7 +79,12 @@ pub fn create() -> String {
             ..Default::default()
         },
     );
-    format!("/ptym/{}", id)
+    Some(format!("/ptym/{}", id))
+}
+
+/// kernel.pty.nr — live pairs.
+pub fn count() -> u64 {
+    PTS.lock().len() as u64
 }
 
 /// Slave node name for a master path (or the path itself if already slave).

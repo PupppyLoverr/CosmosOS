@@ -267,6 +267,11 @@ fn err_to_i64(e: fat32::Error) -> i64 {
 /// the fd INDEX — slots at or above the limit are never handed out,
 /// even when the vec has holes there.
 fn alloc_fd() -> Option<usize> {
+    // fs.file-max: system-wide descriptor budget (Linux ENFILE — surfaced
+    // as EMFILE here since this funnel has no second error kind)
+    if task::live_fd_count() >= crate::sysctl::fs_file_max() {
+        return None;
+    }
     task::with_current(|t| {
         let open_cap = t.rlim_nofile.min(crate::sysctl::fs_nr_open());
         for (i, f) in t.fds.iter().enumerate() {

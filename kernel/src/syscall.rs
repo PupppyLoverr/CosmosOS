@@ -502,16 +502,18 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_PIDFD_SIGNAL => sys_pidfd_signal(a1, a2),
         shared::SYS_OPENPT => {
             // posix_openpt folded: master fd; slave lives at /dev/pts/{id}
-            let path = crate::pty::create();
-            task::with_current(|t| {
-                let Some(s) = alloc_slot(t) else { return ERR; };
-                t.fds[s] = Some(task::FileDesc {
-                    path,
-                    pos: 0,
-                    flags: shared::O_RDWR,
-                });
-                s as u64
-            })
+            match crate::pty::create() {
+                None => (-28i64) as u64, // ENOSPC: kernel.pty.max reached
+                Some(path) => task::with_current(|t| {
+                    let Some(s) = alloc_slot(t) else { return ERR; };
+                    t.fds[s] = Some(task::FileDesc {
+                        path,
+                        pos: 0,
+                        flags: shared::O_RDWR,
+                    });
+                    s as u64
+                }),
+            }
         }
         shared::SYS_TCSETS => task::with_current(|t| match t.fds.get(a1 as usize) {
             Some(Some(f)) if crate::pty::handles(&f.path) => {
@@ -2303,6 +2305,13 @@ fn sys_mmap(size: u64, flags: u64, addr: u64) -> u64 {
     if over {
         return 0;
     }
+    // vm.max_map_count: ENOMEM when the per-task map table is full
+    let map_full = task::with_current(|t| {
+        (t.maps.len() + t.filemaps.len()) as u64 >= crate::sysctl::vm_max_map_count()
+    });
+    if map_full {
+        return 0;
+    }
     let pages = size.div_ceil(0x1000);
     if fixed {
         // POSIX MAP_FIXED: evict overlapping maps first (real munmap —
@@ -2361,6 +2370,12 @@ fn sys_mmap_file(fd: u64, size: u64, offset: u64) -> u64 {
         used.saturating_add(size) > t.rlim_as
     });
     if over {
+        return 0;
+    }
+    // vm.max_map_count for file maps too
+    if task::with_current(|t| {
+        (t.maps.len() + t.filemaps.len()) as u64 >= crate::sysctl::vm_max_map_count()
+    }) {
         return 0;
     }
     let path = task::with_current(|t| match t.fds.get(fd as usize) {
@@ -2969,12 +2984,13 @@ fn sys_seek(fd: u64, off: u64, whence: u64) -> u64 {
 /// the fd INDEX — slots at or above the limit are never handed out,
 /// even when the vec has holes there.
 fn alloc_slot(t: &mut task::Task) -> Option<usize> {
+    let cap = t.rlim_nofile.min(crate::sysctl::fs_nr_open());
     for (i, f) in t.fds.iter().enumerate() {
-        if f.is_none() && (i as u64) < t.rlim_nofile {
+        if f.is_none() && (i as u64) < cap {
             return Some(i);
         }
     }
-    if t.fds.len() as u64 >= t.rlim_nofile {
+    if t.fds.len() as u64 >= cap {
         return None;
     }
     t.fds.push(None);

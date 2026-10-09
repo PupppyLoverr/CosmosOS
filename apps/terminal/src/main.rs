@@ -38204,6 +38204,11 @@ impl Term {
                     "/proc/sys/fs/nr_open",
                     "/proc/sys/fs/pipe-max-size",
                     "/proc/sys/fs/inotify/max_user_watches",
+                    "/proc/sys/fs/file-max",
+                    "/proc/sys/fs/file-nr",
+                    "/proc/sys/kernel/pty/max",
+                    "/proc/sys/kernel/pty/nr",
+                    "/proc/sys/vm/max_map_count",
                     "/proc/sys/net/ipv4/icmp_echo_ignore_all",
                     "/proc/sys/net/ipv4/ip_default_ttl",
                 ];
