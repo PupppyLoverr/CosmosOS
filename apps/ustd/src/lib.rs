@@ -632,6 +632,29 @@ pub fn net_ping_qos(
     );
     if r == u64::MAX { None } else { Some(r) }
 }
+/// `ping -p` — like net_ping_qos but the ICMP payload repeats `pat`
+/// (<=16 bytes) instead of the default 0x10.. fill. The pattern
+/// pointer rides a5's upper bits; its length a4's.
+pub fn net_ping_pat(
+    ip: u32,
+    timeout_ms: u64,
+    ttl: u8,
+    size: u64,
+    iface: u8,
+    tos: u8,
+    pat: &[u8],
+) -> Option<u64> {
+    let plen = pat.len().min(16) as u64;
+    let r = sc5(
+        shared::SYS_NET_PING,
+        ip as u64,
+        timeout_ms,
+        (ttl as u64) | ((tos as u64) << 8),
+        (size & 0xffff_ffff) | (plen << 32),
+        iface as u64 | ((pat.as_ptr() as u64) << 8),
+    );
+    if r == u64::MAX { None } else { Some(r) }
+}
 /// Resolve a hostname to an IPv4 address via a real DNS query (UDP/53).
 pub fn net_dns(name: &str) -> Option<[u8; 4]> {
     let mut ip = [0u8; 4];

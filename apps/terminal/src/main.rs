@@ -8070,6 +8070,8 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut state = String::new();
     let mut comment = String::new();
     let mut ttl_spec = String::new();
+    let mut tos_spec = String::new();
+    let mut mac_spec = String::new();
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
     let mut jump = "DROP";
@@ -8148,6 +8150,16 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             // `--ttl N` is the canonical form of --ttl-eq N.
             "--ttl" => {
                 ttl_spec = alloc::format!("eq:{}", args.get(i + 1).copied().unwrap_or("0"));
+                i += 1;
+            }
+            // `-m tos --tos V[/M]` — real DS-byte match.
+            "--tos" => {
+                tos_spec = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
+            // `-m mac --mac-source aa:bb:..` — real L2 sender match.
+            "--mac-source" => {
+                mac_spec = String::from(args.get(i + 1).copied().unwrap_or(""));
                 i += 1;
             }
             "--dst-range" | "--destination-range" => {
@@ -8287,6 +8299,12 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !ttl_spec.is_empty() {
         line.push_str(&alloc::format!(" ttl {}", ttl_spec));
+    }
+    if !tos_spec.is_empty() {
+        line.push_str(&alloc::format!(" tos {}", tos_spec));
+    }
+    if !mac_spec.is_empty() {
+        line.push_str(&alloc::format!(" mac {}", mac_spec));
     }
     if !iif.is_empty() {
         line.push_str(&alloc::format!(" iif {}", iif));
@@ -19910,7 +19928,7 @@ impl Term {
                                 .unwrap_or(usize::MAX);
                             i += 1;
                         }
-                        "-n" | "-q" | "-e" | "-v" | "-tt" | "-ttt" => {}
+                        "-n" | "-q" | "-e" | "-v" | "-tt" | "-ttt" | "-x" | "-X" => {}
                         _ => {}
                     }
                     i += 1;
@@ -19919,6 +19937,10 @@ impl Term {
                 // -e: real tcpdump flag — print the link-level header
                 // (srcmac > dstmac, ethertype, frame length).
                 let show_eth = args.iter().any(|a| *a == "-e");
+                // -x/-X: real tcpdump flags — hex dump of the frame
+                // after each decoded line; -X adds the ASCII gutter.
+                let show_hex = args.iter().any(|a| *a == "-x" || *a == "-X");
+                let show_ascii = args.iter().any(|a| *a == "-X");
                 let Some(f) = file else {
                     self.fail("usage: tcpdump -r <file.pcap> [-c N]");
                     return;
@@ -20122,6 +20144,40 @@ impl Term {
                             et,
                             wire
                         )),
+                    }
+                    // tcpdump -x/-X layout: 16B rows, u16 hex groups,
+                    // ascii gutter on -X.
+                    if show_hex {
+                        let mut ho = 0usize;
+                        while ho < fr.len() {
+                            let mut line =
+                                alloc::format!("0x{:04x}:  ", ho);
+                            let mut asc = String::new();
+                            for j in 0..16usize {
+                                if ho + j < fr.len() {
+                                    let b = fr[ho + j];
+                                    line.push_str(&alloc::format!(
+                                        "{:02x}",
+                                        b
+                                    ));
+                                    asc.push(if (0x20..0x7f).contains(&b) {
+                                        b as char
+                                    } else {
+                                        '.'
+                                    });
+                                } else {
+                                    line.push_str("  ");
+                                }
+                                if j % 2 == 1 {
+                                    line.push(' ');
+                                }
+                            }
+                            if show_ascii {
+                                line.push_str(&alloc::format!(" {}", asc));
+                            }
+                            self.emit(&line);
+                            ho += 16;
+                        }
                     }
                 }
                 self.emit(&alloc::format!(
@@ -22981,6 +23037,7 @@ impl Term {
                 let mut ts_stamp = false;
                 let mut ttl = 0u8;
                 let mut tos = 0u8;
+                let mut pat: Vec<u8> = Vec::new();
                 let mut audible = false;
                 let mut size = 0u64;
                 let mut iface = 0u8;
@@ -23087,6 +23144,27 @@ impl Term {
                             ts_stamp = true;
                             i += 1;
                         }
+                        "-p" => {
+                            // -p <hex>: real iputils flag — pad the ICMP
+                            // payload with the byte pattern (up to 16B).
+                            pat.clear();
+                            let h = args.get(i + 1).copied().unwrap_or("");
+                            let mut okp = h.len() >= 2 && h.len() <= 32 && h.len() % 2 == 0;
+                            for j in (0..h.len()).step_by(2) {
+                                match u8::from_str_radix(&h[j..j + 2], 16) {
+                                    Ok(b) => pat.push(b),
+                                    Err(_) => {
+                                        okp = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !okp {
+                                self.fail("ping: bad -p pattern (1-16 hex bytes)");
+                                return;
+                            }
+                            i += 2;
+                        }
                         "-Q" => {
                             // -Q N: real iputils flag — stamps the
                             // IPv4 TOS/DSCP byte on the echo request
@@ -23137,7 +23215,12 @@ impl Term {
                                 self.fail("ping: connect: Invalid argument");
                                 break;
                             }
-                            match ustd::net_ping_qos(packed, wto, ttl, size, iface, tos) {
+                            let r = if pat.is_empty() {
+                                ustd::net_ping_qos(packed, wto, ttl, size, iface, tos)
+                            } else {
+                                ustd::net_ping_pat(packed, wto, ttl, size, iface, tos, &pat)
+                            };
+                            match r {
                                 Some(rtt) => {
                                     got += 1;
                                     if audible {

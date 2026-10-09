@@ -966,7 +966,22 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 (a1 >> 8) as u8,
                 a1 as u8,
             ];
-            net::ping_ttl_if(ip, a2.min(10_000), a3 as u8, if a4 == 0 { 36 } else { a4 as usize }, a5 as u8, (a3 >> 8) as u8)
+            // a4 = size | (pat_len << 32), a5 = iface | (pat_ptr << 8):
+            // `ping -p` delivers a real payload pattern (<=16B) by VA.
+            let size = (a4 & 0xffff_ffff) as usize;
+            let plen = (a4 >> 32).min(16);
+            let pat = if plen > 0 {
+                match copy_in(a5 >> 8, plen) {
+                    Some(v) => Some(v),
+                    None => {
+                        ctx.rax = ERR;
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            net::ping_ttl_pat(ip, a2.min(10_000), a3 as u8, if size == 0 { 36 } else { size }, (a5 & 0xff) as u8, (a3 >> 8) as u8, pat.as_deref())
                 .unwrap_or(ERR)
         }
         shared::SYS_NET_DNS => {
