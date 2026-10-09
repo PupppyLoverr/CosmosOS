@@ -150,7 +150,9 @@ pub const LOOPBACK_IP: [u8; 4] = [127, 0, 0, 1];
 fn is_loopback(ip: [u8; 4]) -> bool {
     ip[0] == 127 || ip == our_ip()
 }
-static LOOPBACK_Q: Mutex<VecDeque<([u8; 4], u8, Vec<u8>)>> = Mutex::new(VecDeque::new());
+// rx tuples: (src_ip, proto, payload, ttl) — ttl is the packet's real
+// IPv4 TTL at ingress (lo packets carry the nominal def_ttl()).
+static LOOPBACK_Q: Mutex<VecDeque<([u8; 4], u8, Vec<u8>, u8)>> = Mutex::new(VecDeque::new());
 // lo interface counters (/proc/net/dev row is real, like eth0's)
 static LO_RX_PKTS: AtomicU64 = AtomicU64::new(0);
 static LO_RX_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -325,6 +327,8 @@ struct FwRule {
     iface: u8,            // `-i` in-interface: 0 = any, 1 = eth0, 2 = lo
     oiface: u8,           // `-o` out-interface: same encoding
     state: u8,            // 0 = any; bit0 = NEW, bit1 = ESTABLISHED
+    ttl_mode: u8,         // `-m ttl`: 0 = any, 1 = --ttl-eq, 2 = --ttl-lt, 3 = --ttl-gt
+    ttl_v: u8,            // operand N for the ttl match
     limit_pps: u16,       // 0 = unlimited; `-m limit --limit N/s` cap on rule hits
     comment: String,      // `-m comment --comment` — real per-rule annotation
     limit_burst: u16,     // bucket depth (real iptables default 5)
@@ -495,9 +499,10 @@ fn fw_verdict(
     st: u8,
     iface: u8,
     plen: u64,
+    ttl: u8,
 ) -> u8 {
     let mut fw = chain.lock();
-    match fw_eval(&mut *fw, inbound, src, dst, proto, sport, dport, st, iface, plen, 0) {
+    match fw_eval(&mut *fw, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, 0) {
         // 255 = walked off the end of the builtin chain: policy decides
         255 => {
             if *policy.lock() {
@@ -528,6 +533,7 @@ fn fw_eval(
     st: u8,
     iface: u8,
     plen: u64,
+    ttl: u8,
     depth: u8,
 ) -> u8 {
     for r in chain.iter_mut() {
@@ -556,6 +562,14 @@ fn fw_eval(
         // payload length (plen is bytes as seen at the hook).
         if r.len_hi != 0 && (plen < r.len_lo as u64 || plen > r.len_hi as u64) {
             continue;
+        }
+        // `-m ttl --ttl-eq/--ttl-lt/--ttl-gt`: the packet's real IPv4
+        // TTL as it arrived (ingress) or was stamped (egress).
+        match r.ttl_mode {
+            1 if ttl != r.ttl_v => continue,
+            2 if ttl >= r.ttl_v => continue,
+            3 if ttl <= r.ttl_v => continue,
+            _ => {}
         }
         // `-m multiport --dports`: real set match on the dest port
         if !r.dports.is_empty() && !r.dports.contains(&dport) {
@@ -606,7 +620,7 @@ fn fw_eval(
                 continue; // loop guard — treat as no-match
             }
             let mut snap = FW_USER.lock().get(&r.jump).cloned().unwrap_or_default();
-            let v = fw_eval(&mut snap, inbound, src, dst, proto, sport, dport, st, iface, plen, depth + 1);
+            let v = fw_eval(&mut snap, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, depth + 1);
             if let Some(u) = FW_USER.lock().get_mut(&r.jump) {
                 *u = snap;
             }
@@ -664,7 +678,7 @@ fn out_reject(src_ip: [u8; 4], dst_ip: [u8; 4], proto: u8, payload: &[u8]) {
             let me = if is_loopback(src_ip) { LOOPBACK_IP } else { our_ip() };
             let c = tcp_csum(src, me, &seg);
             put16(&mut seg[16..], c);
-            LOOPBACK_Q.lock().push_back((src, 6, seg));
+            LOOPBACK_Q.lock().push_back((src, 6, seg, def_ttl()));
         }
     } else {
         // ICMP 3/3 from the destination we "tried" to reach, quoting the
@@ -688,7 +702,7 @@ fn out_reject(src_ip: [u8; 4], dst_ip: [u8; 4], proto: u8, payload: &[u8]) {
         let c = csum(&icmp);
         put16(&mut icmp[2..], c);
         let src = if dst_ip[0] == 127 { LOOPBACK_IP } else { dst_ip };
-        LOOPBACK_Q.lock().push_back((src, 1, icmp));
+        LOOPBACK_Q.lock().push_back((src, 1, icmp, def_ttl()));
     }
 }
 
@@ -830,6 +844,14 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
             if r.state == 3 { "," } else { "" },
             if r.state & 2 != 0 { "ESTABLISHED" } else { "" }
         ));
+    }
+    if r.ttl_mode != 0 {
+        let op = match r.ttl_mode {
+            1 => "--ttl-eq",
+            2 => "--ttl-lt",
+            _ => "--ttl-gt",
+        };
+        out.push_str(&alloc::format!(" -m ttl {} {}", op, r.ttl_v));
     }
     if r.limit_pps != 0 {
         out.push_str(&alloc::format!(" -m limit --limit {}/s", r.limit_pps));
@@ -1206,7 +1228,7 @@ fn fw_name_ok(n: &str) -> bool {
         "IN", "OUT", "INPUT", "OUTPUT", "FORWARD", "PREROUTING", "POSTROUTING",
         "icmp", "tcp", "udp", "all", "*", "dport", "multiport", "range", "src",
         "state", "limit", "lburst", "log", "reject", "accept", "return", "drop",
-        "iif", "oif", "sport", "length", "comment",
+        "iif", "oif", "sport", "length", "comment", "ttl",
     ];
     !n.is_empty()
         && n.len() <= 28
@@ -1587,6 +1609,8 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         iface: 0,
         oiface: 0,
         state: 0,
+        ttl_mode: 0,
+        ttl_v: 0,
         limit_pps: 0,
         comment: String::new(),
         limit_burst: 5,
@@ -1724,6 +1748,24 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
             "comment" => {
                 r.comment = String::from(f.next().unwrap_or(""));
             }
+            // `-m ttl --ttl-{eq,lt,gt} N` — wire token `ttl <op>:<N>`.
+            "ttl" => {
+                let spec = f.next().unwrap_or("");
+                if let Some((op, n)) = spec.split_once(':') {
+                    r.ttl_v = n.parse().unwrap_or(0);
+                    r.ttl_mode = match op {
+                        "eq" => 1,
+                        "lt" => 2,
+                        "gt" => 3,
+                        _ => 0,
+                    };
+                    if r.ttl_mode == 0 {
+                        ok = false;
+                    }
+                } else {
+                    ok = false;
+                }
+            }
             "lburst" => {
                 let v = f.next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
                 if v == 0 {
@@ -1761,6 +1803,8 @@ fn fw_rule_eq(a: &FwRule, b: &FwRule) -> bool {
         && a.iface == b.iface
         && a.oiface == b.oiface
         && a.state == b.state
+        && a.ttl_mode == b.ttl_mode
+        && a.ttl_v == b.ttl_v
         && a.limit_pps == b.limit_pps
         && a.comment == b.comment
         && a.limit_burst == b.limit_burst
@@ -1832,7 +1876,7 @@ fn now_ms() -> u64 {
 /// Net is polled: virtio-net IRQs are not wired; wait loops `sti;hlt` so the
 /// PIT keeps ticking and deadlines stay real.
 /// Returns (ip_proto, transport_payload) for IPv4 frames addressed to us.
-fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
+fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>, u8)> {
     let mut out = Vec::new();
     let up = is_up();
     for f in virtio_net::take_rx() {
@@ -1875,7 +1919,7 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
     drop(lq);
     // protocol counters: InReceives counts everything that arrived (incl.
     // packets the INPUT filter is about to drop), InDelivers post-filter.
-    for (_, proto, p) in &out {
+    for (_, proto, p, _) in &out {
         IP_IN_RECV.fetch_add(1, Ordering::Relaxed);
         match *proto {
             1 => {
@@ -1896,7 +1940,7 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
     // iptables INPUT: every inbound packet is evaluated once here at ingress —
     // wire, slirp-forwarded, and loopback alike — before dispatch, raw
     // consumers (ping/dhcp), or the ICMP echo responder can see it.
-    out.retain(|(src_ip, proto, p)| {
+    out.retain(|(src_ip, proto, p, ttl)| {
         let (sport, dport) = pkt_ports(*proto, p);
         // each packet updates the real conntrack flow table, then the
         // INPUT chain sees that packet's own NEW/ESTABLISHED state. The
@@ -1908,7 +1952,7 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
         // Arrival iface: loopback-queued packets always carry a local
         // source (127/8 or our own address); wire packets don't.
         let ifx = if is_loopback(*src_ip) { 2u8 } else { 1 };
-        let v = fw_verdict(&FW, &FW_POLICY, true, *src_ip, dst, *proto, sport, dport, st, ifx, p.len() as u64);
+        let v = fw_verdict(&FW, &FW_POLICY, true, *src_ip, dst, *proto, sport, dport, st, ifx, p.len() as u64, *ttl);
         if v == 2 {
             // -j REJECT: a real refusal goes back — TCP_RST for TCP
             // (same wire shape as the unclaimed-port responder),
@@ -1927,7 +1971,7 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
     // ICMP: answer echo requests like a real host — wire or loopback;
     // net.ipv4.icmp_echo_ignore_all silences the responder.
     let ignore_all = ICMP_IGNORE_ALL.load(Ordering::Relaxed) != 0;
-    for (src_ip, proto, p) in &out {
+    for (src_ip, proto, p, _) in &out {
         if *proto == 1 && p.len() >= 8 && p[0] == 8 && !ignore_all {
             icmp_echo_reply(*src_ip, p);
         }
@@ -2111,7 +2155,7 @@ pub fn net_trace(
         }
         let mut hit: Option<([u8; 4], bool)> = None;
         while now_ms() - t0 < per_ms && hit.is_none() {
-            for (src_ip, proto, p) in pump_rx() {
+            for (src_ip, proto, p, _pkt_ttl) in pump_rx() {
                 if proto != 1 {
                     dispatch(src_ip, proto, p); // feed real sockets mid-run
                     continue;
@@ -2179,7 +2223,7 @@ pub fn net_trace_icmp(
         }
         let mut hit: Option<([u8; 4], bool)> = None;
         while now_ms() - t0 < per_ms && hit.is_none() {
-            for (src_ip, proto, p) in pump_rx() {
+            for (src_ip, proto, p, _pkt_ttl) in pump_rx() {
                 if proto != 1 {
                     dispatch(src_ip, proto, p);
                     continue;
@@ -2258,7 +2302,7 @@ pub fn net_trace_tcp(
         }
         let mut hit: Option<([u8; 4], bool)> = None;
         while now_ms() - t0 < per_ms && hit.is_none() {
-            for (src_ip, proto, p) in pump_rx() {
+            for (src_ip, proto, p, _pkt_ttl) in pump_rx() {
                 if proto == 6 {
                     // The target's own answer (SYN-ACK or RST) to our
                     // probe port — real tcptraceroute stops here.
@@ -2480,6 +2524,11 @@ fn send_icmp_echo_ttl(dst_mac: [u8; 6], dst_ip: [u8; 4], id: u16, seq: u16, ttl:
 /// Echo request with an explicit source address (`ping -I <iface>` —
 /// the iface picks the source IP; routing still follows the dst).
 fn send_icmp_echo_src(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], id: u16, seq: u16, ttl: u8, payload: &[u8]) {
+    send_icmp_echo_qos(src_ip, dst_mac, dst_ip, id, seq, 0, ttl, payload)
+}
+
+/// Echo request carrying a real IPv4 TOS/DSCP byte (`ping -Q`).
+fn send_icmp_echo_qos(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], id: u16, seq: u16, tos: u8, ttl: u8, payload: &[u8]) {
     ICMP_OUT_ECHOREQ.fetch_add(1, Ordering::Relaxed);
     let mut icmp = Vec::with_capacity(8 + payload.len());
     icmp.push(8); // echo request
@@ -2490,13 +2539,13 @@ fn send_icmp_echo_src(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], id: u1
     icmp.extend_from_slice(payload);
     let c = csum(&icmp);
     put16(&mut icmp[2..], c);
-    send_ip_src_ttl(src_ip, dst_mac, dst_ip, 1, ttl, &icmp);
+    send_ip_src_qos(src_ip, dst_mac, dst_ip, 1, tos, ttl, &icmp);
 }
 
 /// Handle one ethernet frame: ARP cache/reply, or deliver an IPv4 payload.
 /// Returns Some((ip_proto, transport_payload)) when the frame carried IPv4
 /// addressed to our IP.
-fn handle_frame(f: &[u8]) -> Option<([u8; 4], u8, Vec<u8>)> {
+fn handle_frame(f: &[u8]) -> Option<([u8; 4], u8, Vec<u8>, u8)> {
     if f.len() < 14 {
         return None;
     }
@@ -2548,7 +2597,9 @@ fn handle_frame(f: &[u8]) -> Option<([u8; 4], u8, Vec<u8>)> {
                 return None;
             }
             let src: [u8; 4] = ip[12..16].try_into().ok()?;
-            Some((src, ip[9], ip[ihl..].to_vec()))
+            // The real IPv4 TTL (ip[8]) rides the tuple — `-m ttl`
+            // matches on the value as it arrived on the wire.
+            Some((src, ip[9], ip[ihl..].to_vec(), ip[8]))
         }
         _ => None,
     }
@@ -2662,21 +2713,21 @@ pub fn arp_stat() -> String {
 /// Returns rtt in milliseconds, or None on timeout/unreachable.
 /// `ttl` stamps the echo request's IPv4 TTL; 0 = ip_default_ttl.
 pub fn ping_ttl(ip: [u8; 4], timeout_ms: u64, ttl: u8) -> Option<u64> {
-    ping_ttl_if(ip, timeout_ms, ttl, 36, 0)
+    ping_ttl_if(ip, timeout_ms, ttl, 36, 0, 0)
 }
 
 /// `ping_ttl` with an explicit ICMP payload size (`ping -s N` — the
 /// real -s semantics: N bytes of patterned payload, so the wire
 /// datagram is 20+8+N). Capped at 1450 — no IP fragmentation.
 pub fn ping_ttl_sz(ip: [u8; 4], timeout_ms: u64, ttl: u8, size: usize) -> Option<u64> {
-    ping_ttl_if(ip, timeout_ms, ttl, size, 0)
+    ping_ttl_if(ip, timeout_ms, ttl, size, 0, 0)
 }
 
 /// `ping -I <iface>`: the iface chooses the source address (lo →
 /// 127.0.0.1, eth0 → our IP). Routing still follows the destination,
 /// like real ping — so `-I lo <remote>` sends a wire packet nobody can
 /// answer (timeout), and `-I eth0 <127.x>` is unroutable (EINVAL).
-pub fn ping_ttl_if(ip: [u8; 4], timeout_ms: u64, ttl: u8, size: usize, iface: u8) -> Option<u64> {
+pub fn ping_ttl_if(ip: [u8; 4], timeout_ms: u64, ttl: u8, size: usize, iface: u8, tos: u8) -> Option<u64> {
     if NET.lock().is_none() {
         sprintln!("[net] ping: no device");
         return None;
@@ -2706,9 +2757,9 @@ pub fn ping_ttl_if(ip: [u8; 4], timeout_ms: u64, ttl: u8, size: usize, iface: u8
     // same fill byte pattern as iputils ping (0x10,0x11,...)
     let payload: Vec<u8> = (0..size).map(|i| 0x10 + (i % 56) as u8).collect();
     let t0 = now_ms();
-    send_icmp_echo_src(src, dst_mac, ip, id, seq, if ttl == 0 { def_ttl() } else { ttl }, &payload);
+    send_icmp_echo_qos(src, dst_mac, ip, id, seq, tos, if ttl == 0 { def_ttl() } else { ttl }, &payload);
     loop {
-        for (_src_ip, proto, p) in pump_rx() {
+        for (_src_ip, proto, p, _pkt_ttl) in pump_rx() {
             if proto == 1 && p.len() >= 8 && p[0] == 0 && be16(&p[4..]) == id && be16(&p[6..]) == seq {
                 return Some(now_ms() - t0);
             }
@@ -2739,6 +2790,22 @@ fn send_ip_src_ttl(
     ttl: u8,
     payload: &[u8],
 ) {
+    send_ip_src_qos(src_ip, dst_mac, dst_ip, proto, 0, ttl, payload)
+}
+
+/// The real egress funnel — `tos` stamps the IPv4 DS byte (`ping -Q`,
+/// IP_TOS); `ttl` stamps the TTL. Everything wire-bound funnels
+/// through here so the OUTPUT chain, MTU gate and lo shortcut apply
+/// to every datagram uniformly.
+fn send_ip_src_qos(
+    src_ip: [u8; 4],
+    dst_mac: [u8; 6],
+    dst_ip: [u8; 4],
+    proto: u8,
+    tos: u8,
+    ttl: u8,
+    payload: &[u8],
+) {
     IP_OUT_REQ.fetch_add(1, Ordering::Relaxed);
     match proto {
         1 => ICMP_OUT.fetch_add(1, Ordering::Relaxed),
@@ -2751,7 +2818,7 @@ fn send_ip_src_ttl(
     let (osport, odport) = pkt_ports(proto, payload);
     // Egress iface: destinations on a local address leave via lo.
     let oifx = if is_loopback(dst_ip) { 2u8 } else { 1 };
-    let v = fw_verdict(&FW_OUT, &FW_OUT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64);
+    let v = fw_verdict(&FW_OUT, &FW_OUT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64, ttl);
     if v == 2 {
         out_reject(src_ip, dst_ip, proto, payload);
         return;
@@ -2760,8 +2827,9 @@ fn send_ip_src_ttl(
         return; // -j DROP: the datagram never leaves
     }
     if is_loopback(dst_ip) {
-        // lo: no ethernet, no ARP — the datagram re-enters rx as-is
-        LOOPBACK_Q.lock().push_back((src_ip, proto, payload.to_vec()));
+        // lo: no ethernet, no ARP — the datagram re-enters rx as-is,
+        // carrying the TTL it was stamped with so `-m ttl` sees it.
+        LOOPBACK_Q.lock().push_back((src_ip, proto, payload.to_vec(), ttl));
         LO_TX_PKTS.fetch_add(1, Ordering::Relaxed);
         LO_TX_BYTES.fetch_add(payload.len() as u64, Ordering::Relaxed);
         return;
@@ -2774,7 +2842,7 @@ fn send_ip_src_ttl(
     }
     let mut ip = Vec::with_capacity(20 + payload.len());
     ip.push(0x45);
-    ip.push(0);
+    ip.push(tos); // DS field — real TOS/DSCP byte on the wire
     ip.extend_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
     ip.extend_from_slice(&1u16.to_be_bytes());
     ip.extend_from_slice(&[0u8; 2]);
@@ -3413,7 +3481,7 @@ fn dhcp_parse(udp: &[u8]) -> Option<(u8, [u8; 4], Option<[u8; 4]>)> {
 
 fn dhcp_recv(want_type: u8, deadline: u64) -> Option<([u8; 4], Option<[u8; 4]>)> {
     while now_ms() < deadline {
-        for (_src_ip, proto, p) in pump_rx() {
+        for (_src_ip, proto, p, _pkt_ttl) in pump_rx() {
             if proto != 17 || p.len() < 8 {
                 continue;
             }
@@ -3556,7 +3624,7 @@ pub fn udp_recv(lport: u16, timeout_ms: u64) -> Option<([u8; 4], u16, Vec<u8>)> 
     }
     // one non-blocking pump even at timeout=0 — poll-style callers (nc -u,
     // nc -lu) must still move NIC-ring packets into the socket queues
-    for (src_ip, proto, p) in pump_rx() {
+    for (src_ip, proto, p, _pkt_ttl) in pump_rx() {
         dispatch(src_ip, proto, p);
     }
     if let Some(d) = SOCKS.lock().get_mut(&lport).and_then(|q| q.pop_front()) {
@@ -3564,7 +3632,7 @@ pub fn udp_recv(lport: u16, timeout_ms: u64) -> Option<([u8; 4], u16, Vec<u8>)> 
     }
     let deadline = now_ms() + timeout_ms;
     while now_ms() < deadline {
-        for (src_ip, proto, p) in pump_rx() {
+        for (src_ip, proto, p, _pkt_ttl) in pump_rx() {
             dispatch(src_ip, proto, p);
         }
         if let Some(d) = SOCKS.lock().get_mut(&lport).and_then(|q| q.pop_front()) {
@@ -3871,7 +3939,7 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
             send_tcp(mac, rip, lport, rport, isn, 0, TCP_SYN, &[], 65535);
             last_syn = now_ms();
         }
-        for (src_ip, proto, p) in pump_rx() {
+        for (src_ip, proto, p, _pkt_ttl) in pump_rx() {
             dispatch(src_ip, proto, p);
         }
         match TCP_SOCKS.lock().get(&lport).map(|k| k.state) {
@@ -3966,7 +4034,7 @@ fn accept_syn(s: &TcpSeg, src_ip: [u8; 4]) {
 pub fn tcp_accept(lport: u16, timeout_ms: u64) -> Option<(u16, [u8; 4], u16)> {
     let deadline = now_ms() + timeout_ms;
     loop {
-        for (src_ip, proto, p) in pump_rx() {
+        for (src_ip, proto, p, _pkt_ttl) in pump_rx() {
             dispatch(src_ip, proto, p);
         }
         if let Some(x) = ACCEPTED
@@ -4027,7 +4095,7 @@ pub fn tcp_send(lport: u16, data: &[u8], timeout_ms: u64) -> Result<(), i64> {
             }
         }
         if !enqueued {
-            for (src_ip, proto, p) in pump_rx() {
+            for (src_ip, proto, p, _pkt_ttl) in pump_rx() {
                 dispatch(src_ip, proto, p);
             }
             wait_irq();
@@ -4044,7 +4112,7 @@ pub fn tcp_send(lport: u16, data: &[u8], timeout_ms: u64) -> Result<(), i64> {
             }
             last_tx = now_ms();
         }
-        for (src_ip, proto, p) in pump_rx() {
+        for (src_ip, proto, p, _pkt_ttl) in pump_rx() {
             dispatch(src_ip, proto, p);
         }
         {
@@ -4081,7 +4149,7 @@ pub fn tcp_recv(lport: u16, timeout_ms: u64) -> Option<Vec<u8>> {
             }
         }
         // pump before the deadline check so recv(0) still forwards packets
-        for (src_ip, proto, p) in pump_rx() {
+        for (src_ip, proto, p, _pkt_ttl) in pump_rx() {
             dispatch(src_ip, proto, p);
         }
         if let Some(d) = TCP_SOCKS.lock().get_mut(&lport).and_then(|k| k.q.pop_front()) {
@@ -4107,7 +4175,7 @@ pub fn tcp_close(lport: u16) {
 /// One non-blocking rx pump+dispatch so socket-fd readiness and reads see
 /// packets that arrived since the last blocking call.
 pub fn pump_once() {
-    for (src_ip, proto, p) in pump_rx() {
+    for (src_ip, proto, p, _pkt_ttl) in pump_rx() {
         dispatch(src_ip, proto, p);
     }
 }

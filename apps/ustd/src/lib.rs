@@ -610,11 +610,23 @@ pub fn net_ping_size(ip: u32, timeout_ms: u64, ttl: u8, size: u64) -> Option<u64
 /// Ping bound to an interface (`ping -I`): 0 = auto, 1 = eth0, 2 = lo.
 /// The iface picks the source address; routing still follows the dst.
 pub fn net_ping_if(ip: u32, timeout_ms: u64, ttl: u8, size: u64, iface: u8) -> Option<u64> {
+    net_ping_qos(ip, timeout_ms, ttl, size, iface, 0)
+}
+/// Ping with a real IPv4 TOS/DSCP byte on the echo request (`ping -Q`).
+/// tos rides the high byte of the ttl arg word on the wire ABI.
+pub fn net_ping_qos(
+    ip: u32,
+    timeout_ms: u64,
+    ttl: u8,
+    size: u64,
+    iface: u8,
+    tos: u8,
+) -> Option<u64> {
     let r = sc5(
         shared::SYS_NET_PING,
         ip as u64,
         timeout_ms,
-        ttl as u64,
+        (ttl as u64) | ((tos as u64) << 8),
         size,
         iface as u64,
     );

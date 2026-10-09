@@ -4972,14 +4972,14 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                     .map(|b| String::from_utf8_lossy(&b).into_owned())
                     .unwrap_or_default();
                 ok = ok && !st.contains("stopped");
-                ok = ok && ustd::write_all("/sys/fs/cgroup/f1/cgroup.kill", b"1").is_ok();
-                let code = ustd::waitpid(p as u32, 6000).unwrap_or(-1);
-                ok = ok && code == 128 + 9;
+                            ok = ok && ustd::write_all("/sys/fs/cgroup/f1/cgroup.kill", b"1").is_ok();
+                            let code = ustd::waitpid(p as u32, 6000).unwrap_or(-1);
+                            ok = ok && code == 128 + 9;
             }
             _ => ok = false,
         }
-        let _ = ustd::remove("/sys/fs/cgroup/f1");
-        ok
+            let _ = ustd::remove("/sys/fs/cgroup/f1");
+            ok
     });
     check("cgroup-io", {
         // io.max paces real block I/O: a member writing 256KiB at
@@ -5222,6 +5222,96 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         hops.first()
             .map(|(_, h, r)| *r && h.map(|(ip, _)| ip) == Some([127, 0, 0, 1]))
             .unwrap_or(false)
+    });
+    check("ipt-ttl", {
+        // `-m ttl` matches the packet's real IPv4 TTL. lo packets carry
+        // the stamped TTL (64 here), so eq:64 drops lo traffic and
+        // lt:64 doesn't — observable through a real ping.
+        let a = ustd::write_all("/proc/net/iptables", b"A IN 0 ttl eq:64 drop\n").is_ok();
+        let dropped = ustd::net_ping(0x7F00_0001, 350).is_none();
+        let _ = ustd::write_all("/proc/net/iptables", b"F IN\n");
+        let b = ustd::write_all("/proc/net/iptables", b"A IN 0 ttl lt:64 drop\n").is_ok();
+        let passed = ustd::net_ping(0x7F00_0001, 600).is_some();
+        let _ = ustd::write_all("/proc/net/iptables", b"F IN\n");
+        a && dropped && b && passed
+    });
+    check("ping-tos", {
+        // `ping -Q`: the DS byte rides the real wire frame — the kernel
+        // pcap proves it (TX frames are tapped at send_frame).
+        let _ = ustd::pcap(0, &mut []);
+        let _ = ustd::net_ping_qos(0x0A00_0202, 400, 0, 0, 0, 0x2e);
+        let _ = ustd::pcap(1, &mut []);
+        let mut cap = alloc::vec![0u8; 262_144];
+        let n = ustd::pcap(4, &mut cap);
+        let d: &[u8] = if n > 0 { &cap[..n as usize] } else { &[] };
+        let mut i = 24usize; // past the global header
+        let mut seen = false;
+        while i + 16 <= d.len() {
+            let cl = u32::from_le_bytes([d[i + 8], d[i + 9], d[i + 10], d[i + 11]]) as usize;
+            i += 16;
+            if i + cl > d.len() {
+                break;
+            }
+            let fr = &d[i..i + cl];
+            i += cl;
+            // eth IPv4 frame whose IP DS field is our stamped 0x2e
+            if fr.len() >= 34
+                && fr[12] == 0x08
+                && fr[13] == 0x00
+                && fr[14] >> 4 == 4
+                && fr[15] == 0x2e
+                && fr[23] == 1
+            {
+                seen = true;
+            }
+        }
+        seen
+    });
+    check("dns-tcp", {
+        // DNS over TCP/53 (the transport `dig +tcp` uses): RFC 1035
+        // two-byte length prefix over a real TCP stream.
+        let mut q = Vec::new();
+        q.extend_from_slice(&0x0077u16.to_be_bytes()); // id
+        q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+        q.extend_from_slice(&1u16.to_be_bytes()); // qd
+        q.extend_from_slice(&0u16.to_be_bytes());
+        q.extend_from_slice(&0u16.to_be_bytes());
+        q.extend_from_slice(&0u16.to_be_bytes());
+        q.push(7);
+        q.extend_from_slice(b"example");
+        q.push(3);
+        q.extend_from_slice(b"com");
+        q.push(0);
+        q.extend_from_slice(&1u16.to_be_bytes());
+        q.extend_from_slice(&1u16.to_be_bytes());
+        let mut got = false;
+        if let Some(s) = ustd::TcpSock::connect_timeout(15355, [10, 0, 2, 3], 53, 2500) {
+            let mut m = Vec::with_capacity(q.len() + 2);
+            m.extend_from_slice(&(q.len() as u16).to_be_bytes());
+            m.extend_from_slice(&q);
+            if s.send(&m).is_some() {
+                let mut buf: Vec<u8> = Vec::new();
+                for _ in 0..8 {
+                    if buf.len() >= 2 {
+                        let want = 2 + u16::from_be_bytes([buf[0], buf[1]]) as usize;
+                        if buf.len() >= want {
+                            break;
+                        }
+                    }
+                    if let Some(c) = s.recv(1500) {
+                        buf.extend_from_slice(&c);
+                    } else {
+                        break;
+                    }
+                }
+                // id echoed back at the head of the DNS message
+                got = buf.len() >= 14
+                    && buf.len() >= 2 + u16::from_be_bytes([buf[0], buf[1]]) as usize
+                    && buf[2] == 0x00
+                    && buf[3] == 0x77;
+            }
+        }
+        got
     });
 
     // --- performance baseline: real durations (tick = 10ms resolution) ---
