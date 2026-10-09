@@ -25,8 +25,6 @@ use spin::Mutex;
 use x86_64::instructions::port::Port;
 
 const SNAPSHOT: usize = 4096;
-/// /dev/vda caps a single open at 1 MiB (cat-style readers terminate).
-const VDA_SNAPSHOT: usize = 1 << 20;
 const NAMES: [&str; 21] = [
     "null", "zero", "full", "random", "urandom", "rtc", "vda",
     "fb0", "kmsg", "console", "mem", "nvram", "smbios", "dsp",
@@ -539,15 +537,15 @@ fn smbios_read(pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
     Ok(n)
 }
 
-/// Raw disk read at byte offset `pos` (512B-granular), capped at 1 MiB
-/// per open. Read-only: writes return EROFS below.
+/// Raw disk read at byte offset `pos` (512B-granular). Read-only: writes
+/// return EROFS below. EOF is the real end of the disk — no artificial cap.
 fn vda_read(pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
     use fat32::BlockDevice;
     let mut d = match crate::virtio::block_device() {
         Some(d) => d,
         None => return Err(-2),
     };
-    let cap = (d.capacity_sectors() * 512).min(VDA_SNAPSHOT as u64);
+    let cap = d.capacity_sectors() * 512;
     let rem = cap.saturating_sub(pos) as usize;
     let n = buf.len().min(rem);
     if n == 0 {
