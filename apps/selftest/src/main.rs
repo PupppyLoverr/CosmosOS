@@ -3555,6 +3555,92 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    check("fsuid-creds", {
+        // setfsuid/fsgid return the PREVIOUS id on every call — successful
+        // or not; restoration leaves the DAC subject back at 0.
+        ustd::setfsuid(500) == 0
+            && ustd::setfsuid(500) == 500
+            && ustd::setfsuid(0) == 500
+            && ustd::setfsgid(600) == 0
+            && ustd::setfsgid(600) == 600
+            && ustd::setfsgid(0) == 600
+    });
+    check("fsuid-dac", {
+        // the VFS DAC subject is fsuid: moving it away from 0 drops the
+        // root-owned-file bypass even while euid stays 0.
+        let _ = ustd::write_all("/tmp/fsuid-dac", b"x");
+        let _ = ustd::chmod("/tmp/fsuid-dac", 0o600);
+        match ustd::fork() {
+            0 => {
+                // keep only CAP_SETUID|CAP_SETGID: no DAC-bypass caps
+                let keep = (1u64 << 6) | (1u64 << 7);
+                let _ = ustd::capset(keep, keep);
+                if ustd::setfsuid(500) != 0 {
+                    ustd::exit(9);
+                }
+                // DAC bites at read_range: fsuid 500 vs root-owned 0600
+                match ustd::read_all("/tmp/fsuid-dac") {
+                    Ok(_) => ustd::exit(42), // read allowed -> FAIL
+                    Err(_) => ustd::exit(7), // EACCES -> pass
+                }
+            }
+            c if c > 0 => ustd::waitpid(c as u32, 5000).map(|v| v == 7).unwrap_or(false),
+            _ => false,
+        }
+    });
+    check("nnp-seccomp", {
+        let mut ok = true;
+        // deny leg first: no nnp + no CAP_SYS_ADMIN -> FILTER install EPERM
+        match ustd::fork() {
+            0 => {
+                let _ = ustd::capset(0, 0);
+                let mut b = [0u8; 32];
+                b[0] = 1;
+                ustd::exit(if ustd::prctl_seccomp(2, &b) != 0 { 42 } else { 9 });
+            }
+            c if c > 0 => {
+                ok = ok && ustd::waitpid(c as u32, 5000).map(|v| v == 42).unwrap_or(false)
+            }
+            _ => ok = false,
+        }
+        // the bit is real: set once, reads back, cannot be unset
+        ok = ok && ustd::get_no_new_privs() == 0
+            && ustd::set_no_new_privs() == 0
+            && ustd::get_no_new_privs() == 1;
+        // allow leg: inherited nnp lets a zero-cap child install a filter
+        match ustd::fork() {
+            0 => {
+                let _ = ustd::capset(0, 0);
+                let mut b = [0u8; 32];
+                b[0] = 1; // SYS_EXIT only
+                if ustd::prctl_seccomp(2, &b) != 0 {
+                    ustd::exit(9);
+                }
+                let _ = ustd::gettimeofday(); // ENOSYS under the filter
+                ustd::exit(42);
+            }
+            c if c > 0 => {
+                ok = ok && ustd::waitpid(c as u32, 5000).map(|v| v == 42).unwrap_or(false)
+            }
+            _ => ok = false,
+        }
+        ok
+    });
+    check("fd-flag-variants", {
+        // create-with-flags syscalls: CLOEXEC lands on the descriptor flag,
+        // NONBLOCK makes an empty signalfd/inotify read EAGAIN instead of blocking.
+        let mut ok = true;
+        let ep = ustd::epoll_create1(shared::O_CLOEXEC);
+        ok = ok && ep >= 0 && ustd::fcntl(ep, 1, 0) & 1 == 1; // F_GETFD -> FD_CLOEXEC
+        let _ = ustd::close(ep);
+        let sf = ustd::signalfd4(1 << 5, shared::O_NONBLOCK);
+        ok = ok && sf >= 0 && ustd::read(sf, &mut [0u8; 128]).is_err();
+        let _ = ustd::close(sf);
+        let iw = ustd::inotify_init1(shared::O_NONBLOCK);
+        ok = ok && iw >= 0 && ustd::read(iw, &mut [0u8; 64]).is_err();
+        let _ = ustd::close(iw);
+        ok
+    });
     check("epoll-flags", {
         // EPOLLET fires once per ready level, EPOLLONESHOT until MOD
         // re-arms, EPOLLHUP surfaces on writer close, and the epoll fd
