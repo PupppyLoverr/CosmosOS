@@ -20,6 +20,7 @@ static IFACE_UP: AtomicU64 = AtomicU64::new(1);
 // /proc/net/snmp + netstat -s counters: pre/post-filter inbound, egress by
 // proto, and ICMP echo subcounts. All relaxed — observability only.
 pub static IP_IN_RECV: AtomicU64 = AtomicU64::new(0);
+static IP_IN_MARTIAN: AtomicU64 = AtomicU64::new(0);
 pub static IP_IN_DELIV: AtomicU64 = AtomicU64::new(0);
 pub static IP_OUT_REQ: AtomicU64 = AtomicU64::new(0);
 pub static ICMP_IN: AtomicU64 = AtomicU64::new(0);
@@ -3511,7 +3512,9 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>, u64)> {
         if let Some(t) = lq.pop_front() {
             LO_RX_PKTS.fetch_add(1, Ordering::Relaxed);
             LO_RX_BYTES.fetch_add(t.2.len() as u64, Ordering::Relaxed);
-            out.push(t);
+            // meta bit62: arrived via the lo queue, not the wire —
+            // martian-source filtering only applies to wire frames.
+            out.push((t.0, t.1, t.2, t.3 | (1u64 << 62)));
         }
     }
     drop(lq);
@@ -3534,6 +3537,39 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>, u64)> {
             17 => { UDP_IN.fetch_add(1, Ordering::Relaxed); }
             _ => {}
         }
+    }
+    // net.ipv4.conf.all.rp_filter: wire frames whose source is a
+    // martian — 127/8, a multicast-class address, or our own address —
+    // are dropped before conntrack and the INPUT chain see them, like
+    // Linux's reverse-path check. Strict mode (1) also drops sources
+    // the routing table can't reach back; loose (2) accepts any
+    // routable source, and a default route makes everything routable —
+    // matching Linux semantics on a single-NIC box.
+    let rp = crate::sysctl::rp_filter();
+    if rp != 0 {
+        let log = crate::sysctl::log_martians() != 0;
+        let me = our_ip();
+        out.retain(|(src_ip, _, _, meta)| {
+            if meta >> 62 & 1 == 1 {
+                return true; // lo-queued — never a martian
+            }
+            let martian = src_ip[0] == 127
+                || src_ip[0] >= 224
+                || *src_ip == me
+                || *src_ip == [0; 4]
+                || (rp == 1 && route_lookup(*src_ip).is_none());
+            if martian {
+                IP_IN_MARTIAN.fetch_add(1, Ordering::Relaxed);
+                if log {
+                    crate::klog::append(&alloc::format!(
+                        "IPv4: martian source {}.{}.{}.{} from {}.{}.{}.{}, on dev eth0\n",
+                        me[0], me[1], me[2], me[3],
+                        src_ip[0], src_ip[1], src_ip[2], src_ip[3]
+                    ));
+                }
+            }
+            !martian
+        });
     }
     // iptables INPUT: every inbound packet is evaluated once here at ingress —
     // wire, slirp-forwarded, and loopback alike — before dispatch, raw

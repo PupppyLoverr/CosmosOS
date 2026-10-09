@@ -2378,6 +2378,26 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             && ustd::write_all("/proc/sys/net/ipv4/tcp_rmem", b"99999 1 1").is_err()
             && ustd::write_all("/proc/sys/net/ipv4/tcp_rmem", b"4096 131072 6291456").is_ok()
     });
+    check("rp-filter-sysctl", {
+        // net.ipv4.conf.all.{rp_filter,log_martians}: real per-iface
+        // sysctl files under conf/all — round-trip and range checks.
+        ustd::write_all("/proc/sys/net/ipv4/conf/all/rp_filter", b"2").is_ok()
+            && ustd::read_all("/proc/sys/net/ipv4/conf/all/rp_filter")
+                .map(|d| String::from_utf8_lossy(&d).trim() == "2")
+                .unwrap_or(false)
+            && ustd::write_all("/proc/sys/net/ipv4/conf/all/rp_filter", b"3").is_err()
+            && ustd::write_all("/proc/sys/net/ipv4/conf/all/log_martians", b"1").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/conf/all/log_martians", b"0").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/conf/all/rp_filter", b"0").is_ok()
+    });
+    check("nonlocal-bind-sysctl", {
+        // net.ipv4.ip_nonlocal_bind: the EADDRNOTAVAIL-loosening knob.
+        ustd::write_all("/proc/sys/net/ipv4/ip_nonlocal_bind", b"1").is_ok()
+            && ustd::read_all("/proc/sys/net/ipv4/ip_nonlocal_bind")
+                .map(|d| String::from_utf8_lossy(&d).trim() == "1")
+                .unwrap_or(false)
+            && ustd::write_all("/proc/sys/net/ipv4/ip_nonlocal_bind", b"0").is_ok()
+    });
     check("domainname-sysctl", {
         // kernel.domainname: a real UTS-scoped string sysctl — round
         // trip through the proc file; empty restores the "(none)" value.

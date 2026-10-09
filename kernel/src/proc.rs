@@ -56,7 +56,11 @@ const USER_SYS_FILES: &[&str] = &[
 ];
 
 /// files under /proc/sys/net/ipv4
-const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "tcp_wmem", "tcp_rmem", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range"];
+const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "tcp_wmem", "tcp_rmem", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range", "ip_nonlocal_bind"];
+
+/// files under /proc/sys/net/ipv4/conf/all — a single-NIC box has one
+/// real per-interface sysctl set, surfaced as `all`.
+const NET_CONF_SYS_FILES: &[&str] = &["rp_filter", "log_martians"];
 
 /// kernel.kptr_restrict: %pK-style addresses in /proc output —
 /// 0 = show, 1 = hide unless CAP_SYSLOG, 2 = hide for everyone.
@@ -110,6 +114,8 @@ pub fn is_dir(path: &str) -> bool {
         || path == "/proc/sys/fs/epoll"
         || path == "/proc/sys/net"
         || path == "/proc/sys/net/ipv4"
+        || path == "/proc/sys/net/ipv4/conf"
+        || path == "/proc/sys/net/ipv4/conf/all"
         || path == "/proc/sys/net/unix"
         || path == "/proc/sys/net/core"
         || path == "/proc/sys/net/netfilter"
@@ -181,6 +187,9 @@ pub fn exists(path: &str) -> bool {
             return n == "max" || n == "nr";
         }
         return SYS_FILES.contains(&f);
+    }
+    if let Some(f) = path.strip_prefix("/proc/sys/net/ipv4/conf/all/") {
+        return NET_CONF_SYS_FILES.contains(&f);
     }
     if let Some(f) = path.strip_prefix("/proc/sys/net/ipv4/") {
         return NET_SYS_FILES.contains(&f);
@@ -363,7 +372,30 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         }
         return out;
     }
+    if path == "/proc/sys/net/ipv4/conf/all" {
+        for name in NET_CONF_SYS_FILES {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            out.push(de);
+        }
+        return out;
+    }
+    if path == "/proc/sys/net/ipv4/conf" {
+        let mut de = shared::DirEntry::default();
+        de.name[..3].copy_from_slice(b"all");
+        de.name_len = 3;
+        de.is_dir = 1;
+        out.push(de);
+        return out;
+    }
     if path == "/proc/sys/net/ipv4" {
+        let mut cde = shared::DirEntry::default();
+        cde.name[..4].copy_from_slice(b"conf");
+        cde.name_len = 4;
+        cde.is_dir = 1;
+        out.push(cde);
         for name in NET_SYS_FILES {
             let mut de = shared::DirEntry::default();
             let nb = name.as_bytes();
@@ -1059,7 +1091,11 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
             .then_some(buf.len());
     }
     if let Some(rel) = path.strip_prefix("/proc/sys/net/ipv4/") {
-        if rel == "icmp_echo_ignore_broadcasts" || rel == "ip_forward" {
+        if rel == "icmp_echo_ignore_broadcasts"
+            || rel == "ip_forward"
+            || rel == "ip_nonlocal_bind"
+            || rel.starts_with("conf/")
+        {
             let s = String::from(String::from_utf8_lossy(buf).trim());
             let Ok(v) = s.parse::<u64>() else { return None };
             return crate::sysctl::set(
