@@ -373,6 +373,22 @@ pub fn net_conntrack() -> String {
     out
 }
 
+/// `/proc/net/arp` — Linux-format ARP cache (type 0x1 ether, flags 0x2
+/// complete, mask `*`, dev eth0) — same entries `arp` prints.
+pub fn net_arp() -> String {
+    let mut s = String::from(
+        "IP address       HW type     Flags       HW address            Mask     Device\n",
+    );
+    for (ip, mac) in ARP_CACHE.lock().iter() {
+        s.push_str(&alloc::format!(
+            "{:<17}0x1         0x2         {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}     *        eth0\n",
+            alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+        ));
+    }
+    s
+}
+
 /// `/proc/sys/net/ipv4/icmp_echo_ignore_all` — 0/1 sysctl body.
 pub fn net_icmp_ignore_all() -> String {
     alloc::format!(
