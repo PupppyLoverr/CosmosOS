@@ -22060,6 +22060,8 @@ impl Term {
                 let mut body_v: Vec<u8> = Vec::new();
                 let mut last_path: String = String::new();
                 let mut t0 = ustd::uptime_ms();
+                let mut dns_elapsed = 0u64;
+                let mut conn_elapsed = 0u64;
                 loop {
                     let u = cur.strip_prefix("http://").unwrap_or(&cur);
                     let (authority, path) = match u.find('/') {
@@ -22079,6 +22081,7 @@ impl Term {
                         .iter()
                         .find(|(h, p, _)| h == host && *p == port)
                         .and_then(|(_, _, a)| parse_ipv4(a));
+                    let dns_t0 = ustd::uptime_ms();
                     let Some(ip) = rsv.or_else(|| parse_ipv4(host).or_else(|| ustd::net_dns(host)))
                     else {
                         self.last_ok = false;
@@ -22096,6 +22099,7 @@ impl Term {
                             ip[0], ip[1], ip[2], ip[3], port
                         ));
                     }
+                    dns_elapsed = ustd::uptime_ms().saturating_sub(dns_t0);
                     // 303 → GET on the redirected request (real -L).
                     let m = method.clone().unwrap_or_else(|| {
                         String::from(if ddata.is_some() && redirects == 0 {
@@ -22169,6 +22173,7 @@ impl Term {
                     }
                     req.push_str("\r\n");
                     t0 = ustd::uptime_ms();
+                    let conn_t0 = ustd::uptime_ms();
                     let Some(sock) = (40000..40400).find_map(|lp| {
                         ustd::TcpSock::connect_timeout(lp, ip, port, conn_ms)
                     })
@@ -22179,6 +22184,8 @@ impl Term {
                         }
                         return;
                     };
+                    conn_elapsed =
+                        ustd::uptime_ms().saturating_sub(conn_t0);
                     if verbose {
                         // Real curl stderr trace: connect, then every
                         // request/response header line > and <
@@ -22355,6 +22362,33 @@ impl Term {
                     out = out.replace(
                         "%{time_total}",
                         &alloc::format!("{}.{:03}", ms / 1000, ms % 1000),
+                    );
+                    out = out.replace(
+                        "%{time_connect}",
+                        &alloc::format!(
+                            "{}.{:03}",
+                            conn_elapsed / 1000,
+                            conn_elapsed % 1000
+                        ),
+                    );
+                    out = out.replace(
+                        "%{time_namelookup}",
+                        &alloc::format!(
+                            "{}.{:03}",
+                            dns_elapsed / 1000,
+                            dns_elapsed % 1000
+                        ),
+                    );
+                    out = out.replace(
+                        "%{speed_download}",
+                        &alloc::format!(
+                            "{}",
+                            if ms > 0 {
+                                (body_b.len() as u64 * 1000) / ms
+                            } else {
+                                0
+                            }
+                        ),
                     );
                     self.emit(&out);
                 }
@@ -38445,6 +38479,7 @@ impl Term {
                     "/proc/sys/user/max_time_namespaces",
                     "/proc/sys/kernel/domainname",
                     "/proc/sys/net/ipv4/tcp_wmem",
+                    "/proc/sys/net/ipv4/tcp_rmem",
                     "/proc/sys/net/netfilter/nf_conntrack_max",
                 ];
                 // `-N` prints names only, `-n`/`--values` values only —
@@ -41999,7 +42034,9 @@ impl Term {
                 let only_tcp = args.iter().any(|a| *a == "-t");
                 let only_udp = args.iter().any(|a| *a == "-u");
                 let only_l = args.iter().any(|a| *a == "-l" || *a == "--listening");
-                let want_p = args.iter().any(|a| *a == "-p");
+                let want_p = args
+                    .iter()
+                    .any(|a| *a == "-p" || *a == "--processes");
                 // `ss state <name>[,..]` — real state filter on the
                 // /proc/net/tcp st column (01 Open, 02 SynSent, 03 SynRecv,
                 // 0A Listen, 07 Closed).

@@ -56,7 +56,7 @@ const USER_SYS_FILES: &[&str] = &[
 ];
 
 /// files under /proc/sys/net/ipv4
-const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "tcp_wmem", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range"];
+const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "tcp_wmem", "tcp_rmem", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range"];
 
 /// kernel.kptr_restrict: %pK-style addresses in /proc output —
 /// 0 = show, 1 = hide unless CAP_SYSLOG, 2 = hide for everyone.
@@ -581,6 +581,10 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/sys/kernel/domainname" => {
             alloc::format!("{}\n", crate::syscall::domainname())
         }
+        "/proc/sys/net/ipv4/tcp_rmem" => {
+            let (lo, def, max) = crate::sysctl::tcp_rmem();
+            alloc::format!("{}\t{}\t{}\n", lo, def, max)
+        }
         "/proc/sys/net/ipv4/tcp_wmem" => {
             let (lo, def, max) = crate::sysctl::tcp_wmem();
             alloc::format!("{}\t{}\t{}\n", lo, def, max)
@@ -1026,6 +1030,27 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
             max = parts[2];
         }
         return crate::sysctl::set_tcp_wmem(lo, def, max).then_some(buf.len());
+    }
+    if path == "/proc/sys/net/ipv4/tcp_rmem" {
+        let s = String::from(String::from_utf8_lossy(buf));
+        let parts: Vec<u64> = s
+            .split_whitespace()
+            .filter_map(|t| t.parse::<u64>().ok())
+            .collect();
+        if parts.is_empty() || parts.len() > 3 {
+            return None;
+        }
+        let (mut lo, mut def, mut max) = crate::sysctl::tcp_rmem();
+        if parts.len() > 0 {
+            lo = parts[0];
+        }
+        if parts.len() > 1 {
+            def = parts[1];
+        }
+        if parts.len() > 2 {
+            max = parts[2];
+        }
+        return crate::sysctl::set_tcp_rmem(lo, def, max).then_some(buf.len());
     }
     if let Some(rel) = path.strip_prefix("/proc/sys/user/") {
         let s = String::from(String::from_utf8_lossy(buf).trim());
