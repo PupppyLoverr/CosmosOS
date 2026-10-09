@@ -351,6 +351,8 @@ struct FwRule {
     tos_v: u8,            // `-m tos --tos V[/M]` — DS-byte match value
     tos_mask: u8,         // 0 = unused; else the mask both sides share
     smac: Option<[u8; 6]>,// `-m mac --mac-source` — L2 sender (INPUT)
+    dscp: u8,             // `-m dscp --dscp N` — 0xff = unused
+    icmp_type: u8,        // `-m icmp --icmp-type N` — 0xff = unused
     limit_pps: u16,       // 0 = unlimited; `-m limit --limit N/s` cap on rule hits
     comment: String,      // `-m comment --comment` — real per-rule annotation
     limit_burst: u16,     // bucket depth (real iptables default 5)
@@ -524,9 +526,10 @@ fn fw_verdict(
     ttl: u8,
     tos: u8,
     smac: [u8; 6],
+    itype: u8,
 ) -> u8 {
     let mut fw = chain.lock();
-    match fw_eval(&mut *fw, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, 0) {
+    match fw_eval(&mut *fw, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, 0) {
         // 255 = walked off the end of the builtin chain: policy decides
         255 => {
             if *policy.lock() {
@@ -560,6 +563,7 @@ fn fw_eval(
     ttl: u8,
     tos: u8,
     smac: [u8; 6],
+    itype: u8,
     depth: u8,
 ) -> u8 {
     for r in chain.iter_mut() {
@@ -610,6 +614,15 @@ fn fw_eval(
                 continue;
             }
         }
+        // `-m dscp --dscp N`: DSCP = the top 6 bits of the DS byte.
+        if r.dscp != 0xff && (tos >> 2) != r.dscp {
+            continue;
+        }
+        // `-m icmp --icmp-type N`: the first ICMP payload byte.
+        // Non-ICMP packets carry the 0xff sentinel and never match.
+        if r.icmp_type != 0xff && itype != r.icmp_type {
+            continue;
+        }
         // `-m multiport --dports`: real set match on the dest port
         if !r.dports.is_empty() && !r.dports.contains(&dport) {
             continue;
@@ -659,7 +672,7 @@ fn fw_eval(
                 continue; // loop guard — treat as no-match
             }
             let mut snap = FW_USER.lock().get(&r.jump).cloned().unwrap_or_default();
-            let v = fw_eval(&mut snap, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, depth + 1);
+            let v = fw_eval(&mut snap, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, depth + 1);
             if let Some(u) = FW_USER.lock().get_mut(&r.jump) {
                 *u = snap;
             }
@@ -905,6 +918,12 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
             m[0], m[1], m[2], m[3], m[4], m[5]
         ));
     }
+    if r.dscp != 0xff {
+        out.push_str(&alloc::format!(" -m dscp --dscp {}", r.dscp));
+    }
+    if r.icmp_type != 0xff {
+        out.push_str(&alloc::format!(" -m icmp --icmp-type {}", r.icmp_type));
+    }
     if r.limit_pps != 0 {
         out.push_str(&alloc::format!(" -m limit --limit {}/s", r.limit_pps));
         if r.limit_burst != 5 {
@@ -1025,6 +1044,12 @@ fn fmt_fw_rule(out: &mut String, i: usize, r: &FwRule) {
             "  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             m[0], m[1], m[2], m[3], m[4], m[5]
         ));
+    }
+    if r.dscp != 0xff {
+        extra.push_str(&alloc::format!("  DSCP 0x{:02x}", r.dscp));
+    }
+    if r.icmp_type != 0xff {
+        extra.push_str(&alloc::format!("  icmptype {}", r.icmp_type));
     }
     if r.len_hi != 0 {
         if r.len_lo == r.len_hi {
@@ -1290,6 +1315,7 @@ fn fw_name_ok(n: &str) -> bool {
         "icmp", "tcp", "udp", "all", "*", "dport", "multiport", "range", "src",
         "state", "limit", "lburst", "log", "reject", "accept", "return", "drop",
         "iif", "oif", "sport", "length", "comment", "ttl", "tos", "mac",
+        "dscp", "icmpt",
     ];
     !n.is_empty()
         && n.len() <= 28
@@ -1675,6 +1701,8 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         tos_v: 0,
         tos_mask: 0,
         smac: None,
+        dscp: 0xff,
+        icmp_type: 0xff,
         limit_pps: 0,
         comment: String::new(),
         limit_burst: 5,
@@ -1856,6 +1884,20 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
                     _ => ok = false,
                 }
             }
+            // `-m dscp --dscp <n>` — DiffServ codepoint (tos>>2).
+            "dscp" => {
+                r.dscp = f.next().unwrap_or("").parse().unwrap_or(0xff);
+                if r.dscp > 63 {
+                    ok = false;
+                }
+            }
+            // `-m icmp --icmp-type <n>` — ICMP type byte match.
+            "icmpt" => {
+                r.icmp_type = f.next().unwrap_or("").parse().unwrap_or(0xff);
+                if r.icmp_type == 0xff {
+                    ok = false;
+                }
+            }
             // `-m mac --mac-source aa:bb:cc:dd:ee:ff` — L2 sender.
             "mac" => {
                 let spec = f.next().unwrap_or("");
@@ -1921,6 +1963,8 @@ fn fw_rule_eq(a: &FwRule, b: &FwRule) -> bool {
         && a.tos_v == b.tos_v
         && a.tos_mask == b.tos_mask
         && a.smac == b.smac
+        && a.dscp == b.dscp
+        && a.icmp_type == b.icmp_type
         && a.state == b.state
         && a.ttl_mode == b.ttl_mode
         && a.ttl_v == b.ttl_v
@@ -2071,7 +2115,8 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>, u64)> {
         // Arrival iface: loopback-queued packets always carry a local
         // source (127/8 or our own address); wire packets don't.
         let ifx = if is_loopback(*src_ip) { 2u8 } else { 1 };
-        let v = fw_verdict(&FW, &FW_POLICY, true, *src_ip, dst, *proto, sport, dport, st, ifx, p.len() as u64, meta_ttl(*meta), meta_tos(*meta), meta_mac(*meta));
+        let itype = if *proto == 1 && !p.is_empty() { p[0] } else { 0xff };
+        let v = fw_verdict(&FW, &FW_POLICY, true, *src_ip, dst, *proto, sport, dport, st, ifx, p.len() as u64, meta_ttl(*meta), meta_tos(*meta), meta_mac(*meta), itype);
         if v == 2 {
             // -j REJECT: a real refusal goes back — TCP_RST for TCP
             // (same wire shape as the unclaimed-port responder),
@@ -2949,7 +2994,8 @@ fn send_ip_src_qos(
     let (osport, odport) = pkt_ports(proto, payload);
     // Egress iface: destinations on a local address leave via lo.
     let oifx = if is_loopback(dst_ip) { 2u8 } else { 1 };
-    let v = fw_verdict(&FW_OUT, &FW_OUT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64, ttl, tos, [0; 6]);
+    let itype = if proto == 1 && !payload.is_empty() { payload[0] } else { 0xff };
+    let v = fw_verdict(&FW_OUT, &FW_OUT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64, ttl, tos, [0; 6], itype);
     if v == 2 {
         out_reject(src_ip, dst_ip, proto, payload);
         return;

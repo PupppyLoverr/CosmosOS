@@ -8072,6 +8072,8 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut ttl_spec = String::new();
     let mut tos_spec = String::new();
     let mut mac_spec = String::new();
+    let mut icmpt_spec = String::new();
+    let mut dscp_spec = String::new();
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
     let mut jump = "DROP";
@@ -8160,6 +8162,67 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             // `-m mac --mac-source aa:bb:..` — real L2 sender match.
             "--mac-source" => {
                 mac_spec = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
+            // `-m icmp --icmp-type <name|n>` — real ICMP-type match;
+            // names map to their real type codes.
+            "--icmp-type" => {
+                let t = args.get(i + 1).copied().unwrap_or("");
+                let n = match t {
+                    "echo-reply" => 0,
+                    "destination-unreachable" | "network-unreachable"
+                    | "host-unreachable" | "protocol-unreachable"
+                    | "port-unreachable" => 3,
+                    "source-quench" => 4,
+                    "redirect" => 5,
+                    "echo-request" => 8,
+                    "router-advertisement" => 9,
+                    "router-solicitation" => 10,
+                    "time-exceeded" | "ttl-exceeded" => 11,
+                    "parameter-problem" => 12,
+                    "timestamp" | "timestamp-request" => 13,
+                    "timestamp-reply" => 14,
+                    "address-mask-request" => 17,
+                    "address-mask-reply" => 18,
+                    _ => t.parse::<u8>().unwrap_or(0xff),
+                };
+                if n == 0xff {
+                    return None; // bad --icmp-type operand
+                }
+                icmpt_spec = alloc::format!("{}", n);
+                i += 1;
+            }
+            // `-m dscp --dscp <n|class>` — real DSCP match (tos>>2).
+            "--dscp" => {
+                let t = args.get(i + 1).copied().unwrap_or("");
+                let n = match t {
+                    "BE" | "CS0" => 0,
+                    "CS1" => 8,
+                    "CS2" => 16,
+                    "CS3" => 24,
+                    "CS4" => 32,
+                    "CS5" => 40,
+                    "CS6" => 48,
+                    "CS7" => 56,
+                    "AF11" => 10,
+                    "AF12" => 12,
+                    "AF13" => 14,
+                    "AF21" => 18,
+                    "AF22" => 20,
+                    "AF23" => 22,
+                    "AF31" => 26,
+                    "AF32" => 28,
+                    "AF33" => 30,
+                    "AF41" => 34,
+                    "AF42" => 36,
+                    "AF43" => 38,
+                    "EF" => 46,
+                    _ => t.parse::<u8>().unwrap_or(0xff),
+                };
+                if n > 63 {
+                    return None; // bad --dscp operand
+                }
+                dscp_spec = alloc::format!("{}", n);
                 i += 1;
             }
             "--dst-range" | "--destination-range" => {
@@ -8305,6 +8368,12 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !mac_spec.is_empty() {
         line.push_str(&alloc::format!(" mac {}", mac_spec));
+    }
+    if !icmpt_spec.is_empty() {
+        line.push_str(&alloc::format!(" icmpt {}", icmpt_spec));
+    }
+    if !dscp_spec.is_empty() {
+        line.push_str(&alloc::format!(" dscp {}", dscp_spec));
     }
     if !iif.is_empty() {
         line.push_str(&alloc::format!(" iif {}", iif));
@@ -19928,7 +19997,7 @@ impl Term {
                                 .unwrap_or(usize::MAX);
                             i += 1;
                         }
-                        "-n" | "-q" | "-e" | "-v" | "-tt" | "-ttt" | "-x" | "-X" => {}
+                        "-n" | "-q" | "-e" | "-v" | "-tt" | "-ttt" | "-x" | "-X" | "-A" => {}
                         _ => {}
                     }
                     i += 1;
@@ -19941,6 +20010,9 @@ impl Term {
                 // after each decoded line; -X adds the ASCII gutter.
                 let show_hex = args.iter().any(|a| *a == "-x" || *a == "-X");
                 let show_ascii = args.iter().any(|a| *a == "-X");
+                // -A: real tcpdump flag — payload as printable ASCII
+                // (control bytes become dots), after the decoded line.
+                let show_atxt = args.iter().any(|a| *a == "-A");
                 let Some(f) = file else {
                     self.fail("usage: tcpdump -r <file.pcap> [-c N]");
                     return;
@@ -20147,6 +20219,24 @@ impl Term {
                     }
                     // tcpdump -x/-X layout: 16B rows, u16 hex groups,
                     // ascii gutter on -X.
+                    if show_atxt {
+                        // tcpdump -A: the whole frame as text lines,
+                        // printable bytes verbatim, others as dots.
+                        let mut ao = 0usize;
+                        while ao < fr.len() {
+                            let e = (ao + 64).min(fr.len());
+                            let mut line = String::new();
+                            for &b in &fr[ao..e] {
+                                line.push(if (0x20..0x7f).contains(&b) {
+                                    b as char
+                                } else {
+                                    '.'
+                                });
+                            }
+                            self.emit(&line);
+                            ao += 64;
+                        }
+                    }
                     if show_hex {
                         let mut ho = 0usize;
                         while ho < fr.len() {
@@ -20837,6 +20927,7 @@ impl Term {
                 let mut conn_ms: u64 = 0; // --connect-timeout (0 = default)
                 let mut follow = false;
                 let mut max_redirs = 50u32;
+                let mut resolve_map: Vec<(String, u16, String)> = Vec::new();
                 let mut i = 0usize;
                 while i < args.len() {
                     let a = args[i];
@@ -20869,6 +20960,32 @@ impl Term {
                         "-H" | "--header" => {
                             if let Some(h) = args.get(i + 1) {
                                 xhdrs.push(String::from(*h));
+                            }
+                            i += 1;
+                        }
+                        "-u" | "--user" => {
+                            // real curl flag — Basic auth: base64 of
+                            // the literal "user:pass" on the wire.
+                            if let Some(cred) = args.get(i + 1) {
+                                xhdrs.push(alloc::format!(
+                                    "Authorization: Basic {}",
+                                    b64_encode(cred.as_bytes())
+                                ));
+                            }
+                            i += 1;
+                        }
+                        "--resolve" => {
+                            // real curl flag — host:port:addr overrides
+                            // DNS for exactly that (host,port).
+                            if let Some(r) = args.get(i + 1) {
+                                let parts: Vec<&str> = r.split(':').collect();
+                                if parts.len() == 3 {
+                                    resolve_map.push((
+                                        String::from(parts[0]),
+                                        parts[1].parse::<u16>().unwrap_or(0),
+                                        String::from(parts[2]),
+                                    ));
+                                }
                             }
                             i += 1;
                         }
@@ -20951,7 +21068,13 @@ impl Term {
                         ),
                         None => (authority, 80u16),
                     };
-                    let Some(ip) = parse_ipv4(host).or_else(|| ustd::net_dns(host))
+                    // --resolve host:port:ip wins over DNS for that
+                    // exact (host, port) pair — real curl behavior.
+                    let rsv = resolve_map
+                        .iter()
+                        .find(|(h, p, _)| h == host && *p == port)
+                        .and_then(|(_, _, a)| parse_ipv4(a));
+                    let Some(ip) = rsv.or_else(|| parse_ipv4(host).or_else(|| ustd::net_dns(host)))
                     else {
                         self.last_ok = false;
                         if !silent {
