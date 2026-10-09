@@ -5966,6 +5966,41 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::write_all(nfa, b"F\n");
         add && a1 && charged
     });
+    check("ipt-set", {
+        // `ipset` + `-m set`: real named kernel sets — create, add,
+        // membership test, and a rule that only gates while the
+        // gateway is listed.
+        let ipt = "/proc/net/iptables";
+        let ips = "/proc/net/ipset";
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let _ = ustd::write_all(ips, b"X BL\nX NETS\n");
+        let c1 = ustd::write_all(ips, b"C BL hash:ip\n").is_ok();
+        let a1 = ustd::write_all(ips, b"A BL 10.0.2.2\n").is_ok();
+        let t1 = ustd::write_all(ips, b"T BL 10.0.2.2\n").is_ok();
+        let t2 = ustd::write_all(ips, b"T BL 1.2.3.4\n").is_err();
+        let r1 = ustd::write_all(ipt, b"A INPUT icmp set BL src drop\n").is_ok();
+        let p1 = ustd::net_ping(0x0A00_0202, 1500).is_none();
+        let _ = ustd::write_all(ipt, b"F\n");
+        // dst flag: inbound replies are *to* us — not in BL → open.
+        let r2 = ustd::write_all(ipt, b"A INPUT icmp set BL dst drop\n").is_ok();
+        let p2 = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        let _ = ustd::write_all(ipt, b"F\n");
+        // hash:net containment on the /24 covering the gateway.
+        let c2 = ustd::write_all(ips, b"C NETS hash:net\n").is_ok();
+        let a2 = ustd::write_all(ips, b"A NETS 10.0.2.0/24\n").is_ok();
+        let t3 = ustd::write_all(ips, b"T NETS 10.0.2.5\n").is_ok();
+        let r3 = ustd::write_all(ipt, b"A INPUT icmp set NETS src drop\n").is_ok();
+        let p3 = ustd::net_ping(0x0A00_0202, 1500).is_none();
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let _ = ustd::write_all(ips, b"X BL\nX NETS\n");
+        if !(c1 && a1 && t1 && t2 && r1 && p1 && r2 && p2 && c2 && a2 && t3 && r3 && p3) {
+            println!(
+                "[dbg] ipset c1={} a1={} t1={} t2={} r1={} p1={} r2={} p2={} c2={} a2={} t3={} r3={} p3={}",
+                c1, a1, t1, t2, r1, p1, r2, p2, c2, a2, t3, r3, p3
+            );
+        }
+        c1 && a1 && t1 && t2 && r1 && p1 && r2 && p2 && c2 && a2 && t3 && r3 && p3
+    });
     check("ipt-rpfilter", {
         // `-m rpfilter`: while a route back to the gw exists the rule
         // matches and drops; with the subnet route gone there's no

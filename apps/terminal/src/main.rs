@@ -8119,6 +8119,8 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut cpu_set = false;
     let mut cpu_n = 0u8;
     let mut nfacct = String::new();
+    let mut set_name = String::new();
+    let mut set_dir = String::new();
     let mut atype_dst = String::new();
     let mut atype_src = String::new();
     let mut rpfilter = false;
@@ -8402,6 +8404,24 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             // `-m nfacct --nfacct-name X`.
             "--nfacct-name" => {
                 nfacct = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
+            // `-m set --match-set NAME src[,dst]`.
+            "--match-set" => {
+                set_name = String::from(args.get(i + 1).copied().unwrap_or(""));
+                set_dir = String::from(
+                    args.get(i + 2)
+                        .copied()
+                        .filter(|d| d.starts_with("src") || d.starts_with("dst"))
+                        .unwrap_or("src"),
+                );
+                if args
+                    .get(i + 2)
+                    .map(|d| d.starts_with("src") || d.starts_with("dst"))
+                    .unwrap_or(false)
+                {
+                    i += 1;
+                }
                 i += 1;
             }
             // `-m addrtype --src-type/--dst-type`.
@@ -8714,6 +8734,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !nfacct.is_empty() {
         line.push_str(&alloc::format!(" nfacct {}", nfacct));
+    }
+    if !set_name.is_empty() {
+        line.push_str(&alloc::format!(" set {} {}", set_name, set_dir));
     }
     if !atype_dst.is_empty() {
         line.push_str(&alloc::format!(" addrtype dst {}", atype_dst));
@@ -27028,6 +27051,93 @@ impl Term {
                         continue;
                     }
                     self.emit(l);
+                }
+            }
+            "ipset" => {
+                // ipset create/add/del/test/list/flush/destroy — the real
+                // named sets `-m set --match-set` matches against, via
+                // /proc/net/ipset.
+                let p = "/proc/net/ipset";
+                let wr = |line: &str| -> bool {
+                    ustd::write_all(p, alloc::format!("{}\n", line).as_bytes()).is_ok()
+                };
+                match args.first().copied() {
+                    Some("create") | Some("-N") => match (args.get(1), args.get(2)) {
+                        (Some(n), Some(k)) => {
+                            if !wr(&alloc::format!("C {} {}", n, k)) {
+                                self.fail("ipset: create failed (exists or bad type)");
+                            }
+                        }
+                        _ => self.fail("usage: ipset create <name> hash:ip|hash:ip,port|hash:net"),
+                    },
+                    Some("add") => match (args.get(1), args.get(2)) {
+                        (Some(n), Some(it)) => {
+                            if !wr(&alloc::format!("A {} {}", n, it)) {
+                                self.fail("ipset: add failed (no set or bad entry)");
+                            }
+                        }
+                        _ => self.fail("usage: ipset add <name> <ip[/plen][,port]>"),
+                    },
+                    Some("del") => match (args.get(1), args.get(2)) {
+                        (Some(n), Some(it)) => {
+                            if !wr(&alloc::format!("D {} {}", n, it)) {
+                                self.fail("ipset: del failed (not a member)");
+                            }
+                        }
+                        _ => self.fail("usage: ipset del <name> <entry>"),
+                    },
+                    Some("test") => match (args.get(1), args.get(2)) {
+                        (Some(n), Some(it)) => {
+                            if wr(&alloc::format!("T {} {}", n, it)) {
+                                self.emit(&alloc::format!("{} is in set {}.", it, n));
+                            } else {
+                                self.fail(&alloc::format!(
+                                    "{} is NOT in set {}.",
+                                    it, n
+                                ));
+                            }
+                        }
+                        _ => self.fail("usage: ipset test <name> <entry>"),
+                    },
+                    Some("flush") | Some("-F") => {
+                        let l = match args.get(1) {
+                            Some(n) => alloc::format!("F {}", n),
+                            None => String::from("F"),
+                        };
+                        if !wr(&l) {
+                            self.fail("ipset: no such set");
+                        }
+                    }
+                    Some("destroy") | Some("del-set") | Some("-X") => match args.get(1) {
+                        Some(n) => {
+                            if !wr(&alloc::format!("X {}", n)) {
+                                self.fail("ipset: no such set");
+                            }
+                        }
+                        None => self.fail("usage: ipset destroy <name>"),
+                    },
+                    Some("list") | Some("save") | Some("-L") | Some("-S") | None => {
+                        match ustd::read_all(p) {
+                            Ok(d) => {
+                                let want = args.get(1).copied().unwrap_or("");
+                                let mut cur = String::new();
+                                for l in String::from_utf8_lossy(&d).lines() {
+                                    if let Some(rest) = l.strip_prefix("create ") {
+                                        cur = String::from(
+                                            rest.split_whitespace().next().unwrap_or(""),
+                                        );
+                                    }
+                                    if want.is_empty() || cur == want {
+                                        self.emit(l);
+                                    }
+                                }
+                            }
+                            Err(e) => self.fail(&alloc::format!("ipset: err {}", e)),
+                        }
+                    }
+                    Some(_) => self.fail(
+                        "usage: ipset <create|add|del|test|list|flush|destroy|save> ...",
+                    ),
                 }
             }
             "nfacct" => {
