@@ -5907,6 +5907,24 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::write_all(ipt, b"F\n/\n");
         a1 && gated && a2 && open && a3 && gated2
     });
+    check("ipt-ctdir", {
+        // `-m conntrack --ctdir`: our outbound ping creates the flow,
+        // so the request is ORIGINAL-dir on egress and the gateway's
+        // answer is REPLY-dir on ingress — both verified through real
+        // packet drops.
+        let ipt = "/proc/net/iptables";
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let a1 = ustd::write_all(ipt, b"A INPUT icmp ctdir REPLY drop\n").is_ok();
+        let p1 = ustd::net_ping(0x0A00_0202, 1500).is_none();
+        let _ = ustd::write_all(ipt, b"F\n");
+        let a2 = ustd::write_all(ipt, b"A INPUT icmp ctdir ORIGINAL drop\n").is_ok();
+        let p2 = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        let _ = ustd::write_all(ipt, b"F\n");
+        let a3 = ustd::write_all(ipt, b"A OUTPUT icmp ctdir ORIGINAL drop\n").is_ok();
+        let p3 = ustd::net_ping(0x0A00_0202, 1500).is_none();
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        a1 && p1 && a2 && p2 && a3 && p3
+    });
     check("ipt-rpfilter", {
         // `-m rpfilter`: while a route back to the gw exists the rule
         // matches and drops; with the subnet route gone there's no
