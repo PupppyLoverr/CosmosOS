@@ -212,6 +212,169 @@ fn route_del(spec: &str) -> bool {
     r.len() != before
 }
 
+// ---------------------------------------------------------------------------
+// iptables — real INPUT-chain packet filter. Rules live in FW; every packet
+// reaching dispatch() is checked and matching ones are silently dropped
+// (real -j DROP semantics: no ICMP reply, no RST, no delivery).
+// ---------------------------------------------------------------------------
+
+struct FwRule {
+    proto: u8,            // 0 = any; 1 icmp, 6 tcp, 17 udp
+    dport: u16,           // 0 = any (tcp/udp destination port)
+    src: [u8; 4],         // [0;4] = anywhere
+    smask: [u8; 4],
+    hits: u64,
+}
+
+static FW: Mutex<Vec<FwRule>> = Mutex::new(Vec::new());
+
+/// INPUT chain policy: false = ACCEPT (default-allow), true = DROP.
+static FW_POLICY: Mutex<bool> = Mutex::new(false);
+
+/// true => drop this packet (a rule matched, or policy DROP)
+fn fw_dropped(src: [u8; 4], proto: u8, dport: u16) -> bool {
+    let mut fw = FW.lock();
+    for r in fw.iter_mut() {
+        if r.proto != 0 && r.proto != proto {
+            continue;
+        }
+        if r.dport != 0 && r.dport != dport {
+            continue;
+        }
+        if r.src != [0; 4] {
+            let m = u32::from_be_bytes(src) & u32::from_be_bytes(r.smask)
+                == u32::from_be_bytes(r.src) & u32::from_be_bytes(r.smask);
+            if !m {
+                continue;
+            }
+        }
+        r.hits += 1;
+        return true;
+    }
+    *FW_POLICY.lock()
+}
+
+/// `/proc/net/iptables` — `iptables -L -n` listing (INPUT chain).
+pub fn net_iptables() -> String {
+    let mut out = alloc::format!(
+        "Chain INPUT (policy {})\nnum  pkts target  prot  source       destination\n",
+        if *FW_POLICY.lock() { "DROP" } else { "ACCEPT" }
+    );
+    for (i, r) in FW.lock().iter().enumerate() {
+        let proto = match r.proto {
+            1 => String::from("icmp"),
+            6 => String::from("tcp"),
+            17 => String::from("udp"),
+            n => alloc::format!("{}", n),
+        };
+        let src = if r.src == [0; 4] {
+            String::from("0.0.0.0/0")
+        } else {
+            let plen = r.smask.iter().map(|b| b.count_ones()).sum::<u32>();
+            alloc::format!("{}.{}.{}.{}/{}", r.src[0], r.src[1], r.src[2], r.src[3], plen)
+        };
+        let extra = if r.dport != 0 {
+            alloc::format!("  {} dpt:{}", proto, r.dport)
+        } else {
+            String::new()
+        };
+        out.push_str(&alloc::format!(
+            "{:<4} {:<5} {:<8} {:<6} {:<12} 0.0.0.0/0{}\n",
+            i + 1,
+            r.hits,
+            "DROP",
+            proto,
+            src,
+            extra
+        ));
+    }
+    out
+}
+
+/// `/proc/net/iptables` write grammar (kernel side of the `iptables` cmd):
+///   "F"                                  flush all rules
+///   "D <n>"                              delete 1-based rule number
+///   "A <proto|*> [dport N] [src ip/plen]" append a DROP rule
+///   "P <ACCEPT|DROP>"                    set the real chain policy (FW_POLICY —
+///                                         DROP catches every packet no rule hit)
+/// Returns false on a parse miss.
+pub fn iptables_ctl(line: &str) -> bool {
+    let mut f = line.split_whitespace();
+    match f.next() {
+        Some("F") => {
+            FW.lock().clear();
+            true
+        }
+        Some("D") => {
+            let n: usize = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let mut fw = FW.lock();
+            if n == 0 || n > fw.len() {
+                return false;
+            }
+            fw.remove(n - 1);
+            true
+        }
+        Some("P") => match f.next() {
+            Some("ACCEPT") => {
+                *FW_POLICY.lock() = false;
+                true
+            }
+            Some("DROP") => {
+                *FW_POLICY.lock() = true;
+                true
+            }
+            _ => false,
+        },
+        Some("A") => {
+            let proto = match f.next() {
+                Some("*") | Some("all") => 0u8,
+                Some("icmp") => 1,
+                Some("tcp") => 6,
+                Some("udp") => 17,
+                Some(n) => n.parse().unwrap_or(0),
+                None => return false,
+            };
+            let mut r = FwRule { proto, dport: 0, src: [0; 4], smask: [0; 4], hits: 0 };
+            let mut ok = true;
+            while let Some(k) = f.next() {
+                match k {
+                    "dport" => {
+                        r.dport = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                        if r.dport == 0 {
+                            ok = false;
+                        }
+                    }
+                    "src" => {
+                        let spec = f.next().unwrap_or("");
+                        let (ip, plen) = match spec.split_once('/') {
+                            Some((d, p)) => (d, p.parse::<u32>().unwrap_or(32)),
+                            None => (spec, 32),
+                        };
+                        if plen > 32 {
+                            ok = false;
+                            break;
+                        }
+                        let mask = if plen == 0 { 0u32 } else { u32::MAX << (32 - plen) };
+                        match parse_ip(ip) {
+                            Some(ip) => {
+                                r.src = ip;
+                                r.smask = mask.to_be_bytes();
+                            }
+                            None => ok = false,
+                        }
+                    }
+                    _ => ok = false,
+                }
+            }
+            if ok {
+                FW.lock().push(r);
+            }
+            ok
+        }
+        _ => false,
+    }
+}
+
 fn parse_ip(s: &str) -> Option<[u8; 4]> {
     let mut out = [0u8; 4];
     let mut i = 0;
@@ -317,6 +480,17 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
         }
     }
     drop(lq);
+    // iptables INPUT: every inbound packet is evaluated once here at ingress —
+    // wire, slirp-forwarded, and loopback alike — before dispatch, raw
+    // consumers (ping/dhcp), or the ICMP echo responder can see it.
+    out.retain(|(src_ip, proto, p)| {
+        let dport = if (*proto == 6 || *proto == 17) && p.len() >= 4 {
+            be16(&p[2..])
+        } else {
+            0
+        };
+        !fw_dropped(*src_ip, *proto, dport)
+    });
     // ICMP: answer echo requests like a real host — wire or loopback
     for (src_ip, proto, p) in &out {
         if *proto == 1 && p.len() >= 8 && p[0] == 8 {
