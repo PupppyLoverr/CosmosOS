@@ -2522,6 +2522,71 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             && ustd::write_all("/proc/sys/net/ipv4/tcp_retries1", b"3").is_ok()
             && ustd::write_all("/proc/sys/net/ipv4/tcp_max_syn_backlog", b"128").is_ok()
     });
+    check("icmp-rate-limit", {
+        // net.ipv4.icmp_*: locally-generated ICMP errors pass two
+        // gates — ratemask+ratelimit (per-type interval) and
+        // msgs_per_sec+msgs_burst (global token bucket). Each UDP
+        // datagram to an unclaimed port produces a 3/3 — count real
+        // emissions via /proc/net/snmp OutMsgs.
+        let out_msgs = || {
+            ustd::read_all("/proc/net/snmp").ok().and_then(|d| {
+                let s = String::from_utf8_lossy(&d);
+                s.lines().filter(|l| l.starts_with("Icmp: ")).nth(1)
+                    .and_then(|l| l.split_whitespace().nth(2))
+                    .and_then(|v| v.parse::<u64>().ok())
+            }).unwrap_or(0)
+        };
+        let fd = ustd::socket(ustd::SOCK_DGRAM);
+        let mut ok = fd >= 0;
+        if ok {
+            let u = ustd::UdpFd(fd); // sendto auto-binds ephemeral
+            let w = |p: &str, v: &[u8]| ustd::write_all(p, v).is_ok();
+            // Loopback datagrams only reach the socket dispatch when a
+            // consumer pumps rx — a nonblocking read pumps the queue
+            // (try_read_once → pump_once), generating the 3/3s now.
+            ustd::fcntl(fd, ustd::F_SETFL, ustd::O_NONBLOCK);
+            let pump = || {
+                let mut sink = [0u8; 64];
+                for _ in 0..4 { let _ = ustd::read(fd, &mut sink); }
+                ustd::sleep_ms(50);
+            };
+            // phase A: gates off — every send emits a 3/3.
+            ok = ok && w("/proc/sys/net/ipv4/icmp_ratelimit", b"0")
+                && w("/proc/sys/net/ipv4/icmp_ratemask", b"0")
+                && w("/proc/sys/net/ipv4/icmp_msgs_per_sec", b"10000")
+                && w("/proc/sys/net/ipv4/icmp_msgs_burst", b"1000");
+            let a0 = out_msgs();
+            for _ in 0..6 { u.sendto(b"x", [127, 0, 0, 1], 19998); }
+            pump();
+            let da = out_msgs().saturating_sub(a0);
+            // phase B: type 3 rate-limited to 1 per 60s.
+            ok = ok && w("/proc/sys/net/ipv4/icmp_ratemask", b"8")
+                && w("/proc/sys/net/ipv4/icmp_ratelimit", b"60000");
+            let b0 = out_msgs();
+            for _ in 0..6 { u.sendto(b"x", [127, 0, 0, 1], 19998); }
+            pump();
+            let db = out_msgs().saturating_sub(b0);
+            // phase C: ratemask off; token bucket clamped to depth 1.
+            ok = ok && w("/proc/sys/net/ipv4/icmp_ratemask", b"0")
+                && w("/proc/sys/net/ipv4/icmp_ratelimit", b"0")
+                && w("/proc/sys/net/ipv4/icmp_msgs_per_sec", b"1")
+                && w("/proc/sys/net/ipv4/icmp_msgs_burst", b"1");
+            ustd::sleep_ms(1200); // next check clamps the bucket to 1
+            let c0 = out_msgs();
+            for _ in 0..6 { u.sendto(b"x", [127, 0, 0, 1], 19998); }
+            pump();
+            let dc = out_msgs().saturating_sub(c0);
+            if !(da >= 4 && db <= 1 && dc <= 1) {
+                println!("[dbg icmp-rate] a={} b={} c={}", da, db, dc);
+            }
+            ok = ok && da >= 4 && db <= 1 && dc <= 1
+                && w("/proc/sys/net/ipv4/icmp_ratelimit", b"1000")
+                && w("/proc/sys/net/ipv4/icmp_ratemask", b"6168")
+                && w("/proc/sys/net/ipv4/icmp_msgs_per_sec", b"1000")
+                && w("/proc/sys/net/ipv4/icmp_msgs_burst", b"50");
+        }
+        ok
+    });
     check("domainname-sysctl", {
         // kernel.domainname: a real UTS-scoped string sysctl — round
         // trip through the proc file; empty restores the "(none)" value.

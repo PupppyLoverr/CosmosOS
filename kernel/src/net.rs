@@ -1216,6 +1216,9 @@ fn out_reject(src_ip: [u8; 4], dst_ip: [u8; 4], proto: u8, payload: &[u8]) {
     } else {
         // ICMP 3/3 from the destination we "tried" to reach, quoting the
         // offending datagram's header + first 8 payload bytes.
+        if !icmp_error_allowed(3) {
+            return;
+        }
         let mut icmp = Vec::with_capacity(8 + 20 + 8);
         icmp.push(3);
         icmp.push(3);
@@ -3737,6 +3740,49 @@ fn icmp_echo_reply(src_ip: [u8; 4], req: &[u8]) {
     }
 }
 
+/// Per-type last-error stamps and the global token bucket behind
+/// `icmp_error_allowed`.
+static ICMP_TYPE_LAST: Mutex<alloc::collections::BTreeMap<u8, u64>> =
+    Mutex::new(alloc::collections::BTreeMap::new());
+static ICMP_BUCKET: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
+/// ICMP error emission gate — the same two layers Linux applies to
+/// locally-generated ICMP errors: net.ipv4.icmp_ratemask+icmp_ratelimit
+/// (per-type minimum interval) then icmp_msgs_per_sec+icmp_msgs_burst
+/// (a global token bucket). Echo replies are never gated. The type
+/// stamp lands only when the packet will actually emit — a dropped
+/// error can't hold off its own retry.
+fn icmp_error_allowed(ty: u8) -> bool {
+    let now = now_ms();
+    let type_limited = (crate::sysctl::icmp_ratemask() >> ty) & 1 == 1;
+    if type_limited {
+        let l = ICMP_TYPE_LAST.lock();
+        let last = l.get(&ty).copied().unwrap_or(0);
+        if last != 0 && now.saturating_sub(last) < crate::sysctl::icmp_ratelimit() {
+            return false;
+        }
+    }
+    let mut b = ICMP_BUCKET.lock();
+    if b.1 == 0 {
+        // first error ever: the bucket starts full, like a fresh netns.
+        b.0 = crate::sysctl::icmp_msgs_burst();
+        b.1 = now;
+    }
+    let refill = now.saturating_sub(b.1) * crate::sysctl::icmp_msgs_per_sec() / 1000;
+    if refill > 0 {
+        b.0 = (b.0 + refill).min(crate::sysctl::icmp_msgs_burst());
+        b.1 = now;
+    }
+    if b.0 == 0 {
+        return false;
+    }
+    b.0 -= 1;
+    if type_limited {
+        ICMP_TYPE_LAST.lock().insert(ty, now);
+    }
+    true
+}
+
 /// ICMP 3/3 port-unreachable, sent when a UDP datagram hits a port nobody
 /// owns — the real response a host gives, and what a tracer probe to an
 /// unbound port on ourselves answers with. `orig_udp` is the offending
@@ -3745,6 +3791,9 @@ fn icmp_echo_reply(src_ip: [u8; 4], req: &[u8]) {
 fn icmp_port_unreach(sender: [u8; 4], orig_udp: &[u8]) {
     if sender == [0, 0, 0, 0] || is_bcast(sender) || (sender[0] == 224) {
         return; // never send errors to bcast/mcast/unspecified sources
+    }
+    if !icmp_error_allowed(3) {
+        return; // icmp_ratelimit / icmp_msgs_per_sec gate
     }
     let mut icmp = Vec::with_capacity(8 + 20 + 8);
     icmp.push(3); // destination unreachable
