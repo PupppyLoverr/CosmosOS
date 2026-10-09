@@ -49,6 +49,7 @@ struct Sock {
     keepalive: bool,              // SO_KEEPALIVE (TCP: real wire probes)
     ttl: u8,                      // IP_TTL (0 = default 64)
     wait_expired: bool,           // recv hit rcvtimeo — surface EAGAIN, no reblock
+    linger: i64,                // SO_LINGER — -1 off (FIN close), 0 abortive RST, >0 drain-wait secs
 }
 
 /// AF_UNIX named-socket registry: path -> listener state. `queue` holds
@@ -152,6 +153,7 @@ pub fn create(stream: bool, domain: u64) -> Result<String, i64> {
             keepalive: false,
             ttl: 0,
             wait_expired: false,
+            linger: -1,
         },
     );
     Ok(format!("/socket/{}", id))
@@ -516,6 +518,7 @@ pub fn accept(id: u64) -> Result<(String, [u8; 4], u16), i64> {
                         keepalive: false,
                         ttl: 0,
                         wait_expired: false,
+                        linger: -1,
                     },
                 );
                 Ok((format!("/socket/{}", nid), rip, rport))
@@ -561,6 +564,7 @@ pub fn accept(id: u64) -> Result<(String, [u8; 4], u16), i64> {
                             keepalive: false,
                             ttl: 0,
                             wait_expired: false,
+                        linger: -1,
                         },
                     );
                     Ok((format!("/socket/{}", nid), [0; 4], 0))
@@ -1093,7 +1097,7 @@ pub fn close_obj(path: &str) {
     SOCKS.lock().remove(&id);
     match s.kind {
         Kind::Udp => crate::net::udp_close_one(s.lport),
-        Kind::Tcp => crate::net::tcp_close(s.cid),
+        Kind::Tcp => crate::net::tcp_close_linger(s.cid, s.linger),
         Kind::TcpListener => crate::net::tcp_unlisten(s.lport),
         _ => {}
     }
@@ -1178,6 +1182,7 @@ pub fn getsockopt(id: u64, level: u64, opt: u64) -> Result<u32, i64> {
         9 => Ok(s.keepalive as u32),  // SO_KEEPALIVE
         20 => Ok(s.rcvtimeo as u32),  // SO_RCVTIMEO (ms)
         21 => Ok(s.sndtimeo as u32),  // SO_SNDTIMEO (ms)
+        13 => Ok(if s.linger < 0 { u32::MAX } else { s.linger as u32 }), // SO_LINGER secs (u32::MAX = off)
         _ => Err(-92),
     }
 }
@@ -1232,6 +1237,12 @@ pub fn setsockopt(id: u64, level: u64, opt: u64, val: u64) -> i64 {
             s.sndtimeo = val.min(600_000); // SO_SNDTIMEO, ms
             0
         }
+        13 => {
+            // SO_LINGER — u64 ABI: u64::MAX = off, else l_linger
+            // seconds (0 = abortive close → RST instead of FIN).
+            s.linger = if val == u64::MAX { -1 } else { val.min(300) as i64 };
+            0
+        }
         _ => -92,
     }
 }
@@ -1277,6 +1288,7 @@ pub fn socketpair_dgram() -> Option<(String, String)> {
                 keepalive: false,
                 ttl: 0,
                 wait_expired: false,
+                linger: -1,
             },
         );
     }
