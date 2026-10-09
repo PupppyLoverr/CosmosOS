@@ -254,6 +254,33 @@ pub fn dispatch(ctx: &mut CpuContext) {
                     }
                     None => ERR,
                 }
+            } else if a1 == 16 {
+                // PR_GET_NAME: NUL-padded 16-byte task name out
+                match task::sched_fields(0) {
+                    Some((_, _, name, _, _)) => {
+                        let mut b = [0u8; 16];
+                        let nb = name.as_bytes();
+                        b[..nb.len().min(15)].copy_from_slice(&nb[..nb.len().min(15)]);
+                        if copy_out(a2, &b).is_some() {
+                            0
+                        } else {
+                            ERR
+                        }
+                    }
+                    None => ERR,
+                }
+            } else if a1 == 2 {
+                // PR_GET_PDEATHSIG: *int = pdeathsig
+                match task::sched_fields(0) {
+                    Some((_, _, _, ds, _)) => {
+                        if copy_out(a2, &(ds as u32).to_le_bytes()).is_some() {
+                            0
+                        } else {
+                            ERR
+                        }
+                    }
+                    None => ERR,
+                }
             } else {
                 task::sys_prctl(a1, a2) as u64
             }
@@ -771,6 +798,81 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_SET_ROBUST_LIST => {
             task::with_current(|t| t.robust_list = a1);
             0
+        }
+        shared::SYS_GETPRIORITY => {
+            // (which 0=PRIO_PROCESS, pid 0=self) -> stored nice | -3 ESRCH
+            if a1 != 0 {
+                ERR
+            } else {
+                match task::sched_fields(a2 as u32) {
+                    Some((nice, _, _, _, _)) => nice as i64 as u64,
+                    None => (-3i64) as u64,
+                }
+            }
+        }
+        shared::SYS_SETPRIORITY => {
+            if a1 != 0 {
+                ERR
+            } else {
+                task::set_nice(a2 as u32, a3 as i64) as u64
+            }
+        }
+        shared::SYS_SCHED_GETSCHEDULER => {
+            // (pid) -> 0=SCHED_OTHER | 1=SCHED_RT | -3 ESRCH
+            match task::sched_fields(a1 as u32) {
+                Some((_, rt, _, _, _)) => {
+                    if rt {
+                        shared::SCHED_RT
+                    } else {
+                        shared::SCHED_OTHER
+                    }
+                }
+                None => (-3i64) as u64,
+            }
+        }
+        shared::SYS_SCHED_GETPARAM => {
+            // (pid, out u64 sched_priority) — rt tasks read back 99,
+            // normal tasks 0 (Linux convention).
+            match task::sched_fields(a1 as u32) {
+                Some((_, rt, _, _, _)) => {
+                    let pr: u64 = if rt { 99 } else { 0 };
+                    if copy_out(a2, &pr.to_le_bytes()).is_none() {
+                        ERR
+                    } else {
+                        0
+                    }
+                }
+                None => (-3i64) as u64,
+            }
+        }
+        shared::SYS_GETCPU => {
+            // (cpu_out, node_out) — UP box: always cpu 0, node 0.
+            let mut ok = true;
+            if a1 != 0 {
+                ok = ok && copy_out(a1, &0u32.to_le_bytes()).is_some();
+            }
+            if a2 != 0 {
+                ok = ok && copy_out(a2, &0u32.to_le_bytes()).is_some();
+            }
+            if ok {
+                0
+            } else {
+                ERR
+            }
+        }
+        shared::SYS_TIMES => {
+            // (out u64[4] {utime,stime,cutime,cstime}) in PIT ticks.
+            // utime is the real per-task cpu_ticks; no user/system split
+            // or child accumulation yet, so the other three read 0.
+            let mut b = alloc::vec![0u8; 32];
+            if let Some((_, _, _, _, ticks)) = task::sched_fields(0) {
+                b[0..8].copy_from_slice(&ticks.to_le_bytes());
+            }
+            if copy_out(a1, &b).is_some() {
+                task::ticks()
+            } else {
+                ERR
+            }
         }
         shared::SYS_STATFS => match copy_str(a1, a2) {
             Some(p) => sys_statfs_out(&p, a3),

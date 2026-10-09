@@ -316,6 +316,12 @@ pub const SYS_ARPING: u64 = 254;       // (ip u32 BE, timeout_ms) -> mac<<16|rtt
 pub const SYS_NET_DHCP_RELEASE: u64 = 255; // () -> 0 | ERR (no lease)
 pub const SYS_ACCEPT4: u64 = 256;         // (fd, peer_out[8]|0, flags) -> connfd | ERR
 pub const SYS_GET_ROBUST_LIST: u64 = 257; // (out u64*) -> 0 | err
+pub const SYS_GETPRIORITY: u64 = 258;    // (which 0=PRIO_PROCESS, pid) -> nice | err
+pub const SYS_SETPRIORITY: u64 = 259;    // (which, pid, nice) -> stored nice | err
+pub const SYS_SCHED_GETSCHEDULER: u64 = 260; // (pid) -> 0=OTHER|1=RT | err -3
+pub const SYS_SCHED_GETPARAM: u64 = 261;     // (pid, out u64 sched_priority) -> 0 | err
+pub const SYS_GETCPU: u64 = 262;             // (out u32 cpu, out u32 node) -> 0 | err
+pub const SYS_TIMES: u64 = 263;              // (out u64[4] tms) -> 0 | err
 /// MS_MOVE: move a mount point instead of creating one
 pub const MS_MOVE: u64 = 0x2000;
 /// CLONE_NEWUTS: unshare the UTS namespace (hostname)

@@ -3379,6 +3379,29 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             _ => false,
         }
     });
+    check("posix-getters", {
+        // real getters for stored scheduling/prctl state:
+        // getpriority/setpriority, sched_getscheduler/param, getcpu,
+        // times, PR_GET_NAME, PR_GET_PDEATHSIG.
+        let mut ok = true;
+        let pid = ustd::getpid() as u32;
+        // nice round-trip: setpriority then getpriority reads it back
+        ok = ok && ustd::setpriority(pid, 7) == 7;
+        ok = ok && ustd::getpriority(pid) == 7;
+        let _ = ustd::setpriority(pid, 0);
+        // scheduler class round-trip via chrt + sched_getscheduler
+        let was_rt = ustd::sched_getscheduler(pid) == 1;
+        ok = ok && ustd::sched_getparam(pid) == if was_rt { 99 } else { 0 };
+        // getcpu is real: UP box -> (0,0)
+        ok = ok && ustd::getcpu() == (0, 0);
+        // times: utime is the real tick counter — nonzero after running
+        let (ut, _st, _ct, _cs) = ustd::times();
+        ok = ok && ut > 0;
+        // PR_GET_NAME matches the binary name; PR_GET_PDEATHSIG reads 0
+        ok = ok && ustd::get_name().contains("selftest");
+        ok = ok && ustd::get_pdeathsig() == 0;
+        ok
+    });
     check("epoll-flags", {
         // EPOLLET fires once per ready level, EPOLLONESHOT until MOD
         // re-arms, EPOLLHUP surfaces on writer close, and the epoll fd
