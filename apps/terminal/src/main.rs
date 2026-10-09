@@ -12633,6 +12633,8 @@ impl Term {
             "wipefs", "isosize", "losetup", "fatlabel", "volname",
             "badblocks", "mkisofs", "genisoimage", "xorrisofs",
             "filefrag", "freefrag", "isols", "isocat", "fatls", "fatget",
+            "openssl", "lsscsi", "ioping", "pidwait", "fincore",
+            "journalctl", "nstat", "busybox",
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look", "fmt",
         "pwck", "grpck", "pathchk", "nslookup", "b2sum",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
@@ -32056,6 +32058,391 @@ impl Term {
                     }
                 }
             }
+            "busybox" => {
+                // meta-dispatch: `busybox cmd args` re-enters run() — every
+                // builtin is reachable as an applet, --list dumps the table
+                match args.first().copied() {
+                    None | Some("--list") => {
+                        for c in Self::BUILTINS.iter() {
+                            self.emit(c);
+                        }
+                    }
+                    Some("--help") | Some("-h") => {
+                        self.emit("usage: busybox <applet> [args...] | --list");
+                    }
+                    Some("busybox") => {
+                        self.emit("busybox: refusing to recurse");
+                    }
+                    Some(_) => {
+                        let line = args.join(" ");
+                        self.run(&line);
+                    }
+                }
+            }
+            "openssl" => match args.first().copied() {
+                Some("dgst") => {
+                    // openssl dgst -ALG file… — real digests, coreutils fmt
+                    let mut alg = "sha256";
+                    let mut files: Vec<&str> = Vec::new();
+                    for a in args.iter().skip(1) {
+                        match *a {
+                            "-md5" => alg = "md5",
+                            "-sha1" => alg = "sha1",
+                            "-sha224" => alg = "sha224",
+                            "-sha256" => alg = "sha256",
+                            "-sha384" => alg = "sha384",
+                            "-sha512" => alg = "sha512",
+                            "-r" | "-binary" | "-c" | "-hex" => {}
+                            _ => files.push(a),
+                        }
+                    }
+                    if files.is_empty() {
+                        self.fail("usage: openssl dgst -<alg> <file>...");
+                        return;
+                    }
+                    for f in files {
+                        match ustd::read_all(f) {
+                            Ok(d) => {
+                                let dg: Vec<u8> = match alg {
+                                    "md5" => ustd::md5(&d).to_vec(),
+                                    "sha1" => ustd::sha1(&d).to_vec(),
+                                    "sha224" => sha224(&d).to_vec(),
+                                    "sha256" => sha256(&d).to_vec(),
+                                    "sha384" => sha384(&d).to_vec(),
+                                    _ => sha512(&d).to_vec(),
+                                };
+                                self.emit(&alloc::format!(
+                                    "{}({})= {}",
+                                    alg.to_uppercase(),
+                                    f,
+                                    hexs(&dg)
+                                ));
+                            }
+                            Err(e) => self.fail(&alloc::format!(
+                                "openssl: {}: err {}",
+                                f, e
+                            )),
+                        }
+                    }
+                }
+                Some("rand") => {
+                    // openssl rand N — CSPRNG bytes, printed as hex
+                    let mut n: Option<usize> = None;
+                    for a in args.iter().skip(1) {
+                        match *a {
+                            "-hex" | "-base64" | "-engine" => {}
+                            a => {
+                                if n.is_none() {
+                                    n = a.parse().ok();
+                                }
+                            }
+                        }
+                    }
+                    match n {
+                        Some(n) if n > 0 && n <= 65536 => {
+                            let mut b = alloc::vec![0u8; n];
+                            ustd::getrandom(&mut b);
+                            self.emit(&hexs(&b));
+                        }
+                        _ => self.fail("usage: openssl rand [-hex] N"),
+                    }
+                }
+                Some("version") | Some("-version") => {
+                    self.emit("CosmosSSL 1.0.0 (dgst: md5 sha1 sha2; rand)");
+                }
+                _ => self.fail("usage: openssl dgst|rand|version"),
+            },
+            "lsscsi" => {
+                // PCI mass-storage devices (class 0x01) mapped to the block
+                // device — virtio-blk is /dev/vda
+                let mut ents = [shared::PciEnt::default(); 64];
+                let n = ustd::pci_scan(&mut ents);
+                let mut seen = false;
+                for e in ents.iter().take(n) {
+                    if e.class == 0x01 {
+                        // only virtio-blk is bound — other controllers
+                        // (e.g. the q35 AHCI) have no driver/disk
+                        let dev = if e.vendor == 0x1af4 {
+                            "/dev/vda"
+                        } else {
+                            "(no driver)"
+                        };
+                        self.emit(&alloc::format!(
+                            "[{:02x}:{:02x}.{}]  disk  {:04x}:{:04x}  {}",
+                            e.bus, e.dev, e.fun, e.vendor, e.device, dev
+                        ));
+                        seen = true;
+                    }
+                }
+                if !seen {
+                    self.emit("(no scsi/block devices)");
+                }
+            }
+            "ioping" => {
+                // ioping [-c N] [-q] <path> — 4KiB pread latency loop
+                let mut count = 4usize;
+                let mut quiet = false;
+                let mut target = "";
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-c" => {
+                            i += 1;
+                            count = args
+                                .get(i)
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(4);
+                        }
+                        "-q" => quiet = true,
+                        a => target = a,
+                    }
+                    i += 1;
+                }
+                if target.is_empty() {
+                    self.fail("usage: ioping [-c N] [-q] <path>");
+                    return;
+                }
+                let t = |s: &mut Self| -> u64 {
+                    let _ = s;
+                    ustd::clock_gettime(1)
+                        .map(|(sec, ns)| sec * 1_000_000_000 + ns)
+                        .unwrap_or(ustd::uptime_ms() * 1_000_000)
+                };
+                match ustd::open(target, ustd::O_RDONLY) {
+                    Ok(fd) => {
+                        let mut buf = [0u8; 4096];
+                        let (mut mn, mut mx, mut tot) = (u64::MAX, 0u64, 0u64);
+                        let sz = ustd::stat(target)
+                            .map(|s| s.size)
+                            .unwrap_or(4096)
+                            .max(1);
+                        for k in 0..count {
+                            // cycle through 4KiB windows so a big file
+                            // reads a fresh sector each op
+                            let off = (k as u64 * 4096) % sz;
+                            let t0 = t(self);
+                            let _ = pread_all(fd, off, &mut buf);
+                            let ns = t(self).saturating_sub(t0);
+                            mn = mn.min(ns);
+                            mx = mx.max(ns);
+                            tot += ns;
+                            if !quiet {
+                                self.emit(&alloc::format!(
+                                    "4096 bytes from {} (seq {}): {}.{} us",
+                                    target,
+                                    k + 1,
+                                    ns / 1000,
+                                    (ns % 1000) / 10
+                                ));
+                            }
+                            ustd::sleep_ms(200);
+                        }
+                        ustd::close(fd);
+                        self.emit(&alloc::format!(
+                            "--- {} ioping statistics ---",
+                            target
+                        ));
+                        self.emit(&alloc::format!(
+                            "{} requests: min {}.{} us, avg {}.{} us, max {}.{} us",
+                            count,
+                            mn / 1000,
+                            (mn % 1000) / 10,
+                            tot / count.max(1) as u64 / 1000,
+                            (tot / count.max(1) as u64 % 1000) / 10,
+                            mx / 1000,
+                            (mx % 1000) / 10
+                        ));
+                    }
+                    Err(e) => self.fail(&alloc::format!(
+                        "ioping: {}: err {}",
+                        target, e
+                    )),
+                }
+            }
+            "pidwait" => {
+                // pidwait [-t sec] <pid|name> — poll proclist until gone
+                let mut timeout = 10_000u64;
+                let mut target = "";
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-t" => {
+                            i += 1;
+                            timeout = args
+                                .get(i)
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .map(|s| s * 1000)
+                                .unwrap_or(10_000);
+                        }
+                        a => target = a,
+                    }
+                    i += 1;
+                }
+                if target.is_empty() {
+                    self.fail("usage: pidwait [-t sec] <pid|name>");
+                    return;
+                }
+                let wantc = alloc::format!("cosmos-{}", target);
+                let wantpid = target.parse::<u64>().ok();
+                let start = ustd::uptime_ms();
+                loop {
+                    let buf = ustd::proclist(64);
+                    let alive = buf.iter().any(|p| {
+                        if let Some(w) = wantpid {
+                            p.pid as u64 == w
+                        } else {
+                            let nb = &p.name[..p
+                                .name
+                                .iter()
+                                .position(|b| *b == 0)
+                                .unwrap_or(32)];
+                            let nm = core::str::from_utf8(nb).unwrap_or("");
+                            nm == target || nm == wantc.as_str()
+                        }
+                    });
+                    if !alive {
+                        self.emit(&alloc::format!("{} exited", target));
+                        break;
+                    }
+                    if ustd::uptime_ms() - start > timeout {
+                        self.fail(&alloc::format!(
+                            "pidwait: {} still running",
+                            target
+                        ));
+                        return;
+                    }
+                    ustd::sleep_ms(50);
+                }
+            }
+            "fincore" => {
+                // fincore <file> — mmap + mincore residency report
+                let Some(p) = args.first() else {
+                    self.fail("usage: fincore <file>");
+                    return;
+                };
+                match ustd::open(p, ustd::O_RDONLY) {
+                    Ok(fd) => {
+                        let sz = ustd::stat(p).map(|s| s.size).unwrap_or(0);
+                        if sz == 0 {
+                            self.emit("0 bytes resident");
+                            ustd::close(fd);
+                            return;
+                        }
+                        match ustd::mmap_file(fd, sz, 0) {
+                            Some(addr) => {
+                                let bits =
+                                    ustd::mincore(addr as u64, sz).unwrap_or_default();
+                                let res = bits.iter().filter(|b| **b != 0).count()
+                                    as u64
+                                    * 4096;
+                                let pages = bits.len();
+                                self.emit(&alloc::format!(
+                                    "{}: {} of {} pages resident ({} of {} bytes)",
+                                    p,
+                                    res / 4096,
+                                    pages,
+                                    res.min(sz),
+                                    sz
+                                ));
+                            }
+                            None => self.fail(&alloc::format!(
+                                "fincore: {}: mmap failed",
+                                p
+                            )),
+                        }
+                        ustd::close(fd);
+                    }
+                    Err(e) => self.fail(&alloc::format!(
+                        "fincore: {}: err {}",
+                        p, e
+                    )),
+                }
+            }
+            "journalctl" => {
+                // journalctl [-n N] [-r] [-p substr] — the kernel log ring
+                let mut tail: Option<usize> = None;
+                let mut rev = false;
+                let mut pri: Option<&str> = None;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-n" => {
+                            i += 1;
+                            tail = args.get(i).and_then(|v| v.parse().ok());
+                        }
+                        "-r" => rev = true,
+                        "-p" => {
+                            i += 1;
+                            pri = args.get(i).copied();
+                        }
+                        "-k" | "--no-pager" | "-q" | "-b" => {}
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let mut buf = alloc::vec![0u8; 32 * 1024];
+                let n = ustd::syslog(3, &mut buf);
+                if n <= 0 {
+                    self.emit("(log empty)");
+                } else {
+                    let text = String::from_utf8_lossy(&buf[..n as usize]);
+                    let mut lines: Vec<&str> =
+                        text.lines().filter(|l| !l.is_empty()).collect();
+                    if let Some(p) = pri {
+                        lines.retain(|l| l.contains(p));
+                    }
+                    if rev {
+                        lines.reverse();
+                    }
+                    if let Some(t) = tail {
+                        let keep = if rev {
+                            lines.iter().take(t).cloned().collect::<Vec<_>>()
+                        } else {
+                            lines
+                                .iter()
+                                .skip(lines.len().saturating_sub(t))
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        };
+                        lines = keep;
+                    }
+                    for l in lines {
+                        self.emit(l);
+                    }
+                }
+            }
+            "nstat" => {
+                // name=value kernel net counters, parsed from /proc/net/dev
+                match ustd::read_all("/proc/net/dev") {
+                    Ok(d) => {
+                        let text = String::from_utf8_lossy(&d);
+                        for l in text.lines() {
+                            let Some((iface, rest)) = l.split_once(':') else {
+                                continue;
+                            };
+                            let f: Vec<&str> = rest.split_whitespace().collect();
+                            if f.len() < 10 {
+                                continue;
+                            }
+                            let iface = iface.trim();
+                            for (k, v) in [
+                                ("rx_bytes", f[0]),
+                                ("rx_packets", f[1]),
+                                ("tx_bytes", f[8]),
+                                ("tx_packets", f[9]),
+                            ] {
+                                self.emit(&alloc::format!(
+                                    "{}.{:<16} {}",
+                                    iface,
+                                    k,
+                                    v
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => self.fail(&alloc::format!("nstat: err {}", e)),
+                }
+            }
             "halt" => ustd::poweroff(),
             "tput" => match args.first() {
                 Some(&"cols") => self.emit(&alloc::format!("{}", COLS)),
@@ -36373,6 +36760,8 @@ impl Term {
         "isosize", "sar", "swaps", "fatlabel", "volname", "badblocks",
         "mkisofs", "genisoimage", "xorrisofs", "filefrag", "freefrag",
         "ifstat", "mountpoint", "isols", "isocat", "fatls", "fatget",
+        "openssl", "lsscsi", "ioping", "pidwait", "fincore",
+        "journalctl", "nstat", "busybox",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
