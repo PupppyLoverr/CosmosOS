@@ -5215,6 +5215,14 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::write_all("/proc/net/iptables", b"F IN\n");
         a && has
     });
+    check("trace-tcp", {
+        // `traceroute -T`: real SYN probes. Over lo to :80 the RST
+        // responder answers for the unclaimed port → reached at hop 1.
+        let hops = ustd::net_trace_tcp(0x7F00_0001, 3, 0);
+        hops.first()
+            .map(|(_, h, r)| *r && h.map(|(ip, _)| ip) == Some([127, 0, 0, 1]))
+            .unwrap_or(false)
+    });
 
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {

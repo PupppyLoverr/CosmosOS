@@ -2209,6 +2209,89 @@ pub fn net_trace_icmp(
     hops
 }
 
+/// Match an ICMP time-exceeded quoting one of our TCP SYN probes — same
+/// excerpt layout as `icmp_probe_ports` but accepts proto 6.
+fn icmp_probe_tcp(p: &[u8]) -> Option<(u16, [u8; 4])> {
+    if p.len() < 36 || p[0] != 11 {
+        return None;
+    }
+    let ip = &p[8..];
+    if ip.len() < 20 || ip[0] >> 4 != 4 || ip[9] != 6 {
+        return None;
+    }
+    let ihl = ((ip[0] & 0xF) as usize) * 4;
+    if ip.len() < ihl + 4 {
+        return None;
+    }
+    let sport = be16(&ip[ihl..]);
+    let dport = be16(&ip[ihl + 2..]);
+    if sport != TRACER_SPORT {
+        return None;
+    }
+    let dst: [u8; 4] = ip[16..20].try_into().ok()?;
+    Some((dport, dst))
+}
+
+/// Traceroute over TCP SYN probes (`traceroute -T`): real SYN segments
+/// with rising TTLs toward `dport_probe`. Intermediate hops answer ICMP
+/// time-exceeded quoting the segment; the target answers its own
+/// SYN-ACK or RST (visible on the raw rx stream) — `reached`.
+pub fn net_trace_tcp(
+    dst: [u8; 4],
+    first_hop: u8,
+    max_hops: u8,
+    per_ms: u64,
+    dport_probe: u16,
+    probes: u8,
+) -> Vec<(u8, Option<([u8; 4], u64)>, bool)> {
+    let mut hops = Vec::new();
+    let Some(mac) = next_hop(dst, 1500) else {
+        return hops;
+    };
+    let first = first_hop.max(1).min(30);
+    let probes = probes.max(1).min(10);
+    for ttl in first..=max_hops.min(30).max(first) {
+        let isn = (now_ms() as u32) ^ 0x7ACE_0000;
+        let t0 = now_ms();
+        for _ in 0..probes {
+            send_tcp_ttl(mac, dst, TRACER_SPORT, dport_probe, isn, 0, TCP_SYN, &[], 65535, ttl);
+        }
+        let mut hit: Option<([u8; 4], bool)> = None;
+        while now_ms() - t0 < per_ms && hit.is_none() {
+            for (src_ip, proto, p) in pump_rx() {
+                if proto == 6 {
+                    // The target's own answer (SYN-ACK or RST) to our
+                    // probe port — real tcptraceroute stops here.
+                    if src_ip == dst && p.len() >= 4 && be16(&p[2..]) == TRACER_SPORT {
+                        hit = Some((src_ip, true));
+                        break;
+                    }
+                    dispatch(src_ip, proto, p);
+                    continue;
+                }
+                if proto != 1 {
+                    dispatch(src_ip, proto, p);
+                    continue;
+                }
+                if let Some((dp, odst)) = icmp_probe_tcp(&p) {
+                    if dp == dport_probe && odst == dst {
+                        hit = Some((src_ip, false));
+                    }
+                }
+            }
+            if hit.is_none() {
+                wait_irq();
+            }
+        }
+        let reached = hit.map(|h| h.1).unwrap_or(false);
+        hops.push((ttl, hit.map(|(ip, _)| (ip, now_ms() - t0)), reached));
+        if reached {
+            break;
+        }
+    }
+    hops
+}
+
 fn send_frame(dst: [u8; 6], ethertype: u16, payload: &[u8]) -> Result<(), ()> {
     if !is_up() {
         return Err(()); // interface administratively down
@@ -3010,6 +3093,24 @@ fn send_tcp(
     payload: &[u8],
     win: u16,
 ) {
+    send_tcp_ttl(dst_mac, dst_ip, sport, dport, seq, ack, flags, payload, win, def_ttl())
+}
+
+/// send_tcp with an explicit IP TTL — TCP traceroute probes stamp a
+/// rising TTL like the UDP/ICMP variants.
+#[allow(clippy::too_many_arguments)]
+fn send_tcp_ttl(
+    dst_mac: [u8; 6],
+    dst_ip: [u8; 4],
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+    win: u16,
+    ttl: u8,
+) {
     let mut seg = Vec::with_capacity(20 + payload.len());
     seg.extend_from_slice(&sport.to_be_bytes());
     seg.extend_from_slice(&dport.to_be_bytes());
@@ -3024,7 +3125,7 @@ fn send_tcp(
     let src = if dst_ip[0] == 127 { LOOPBACK_IP } else { our_ip() };
     let c = tcp_csum(src, dst_ip, &seg);
     put16(&mut seg[16..], c);
-    send_ip(dst_mac, dst_ip, 6, &seg);
+    send_ip_src_ttl(src, dst_mac, dst_ip, 6, ttl, &seg);
 }
 
 struct TcpSeg {

@@ -1969,8 +1969,10 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 (a1 >> 8) as u8,
                 a1 as u8,
             ];
-            // a2 packs max_hops in the low byte; bit16 selects ICMP-mode
-            // probes (traceroute -I — echo requests instead of UDP).
+            // a2 packs max_hops in the low byte; a2[16..18) selects the
+            // probe proto: 0 = UDP (-U), 1 = ICMP echo (-I), 2 = TCP
+            // SYN (-T; the base-port field then carries the probe
+            // dport — unset → 80).
             // a5 packs opts: [0..16]=base port (0 → 33434, -p),
             // [16..24]=first hop (-f), [24..56]=per-hop wait ms (-w),
             // [56..64]=probes per hop (-q).
@@ -1980,15 +1982,16 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 v => v.max(50).min(30_000),
             };
             let probes = ((a5 >> 56) as u8).max(1);
-            let base = {
-                let b = (a5 & 0xFFFF) as u16;
-                if b == 0 { 33434 } else { b }
-            };
+            let b16 = (a5 & 0xFFFF) as u16;
+            let base = if b16 == 0 { 33434 } else { b16 };
             let maxh = (a2 as u8).max(1).min(30);
-            let hops = if a2 & (1 << 16) != 0 {
-                net::net_trace_icmp(ip, first, maxh, per, probes)
-            } else {
-                net::net_trace(ip, first, maxh, per, base, probes)
+            let hops = match (a2 >> 16) & 0x3 {
+                1 => net::net_trace_icmp(ip, first, maxh, per, probes),
+                2 => {
+                    let dport = if b16 == 0 { 80 } else { b16 };
+                    net::net_trace_tcp(ip, first, maxh, per, dport, probes)
+                }
+                _ => net::net_trace(ip, first, maxh, per, base, probes),
             };
             let mut buf = alloc::vec::Vec::with_capacity(hops.len() * 16);
             for (ttl, hop, reached) in hops {
