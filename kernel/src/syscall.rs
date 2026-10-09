@@ -1954,7 +1954,13 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 (a1 >> 8) as u8,
                 a1 as u8,
             ];
-            let hops = net::net_trace(ip, (a2 as u8).max(1).min(30), 900);
+            // a2 packs max_hops in the low byte; bit16 selects ICMP-mode
+            // probes (traceroute -I — echo requests instead of UDP).
+            let hops = if a2 & (1 << 16) != 0 {
+                net::net_trace_icmp(ip, (a2 as u8).max(1).min(30), 900)
+            } else {
+                net::net_trace(ip, (a2 as u8).max(1).min(30), 900)
+            };
             let mut buf = alloc::vec::Vec::with_capacity(hops.len() * 16);
             for (ttl, hop, reached) in hops {
                 buf.push(ttl);
