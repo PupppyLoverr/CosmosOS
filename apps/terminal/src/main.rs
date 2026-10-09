@@ -8114,6 +8114,10 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut hlim = String::new();
     let mut hlim_burst = String::new();
     let mut hlim_name = String::new();
+    let mut msocket = false;
+    let mut atype_dst = String::new();
+    let mut atype_src = String::new();
+    let mut rpfilter = false;
     let mut connl_mask = String::from("32");
     let mut snat_ip = String::new();
     let mut limit_pps = 0u64;
@@ -8368,6 +8372,25 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             }
             "--hashlimit-name" => {
                 hlim_name = String::from(args.get(i + 1).copied().unwrap_or("DEFAULT"));
+                i += 1;
+            }
+            // `-m socket` — local-socket association (no arg).
+            "-m" if args.get(i + 1) == Some(&"socket") => {
+                msocket = true;
+                i += 1;
+            }
+            // `-m rpfilter` — reverse-path check (no arg).
+            "-m" if args.get(i + 1) == Some(&"rpfilter") => {
+                rpfilter = true;
+                i += 1;
+            }
+            // `-m addrtype --src-type/--dst-type`.
+            "--dst-type" => {
+                atype_dst = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
+            "--src-type" => {
+                atype_src = String::from(args.get(i + 1).copied().unwrap_or(""));
                 i += 1;
             }
             // `-m connbytes --connbytes N[:M]` — flow byte-total window.
@@ -8659,6 +8682,18 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !pktype.is_empty() {
         line.push_str(&alloc::format!(" pkttype {}", pktype));
+    }
+    if msocket {
+        line.push_str(" msocket");
+    }
+    if !atype_dst.is_empty() {
+        line.push_str(&alloc::format!(" addrtype dst {}", atype_dst));
+    }
+    if !atype_src.is_empty() {
+        line.push_str(&alloc::format!(" addrtype src {}", atype_src));
+    }
+    if rpfilter {
+        line.push_str(" rpfilter");
     }
     if !hlim.is_empty() {
         line.push_str(&alloc::format!(

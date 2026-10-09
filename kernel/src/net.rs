@@ -383,6 +383,10 @@ struct FwRule {
     hlimit_burst: u32,
     hlimit_name: String,
     hlimit_above: bool,   // true = --hashlimit-above (match once over the rate)
+    msocket: bool,        // `-m socket` — packet belongs to a local socket
+    atype_dst: u8,        // `-m addrtype --dst-type` (0 any,1 UNICAST,2 LOCAL,3 BROADCAST,4 MULTICAST)
+    atype_src: u8,        // `--src-type` same map
+    rpfilter: bool,       // `-m rpfilter` — a real route back to src exists
     snat_to: Option<[u8; 4]>, // -j SNAT --to-source (nat POSTROUTING)
     limit_pps: u16,       // 0 = unlimited; `-m limit --limit N/s` cap on rule hits
     comment: String,      // `-m comment --comment` — real per-rule annotation
@@ -885,6 +889,55 @@ fn fw_eval(
             } else {
                 e.0 -= 1.0;
             }
+        }
+        // `-m socket` — the packet is associated with a socket that
+        // exists locally (real transparent-proxy test): TCP checks
+        // the established table + listeners on the local port, UDP
+        // the bound-owner map.
+        if r.msocket {
+            // real xt_socket: on egress the skb's own socket is the
+            // sending one (sport); inbound it's the socket the packet
+            // would be delivered to (dport).
+            let port = if inbound { dport } else { sport };
+            let hit = match proto {
+                6 => TCP_SOCKS.lock().contains_key(&port)
+                    || LISTENERS.lock().contains(&port),
+                // both UDP registries: legacy port-owner map and the
+                // fd-socket object table
+                17 => UDP_OWNERS.lock().contains_key(&port)
+                    || SOCKS.lock().contains_key(&port),
+                _ => false,
+            };
+            if !hit {
+                continue;
+            }
+        }
+        // `-m addrtype` — real address-class match on src/dst.
+        if r.atype_dst != 0 || r.atype_src != 0 {
+            let cls = |ip: [u8; 4]| -> u8 {
+                if ip[0] == 127 || ip == our_ip() {
+                    2 // LOCAL
+                } else if ip == [255, 255, 255, 255]
+                    || (ip[0..3] == our_ip()[0..3] && ip[3] == 255)
+                {
+                    3 // BROADCAST
+                } else if ip[0] >= 224 && ip[0] < 240 {
+                    4 // MULTICAST
+                } else {
+                    1 // UNICAST
+                }
+            };
+            if r.atype_dst != 0 && cls(dst) != r.atype_dst {
+                continue;
+            }
+            if r.atype_src != 0 && cls(src) != r.atype_src {
+                continue;
+            }
+        }
+        // `-m rpfilter` — a real route back to the source must exist
+        // (single-iface box: loose == strict here).
+        if r.rpfilter && route_lookup(src).is_none() {
+            continue;
         }
         // `-m multiport --dports`: real set match on the dest port
         if !r.dports.is_empty() && !r.dports.contains(&dport) {
@@ -1480,6 +1533,30 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
             r.hlimit_pps, r.hlimit_burst, r.hlimit_name
         ));
     }
+    if r.msocket {
+        out.push_str(" -m socket");
+    }
+    let atype_name = |v: u8| match v {
+        2 => "LOCAL",
+        3 => "BROADCAST",
+        4 => "MULTICAST",
+        _ => "UNICAST",
+    };
+    if r.atype_dst != 0 {
+        out.push_str(&alloc::format!(
+            " -m addrtype --dst-type {}",
+            atype_name(r.atype_dst)
+        ));
+    }
+    if r.atype_src != 0 {
+        out.push_str(&alloc::format!(
+            " -m addrtype --src-type {}",
+            atype_name(r.atype_src)
+        ));
+    }
+    if r.rpfilter {
+        out.push_str(" -m rpfilter");
+    }
     if r.limit_pps != 0 {
         out.push_str(&alloc::format!(" -m limit --limit {}/s", r.limit_pps));
         if r.limit_burst != 5 {
@@ -1950,7 +2027,8 @@ fn fw_name_ok(n: &str) -> bool {
         "state", "limit", "lburst", "log", "reject", "accept", "return", "drop",
         "iif", "oif", "sport", "length", "comment", "ttl", "tos", "mac",
         "dscp", "icmpt", "syn", "rset", "rchk", "rupd", "rrem", "rhitc", "sports", "dstrange",
-        "string", "u32", "statnth", "tflags", "quota", "time", "connl",
+        "string", "u32", "statnth", "tflags", "quota", "time", "connl", "ctstate", "connbytes", "ouid", "ogid",
+        "pkttype", "hlimit", "msocket", "addrtype", "rpfilter",
         "snat", "masq",
     ];
     !n.is_empty()
@@ -2379,6 +2457,10 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         hlimit_burst: 0,
         hlimit_name: String::new(),
         hlimit_above: false,
+        msocket: false,
+        atype_dst: 0,
+        atype_src: 0,
+        rpfilter: false,
         snat_to: None,
         limit_pps: 0,
         comment: String::new(),
@@ -2772,6 +2854,27 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
                     "multicast" => 3,
                     _ => 1,
                 };
+            }
+            "msocket" => {
+                r.msocket = true;
+            }
+            "addrtype" => {
+                // `addrtype <src|dst> <UNICAST|LOCAL|BROADCAST|MULTICAST>`
+                let dir = f.next().unwrap_or("dst");
+                let v = match f.next().unwrap_or("") {
+                    "LOCAL" => 2,
+                    "BROADCAST" => 3,
+                    "MULTICAST" => 4,
+                    _ => 1,
+                };
+                if dir == "src" {
+                    r.atype_src = v;
+                } else {
+                    r.atype_dst = v;
+                }
+            }
+            "rpfilter" => {
+                r.rpfilter = true;
             }
             "hlimit" => {
                 // `hlimit <pps> <burst> <name> [above]` — per-src bucket.

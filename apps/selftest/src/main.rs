@@ -5846,6 +5846,84 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::write_all(ipt, b"F\n/\n");
         a1 && p1 && p2 && p3
     });
+    check("ipt-msocket", {
+        // `-m socket` on egress: a UDP sendto from a bound socket
+        // matches (sport is a real socket port). Verified through
+        // real delivery over lo: s1 -> s2 is dropped by the rule,
+        // and an icmp rule can never match (no socket association).
+        let ipt = "/proc/net/iptables";
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let mut ok = false;
+        let s1 = ustd::socket(ustd::SOCK_DGRAM);
+        let s2 = ustd::socket(ustd::SOCK_DGRAM);
+        // a busy ephemeral port just re-rolls: sendto auto-binds, and
+        // any bound port satisfies `-m socket` either way.
+        if s1 >= 0 && s2 >= 0 && ustd::bind(s2, 43333) == 0 {
+            let _ = ustd::bind(s1, 43286);
+            let lo = [127, 0, 0, 1];
+            let a1 = ustd::write_all(ipt, b"A OUTPUT udp msocket drop\n").is_ok();
+            let _ = ustd::sendto(s1, b"ms", lo, 43333);
+            ustd::sleep_ms(60);
+            let blocked = ustd::poll(&[s2 as u32], &[1], 0) == 0;
+            let _ = ustd::write_all(ipt, b"F\n");
+            let _ = ustd::sendto(s1, b"ms", lo, 43333);
+            ustd::sleep_ms(60);
+            // recvfrom pumps the loopback queue before checking —
+            // bare poll() would see the still-queued packet as empty.
+            let mut rb = [0u8; 8];
+            let thru = ustd::recvfrom(s2, &mut rb)
+                .map(|(n, _, _)| n == 2 && rb[0] == b'm')
+                .unwrap_or(false);
+            let a2 = ustd::write_all(ipt, b"A OUTPUT icmp msocket drop\n").is_ok();
+            let open = ustd::net_ping(0x0A00_0202, 1500).is_some();
+            let _ = ustd::write_all(ipt, b"F\n/\n");
+            ok = a1 && blocked && thru && a2 && open;
+            if !ok {
+                println!("[dbg] msocket a1={} blocked={} thru={} a2={} open={}", a1, blocked, thru, a2, open);
+            }
+        }
+        if s1 >= 0 {
+            ustd::close(s1);
+        }
+        if s2 >= 0 {
+            ustd::close(s2);
+        }
+        ok
+    });
+    check("ipt-addrtype", {
+        // `-m addrtype`: inbound echo-replies arrive with src=gw
+        // (UNICAST) and dst=us (LOCAL) — real class matching.
+        let ipt = "/proc/net/iptables";
+        let gw = 0x0A00_0202u32;
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let a1 = ustd::write_all(ipt, b"A INPUT 1 addrtype src UNICAST drop\n").is_ok();
+        let gated = ustd::net_ping(gw, 900).is_none();
+        let _ = ustd::write_all(ipt, b"F\n");
+        let a2 = ustd::write_all(ipt, b"A INPUT 1 addrtype src MULTICAST drop\n").is_ok();
+        let open = ustd::net_ping(gw, 1500).is_some();
+        let _ = ustd::write_all(ipt, b"F\n");
+        let a3 = ustd::write_all(ipt, b"A INPUT 1 addrtype dst LOCAL drop\n").is_ok();
+        let gated2 = ustd::net_ping(gw, 900).is_none();
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        a1 && gated && a2 && open && a3 && gated2
+    });
+    check("ipt-rpfilter", {
+        // `-m rpfilter`: while a route back to the gw exists the rule
+        // matches and drops; with the subnet route gone there's no
+        // route back → no match → accepted.
+        let ipt = "/proc/net/iptables";
+        let gw = 0x0A00_0202u32;
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let a1 = ustd::write_all(ipt, b"A INPUT 1 rpfilter drop\n").is_ok();
+        let gated = ustd::net_ping(gw, 900).is_none();
+        // (a no-match leg would need a packet whose source has no
+        // route back — unreachable here since the default route
+        // covers every slirp peer; the match leg is the honest one)
+        let _ = ustd::write_all(ipt, b"F\n");
+        let open = ustd::net_ping(gw, 1500).is_some();
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        a1 && gated && open
+    });
 
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {
