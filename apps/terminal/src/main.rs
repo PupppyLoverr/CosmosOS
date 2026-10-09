@@ -8101,6 +8101,12 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut u32_spec = String::new();
     let mut stat_every = String::new();
     let mut tflags: Option<(String, String)> = None;
+    let mut quota_n = String::new();
+    let mut time_lo = 0u64;
+    let mut time_hi = 0u64;
+    let mut time_armed = false;
+    let mut connl_n = String::new();
+    let mut connl_mask = String::from("32");
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
     let mut jump = "DROP";
@@ -8279,6 +8285,44 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 }
                 tflags = Some((m, c));
                 i += 2;
+            }
+            // `-m quota --quota <bytes>` — rule stops matching once
+            // its byte budget is spent.
+            "--quota" => {
+                quota_n = String::from(args.get(i + 1).copied().unwrap_or("0"));
+                i += 1;
+            }
+            // `-m time --datestart/--datestop <iso|@secs|secs>` —
+            // real wall-clock window; each side independent.
+            "--datestart" => {
+                match args.get(i + 1).and_then(|t| parse_date_spec(t)) {
+                    Some(secs) => {
+                        time_lo = secs;
+                        time_armed = true;
+                    }
+                    None => return None,
+                }
+                i += 1;
+            }
+            "--datestop" => {
+                match args.get(i + 1).and_then(|t| parse_date_spec(t)) {
+                    Some(secs) => {
+                        time_hi = secs;
+                        time_armed = true;
+                    }
+                    None => return None,
+                }
+                i += 1;
+            }
+            // `-m connlimit --connlimit-above N --connlimit-mask M` —
+            // per-src concurrent-flow cap.
+            "--connlimit-above" => {
+                connl_n = String::from(args.get(i + 1).copied().unwrap_or("0"));
+                i += 1;
+            }
+            "--connlimit-mask" => {
+                connl_mask = String::from(args.get(i + 1).copied().unwrap_or("32"));
+                i += 1;
             }
             // `-m icmp --icmp-type <name|n>` — real ICMP-type match;
             // names map to their real type codes.
@@ -8523,6 +8567,15 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if let Some((m, c)) = &tflags {
         line.push_str(&alloc::format!(" tflags {} {}", m, c));
+    }
+    if !quota_n.is_empty() {
+        line.push_str(&alloc::format!(" quota {}", quota_n));
+    }
+    if time_armed {
+        line.push_str(&alloc::format!(" time {} {}", time_lo, time_hi));
+    }
+    if !connl_n.is_empty() {
+        line.push_str(&alloc::format!(" connl {} {}", connl_n, connl_mask));
     }
     if !iif.is_empty() {
         line.push_str(&alloc::format!(" iif {}", iif));

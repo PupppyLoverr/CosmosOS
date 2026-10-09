@@ -367,6 +367,12 @@ struct FwRule {
     stat_seen: u64,       // packets counted so far for nth
     tf_mask: u8,          // `-m tcp --tcp-flags` mask (0 = unused)
     tf_comp: u8,
+    quota: u64,           // `-m quota --quota N` remaining byte budget (u64::MAX = unused)
+    time_set: bool,       // `-m time` window armed
+    time_lo: u64,         // --datestart unix secs (0 = open)
+    time_hi: u64,         // --datestop unix secs (0 = open)
+    connl_n: u32,         // `-m connlimit --connlimit-above N` (u32::MAX = unused)
+    connl_mask: u8,       // --connlimit-mask bits
     limit_pps: u16,       // 0 = unlimited; `-m limit --limit N/s` cap on rule hits
     comment: String,      // `-m comment --comment` — real per-rule annotation
     limit_burst: u16,     // bucket depth (real iptables default 5)
@@ -723,6 +729,44 @@ fn fw_eval(
                 continue;
             }
             if pl[13] & r.tf_mask != r.tf_comp {
+                continue;
+            }
+        }
+        // `-m quota --quota N`: every matching packet debits its
+        // length from the rule's byte budget; at zero the rule
+        // stops matching (the real xt_quota semantics).
+        if r.quota != u64::MAX {
+            if r.quota == 0 {
+                continue;
+            }
+            r.quota = r.quota.saturating_sub(plen);
+        }
+        // `-m time --datestart/--datestop`: real wall-clock window
+        // match against the RTC (unix seconds).
+        if r.time_set {
+            let now = crate::vfs::now_unix();
+            if (r.time_lo != 0 && now < r.time_lo)
+                || (r.time_hi != 0 && now > r.time_hi)
+            {
+                continue;
+            }
+        }
+        // `-m connlimit --connlimit-above N --connlimit-mask M`:
+        // count live CT flows whose EITHER side's masked src equals
+        // this packet's masked src; match while count > N.
+        if r.connl_n != u32::MAX {
+            let sh = 32u8.saturating_sub(r.connl_mask.min(32));
+            let m = if sh >= 32 { 0 } else { !0u32 << sh };
+            let ipm = u32::from_be_bytes(src) & m;
+            let c = CT
+                .lock()
+                .iter()
+                .filter(|e| {
+                    u32::from_be_bytes(e.a_ip) & m == ipm
+                        || u32::from_be_bytes(e.b_ip) & m == ipm
+                })
+                .count() as u32;
+            if c <= r.connl_n {
                 continue;
             }
         }
@@ -1151,6 +1195,23 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
             names(r.tf_mask), names(r.tf_comp)
         ));
     }
+    if r.quota != u64::MAX {
+        out.push_str(&alloc::format!(" -m quota --quota {}", r.quota));
+    }
+    if r.time_set {
+        if r.time_lo != 0 {
+            out.push_str(&alloc::format!(" -m time --datestart {}", r.time_lo));
+        }
+        if r.time_hi != 0 {
+            out.push_str(&alloc::format!(" --datestop {}", r.time_hi));
+        }
+    }
+    if r.connl_n != u32::MAX {
+        out.push_str(&alloc::format!(
+            " -m connlimit --connlimit-above {} --connlimit-mask {}",
+            r.connl_n, r.connl_mask
+        ));
+    }
     if r.limit_pps != 0 {
         out.push_str(&alloc::format!(" -m limit --limit {}/s", r.limit_pps));
         if r.limit_burst != 5 {
@@ -1325,6 +1386,21 @@ fn fmt_fw_rule(out: &mut String, i: usize, r: &FwRule) {
         extra.push_str(&alloc::format!(
             "  tcp flags:0x{:02x}/0x{:02x}",
             r.tf_mask, r.tf_comp
+        ));
+    }
+    if r.quota != u64::MAX {
+        extra.push_str(&alloc::format!("  quota: {} bytes left", r.quota));
+    }
+    if r.time_set {
+        extra.push_str(&alloc::format!(
+            "  TIME from {} to {}",
+            r.time_lo, r.time_hi
+        ));
+    }
+    if r.connl_n != u32::MAX {
+        extra.push_str(&alloc::format!(
+            "  connlimit above {} mask {}",
+            r.connl_n, r.connl_mask
         ));
     }
     if r.len_hi != 0 {
@@ -1592,7 +1668,7 @@ fn fw_name_ok(n: &str) -> bool {
         "state", "limit", "lburst", "log", "reject", "accept", "return", "drop",
         "iif", "oif", "sport", "length", "comment", "ttl", "tos", "mac",
         "dscp", "icmpt", "syn", "rset", "rchk", "rupd", "sports", "dstrange",
-        "string", "u32", "statnth", "tflags",
+        "string", "u32", "statnth", "tflags", "quota", "time", "connl",
     ];
     !n.is_empty()
         && n.len() <= 28
@@ -1994,6 +2070,12 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         stat_seen: 0,
         tf_mask: 0,
         tf_comp: 0,
+        quota: u64::MAX,
+        time_set: false,
+        time_lo: 0,
+        time_hi: 0,
+        connl_n: u32::MAX,
+        connl_mask: 32,
         limit_pps: 0,
         comment: String::new(),
         limit_burst: 5,
@@ -2347,6 +2429,23 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
                     r.tf_comp = c;
                 }
             }
+            // `-m quota --quota <bytes>` — wire `quota <n>`.
+            "quota" => {
+                r.quota = f.next().unwrap_or("0").parse().unwrap_or(0);
+            }
+            // `-m time --datestart/--datestop` — wire
+            // `time <lo_secs> <hi_secs>` (0 = open bound).
+            "time" => {
+                r.time_set = true;
+                r.time_lo = f.next().unwrap_or("0").parse().unwrap_or(0);
+                r.time_hi = f.next().unwrap_or("0").parse().unwrap_or(0);
+            }
+            // `-m connlimit --connlimit-above N --connlimit-mask M` —
+            // wire `connl <n> <mask>`.
+            "connl" => {
+                r.connl_n = f.next().unwrap_or("0").parse().unwrap_or(0);
+                r.connl_mask = f.next().unwrap_or("32").parse().unwrap_or(32);
+            }
             "log" => r.target = 1,    // "... log" marks -j LOG
             "reject" => r.target = 2, // -j REJECT: refusal goes back
             "accept" => r.target = 3, // -j ACCEPT: terminal allow
@@ -2392,6 +2491,12 @@ fn fw_rule_eq(a: &FwRule, b: &FwRule) -> bool {
         && a.stat_every == b.stat_every
         && a.tf_mask == b.tf_mask
         && a.tf_comp == b.tf_comp
+        && (a.quota == u64::MAX) == (b.quota == u64::MAX)
+        && a.time_set == b.time_set
+        && a.time_lo == b.time_lo
+        && a.time_hi == b.time_hi
+        && a.connl_n == b.connl_n
+        && a.connl_mask == b.connl_mask
         && a.state == b.state
         && a.ttl_mode == b.ttl_mode
         && a.ttl_v == b.ttl_v
