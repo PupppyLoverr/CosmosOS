@@ -233,6 +233,41 @@ pub fn set_tcp_wmem(lo: u64, def: u64, max: u64) -> bool {
     TCP_WMEM_MAX.store(max, Ordering::Relaxed);
     true
 }
+static RP_FILTER: AtomicU64 = AtomicU64::new(0);
+static LOG_MARTIANS: AtomicU64 = AtomicU64::new(0);
+static IP_NONLOCAL_BIND: AtomicU64 = AtomicU64::new(0);
+
+/// net.ipv4.conf.all.rp_filter — 0 off, 1 strict, 2 loose. Wire frames
+/// whose source is martian (127/8, multicast-class, our own addr, or —
+/// strict only — unrouteable back out eth0) are dropped at ingress.
+pub fn rp_filter() -> u64 {
+    RP_FILTER.load(Ordering::Relaxed)
+}
+pub fn set_rp_filter(v: u64) -> bool {
+    if v > 2 {
+        return false;
+    }
+    RP_FILTER.store(v, Ordering::Relaxed);
+    true
+}
+/// net.ipv4.conf.all.log_martians — log each martian drop to klog.
+pub fn log_martians() -> u64 {
+    LOG_MARTIANS.load(Ordering::Relaxed)
+}
+pub fn set_log_martians(v: u64) -> bool {
+    LOG_MARTIANS.store(v & 1, Ordering::Relaxed);
+    true
+}
+/// net.ipv4.ip_nonlocal_bind — bind()/connect source addresses that
+/// aren't ours no longer fail EADDRNOTAVAIL when set.
+pub fn ip_nonlocal_bind() -> u64 {
+    IP_NONLOCAL_BIND.load(Ordering::Relaxed)
+}
+pub fn set_ip_nonlocal_bind(v: u64) -> bool {
+    IP_NONLOCAL_BIND.store(v & 1, Ordering::Relaxed);
+    true
+}
+
 /// net.ipv4.tcp_rmem: [2] is the real byte ceiling backing rx_win —
 /// the advertised receive window = rmem_max - queued bytes, and tcp_feed
 /// drops data past the cap (real overflow behavior).
@@ -310,6 +345,9 @@ pub fn get(name: &str) -> Option<u64> {
         "user/max_ipc_namespaces" => IPC_NS_MAX.load(Ordering::Relaxed),
         "user/max_time_namespaces" => TIME_NS_MAX.load(Ordering::Relaxed),
         "net/netfilter/nf_conntrack_max" => NF_CT_MAX.load(Ordering::Relaxed),
+        "net/ipv4/conf/all/rp_filter" => RP_FILTER.load(Ordering::Relaxed),
+        "net/ipv4/conf/all/log_martians" => LOG_MARTIANS.load(Ordering::Relaxed),
+        "net/ipv4/ip_nonlocal_bind" => IP_NONLOCAL_BIND.load(Ordering::Relaxed),
 
         _ => return None,
     })
@@ -395,6 +433,15 @@ pub fn set(name: &str, v: u64) -> bool {
         }
         "net/netfilter/nf_conntrack_max" if (1..=4194304).contains(&v) => {
             NF_CT_MAX.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/conf/all/rp_filter" if v <= 2 => {
+            RP_FILTER.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/conf/all/log_martians" if v <= 1 => {
+            LOG_MARTIANS.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/ip_nonlocal_bind" if v <= 1 => {
+            IP_NONLOCAL_BIND.store(v, Ordering::Relaxed)
         }
 
         _ => return false,

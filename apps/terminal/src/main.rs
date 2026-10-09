@@ -7778,6 +7778,29 @@ fn dns_read_name(pkt: &[u8], pos: usize, depth: usize) -> Option<(String, usize)
 
 /// Real dig: build a wire-format DNS query, send it through UdpSock,
 /// parse the answer section. Returns display lines.
+/// `nc -o` sink: append one hex-dump record (`>` sent / `<` received),
+/// 16 bytes per line like netcat's own conversation dump.
+fn nc_log(path: &str, dir: u8, data: &[u8]) {
+    let Ok(fd) = ustd::open(path, ustd::O_WRONLY | ustd::O_CREATE | ustd::O_APPEND)
+    else {
+        return;
+    };
+    let mut rec = Vec::new();
+    for chunk in data.chunks(16) {
+        rec.push(dir);
+        rec.push(b' ');
+        for (i, b) in chunk.iter().enumerate() {
+            if i > 0 {
+                rec.push(b' ');
+            }
+            rec.extend_from_slice(alloc::format!("{:02x}", b).as_bytes());
+        }
+        rec.push(b'\n');
+    }
+    let _ = ustd::write(fd, &rec);
+    ustd::close(fd);
+}
+
 fn dig_query(name: &str, qtype: u16, use_tcp: bool) -> Result<Vec<String>, String> {
     dig_query_to(name, qtype, use_tcp, 3000, 1)
 }
@@ -9941,6 +9964,7 @@ struct Term {
     httpd_conn: Option<(ustd::TcpSock, [u8; 4], u16, u64, u32)>,
     nc: Option<ustd::TcpSock>,                         // `nc <ip> <port>` raw session
     nc_crlf: bool,                                     // `nc -C`: Enter sends \r\n (CRLF EOL)
+    nc_out: Option<String>,                            // `nc -o <f>`: hex-dump log of the session
     nc_listen: Option<ustd::TcpListener>,              // `nc -l <port>` waiting for a client
     nc_udp: Option<(ustd::UdpSock, Option<([u8; 4], u16)>)>, // `nc -u`/`-lu` UDP session (peer learned)
     nc_keep: Option<u16>,                                  // `nc -l -k`: re-arm the listen port after disconnect
@@ -25414,6 +25438,14 @@ impl Term {
             "nc" => {
                 // -C: real CRLF line endings on send (netcat -C).
                 self.nc_crlf = args.iter().any(|a| *a == "-C");
+                // -o <file>: netcat-style hex dump of the session —
+                // every sent and received chunk is logged with a >/<
+                // direction marker, like tcpdump's conversation log.
+                self.nc_out = args
+                    .iter()
+                    .position(|a| *a == "-o")
+                    .and_then(|i| args.get(i + 1))
+                    .map(|s| String::from(*s));
                 let zmode = args.iter().any(|a| a == &"-z" || a == &"-zv" || a == &"-vz");
                 let udp = args
                     .iter()
@@ -25454,7 +25486,7 @@ impl Term {
                                 skip = false;
                                 return false;
                             }
-                            if **a == "-w" || **a == "-p" || **a == "-s" {
+                            if **a == "-w" || **a == "-p" || **a == "-s" || **a == "-o" {
                                 skip = true;
                                 return false;
                             }
@@ -25566,8 +25598,16 @@ impl Term {
                         (Some(ip), Some(port)) => {
                             let me = ustd::net_info().map(|(_, i)| i).unwrap_or([0; 4]);
                             let mut bind_ok = true;
+                            // net.ipv4.ip_nonlocal_bind: the kernel
+                            // honors a non-local bind instead of
+                            // EADDRNOTAVAIL when the knob is set.
+                            let nonlocal = ustd::read_all(
+                                "/proc/sys/net/ipv4/ip_nonlocal_bind",
+                            )
+                            .map(|d| String::from_utf8_lossy(&d).trim() == "1")
+                            .unwrap_or(false);
                             if let Some(s) = src_ip {
-                                if s != me && s[0] != 127 {
+                                if !nonlocal && s != me && s[0] != 127 {
                                     self.fail(&alloc::format!(
                                         "nc: connect to {}.{}.{}.{} port {}: Can't assign requested address",
                                         ip[0], ip[1], ip[2], ip[3], port
@@ -38480,6 +38520,9 @@ impl Term {
                     "/proc/sys/kernel/domainname",
                     "/proc/sys/net/ipv4/tcp_wmem",
                     "/proc/sys/net/ipv4/tcp_rmem",
+                    "/proc/sys/net/ipv4/ip_nonlocal_bind",
+                    "/proc/sys/net/ipv4/conf/all/rp_filter",
+                    "/proc/sys/net/ipv4/conf/all/log_martians",
                     "/proc/sys/net/netfilter/nf_conntrack_max",
                 ];
                 // `-N` prints names only, `-n`/`--values` values only —
@@ -43161,21 +43204,31 @@ impl Term {
                 }
                 x if x == KeyCode::Enter as u32 => {
                     // real nc: bare LF on Enter; -C sends CRLF.
-                    let _ = s.send(if self.nc_crlf {
-                        b"\r\n" as &[u8]
+                    let b: &[u8] = if self.nc_crlf {
+                        b"\r\n"
                     } else {
                         b"\n"
-                    });
+                    };
+                    let _ = s.send(b);
+                    if let Some(p) = &self.nc_out {
+                        nc_log(p, b'>', b);
+                    }
                     self.cur.clear();
                     self.cx = 0;
                 }
                 x if x == KeyCode::Backspace as u32 => {
                     let _ = s.send(&[0x7f]);
+                    if let Some(p) = &self.nc_out {
+                        nc_log(p, b'>', &[0x7f]);
+                    }
                     self.cur.pop();
                     self.cx = self.cx.saturating_sub(1);
                 }
                 x if x == KeyCode::Char as u32 => {
                     let _ = s.send(&[k.chr]);
+                    if let Some(p) = &self.nc_out {
+                        nc_log(p, b'>', &[k.chr]);
+                    }
                     self.cur.push(k.chr as char);
                     self.cx += 1;
                 }
@@ -45236,6 +45289,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         httpd_conn: None,
         nc: None,
         nc_crlf: false,
+        nc_out: None,
         nc_listen: None,
         nc_udp: None,
         nc_keep: None,
@@ -45726,6 +45780,9 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 match d {
                     Some(d) => {
                         got = true;
+                        if let Some(path) = &t.nc_out {
+                            nc_log(path, b'<', &d);
+                        }
                         let txt = String::from_utf8_lossy(&d);
                         for l in txt.split('\n') {
                             t.push_line(l.trim_end_matches('\r'));
