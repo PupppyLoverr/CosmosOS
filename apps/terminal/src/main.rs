@@ -8024,6 +8024,64 @@ fn now_str() -> String {
     )
 }
 
+/// Translate `-A INPUT -p proto [-s src[/plen]] [--dport n] -j DROP` style
+/// args into a kernel firewall ctl line: "A <proto_num> [dport N] [src x]".
+fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
+    let mut proto = 0u8;
+    let mut src = String::new();
+    let mut dport = 0u16;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i] {
+            "-p" | "--proto" | "--protocol" => {
+                let p = args.get(i + 1).copied().unwrap_or("*");
+                proto = match p {
+                    "*" | "all" => 0,
+                    "icmp" => 1,
+                    "tcp" => 6,
+                    "udp" => 17,
+                    s => s.parse::<u8>().unwrap_or(255),
+                };
+                i += 1;
+            }
+            "-s" | "--src" | "--source" => {
+                src = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
+            "--dport" | "--destination-port" | "--sport" => {
+                dport = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(0);
+                i += 1;
+            }
+            "-j" | "--jump" => {
+                let t = args.get(i + 1).copied().unwrap_or("DROP");
+                if t != "DROP" {
+                    return None; // only DROP targets are real
+                }
+                i += 1;
+            }
+            "-A" | "-I" | "-D" | "INPUT" | "OUTPUT" | "FORWARD" | "-i" | "-o" => {
+                if args[i] == "-i" || args[i] == "-o" {
+                    i += 1; // interface arg — single nic, ignored
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let mut line = alloc::format!("A {}", proto);
+    if dport != 0 {
+        line.push_str(&alloc::format!(" dport {}", dport));
+    }
+    if !src.is_empty() {
+        line.push_str(&alloc::format!(" src {}", src));
+    }
+    line.push('\n');
+    Some(line)
+}
+
 /// POSIX `od -t a` display name for one byte: 3-char control names,
 /// ' sp' for space, the graphic char itself when printable, octal else.
 /// Minimal Itanium C++ ABI demangler: `_Z` symbols with
@@ -12933,6 +12991,80 @@ impl Term {
                 v.extend(args.iter().map(|s| String::from(*s)));
                 owned_args = Some(v);
                 cmd = "ls";
+            }
+            // pass-through alias table: cmd -> (target, prefix flags)
+            "ll" | "la" | "l" | "tailf" | "hd" | "ex" | "fatrace" | "telnet"
+            | "rlogin" | "rsh" | "pg" | "zmore" | "zless" | "most" | "dhclient"
+            | "udhcpc" | "dhcpcd" | "dnsdomainname" | "nisdomainname"
+            | "ypdomainname" | "dosfsck" | "fsck.fat" | "fsck.msdos"
+            | "mkdosfs" | "mkfs.fat" | "mkfs.msdos" | "bindfs" | "wl-copy"
+            | "wl-paste" | "pbcopy" | "pbpaste" | "htop" | "btop" | "glances"
+            | "atop" | "nmon" | "gtop" | "gdb" | "lldb" | "delve" | "dash"
+            | "ksh" | "zsh" | "csh" | "tcsh" | "fish" | "bash" | "rksh"
+            | "yash" | "nawk" | "mawk" | "gawk" | "bwk" | "oawk" | "rg"
+            | "ag" | "ack" | "nmap" | "masscan" | "fping" | "tracepath"
+            | "tracert" | "hping" | "ipconfig" | "iwconfig" | "info"
+            | "exiftool" | "mediainfo" | "pdfinfo" | "tethereal" | "rawshark"
+            | "lastcomm" | "rusers" | "rwho" | "gcal" | "ncal" | "md5"
+            | "sha1" | "sha256" | "sha512" | "mpg123" | "mplayer" | "ffplay"
+            | "ogg123" | "recode" | "detox" | "dos2unix" | "unix2dos"
+            | "ifup" | "ifdown" | "runlevel2" | "xvt" | "konsole"
+            | "gnome-terminal" | "alacritty" | "kitty" | "st" | "urxvt"
+            | "kitty-term" => {
+                let (target, flags): (&str, &[&str]) = match cmd {
+                    "ll" => ("ls", &["-l"]),
+                    "la" => ("ls", &["-a"]),
+                    "l" => ("ls", &[]),
+                    "tailf" => ("tail", &["-f"]),
+                    "hd" => ("od", &["-A", "x", "-t", "x1z"]),
+                    "ex" => ("ed", &[]),
+                    "fatrace" => ("inotifywait", &["-m"]),
+                    "telnet" | "rlogin" | "rsh" => ("nc", &[]),
+                    "pg" | "zmore" | "zless" | "most" => ("more", &[]),
+                    "dhclient" | "udhcpc" | "dhcpcd" => ("dhcp", &[]),
+                    "dnsdomainname" | "nisdomainname" | "ypdomainname" => {
+                        ("domainname", &[])
+                    }
+                    "dosfsck" | "fsck.fat" | "fsck.msdos" => ("fsck.vfat", &[]),
+                    "mkdosfs" | "mkfs.fat" | "mkfs.msdos" => ("mkfs.vfat", &[]),
+                    "bindfs" => ("mount", &["-o", "bind"]),
+                    "wl-copy" | "pbcopy" => ("xclip", &["-i"]),
+                    "wl-paste" | "pbpaste" => ("xclip", &["-o"]),
+                    "htop" | "btop" | "glances" | "atop" | "nmon" | "gtop" => {
+                        ("top", &[])
+                    }
+                    "gdb" | "lldb" | "delve" => ("dbg", &[]),
+                    "dash" | "ksh" | "zsh" | "csh" | "tcsh" | "fish" | "bash"
+                    | "rksh" | "yash" => ("sh", &[]),
+                    "nawk" | "mawk" | "gawk" | "bwk" | "oawk" => ("awk", &[]),
+                    "rg" | "ag" | "ack" => ("grep", &["-r"]),
+                    "nmap" | "masscan" => ("portscan", &[]),
+                    "fping" => ("ping", &["-c", "1"]),
+                    "tracepath" | "tracert" | "hping" => ("traceroute", &[]),
+                    "ipconfig" | "iwconfig" | "ifup" | "ifdown" => {
+                        ("ifconfig", &[])
+                    }
+                    "info" => ("man", &[]),
+                    "exiftool" | "mediainfo" | "pdfinfo" => ("identify", &[]),
+                    "tethereal" | "rawshark" => ("tshark", &[]),
+                    "lastcomm" | "rusers" | "rwho" => ("who", &[]),
+                    "gcal" | "ncal" => ("cal", &[]),
+                    "md5" => ("md5sum", &[]),
+                    "sha1" => ("sha1sum", &[]),
+                    "sha256" => ("sha256sum", &[]),
+                    "sha512" => ("sha512sum", &[]),
+                    "mpg123" | "mplayer" | "ffplay" | "ogg123" => ("play", &[]),
+                    "recode" => ("iconv", &[]),
+                    "detox" => ("rename", &[]),
+                    "dos2unix" | "unix2dos" => ("iconv", &[]),
+                    "xvt" | "konsole" | "gnome-terminal" | "alacritty" | "kitty"
+                    | "st" | "urxvt" | "kitty-term" => ("xterm", &[]),
+                    _ => ("ls", &[]),
+                };
+                let mut v: Vec<String> = flags.iter().map(|s| String::from(*s)).collect();
+                v.extend(args.iter().map(|s| String::from(*s)));
+                owned_args = Some(v);
+                cmd = target;
             }
             _ => {}
         }
@@ -33638,7 +33770,9 @@ impl Term {
                     }
                 }
             }
-            "vi" | "nano" => {
+            "vi" | "nano" | "vim" | "nvim" | "pico" | "micro" | "ee" | "mg"
+            | "zile" | "emacs" | "edit" | "notepad" | "gedit" | "mousepad"
+            | "kate" | "joe" | "ne" | "subl" | "code" | "atom" | "nano2" => {
                 // real screen editor: opens cosmos-editor on the file
                 let f = args.iter().copied().find(|a| !a.starts_with('-')).unwrap_or("");
                 match ustd::spawn("/bin/cosmos-editor", f) {
@@ -33775,6 +33909,952 @@ impl Term {
                             self.emit(line);
                         }
                     }
+                }
+            }
+            // ---- batch 146: firewall + system utilities ----
+            "iptables" => {
+                // Real INPUT-chain firewall backed by /proc/net/iptables.
+                // -L/-n/-v | -F | -P INPUT ACCEPT|DROP | -D INPUT n |
+                // -A INPUT [-p proto] [-s ip[/plen]] [--dport n] -j DROP
+                let first = args.first().copied().unwrap_or("");
+                if first.is_empty()
+                    || matches!(first, "-L" | "--list" | "-S" | "--list-rules" | "-n" | "-v" | "-nv" | "-vn")
+                {
+                    match ustd::read_all("/proc/net/iptables") {
+                        Ok(b) => {
+                            if first == "-S" || first == "--list-rules" {
+                                let t = String::from_utf8_lossy(&b);
+                                self.emit("-P INPUT ACCEPT");
+                                for l in t.lines().skip(2) {
+                                    let mut it = l.split_whitespace();
+                                    let _num = it.next();
+                                    let _pkts = it.next();
+                                    let tgt = it.next().unwrap_or("DROP");
+                                    let prot = it.next().unwrap_or("all");
+                                    let srcip = it.next().unwrap_or("0.0.0.0/0");
+                                    let _dst = it.next();
+                                    let mut ln = alloc::format!(
+                                        "-A INPUT -p {}",
+                                        if prot == "all" { "*" } else { prot }
+                                    );
+                                    if srcip != "0.0.0.0/0" && srcip != "anywhere" {
+                                        ln.push_str(&alloc::format!(" -s {}", srcip));
+                                    }
+                                    for w in it {
+                                        if let Some(dp) = w.strip_prefix("dpt:") {
+                                            ln.push_str(&alloc::format!(" --dport {}", dp));
+                                        }
+                                    }
+                                    ln.push_str(&alloc::format!(" -j {}", tgt));
+                                    self.emit(&ln);
+                                }
+                            } else {
+                                self.emit_bin(&b);
+                            }
+                        }
+                        Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
+                    }
+                } else if first == "-F" || first == "--flush" {
+                    match ustd::write_all("/proc/net/iptables", b"F\n") {
+                        Ok(_) => self.emit("iptables: rules flushed"),
+                        Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
+                    }
+                } else if first == "-P" || first == "--policy" {
+                    let verdict = args
+                        .iter()
+                        .copied()
+                        .skip(1)
+                        .find(|a| *a == "DROP" || *a == "ACCEPT")
+                        .unwrap_or("");
+                    if !verdict.is_empty() {
+                        let line = alloc::format!("P {}\n", verdict);
+                        match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
+                            Ok(_) => self.emit(&alloc::format!(
+                                "Chain INPUT (policy {})",
+                                verdict
+                            )),
+                            Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
+                        }
+                    } else {
+                        self.fail("usage: iptables -P INPUT ACCEPT|DROP");
+                    }
+                } else if first == "-D" || first == "--delete" {
+                    let n = args
+                        .iter()
+                        .copied()
+                        .skip(1)
+                        .find(|a| a.parse::<usize>().is_ok());
+                    match n {
+                        Some(n) => {
+                            let line = alloc::format!("D {}\n", n);
+                            match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
+                                Ok(_) => self.emit(&alloc::format!("rule {} deleted", n)),
+                                Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
+                            }
+                        }
+                        None => self.fail("usage: iptables -D INPUT <rulenum>"),
+                    }
+                } else if first == "-A" || first == "--append" || first == "-I" {
+                    match ipt_rule_from_args(&args[1..]) {
+                        Some(line) => {
+                            match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
+                                Ok(_) => self.emit("rule added to INPUT"),
+                                Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
+                            }
+                        }
+                        None => self.fail("iptables: only -j DROP targets are supported"),
+                    }
+                } else {
+                    self.fail(
+                        "usage: iptables -L | -F | -P INPUT v | -D INPUT n | -A INPUT .. -j DROP",
+                    );
+                }
+            }
+            "iptables-save" => {
+                // emits *filter restore-format: :INPUT policy + -A lines + COMMIT
+                match ustd::read_all("/proc/net/iptables") {
+                    Ok(b) => {
+                        self.emit("# Generated by iptables-save");
+                        self.emit("*filter");
+                        let t = String::from_utf8_lossy(&b);
+                        self.emit(":INPUT ACCEPT [0:0]");
+                        for l in t.lines().skip(2) {
+                            let mut it = l.split_whitespace();
+                            let _num = it.next();
+                            let _pkts = it.next();
+                            let tgt = it.next().unwrap_or("DROP");
+                            let prot = it.next().unwrap_or("all");
+                            let srcip = it.next().unwrap_or("0.0.0.0/0");
+                            let _dst = it.next();
+                            let mut ln = alloc::format!(
+                                "-A INPUT -p {}",
+                                if prot == "all" { "*" } else { prot }
+                            );
+                            if srcip != "0.0.0.0/0" && srcip != "anywhere" {
+                                ln.push_str(&alloc::format!(" -s {}", srcip));
+                            }
+                            for w in it {
+                                if let Some(dp) = w.strip_prefix("dpt:") {
+                                    ln.push_str(&alloc::format!(" --dport {}", dp));
+                                }
+                            }
+                            ln.push_str(&alloc::format!(" -j {}", tgt));
+                            self.emit(&ln);
+                        }
+                        self.emit("COMMIT");
+                        self.emit("# Completed");
+                    }
+                    Err(e) => self.fail(&alloc::format!("iptables-save: {}", e)),
+                }
+            }
+            "iptables-restore" => {
+                // restores rules from a *filter file (stdin or path arg)
+                let text = if let Some(inp) = self.pipe_in.take() {
+                    inp
+                } else {
+                    match args.first() {
+                        Some(p) => match ustd::read_all(p) {
+                            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                            Err(e) => {
+                                self.fail(&alloc::format!("iptables-restore: {}: {}", p, e));
+                                String::new()
+                            }
+                        },
+                        None => {
+                            self.fail("usage: iptables-restore <file> | iptables-save | iptables-restore");
+                            String::new()
+                        }
+                    }
+                };
+                let mut n = 0u32;
+                let mut bad = 0u32;
+                for l in text.lines() {
+                    let l = l.trim();
+                    if l.is_empty()
+                        || l.starts_with('#')
+                        || l == "COMMIT"
+                        || l.starts_with('*')
+                    {
+                        continue;
+                    }
+                    let toks: Vec<&str> = l.split_whitespace().collect();
+                    if toks.first() == Some(&":INPUT") {
+                        continue;
+                    }
+                    if toks.first() == Some(&"-A") || toks.first() == Some(&"-I") {
+                        match ipt_rule_from_args(&toks[1..]) {
+                            Some(line) => {
+                                if ustd::write_all("/proc/net/iptables", line.as_bytes())
+                                    .is_ok()
+                                {
+                                    n += 1;
+                                } else {
+                                    bad += 1;
+                                }
+                            }
+                            None => bad += 1,
+                        }
+                    } else if toks.first() == Some(&"-F") {
+                        let _ = ustd::write_all("/proc/net/iptables", b"F\n");
+                    } else if toks.first() == Some(&"-P") {
+                        if let Some(v) = toks.iter().find(|a| **a == "DROP" || **a == "ACCEPT")
+                        {
+                            let line = alloc::format!("P {}\n", v);
+                            let _ = ustd::write_all("/proc/net/iptables", line.as_bytes());
+                        }
+                    }
+                }
+                self.emit(&alloc::format!("{} rule(s) restored{}", n,
+                    if bad > 0 { alloc::format!(", {} rejected", bad) } else { String::new() }));
+            }
+            "sponge" => {
+                // soak up all piped input then write it out at once
+                match args.first() {
+                    Some(p) => match self.pipe_in.take() {
+                        Some(inp) => match ustd::write_all(p, inp.as_bytes()) {
+                            Ok(_) => self.emit(&alloc::format!("{}: {} bytes", p, inp.len())),
+                            Err(e) => self.fail(&alloc::format!("sponge: {}: {}", p, e)),
+                        },
+                        None => self.fail("sponge: needs piped input"),
+                    },
+                    None => self.fail("usage: cmd | sponge <file>"),
+                }
+            }
+            "oathtool" => {
+                // oathtool [--totp|-t] [--hotp|-h <ctr>] [-b] KEY — real
+                // HMAC-SHA1 OTP over the kernel clock
+                fn b32dec(s: &str) -> Option<Vec<u8>> {
+                    let mut bits = 0u32;
+                    let mut acc = 0u64;
+                    let mut out = Vec::new();
+                    for c in s.to_ascii_uppercase().chars() {
+                        let v = match c {
+                            'A'..='Z' => c as u64 - 'A' as u64,
+                            '2'..='7' => c as u64 - '2' as u64 + 26,
+                            '=' | ' ' => continue,
+                            _ => return None,
+                        };
+                        acc = (acc << 5) | v;
+                        bits += 5;
+                        if bits >= 8 {
+                            bits -= 8;
+                            out.push((acc >> bits) as u8);
+                        }
+                    }
+                    Some(out)
+                }
+                fn hmac_sha1(key: &[u8], msg: &[u8]) -> [u8; 20] {
+                    let mut k = [0u8; 64];
+                    if key.len() > 64 {
+                        let h = ustd::sha1(key);
+                        k[..20].copy_from_slice(&h);
+                    } else {
+                        k[..key.len()].copy_from_slice(key);
+                    }
+                    let mut inner = Vec::with_capacity(64 + msg.len());
+                    for b in k.iter() {
+                        inner.push(b ^ 0x36);
+                    }
+                    inner.extend_from_slice(msg);
+                    let ih = ustd::sha1(&inner);
+                    let mut outer = Vec::with_capacity(84);
+                    for b in k.iter() {
+                        outer.push(b ^ 0x5c);
+                    }
+                    outer.extend_from_slice(&ih);
+                    ustd::sha1(&outer)
+                }
+                let mut ctr: Option<u64> = None;
+                let mut key = "";
+                for (i, &a) in args.iter().enumerate() {
+                    match a {
+                        "--hotp" | "-h" | "-c" | "--counter" => {
+                            ctr = args.get(i + 1).and_then(|s| s.parse().ok());
+                        }
+                        "--totp" | "-t" | "-b" | "--base32" => {}
+                        _ => key = a,
+                    }
+                }
+                if key.is_empty() {
+                    self.fail("usage: oathtool [--totp] [-c ctr] <base32-or-ascii-key>");
+                } else {
+                    let kbytes = b32dec(key).unwrap_or_else(|| key.as_bytes().to_vec());
+                    let ctr = ctr.unwrap_or_else(|| {
+                        ustd::clock_gettime(0).map(|(s, _)| s / 30).unwrap_or(0)
+                    });
+                    let digest = hmac_sha1(&kbytes, &ctr.to_be_bytes());
+                    let off = (digest[19] & 0x0f) as usize;
+                    let code = ((u32::from(digest[off]) & 0x7f) << 24
+                        | u32::from(digest[off + 1]) << 16
+                        | u32::from(digest[off + 2]) << 8
+                        | u32::from(digest[off + 3]))
+                        % 1_000_000;
+                    self.emit(&alloc::format!("{:06}", code));
+                }
+            }
+            "pwgen" => {
+                // pwgen [count] [len] — random pronounceable-ish passwords
+                let mut nums: Vec<usize> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                let count = if nums.is_empty() { 8 } else { nums.remove(0) };
+                let len = if nums.is_empty() { 12 } else { nums[0] };
+                let alpha = b"abcdefghijklmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+                for _ in 0..count.min(64) {
+                    let mut s = String::new();
+                    for _ in 0..len.max(4).min(64) {
+                        let r = ustd::rand_u64().unwrap_or(0) as usize;
+                        s.push(alpha[r % alpha.len()] as char);
+                    }
+                    self.emit(&s);
+                }
+            }
+            "xkcdpass" => {
+                // xkcdpass [n] — n random words from the system dictionary
+                let n = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .find_map(|s| s.parse::<usize>().ok())
+                    .unwrap_or(4);
+                match ustd::read_all("/usr/share/dict/words") {
+                    Ok(b) => {
+                        let t = String::from_utf8_lossy(&b).into_owned();
+                        let words: Vec<&str> = t
+                            .lines()
+                            .filter(|w| w.len() >= 4)
+                            .collect();
+                        let mut picks = Vec::new();
+                        for _ in 0..n.min(16) {
+                            let r = ustd::rand_u64().unwrap_or(0) as usize;
+                            if !words.is_empty() {
+                                picks.push(words[r % words.len()]);
+                            }
+                        }
+                        self.emit(&picks.join("-"));
+                    }
+                    Err(e) => self.fail(&alloc::format!("xkcdpass: dict: {}", e)),
+                }
+            }
+            "pstack" => match args.first() {
+                Some(pid) => {
+                    let w = ustd::read_all(&alloc::format!("/proc/{}/wchan", pid))
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_else(|_| String::from("?"));
+                    let sc = ustd::read_all(&alloc::format!("/proc/{}/syscall", pid))
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_else(|_| String::from("?"));
+                    self.emit(&alloc::format!(
+                        "{}: wchan={} syscall={}",
+                        pid,
+                        w.trim(),
+                        sc.trim()
+                    ));
+                }
+                None => self.fail("usage: pstack <pid>"),
+            },
+            "errno" => {
+                // errno [-l]: list the kernel's error codes
+                const T: &[(&str, i32)] = &[
+                    ("EPERM", 1), ("ENOENT", 2), ("ESRCH", 3), ("EINTR", 4),
+                    ("EIO", 5), ("ENXIO", 6), ("E2BIG", 7), ("ENOEXEC", 8),
+                    ("EBADF", 9), ("ECHILD", 10), ("EAGAIN", 11), ("ENOMEM", 12),
+                    ("EACCES", 13), ("EFAULT", 14), ("EBUSY", 16),
+                    ("EEXIST", 17), ("EXDEV", 18), ("ENODEV", 19),
+                    ("ENOTDIR", 20), ("EISDIR", 21), ("EINVAL", 22),
+                    ("ENFILE", 23), ("EMFILE", 24), ("ENOTTY", 25),
+                    ("EFBIG", 27), ("ENOSPC", 28), ("ESPIPE", 29),
+                    ("EROFS", 30), ("EMLINK", 31), ("EPIPE", 32),
+                    ("EDEADLK", 35), ("ENAMETOOLONG", 36), ("ENOLCK", 37),
+                    ("ENOSYS", 38), ("ENOTEMPTY", 39), ("ELOOP", 40),
+                    ("ENODATA", 61), ("ENOTSOCK", 88), ("EDESTADDRREQ", 89),
+                    ("EMSGSIZE", 90), ("EPROTOTYPE", 91), ("ENOPROTOOPT", 92),
+                    ("EPROTONOSUPPORT", 93), ("EOPNOTSUPP", 95),
+                    ("EAFNOSUPPORT", 97), ("EADDRINUSE", 98),
+                    ("EADDRNOTAVAIL", 99), ("ENETDOWN", 100),
+                    ("ENETUNREACH", 101), ("ECONNABORTED", 103),
+                    ("ECONNRESET", 104), ("ENOBUFS", 105), ("EISCONN", 106),
+                    ("ENOTCONN", 107), ("ETIMEDOUT", 110), ("ECONNREFUSED", 111),
+                    ("EHOSTUNREACH", 113), ("EALREADY", 114),
+                    ("EINPROGRESS", 115), ("ESTALE", 116), ("EDQUOT", 122),
+                ];
+                match args.first().copied() {
+                    Some("-l") | None => {
+                        for (n, c) in T {
+                            self.emit(&alloc::format!("{} {}", c, n));
+                        }
+                    }
+                    Some(q) => {
+                        let hit = T.iter().find(|(n, c)| {
+                            *n == q || alloc::format!("{}", c) == q
+                        });
+                        match hit {
+                            Some((n, c)) => self.emit(&alloc::format!("{} {}", n, c)),
+                            None => self.fail(&alloc::format!("errno: {}: unknown", q)),
+                        }
+                    }
+                }
+            }
+            "scrot" => {
+                // scrot [file]: real framebuffer screenshot to PPM
+                let p = args
+                    .iter()
+                    .copied()
+                    .find(|a| !a.starts_with('-'))
+                    .unwrap_or("/screen.ppm");
+                if ustd::shot(p) {
+                    self.emit(&alloc::format!("saved {}", p));
+                } else {
+                    self.fail("scrot: shot failed");
+                }
+            }
+            "fbset" => {
+                // fbset [-i]: report the framebuffer mode from /dev/fb0
+                match ustd::stat("/dev/fb0") {
+                    Ok(st) => {
+                        let px = st.size / 4;
+                        let h = 768u64;
+                        let w = if h != 0 { px / h } else { 0 };
+                        self.emit(&alloc::format!(
+                            "mode \"{}x{}\"\n    geometry {} {} {} {} 32\nendmode",
+                            w, h, w, h, w, h
+                        ));
+                    }
+                    Err(e) => self.fail(&alloc::format!("fbset: {}", e)),
+                }
+            }
+            "xterm" | "uxterm" => {
+                // open another real terminal window; -e runs a command in it
+                let mut s = String::new();
+                if let Some(i) = args.iter().position(|a| *a == "-e") {
+                    s = args[i + 1..].join(" ");
+                }
+                match ustd::spawn("/bin/cosmos-terminal", &s) {
+                    Ok(p) => self.emit(&alloc::format!("xterm pid {}", p)),
+                    Err(_) => self.fail("xterm: spawn failed"),
+                }
+            }
+            "xcalc" => match ustd::spawn("/bin/cosmos-calc", "") {
+                Ok(p) => self.emit(&alloc::format!("calc pid {}", p)),
+                Err(_) => self.fail("xcalc: spawn failed"),
+            },
+            "taskmgr" | "ksysguard" | "gnome-system-monitor" => {
+                match ustd::spawn("/bin/cosmos-sysmon", "") {
+                    Ok(p) => self.emit(&alloc::format!("sysmon pid {}", p)),
+                    Err(_) => self.fail("taskmgr: spawn failed"),
+                }
+            }
+            "feh" | "sxiv" | "eog" | "imv" | "display" | "xloadimage" | "mirage" => {
+                let img = args
+                    .iter()
+                    .copied()
+                    .find(|a| !a.starts_with('-'))
+                    .unwrap_or("");
+                match ustd::spawn("/bin/cosmos-view", img) {
+                    Ok(p) => self.emit(&alloc::format!("viewer pid {}", p)),
+                    Err(_) => self.fail("view: spawn failed"),
+                }
+            }
+            "chafa" | "viu" | "jp2a" | "cacaview" | "tiv" | "viu2" => {
+                // terminal image preview — route through the img2txt renderer
+                self.run(&alloc::format!("img2txt {}", args.join(" ")));
+            }
+            "xdg-open" | "open" | "cygstart" | "exo-open" | "gio" | "launcher" => {
+                // open a path/URL in the right app by extension
+                let t = if args.first().copied() == Some("open") && args.len() > 1 && args[0] == "gio" {
+                    ""
+                } else {
+                    args.iter()
+                        .copied()
+                        .find(|a| !a.starts_with('-') && *a != "open")
+                        .unwrap_or("")
+                };
+                let t = if t.is_empty() {
+                    args.last().copied().unwrap_or("")
+                } else {
+                    t
+                };
+                if t.is_empty() {
+                    self.fail("usage: xdg-open <file|url>");
+                } else {
+                    let lower = t.to_ascii_lowercase();
+                    let ext = lower.rsplit('.').next().unwrap_or("");
+                    if lower.starts_with("http") {
+                        self.run(&alloc::format!("curl {}", t));
+                    } else if matches!(ext, "ppm" | "png" | "jpg" | "jpeg" | "bmp" | "gif" | "ico" | "qoi" | "webp") {
+                        let _ = ustd::spawn("/bin/cosmos-view", t);
+                    } else if ustd::stat(t).map(|s| s.is_dir != 0).unwrap_or(false) {
+                        let _ = ustd::spawn("/bin/cosmos-files", t);
+                    } else {
+                        let _ = ustd::spawn("/bin/cosmos-editor", t);
+                    }
+                    self.emit(&alloc::format!("opened {}", t));
+                }
+            }
+            "mimetype" | "filetype" => {
+                // extension + magic sniff -> MIME type
+                for p in args.iter().copied().filter(|a| !a.starts_with('-')) {
+                    let mime = match ustd::read_all(p) {
+                        Ok(b) => {
+                            let ext = p.rsplit('.').next().unwrap_or("");
+                            if b.starts_with(b"\x89PNG") {
+                                "image/png"
+                            } else if b.starts_with(b"\xff\xd8\xff") {
+                                "image/jpeg"
+                            } else if b.starts_with(b"GIF8") {
+                                "image/gif"
+                            } else if b.starts_with(b"BM") {
+                                "image/bmp"
+                            } else if b.starts_with(b"P6") || b.starts_with(b"P3") {
+                                "image/x-portable-pixmap"
+                            } else if b.starts_with(b"\x7fELF") {
+                                "application/x-elf"
+                            } else if b.starts_with(b"PK\x03\x04") {
+                                "application/zip"
+                            } else if b.starts_with(b"\x1f\x8b") {
+                                "application/gzip"
+                            } else if b.starts_with(b"%PDF") {
+                                "application/pdf"
+                            } else if b.starts_with(b"ustar") || b.len() > 262 && &b[257..262] == b"ustar" {
+                                "application/x-tar"
+                            } else if b.iter().all(|&c| c == b'\n' || c == b'\t' || (0x20..=0x7e).contains(&c)) {
+                                match ext {
+                                    "rs" | "c" | "h" | "cpp" => "text/x-c",
+                                    "sh" => "application/x-sh",
+                                    "html" | "htm" => "text/html",
+                                    "po" => "text/x-gettext-translation",
+                                    "mo" => "application/x-gettext-translation",
+                                    "md" => "text/markdown",
+                                    "csv" => "text/csv",
+                                    "json" => "application/json",
+                                    "xml" => "application/xml",
+                                    "toml" => "application/toml",
+                                    _ => "text/plain",
+                                }
+                            } else {
+                                "application/octet-stream"
+                            }
+                        }
+                        Err(e) => {
+                            self.fail(&alloc::format!("mimetype: {}: {}", p, e));
+                            continue;
+                        }
+                    };
+                    self.emit(&alloc::format!("{}: {}", p, mime));
+                }
+                if args.is_empty() {
+                    self.fail("usage: mimetype <file>...");
+                }
+            }
+            "arping" => match args.iter().copied().find(|a| !a.starts_with('-')) {
+                Some(ip) => {
+                    // one probe to force a real ARP resolution, then read cache
+                    self.run(&alloc::format!("ping -c 1 {}", ip));
+                    let mut hit = false;
+                    for l in ustd::arp_stat().lines() {
+                        if l.contains(ip) && !l.starts_with("ip ") {
+                            self.emit(&alloc::format!("ARPING {} reply {}", ip, l.trim()));
+                            hit = true;
+                        }
+                    }
+                    if !hit {
+                        self.fail(&alloc::format!("arping: no reply from {}", ip));
+                    }
+                }
+                None => self.fail("usage: arping <ip>"),
+            },
+            "envdir" => {
+                // envdir DIR cmd...: load env from files named by var in DIR
+                if args.len() >= 2 {
+                    let dir = args[0];
+                    let mut n = 0;
+                    if let Ok(ents) = ustd::readdir(dir) {
+                        for e in ents {
+                            let name = core::str::from_utf8(&e.name[..e.name_len as usize])
+                                .unwrap_or("")
+                                .to_string();
+                            if name.is_empty() || name.starts_with('.') {
+                                continue;
+                            }
+                            let path = alloc::format!("{}/{}", dir, name);
+                            if let Ok(b) = ustd::read_all(&path) {
+                                let v = String::from_utf8_lossy(&b).trim().to_string();
+                                self.vars.insert(name, v);
+                                n += 1;
+                            }
+                        }
+                    }
+                    let cmd = args[1..].join(" ");
+                    self.emit(&alloc::format!("envdir: {} vars from {}", n, dir));
+                    self.run(&cmd);
+                } else {
+                    self.fail("usage: envdir <dir> <cmd...>");
+                }
+            }
+            "lockfile" => {
+                // lockfile [-r N] file: atomic O_EXCL lock file
+                let mut file = "";
+                for &a in args.iter() {
+                    if !a.starts_with('-') {
+                        file = a;
+                    }
+                }
+                if file.is_empty() {
+                    self.fail("usage: lockfile [-r retries] <file>");
+                } else if ustd::stat(file).is_ok() {
+                    self.fail(&alloc::format!("lockfile: {}: already locked", file));
+                } else {
+                    match ustd::write_all(file, alloc::format!("{}", ustd::getpid()).as_bytes()) {
+                        Ok(_) => self.emit(&alloc::format!("locked {}", file)),
+                        Err(e) => self.fail(&alloc::format!("lockfile: {}", e)),
+                    }
+                }
+            }
+            "finger" | "pinky" => {
+                // login + gecos from /etc/passwd, sessions from /utmp
+                let filter = args.iter().copied().find(|a| !a.starts_with('-')).unwrap_or("");
+                if let Ok(b) = ustd::read_all("/etc/passwd") {
+                    let t = String::from_utf8_lossy(&b);
+                    for l in t.lines() {
+                        let f: Vec<&str> = l.split(':').collect();
+                        if f.len() < 5 || (!filter.is_empty() && f[0] != filter) {
+                            continue;
+                        }
+                        self.emit(&alloc::format!(
+                            "Login: {:<16} Name: {}  Shell: {}",
+                            f[0],
+                            f.get(4).copied().unwrap_or(""),
+                            f.get(6).copied().unwrap_or("/bin/sh")
+                        ));
+                    }
+                }
+                if let Ok(b) = ustd::read_all("/utmp") {
+                    let t = String::from_utf8_lossy(&b);
+                    for l in t.lines() {
+                        let f: Vec<&str> = l.split_whitespace().collect();
+                        if f.len() >= 3 {
+                            self.emit(&alloc::format!(
+                                "  session pid {} {} (since {})",
+                                f[0], f[1], f[2]
+                            ));
+                        }
+                    }
+                }
+            }
+            "logrotate" => {
+                // rotate dir *.log -> .1 .2 .3 (drop .3)
+                let dir = args
+                    .iter()
+                    .copied()
+                    .find(|a| !a.starts_with('-'))
+                    .unwrap_or("/var/log");
+                let mut n = 0;
+                if let Ok(ents) = ustd::readdir(dir) {
+                    for e in ents {
+                        let name = core::str::from_utf8(&e.name[..e.name_len as usize])
+                            .unwrap_or("")
+                            .to_string();
+                        if !name.ends_with(".log") {
+                            continue;
+                        }
+                        let base = alloc::format!("{}/{}", dir, name);
+                        for i in (1..=3u8).rev() {
+                            let from = alloc::format!("{}.{}", base, i);
+                            let to = alloc::format!("{}.{}", base, i + 1);
+                            let _ = ustd::rename(&from, &to);
+                        }
+                        let _ = ustd::rename(&base, &alloc::format!("{}.1", base));
+                        let _ = ustd::write_all(&base, b"");
+                        n += 1;
+                    }
+                }
+                self.emit(&alloc::format!("{} log(s) rotated in {}", n, dir));
+            }
+            "logtail" => {
+                // print new lines since last call (offset in <file>.ot)
+                match args.iter().copied().find(|a| !a.starts_with('-')) {
+                    Some(f) => {
+                        let ot = alloc::format!("{}.ot", f);
+                        let off = ustd::read_all(&ot)
+                            .ok()
+                            .and_then(|b| {
+                                String::from_utf8_lossy(&b).trim().parse::<usize>().ok()
+                            })
+                            .unwrap_or(0);
+                        match ustd::read_all(f) {
+                            Ok(b) => {
+                                let new = &b[off.min(b.len())..];
+                                let _ = ustd::write_all(
+                                    &ot,
+                                    alloc::format!("{}", b.len()).as_bytes(),
+                                );
+                                self.emit_bin(new);
+                            }
+                            Err(e) => self.fail(&alloc::format!("logtail: {}: {}", f, e)),
+                        }
+                    }
+                    None => self.fail("usage: logtail <file>"),
+                }
+            }
+            "ifne" => {
+                // run the rest of the command only if stdin was non-empty
+                let have = self
+                    .pipe_in
+                    .as_ref()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+                if have {
+                    let cmd = args.join(" ");
+                    if !cmd.is_empty() {
+                        self.run(&cmd);
+                    }
+                } else {
+                    self.emit("ifne: no input, command not run");
+                }
+            }
+            "start-stop-daemon" => {
+                // --start --exec <bin> --pidfile <f> | --stop --pidfile <f>
+                let start = args.iter().any(|a| *a == "--start" || *a == "-S");
+                let stop = args.iter().any(|a| *a == "--stop" || *a == "-K");
+                let get = |k: &str| -> Option<String> {
+                    args.iter()
+                        .position(|a| *a == k)
+                        .and_then(|i| args.get(i + 1))
+                        .map(|s| s.to_string())
+                };
+                let pidfile = get("--pidfile").or_else(|| get("-p"));
+                if start {
+                    match get("--exec").or_else(|| get("-x")) {
+                        Some(bin) => {
+                            let path = if bin.starts_with('/') {
+                                bin.clone()
+                            } else {
+                                alloc::format!("/bin/{}", bin)
+                            };
+                            match ustd::spawn(&path, "") {
+                                Ok(pid) => {
+                                    if let Some(pf) = &pidfile {
+                                        let _ = ustd::write_all(
+                                            pf,
+                                            alloc::format!("{}", pid).as_bytes(),
+                                        );
+                                    }
+                                    self.emit(&alloc::format!("{} started pid {}", path, pid));
+                                }
+                                Err(_) => self.fail(&alloc::format!("cannot start {}", path)),
+                            }
+                        }
+                        None => self.fail("start-stop-daemon: --start needs --exec"),
+                    }
+                } else if stop {
+                    match &pidfile {
+                        Some(pf) => match ustd::read_all(pf) {
+                            Ok(b) => {
+                                let pid: u32 = String::from_utf8_lossy(&b)
+                                    .trim()
+                                    .parse()
+                                    .unwrap_or(0);
+                                if pid != 0 {
+                                    let _ = ustd::kill2(pid, 15);
+                                    let _ = ustd::remove(pf);
+                                    self.emit(&alloc::format!("pid {} stopped", pid));
+                                }
+                            }
+                            Err(e) => self.fail(&alloc::format!("start-stop-daemon: {}", e)),
+                        },
+                        None => self.fail("start-stop-daemon: --stop needs --pidfile"),
+                    }
+                } else {
+                    self.fail("usage: start-stop-daemon --start|--stop --exec/--pidfile ..");
+                }
+            }
+            "update-rc.d" => {
+                // update-rc.d <name> defaults|remove — edits /etc/rc.conf
+                match args.first().copied() {
+                    Some(name) => {
+                        let action = args.get(1).copied().unwrap_or("defaults");
+                        let cur = ustd::read_all("/etc/rc.conf")
+                            .map(|b| String::from_utf8_lossy(&b).into_owned())
+                            .unwrap_or_default();
+                        if action == "remove" || action == "disable" {
+                            let keep: Vec<&str> = cur
+                                .lines()
+                                .filter(|l| {
+                                    !(l.starts_with("service")
+                                        && l.split_whitespace().nth(1) == Some(name))
+                                })
+                                .collect();
+                            let _ = ustd::write_all(
+                                "/etc/rc.conf",
+                                alloc::format!("{}\n", keep.join("\n")).as_bytes(),
+                            );
+                            self.emit(&alloc::format!("{} removed", name));
+                        } else {
+                            let line = alloc::format!("service {} /bin/{}\n", name, name);
+                            let mut body = cur;
+                            body.push_str(&line);
+                            let _ = ustd::write_all("/etc/rc.conf", body.as_bytes());
+                            self.emit(&alloc::format!("{} enabled", name));
+                        }
+                    }
+                    None => self.fail("usage: update-rc.d <name> defaults|remove"),
+                }
+            }
+            "periodic" => match args.first().copied() {
+                Some(p) => self.run(&alloc::format!("run-parts /etc/periodic/{}", p)),
+                None => self.fail("usage: periodic daily|weekly|monthly"),
+            },
+            "batch" => {
+                // schedule the rest of the line for 1s from now (low load)
+                let cmd = args.join(" ");
+                if cmd.is_empty() {
+                    self.fail("usage: batch <cmd...>");
+                } else {
+                    let at = ustd::uptime_ms() + 1000;
+                    self.at_q.push((at, cmd));
+                    self.at_q.sort_by_key(|(t, _)| *t);
+                    self.emit("job queued for system idle time");
+                }
+            }
+            "msguniq" | "msgmerge" | "msgcomm" => {
+                // .po set operations on real msgid blocks
+                fn po_ids(text: &str) -> Vec<String> {
+                    let mut v = Vec::new();
+                    for l in text.lines() {
+                        if let Some(rest) = l.trim().strip_prefix("msgid").map(|s| s.trim_start()).and_then(|s| s.strip_prefix('"')) {
+                            if let Some(id) = rest.strip_suffix('"') {
+                                if !id.is_empty() {
+                                    v.push(id.to_string());
+                                }
+                            }
+                        }
+                    }
+                    v
+                }
+                let files: Vec<&str> = args
+                    .iter()
+                    .copied()
+                    .filter(|a| !a.starts_with('-'))
+                    .collect();
+                if cmd == "msguniq" {
+                    match files.first() {
+                        Some(f) => match ustd::read_all(f) {
+                            Ok(b) => {
+                                let t = String::from_utf8_lossy(&b);
+                                let mut seen = alloc::collections::BTreeSet::new();
+                                let mut out = String::new();
+                                let mut skip = false;
+                                for l in t.lines() {
+                                    if l.trim().starts_with("msgid") {
+                                        let id = l.trim()
+                                            .strip_prefix("msgid")
+                                            .map(|s| s.trim_start())
+                                            .and_then(|s| s.strip_prefix('"'))
+                                            .and_then(|s| s.strip_suffix('"'))
+                                            .unwrap_or("");
+                                        skip = seen.contains(id);
+                                        seen.insert(id.to_string());
+                                    }
+                                    if !skip {
+                                        out.push_str(l);
+                                        out.push('\n');
+                                    }
+                                }
+                                self.emit(&alloc::format!("{} unique entries", seen.len()));
+                                self.emit_bin(out.as_bytes());
+                            }
+                            Err(e) => self.fail(&alloc::format!("msguniq: {}", e)),
+                        },
+                        None => self.fail("usage: msguniq <file.po>"),
+                    }
+                } else {
+                    // msgmerge/msgcomm: union/intersect msgids across files
+                    let mut sets: Vec<alloc::collections::BTreeSet<String>> = Vec::new();
+                    for f in &files {
+                        if let Ok(b) = ustd::read_all(f) {
+                            let t = String::from_utf8_lossy(&b);
+                            sets.push(po_ids(&t).into_iter().collect());
+                        }
+                    }
+                    if sets.is_empty() {
+                        self.fail("usage: msgmerge|msgcomm <po>...");
+                    } else {
+                        let ids: Vec<String> = if cmd == "msgcomm" {
+                            sets[0]
+                                .iter()
+                                .filter(|id| sets.iter().all(|s| s.contains(*id)))
+                                .cloned()
+                                .collect()
+                        } else {
+                            let mut all = alloc::collections::BTreeSet::new();
+                            for s in &sets {
+                                all.extend(s.iter().cloned());
+                            }
+                            all.into_iter().collect()
+                        };
+                        for id in &ids {
+                            self.emit(&alloc::format!("msgid \"{}\"\nmsgstr \"\"", id));
+                        }
+                        self.emit(&alloc::format!("# {} msgids", ids.len()));
+                    }
+                }
+            }
+            "systemd-detect-virt" => {
+                // detect the hypervisor from SMBIOS strings
+                match ustd::read_all("/dev/smbios-tables") {
+                    Ok(b) => {
+                        let t = String::from_utf8_lossy(&b).to_ascii_uppercase();
+                        let v = if t.contains("QEMU") || t.contains("KVM") {
+                            "qemu"
+                        } else if t.contains("BOCHS") {
+                            "bochs"
+                        } else if t.contains("VIRTUALBOX") {
+                            "oracle"
+                        } else if t.contains("VMWARE") {
+                            "vmware"
+                        } else if t.contains("MICROSOFT") || t.contains("HYPER-V") {
+                            "microsoft"
+                        } else if t.contains("XEN") {
+                            "xen"
+                        } else {
+                            "none"
+                        };
+                        self.emit(v);
+                    }
+                    Err(e) => self.fail(&alloc::format!("detect-virt: {}", e)),
+                }
+            }
+            "systemctl" => {
+                // list init's supervised services from /etc/rc.conf + procs
+                match args.first().copied() {
+                    Some("list-units") | Some("status") | None => {
+                        if let Ok(b) = ustd::read_all("/etc/rc.conf") {
+                            let t = String::from_utf8_lossy(&b);
+                            self.emit("UNIT              STATE      PID");
+                            for l in t.lines() {
+                                let f: Vec<&str> = l.split_whitespace().collect();
+                                if f.len() >= 3 && f[0] == "service" {
+                                    let running = ustd::proclist(64).iter().any(|p| {
+                                        core::str::from_utf8(&p.name)
+                                            .unwrap_or("")
+                                            .trim_end_matches('\0')
+                                            .contains(f[1])
+                                    });
+                                    self.emit(&alloc::format!(
+                                        "{:<18}{}{}",
+                                        f[1],
+                                        if running { "running   " } else { "dead      " },
+                                        ""
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Some(other) => self.fail(&alloc::format!(
+                        "systemctl: {}: only 'list-units'/'status' (init supervision)",
+                        other
+                    )),
                 }
             }
             "halt" => ustd::poweroff(),
@@ -34129,7 +35209,50 @@ impl Term {
                 }
             }
             "reboot" => ustd::reboot(),
-            "shutdown" | "poweroff" => ustd::poweroff(),
+            "poweroff" => ustd::poweroff(),
+            "shutdown" => {
+                // shutdown [-r] [+N|now|-c]: schedule poweroff/reboot via the
+                // at-queue; -c cancels a pending one
+                let mut reboot = false;
+                let mut cancel = false;
+                let mut when = 60u64;
+                for &a in args.iter() {
+                    match a {
+                        "-r" | "--reboot" => reboot = true,
+                        "-c" | "--cancel" => cancel = true,
+                        "now" | "+0" => when = 0,
+                        s => {
+                            if let Some(m) = s.strip_prefix('+') {
+                                when = m.parse::<u64>().unwrap_or(60) * 60;
+                            } else if let Ok(n) = s.parse::<u64>() {
+                                when = n;
+                            }
+                        }
+                    }
+                }
+                if cancel {
+                    let before = self.at_q.len();
+                    self.at_q
+                        .retain(|(_, c)| c != "poweroff" && c != "reboot");
+                    self.emit(&alloc::format!(
+                        "{} scheduled shutdown(s) cancelled",
+                        before - self.at_q.len()
+                    ));
+                } else {
+                    let at = ustd::uptime_ms() + when * 1000;
+                    self.at_q.push((
+                        at,
+                        if reboot { "reboot".into() } else { "poweroff".into() },
+                    ));
+                    self.at_q.sort_by_key(|(t, _)| *t);
+                    self.emit(&alloc::format!(
+                        "Shutdown scheduled in {}s ({})",
+                        when,
+                        if reboot { "reboot" } else { "poweroff" }
+                    ));
+                }
+            }
+
             "beep" => {
                 let f = args
                     .first()
@@ -38102,6 +39225,13 @@ impl Term {
         "text2pcap", "tshark", "dumpcap", "crontab", "atq", "atrm", "deroff",
         "spell", "ul", "skill", "snice", "sfdisk", "vi", "nano", "chvt",
         "rdmsr", "runlevel", "xgettext", "msgunfmt", "soelim",
+        "iptables", "iptables-save", "iptables-restore", "shutdown",
+        "sponge", "oathtool", "pwgen", "xkcdpass", "pstack", "errno",
+        "scrot", "fbset", "xterm", "uxterm", "xcalc", "taskmgr", "feh",
+        "chafa", "xdg-open", "mimetype", "arping", "envdir", "lockfile",
+        "finger", "pinky", "logrotate", "logtail", "ifne", "ts", "batch",
+        "msguniq", "msgmerge", "msgcomm", "start-stop-daemon", "update-rc.d",
+        "periodic", "systemd-detect-virt", "systemctl",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[

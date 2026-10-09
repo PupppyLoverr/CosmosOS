@@ -28,7 +28,9 @@ const FILES: &[&str] = &[
 ];
 
 /// files under /proc/net
-const NET_FILES: &[&str] = &["tcp", "udp", "unix", "dev", "operstate", "owners", "route"];
+const NET_FILES: &[&str] = &[
+    "tcp", "udp", "unix", "dev", "operstate", "owners", "route", "iptables",
+];
 
 /// files under /proc/sys/kernel
 const SYS_FILES: &[&str] = &["hostname", "cow_pages"];
@@ -297,6 +299,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/net/unix" => crate::sockfd::net_unix(),
         "/proc/net/dev" => net::net_dev(),
         "/proc/net/route" => net::net_route(),
+        "/proc/net/iptables" => net::net_iptables(),
         "/proc/net/operstate" => alloc::format!(
             "{}\n",
             if net::is_up() { "up" } else { "down" }
@@ -518,6 +521,19 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
                 continue;
             }
             ok &= net::route_ctl(line);
+        }
+        return ok.then_some(buf.len());
+    }
+    if path == "/proc/net/iptables" {
+        // 'A <proto> [dport N] [src ip/plen]' / 'D <n>' / 'F' / 'P <verdict>'
+        let text = String::from(String::from_utf8_lossy(buf));
+        let mut ok = true;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            ok &= net::iptables_ctl(line);
         }
         return ok.then_some(buf.len());
     }
