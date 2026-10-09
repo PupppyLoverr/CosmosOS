@@ -356,9 +356,10 @@ struct FwRule {
     dscp: u8,             // `-m dscp --dscp N` — 0xff = unused
     icmp_type: u8,        // `-m icmp --icmp-type N` — 0xff = unused
     tcp_syn: bool,        // `-m tcp --syn` — SYN-only segment match
-    recent_op: u8,        // `-m recent`: 0 = none, 1 = --set, 2 = --rcheck, 3 = --update
+    recent_op: u8,        // `-m recent`: 0=none 1=--set 2=--rcheck 3=--update 4=--remove
     recent_name: String,  // list name (real default: "DEFAULT")
     recent_secs: u64,     // --seconds N recency window (0 = any age)
+    recent_hits: u64,     // --hitcount N gate: match iff the list entry has >= N hits
     needle: Vec<u8>,      // `-m string --string` — payload substring
     u32_off: u16,         // `-m u32` — 4-byte BE word at offset (0xffff = unused)
     u32_mask: u32,
@@ -677,10 +678,14 @@ fn fw_eval(
                 e.0 += 1;
                 e.1 = now_ms();
             } else {
+                // --rcheck/--update/--remove (all gated by --seconds and
+                // --hitcount): source must be listed, fresh enough, and
+                // have enough recorded hits.
                 let hit = match t.get(&key) {
-                    Some((_, last)) => {
-                        r.recent_secs == 0
-                            || now_ms().saturating_sub(*last) <= r.recent_secs * 1000
+                    Some((hits, last)) => {
+                        (r.recent_secs == 0
+                            || now_ms().saturating_sub(*last) <= r.recent_secs * 1000)
+                            && (r.recent_hits == 0 || *hits >= r.recent_hits)
                     }
                     None => false,
                 };
@@ -691,6 +696,10 @@ fn fw_eval(
                     if let Some(e) = t.get_mut(&key) {
                         e.1 = now_ms();
                     }
+                } else if r.recent_op == 4 {
+                    // --remove: matched -> drop the entry like
+                    // `echo -<src>` on the real ipt_recent file.
+                    t.remove(&key);
                 }
             }
         }
@@ -1275,10 +1284,17 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
     match r.recent_op {
         1 => out.push_str(&alloc::format!(" -m recent --set --name {}", r.recent_name)),
         2 | 3 => {
-            let op = if r.recent_op == 2 { "--rcheck" } else { "--update" };
+            let op = match r.recent_op {
+                2 => "--rcheck",
+                4 => "--remove",
+                _ => "--update",
+            };
             out.push_str(&alloc::format!(" -m recent {} --name {}", op, r.recent_name));
             if r.recent_secs > 0 {
                 out.push_str(&alloc::format!(" --seconds {}", r.recent_secs));
+            }
+            if r.recent_hits > 0 {
+                out.push_str(&alloc::format!(" --hitcount {}", r.recent_hits));
             }
         }
         _ => {}
@@ -1807,7 +1823,7 @@ fn fw_name_ok(n: &str) -> bool {
         "icmp", "tcp", "udp", "all", "*", "dport", "multiport", "range", "src",
         "state", "limit", "lburst", "log", "reject", "accept", "return", "drop",
         "iif", "oif", "sport", "length", "comment", "ttl", "tos", "mac",
-        "dscp", "icmpt", "syn", "rset", "rchk", "rupd", "sports", "dstrange",
+        "dscp", "icmpt", "syn", "rset", "rchk", "rupd", "rrem", "rhitc", "sports", "dstrange",
         "string", "u32", "statnth", "tflags", "quota", "time", "connl",
         "snat", "masq",
     ];
@@ -2209,6 +2225,7 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         recent_op: 0,
         recent_name: String::new(),
         recent_secs: 0,
+        recent_hits: 0,
         needle: Vec::new(),
         u32_off: 0xffff,
         u32_mask: 0,
@@ -2503,6 +2520,14 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
                 r.recent_op = 3;
                 r.recent_name = String::from(f.next().unwrap_or("DEFAULT"));
                 r.recent_secs = f.next().unwrap_or("0").parse().unwrap_or(0);
+            }
+            "rrem" => {
+                r.recent_op = 4;
+                r.recent_name = String::from(f.next().unwrap_or("DEFAULT"));
+                r.recent_secs = f.next().unwrap_or("0").parse().unwrap_or(0);
+            }
+            "rhitc" => {
+                r.recent_hits = f.next().unwrap_or("0").parse().unwrap_or(0);
             }
             // `-m string --string <txt>` — wire token `string <hex>`:
             // the text travels hex-encoded so spaces never split it.
@@ -4222,26 +4247,30 @@ pub fn net_tcp() -> String {
         }
     }
     let lip = our_ip();
+    // Rows carry a Linux-style `0 <ino>` tail: the socket's TCP_SOCKS
+    // map key is its real kernel identity — `ss -e` prints it.
     let mut s = String::from("  sl  local_address rem_address   st tx_queue rx_queue\n");
     let mut i = 0u32;
     for (p, k) in TCP_SOCKS.lock().iter() {
         let txq: usize = k.unacked.iter().map(|u| u.payload.len()).sum();
         s.push_str(&alloc::format!(
-            "  {:>2}: {} {} {:02X} {:08X}:{:08X}\n",
+            "  {:>2}: {} {} {:02X} {:08X}:{:08X} 0 {}\n",
             i,
             hexaddr(lip, *p),
             hexaddr(k.rip, k.rport),
             stcode(&k.state),
             txq, // real unacked bytes, like /proc/net/tcp's tx_queue
             k.q.iter().map(|c| c.len()).sum::<usize>(),
+            p, // ino tail — real registry key (Linux uid+inode cols)
         ));
         i += 1;
     }
     for p in LISTENERS.lock().iter() {
         s.push_str(&alloc::format!(
-            "  {:>2}: {} 00000000:0000 0A 00000000:00000000\n",
+            "  {:>2}: {} 00000000:0000 0A 00000000:00000000 0 {}\n",
             i,
-            hexaddr(lip, *p)
+            hexaddr(lip, *p),
+            p,
         ));
         i += 1;
     }
@@ -4299,8 +4328,8 @@ pub fn net_udp() -> String {
     let mut s = String::from("  sl  local_address rem_address   st tx_queue rx_queue\n");
     for (i, (p, _)) in SOCKS.lock().iter().enumerate() {
         s.push_str(&alloc::format!(
-            "  {:>2}: {:02X}{:02X}{:02X}{:02X}:{:04X} 00000000:0000 07 00000000:00000000\n",
-            i, lip[3], lip[2], lip[1], lip[0], p
+            "  {:>2}: {:02X}{:02X}{:02X}{:02X}:{:04X} 00000000:0000 07 00000000:00000000 0 {}\n",
+            i, lip[3], lip[2], lip[1], lip[0], p, p
         ));
     }
     s
