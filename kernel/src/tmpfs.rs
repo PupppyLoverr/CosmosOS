@@ -375,13 +375,14 @@ pub fn umount(target: &str, flags: u64) -> Result<(), i64> {
 
 /// open(2) semantics for a tmpfs path. Returns ((), append_pos).
 pub fn open(path: &str, flags: u64) -> Result<u64, i64> {
-    // FS_IMMUTABLE_FL: write-intent opens on an `i`-marked node fail EPERM.
+    // FS_IMMUTABLE_FL / FS_APPEND_FL: write-intent opens on an `i`-marked
+    // node fail EPERM; `a`-marked nodes accept only O_APPEND opens.
     if flags
         & (shared::O_WRONLY | shared::O_RDWR | shared::O_TRUNC | shared::O_APPEND)
         != 0
     {
         if let Some((_, _, _, _, attr)) = stat(path) {
-            if attr & 0x80 != 0 {
+            if attr & 0x80 != 0 || (attr & 0x08 != 0 && flags & shared::O_APPEND == 0) {
                 return Err(-1);
             }
         }

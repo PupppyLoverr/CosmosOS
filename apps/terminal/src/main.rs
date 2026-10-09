@@ -16155,7 +16155,7 @@ impl Term {
                         if a & 0x02 != 0 { "h" } else { "-" },
                         if a & 0x04 != 0 { "s" } else { "-" },
                         if dir || a & 0x10 != 0 { "d" } else { "-" },
-                        if a & 0x20 != 0 { "a" } else { "-" },
+                        if a & 0x08 != 0 { "a" } else { "-" },
                         if a & 0x80 != 0 { "i" } else { "-" }
                     )
                 }
@@ -16198,9 +16198,11 @@ impl Term {
             }
             "chattr" => {
                 // chattr [+-=][rhsai] <files...>: sets/clears real FAT attrs
-                // (r=0x01 h=0x02 s=0x04 a=0x20 i=0x80) via SYS_SETATTR.
+                // (r=0x01 h=0x02 s=0x04 a=0x08 i=0x80) via SYS_SETATTR.
                 // i = immutable: the kernel rejects writes/unlinks/renames
                 // on marked files with EPERM (FS_IMMUTABLE_FL analogue).
+                // a = append-only (FS_APPEND_FL): only O_APPEND write-opens
+                // succeed — persisted on FAT via dirent byte 12 bit 0x20.
                 let op = match args.first() {
                     Some(a) if a.starts_with('+') || a.starts_with('-') || a.starts_with('=') => *a,
                     _ => {
@@ -16215,7 +16217,7 @@ impl Term {
                         b'r' => 0x01,
                         b'h' => 0x02,
                         b's' => 0x04,
-                        b'a' => 0x20,
+                        b'a' => 0x08,
                         b'i' => 0x80,
                         _ => {
                             self.fail(&alloc::format!("chattr: bad flag '{}'", c as char));

@@ -2172,6 +2172,31 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             allowed
         }
     });
+    check("chattr-a", {
+        // FS_APPEND_FL: attr 0x08 — only O_APPEND write-opens allowed;
+        // non-append opens, plain writes, and unlink all fail EPERM.
+        // FAT arm persists the bit in dirent byte 12 (stat round-trips it).
+        fn arm(path: &str) -> bool {
+            let w = ustd::write_all(path, b"ab").is_ok()
+                && ustd::setattr(path, 0x08).is_ok()
+                && ustd::stat(path).map(|s| s.attr & 0x08 != 0).unwrap_or(false)
+                && ustd::open(path, ustd::O_WRONLY).is_err()
+                && ustd::open(path, ustd::O_WRONLY | ustd::O_TRUNC).is_err()
+                && ustd::remove(path).is_err();
+            let app = w && ustd::open(path, ustd::O_WRONLY | ustd::O_APPEND)
+                .map(|fd| {
+                    let ok = ustd::write(fd, b"cd").is_ok();
+                    ustd::close(fd);
+                    ok
+                })
+                .unwrap_or(false);
+            let tail = app && ustd::read_all(path)
+                .map(|d| d == b"abcd")
+                .unwrap_or(false);
+            tail && ustd::setattr(path, 0x00).is_ok() && ustd::remove(path).is_ok()
+        }
+        arm("/tmp/ap1") && arm("/apfat")
+    });
     check("dev-full-enospc", {
         ustd::write_all("/dev/full", b"x").err() == Some(-28)
     });
