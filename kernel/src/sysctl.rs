@@ -41,6 +41,10 @@ static UTS_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static PID_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static IPC_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static TIME_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static TCP_WMEM_LO: AtomicU64 = AtomicU64::new(4096);
+static TCP_WMEM_DEF: AtomicU64 = AtomicU64::new(16384);
+static TCP_WMEM_MAX: AtomicU64 = AtomicU64::new(4194304);
+static NF_CT_MAX: AtomicU64 = AtomicU64::new(65536);
 static ICMP_ECHO_IGNORE_BCAST: AtomicU64 = AtomicU64::new(1);
 static IP_FORWARD: AtomicU64 = AtomicU64::new(0);
 static KERNEL_SYSRQ: AtomicU64 = AtomicU64::new(1);
@@ -206,6 +210,30 @@ pub fn max_ipc_namespaces() -> u64 {
 pub fn max_time_namespaces() -> u64 {
     TIME_NS_MAX.load(Ordering::Relaxed)
 }
+/// net.ipv4.tcp_wmem — (min, default, max) send-buffer bytes; the max
+/// bounds the real unacked-byte queue (Linux triple semantics).
+pub fn tcp_wmem() -> (u64, u64, u64) {
+    (
+        TCP_WMEM_LO.load(Ordering::Relaxed),
+        TCP_WMEM_DEF.load(Ordering::Relaxed),
+        TCP_WMEM_MAX.load(Ordering::Relaxed),
+    )
+}
+/// Write a tcp_wmem triple (1-3 values; missing slots keep the stored
+/// value). Rejects a non-ordered triple like the kernel does.
+pub fn set_tcp_wmem(lo: u64, def: u64, max: u64) -> bool {
+    if !(lo <= def && def <= max && max <= (1 << 24)) {
+        return false;
+    }
+    TCP_WMEM_LO.store(lo, Ordering::Relaxed);
+    TCP_WMEM_DEF.store(def, Ordering::Relaxed);
+    TCP_WMEM_MAX.store(max, Ordering::Relaxed);
+    true
+}
+/// net.netfilter.nf_conntrack_max — real cap on the conntrack table.
+pub fn nf_conntrack_max() -> u64 {
+    NF_CT_MAX.load(Ordering::Relaxed)
+}
 
 /// sysctl name under /proc/sys → current value, or None when unknown.
 /// Names are given relative, e.g. "kernel/pid_max", "fs/nr_open".
@@ -258,6 +286,7 @@ pub fn get(name: &str) -> Option<u64> {
         "user/max_pid_namespaces" => PID_NS_MAX.load(Ordering::Relaxed),
         "user/max_ipc_namespaces" => IPC_NS_MAX.load(Ordering::Relaxed),
         "user/max_time_namespaces" => TIME_NS_MAX.load(Ordering::Relaxed),
+        "net/netfilter/nf_conntrack_max" => NF_CT_MAX.load(Ordering::Relaxed),
 
         _ => return None,
     })
@@ -340,6 +369,9 @@ pub fn set(name: &str, v: u64) -> bool {
         }
         "user/max_time_namespaces" if v <= 65535 => {
             TIME_NS_MAX.store(v, Ordering::Relaxed)
+        }
+        "net/netfilter/nf_conntrack_max" if (1..=4194304).contains(&v) => {
+            NF_CT_MAX.store(v, Ordering::Relaxed)
         }
 
         _ => return false,

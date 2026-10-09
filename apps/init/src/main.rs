@@ -7,7 +7,7 @@
 
 extern crate alloc;
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use ustd::{println, sleep_ms, spawn};
 
@@ -56,6 +56,15 @@ extern "C" fn user_main(args_ptr: u64, args_len: u64) -> i64 {
             let _ = ustd::chmod("/tmp", 0o1777);
         }
         e => println!("[init] tmpfs on /tmp failed: {}", e),
+    }
+
+    // seed the kernel NIS domainname from /etc/domainname (the
+    // `domainname` builtin persists it there; UTS value is runtime).
+    if let Ok(d) = ustd::read_all("/etc/domainname") {
+        let v = String::from_utf8_lossy(&d).trim().to_string();
+        if !v.is_empty() {
+            let _ = ustd::write_all("/proc/sys/kernel/domainname", v.as_bytes());
+        }
     }
 
     let mut services: Vec<Svc> = Vec::new();

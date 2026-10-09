@@ -36,7 +36,7 @@ const NET_FILES: &[&str] = &[
 ];
 
 /// files under /proc/sys/kernel
-const SYS_FILES: &[&str] = &["hostname", "shmmax", "shmall", "shmmni", "ngroups_max", "sysrq", "dmesg_restrict", "randomize_va_space", "kptr_restrict", "unprivileged_userns_clone", "cow_pages", "pid_max", "threads-max"];
+const SYS_FILES: &[&str] = &["hostname", "domainname", "shmmax", "shmall", "shmmni", "ngroups_max", "sysrq", "dmesg_restrict", "randomize_va_space", "kptr_restrict", "unprivileged_userns_clone", "cow_pages", "pid_max", "threads-max"];
 
 /// files under /proc/sys/fs (fs/inotify/max_user_watches lives one deeper)
 const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size", "file-max", "file-nr", "protected_symlinks", "protected_fifos", "protected_regular"];
@@ -44,6 +44,7 @@ const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size", "file-max", "file-nr
 const NET_UNIX_FILES: &[&str] = &["max_dgram_qlen"];
 /// files under /proc/sys/net/core
 const NET_CORE_FILES: &[&str] = &["somaxconn"];
+const NET_NETFILTER_FILES: &[&str] = &["nf_conntrack_max"];
 /// files under /proc/sys/user
 const USER_SYS_FILES: &[&str] = &[
     "max_user_namespaces",
@@ -55,7 +56,7 @@ const USER_SYS_FILES: &[&str] = &[
 ];
 
 /// files under /proc/sys/net/ipv4
-const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range"];
+const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "tcp_wmem", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range"];
 
 /// kernel.kptr_restrict: %pK-style addresses in /proc output —
 /// 0 = show, 1 = hide unless CAP_SYSLOG, 2 = hide for everyone.
@@ -111,6 +112,7 @@ pub fn is_dir(path: &str) -> bool {
         || path == "/proc/sys/net/ipv4"
         || path == "/proc/sys/net/unix"
         || path == "/proc/sys/net/core"
+        || path == "/proc/sys/net/netfilter"
         || path == "/proc/sys/user"
         || pid_of(path)
             .map(|p| task::pids().contains(&p) && path.matches('/').count() == 2)
@@ -188,6 +190,9 @@ pub fn exists(path: &str) -> bool {
     }
     if let Some(f) = path.strip_prefix("/proc/sys/net/core/") {
         return NET_CORE_FILES.contains(&f);
+    }
+    if let Some(f) = path.strip_prefix("/proc/sys/net/netfilter/") {
+        return NET_NETFILTER_FILES.contains(&f);
     }
     if let Some(f) = path.strip_prefix("/proc/sys/user/") {
         return USER_SYS_FILES.contains(&f);
@@ -349,7 +354,7 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         return out;
     }
     if path == "/proc/sys/net" {
-        for (nb, nl) in [(b"ipv4" as &[u8], 4usize), (b"unix", 4), (b"core", 4)] {
+        for (nb, nl) in [(b"ipv4" as &[u8], 4usize), (b"unix", 4), (b"core", 4), (b"netfilter", 9)] {
             let mut de = shared::DirEntry::default();
             de.name[..nl].copy_from_slice(nb);
             de.name_len = nl as u8;
@@ -384,6 +389,17 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
             let nb = name.as_bytes();
             de.name[..nb.len()].copy_from_slice(nb);
             de.name_len = nb.len() as u8;
+            out.push(de);
+        }
+        return out;
+    }
+    if path == "/proc/sys/net/netfilter" {
+        for name in NET_NETFILTER_FILES {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            de.is_dir = 0;
             out.push(de);
         }
         return out;
@@ -561,6 +577,13 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         ),
         "/proc/net/owners" => net::net_owners(),
         "/proc/sys/kernel/hostname" => alloc::format!("{}\n", crate::syscall::hostname()),
+        "/proc/sys/kernel/domainname" => {
+            alloc::format!("{}\n", crate::syscall::domainname())
+        }
+        "/proc/sys/net/ipv4/tcp_wmem" => {
+            let (lo, def, max) = crate::sysctl::tcp_wmem();
+            alloc::format!("{}\t{}\t{}\n", lo, def, max)
+        }
         "/proc/sys/net/ipv4/icmp_echo_ignore_all" => net::net_icmp_ignore_all(),
         "/proc/sys/net/ipv4/ip_unprivileged_port_start" => {
             alloc::format!("{}\n", crate::sysctl::unpriv_port_start())
@@ -973,6 +996,36 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
         return crate::sysctl::set(&alloc::format!("net/core/{}", rel), v)
             .then_some(buf.len());
     }
+    if let Some(rel) = path.strip_prefix("/proc/sys/net/netfilter/") {
+        let s = String::from(String::from_utf8_lossy(buf).trim());
+        let Ok(v) = s.parse::<u64>() else { return None };
+        return crate::sysctl::set(&alloc::format!("net/netfilter/{}", rel), v)
+            .then_some(buf.len());
+    }
+    if path == "/proc/sys/net/ipv4/tcp_wmem" {
+        // 1-3 whitespace/comma numbers; missing slots keep the stored
+        // value; an unordered triple is rejected like the kernel does.
+        let text = String::from(String::from_utf8_lossy(buf));
+        let parts: Vec<u64> = text
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| t.parse::<u64>().ok())
+            .collect();
+        if parts.is_empty() || parts.len() > 3 {
+            return None;
+        }
+        let (mut lo, mut def, mut max) = crate::sysctl::tcp_wmem();
+        if parts.len() > 0 {
+            lo = parts[0];
+        }
+        if parts.len() > 1 {
+            def = parts[1];
+        }
+        if parts.len() > 2 {
+            max = parts[2];
+        }
+        return crate::sysctl::set_tcp_wmem(lo, def, max).then_some(buf.len());
+    }
     if let Some(rel) = path.strip_prefix("/proc/sys/user/") {
         let s = String::from(String::from_utf8_lossy(buf).trim());
         let Ok(v) = s.parse::<u64>() else { return None };
@@ -991,11 +1044,21 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
     }
     if let Some(rel) = path.strip_prefix("/proc/sys/") {
         // hostname is handled by its dedicated arm below; net/* above.
-        if rel != "kernel/hostname" && !rel.starts_with("net/") {
+        if rel != "kernel/hostname" && rel != "kernel/domainname" && !rel.starts_with("net/") {
             let v = String::from(String::from_utf8_lossy(buf).trim());
             let Ok(n) = v.parse::<u64>() else { return None };
             return crate::sysctl::set(rel, n).then_some(buf.len());
         }
+    }
+    if path == "/proc/sys/kernel/domainname" {
+        let s = String::from(String::from_utf8_lossy(buf).trim());
+        if s.len() > 64 {
+            return None;
+        }
+        // "(none)" is the canonical empty value (matches Linux's
+        // printed empty domainname).
+        crate::syscall::set_domainname(if s == "(none)" { String::new() } else { s });
+        return Some(buf.len());
     }
     if path != "/proc/sys/kernel/hostname" {
         return None;

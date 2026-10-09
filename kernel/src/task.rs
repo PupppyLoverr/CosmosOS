@@ -2290,6 +2290,8 @@ pub struct UtsNs {
     /// Stable inode-style id shown by /proc/<pid>/ns/uts.
     pub id: u64,
     pub hostname: String,
+    /// NIS/YP domainname — kernel.domainname / `domainname` (UTS-scoped).
+    pub domainname: String,
     /// Creator's euid — ucounts accounting for max_uts_namespaces.
     pub owner: u32,
 }
@@ -2308,6 +2310,7 @@ pub fn global_uts() -> alloc::sync::Arc<spin::Mutex<UtsNs>> {
             alloc::sync::Arc::new(spin::Mutex::new(UtsNs {
                 id: NEXT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
                 hostname: String::from("cosmos"),
+                domainname: String::new(),
                 owner: 0,
             }))
         })

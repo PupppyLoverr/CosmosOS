@@ -31401,25 +31401,22 @@ impl Term {
             {
                 // domainname [name] — get/set the NIS domain
                 // (persisted in /etc/domainname).
+                // kernel-owned value (UTS ns) — the proc sysctl is
+                // authoritative; /etc/domainname persists it across boots.
                 if let Some(v) = args.iter().find(|a| !a.starts_with('-')) {
-                    match ustd::write_all("/etc/domainname", v.as_bytes()) {
-                        Ok(()) => {}
+                    match ustd::write_all("/proc/sys/kernel/domainname", v.as_bytes()) {
+                        Ok(()) => {
+                            let _ = ustd::write_all("/etc/domainname", v.as_bytes());
+                        }
                         Err(e) => self.fail(&alloc::format!(
                             "domainname: set failed err {}",
                             e
                         )),
                     }
                 } else {
-                    match ustd::read_all("/etc/domainname") {
+                    match ustd::read_all("/proc/sys/kernel/domainname") {
                         Ok(d) => {
-                            let s = String::from_utf8_lossy(&d)
-                                .trim()
-                                .to_string();
-                            if s.is_empty() {
-                                self.emit("(none)");
-                            } else {
-                                self.emit(&s);
-                            }
+                            self.emit(&String::from_utf8_lossy(&d).trim().to_string());
                         }
                         Err(_) => self.emit("(none)"),
                     }
@@ -38306,6 +38303,9 @@ impl Term {
                     "/proc/sys/user/max_pid_namespaces",
                     "/proc/sys/user/max_ipc_namespaces",
                     "/proc/sys/user/max_time_namespaces",
+                    "/proc/sys/kernel/domainname",
+                    "/proc/sys/net/ipv4/tcp_wmem",
+                    "/proc/sys/net/netfilter/nf_conntrack_max",
                 ];
                 // `-N` prints names only, `-n`/`--values` values only —
                 // real sysctl output modes over the same key dump.
