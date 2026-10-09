@@ -311,6 +311,7 @@ fn route_del(spec: &str) -> bool {
 // (real -j DROP semantics: no ICMP reply, no RST, no delivery).
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct FwRule {
     proto: u8,            // 0 = any; 1 icmp, 6 tcp, 17 udp
     dport: u16,           // 0 = any (tcp/udp destination port)
@@ -323,12 +324,24 @@ struct FwRule {
     limit_burst: u16,     // bucket depth (real iptables default 5)
     lim_tokens: u16,      // match-time bucket (packet units)
     lim_ms: u64,          // last bucket refill
-    target: u8,           // 0 = DROP, 1 = LOG (audit + fall through)
+    // 0 = DROP, 1 = LOG (audit + fall through), 2 = REJECT, 3 = ACCEPT,
+    // 4 = RETURN (leave this chain — real `-j RETURN`).
+    target: u8,
+    // Non-empty = jump to the named user chain (`-j NAME`, target 0).
+    // Falling off a user chain's end returns to the caller, like real
+    // iptables; a jump to a missing chain can't be created (ctl-time
+    // validation), and depth is capped against loops.
+    jump: String,
     hits: u64,
     bytes: u64,
 }
 
 static FW: Mutex<Vec<FwRule>> = Mutex::new(Vec::new());
+
+/// User-defined chains (`iptables -N`): evaluated by jump targets from
+/// builtin or other user chains; `X` deletes empty unreferenced ones.
+static FW_USER: Mutex<BTreeMap<String, Vec<FwRule>>> =
+    Mutex::new(BTreeMap::new());
 
 /// INPUT chain policy: false = ACCEPT (default-allow), true = DROP.
 static FW_POLICY: Mutex<bool> = Mutex::new(false);
@@ -477,7 +490,38 @@ fn fw_verdict(
     plen: u64,
 ) -> u8 {
     let mut fw = chain.lock();
-    for r in fw.iter_mut() {
+    match fw_eval(&mut *fw, inbound, src, dst, proto, dport, st, plen, 0) {
+        // 255 = walked off the end of the builtin chain: policy decides
+        255 => {
+            if *policy.lock() {
+                1
+            } else {
+                0
+            }
+        }
+        v => v,
+    }
+}
+
+/// Walk one rule vector against a packet. Verdicts: 0 = ACCEPT (let it
+/// through), 1 = DROP, 2 = REJECT, 255 = fell off the end of this chain
+/// (for a builtin chain the caller applies the policy; for a jumped-to
+/// user chain it means RETURN — resume the parent chain). `-j LOG`
+/// audits and falls through; `-j <name>` evaluates the named user
+/// chain on a snapshot (counters written back); `-j RETURN` ends the
+/// current chain early.
+fn fw_eval(
+    chain: &mut Vec<FwRule>,
+    inbound: bool,
+    src: [u8; 4],
+    dst: [u8; 4],
+    proto: u8,
+    dport: u16,
+    st: u8,
+    plen: u64,
+    depth: u8,
+) -> u8 {
+    for r in chain.iter_mut() {
         if r.proto != 0 && r.proto != proto {
             continue;
         }
@@ -523,6 +567,25 @@ fn fw_verdict(
         }
         r.hits += 1;
         r.bytes += plen;
+        if !r.jump.is_empty() {
+            // -j <chain>: evaluate the user chain on a snapshot (the
+            // FW_USER map can't be re-locked while we hold entries),
+            // then write the counters back. Falling off its end =
+            // RETURN to this chain; a terminal verdict applies to the
+            // packet outright — real iptables semantics.
+            if depth >= 16 {
+                continue; // loop guard — treat as no-match
+            }
+            let mut snap = FW_USER.lock().get(&r.jump).cloned().unwrap_or_default();
+            let v = fw_eval(&mut snap, inbound, src, dst, proto, dport, st, plen, depth + 1);
+            if let Some(u) = FW_USER.lock().get_mut(&r.jump) {
+                *u = snap;
+            }
+            if v == 255 {
+                continue;
+            }
+            return v;
+        }
         if r.target == 1 {
             // -j LOG: audit the packet into the kernel log and fall
             // through to the next rule — the packet is NOT dropped.
@@ -542,9 +605,12 @@ fn fw_verdict(
         if r.target == 3 {
             return 0; // -j ACCEPT: terminal — skips the rest of the chain
         }
+        if r.target == 4 {
+            return 255; // -j RETURN: leave this chain now
+        }
         return if r.target == 2 { 2 } else { 1 };
     }
-    if *policy.lock() { 1 } else { 0 }
+    255
 }
 
 /// OUTPUT -j REJECT: the refusal can't reach a remote — synthesize the
@@ -601,6 +667,21 @@ pub fn net_iptables() -> String {
     fmt_fw_chain(&mut out, "INPUT", &FW, &FW_POLICY);
     out.push('\n');
     fmt_fw_chain(&mut out, "OUTPUT", &FW_OUT, &FW_OUT_POLICY);
+    // User-defined chains after the builtins — real -L order. Header
+    // carries the reference count like the Linux listing.
+    let names: Vec<String> = FW_USER.lock().keys().cloned().collect();
+    for n in names {
+        out.push('\n');
+        out.push_str(&alloc::format!(
+            "Chain {} ({} references)\nnum  pkts bytes target  prot  source       destination\n",
+            n,
+            fw_refs(&n)
+        ));
+        let v = FW_USER.lock().get(&n).cloned().unwrap_or_default();
+        for (i, r) in v.iter().enumerate() {
+            fmt_fw_rule(&mut out, i, r);
+        }
+    }
     out
 }
 
@@ -616,77 +697,88 @@ fn fmt_fw_chain(
         if *policy.lock() { "DROP" } else { "ACCEPT" }
     ));
     for (i, r) in chain.lock().iter().enumerate() {
-        let tgt = match r.target {
+        fmt_fw_rule(out, i, r);
+    }
+}
+
+/// One `-L` rule row: num, pkts, bytes, target (builtin verb or the
+/// jumped-to chain name), proto, source, matcher detail.
+fn fmt_fw_rule(out: &mut String, i: usize, r: &FwRule) {
+    let tgt = if !r.jump.is_empty() {
+        r.jump.clone()
+    } else {
+        String::from(match r.target {
             1 => "LOG",
             2 => "REJECT",
             3 => "ACCEPT",
+            4 => "RETURN",
             _ => "DROP",
-        };
-        let proto = match r.proto {
-            1 => String::from("icmp"),
-            6 => String::from("tcp"),
-            17 => String::from("udp"),
-            n => alloc::format!("{}", n),
-        };
-        let src = if r.src == [0; 4] {
-            String::from("0.0.0.0/0")
-        } else {
-            let plen = r.smask.iter().map(|b| b.count_ones()).sum::<u32>();
-            alloc::format!("{}.{}.{}.{}/{}", r.src[0], r.src[1], r.src[2], r.src[3], plen)
-        };
-        let mut extra = if r.dport != 0 {
-            alloc::format!("  {} dpt:{}", proto, r.dport)
-        } else {
-            String::new()
-        };
-        if !r.dports.is_empty() {
-            let mut csv = String::new();
-            for (i, p) in r.dports.iter().enumerate() {
-                if i > 0 {
-                    csv.push(',');
-                }
-                csv.push_str(&alloc::format!("{}", p));
+        })
+    };
+    let proto = match r.proto {
+        1 => String::from("icmp"),
+        6 => String::from("tcp"),
+        17 => String::from("udp"),
+        n => alloc::format!("{}", n),
+    };
+    let src = if r.src == [0; 4] {
+        String::from("0.0.0.0/0")
+    } else {
+        let plen = r.smask.iter().map(|b| b.count_ones()).sum::<u32>();
+        alloc::format!("{}.{}.{}.{}/{}", r.src[0], r.src[1], r.src[2], r.src[3], plen)
+    };
+    let mut extra = if r.dport != 0 {
+        alloc::format!("  {} dpt:{}", proto, r.dport)
+    } else {
+        String::new()
+    };
+    if !r.dports.is_empty() {
+        let mut csv = String::new();
+        for (i, p) in r.dports.iter().enumerate() {
+            if i > 0 {
+                csv.push(',');
             }
-            extra.push_str(&alloc::format!(" multiport dpts:{}", csv));
+            csv.push_str(&alloc::format!("{}", p));
         }
-        if let Some((lo, hi)) = r.src_range {
-            let fmt = |v: u32| {
-                let b = v.to_be_bytes();
-                alloc::format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
-            };
-            extra.push_str(&alloc::format!(
-                " iprange src-range:{}-{}",
-                fmt(lo),
-                fmt(hi)
-            ));
-        }
-        if r.state != 0 {
-            extra.push_str(&alloc::format!(
-                "  state {}",
-                match r.state {
-                    1 => "NEW",
-                    2 => "ESTABLISHED",
-                    _ => "NEW,ESTABLISHED",
-                }
-            ));
-        }
-        if r.limit_pps != 0 {
-            extra.push_str(&alloc::format!(
-                "  limit: avg {}/sec burst {}",
-                r.limit_pps, r.limit_burst
-            ));
-        }
-        out.push_str(&alloc::format!(
-            "{:<4} {:<5} {:<6} {:<8} {:<6} {:<12} 0.0.0.0/0{}\n",
-            i + 1,
-            r.hits,
-            r.bytes,
-            tgt,
-            proto,
-            src,
-            extra
+        extra.push_str(&alloc::format!(" multiport dpts:{}", csv));
+    }
+    if let Some((lo, hi)) = r.src_range {
+        let fmt = |v: u32| {
+            let b = v.to_be_bytes();
+            alloc::format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+        };
+        extra.push_str(&alloc::format!(
+            " iprange src-range:{}-{}",
+            fmt(lo),
+            fmt(hi)
         ));
     }
+    if r.state != 0 {
+        extra.push_str(&alloc::format!(
+            "  state {}",
+            match r.state {
+                1 => "NEW",
+                2 => "ESTABLISHED",
+                _ => "NEW,ESTABLISHED",
+            }
+        ));
+    }
+    if r.limit_pps != 0 {
+        extra.push_str(&alloc::format!(
+            "  limit: avg {}/sec burst {}",
+            r.limit_pps, r.limit_burst
+        ));
+    }
+    out.push_str(&alloc::format!(
+        "{:<4} {:<5} {:<6} {:<8} {:<6} {:<12} 0.0.0.0/0{}\n",
+        i + 1,
+        r.hits,
+        r.bytes,
+        tgt,
+        proto,
+        src,
+        extra
+    ));
 }
 
 /// `/proc/net/snmp` — Linux-format IP/ICMP/TCP/UDP counters for `netstat -s`.
@@ -885,52 +977,208 @@ pub fn set_icmp_ignore_all(v: u64) {
     ICMP_IGNORE_ALL.store(v, Ordering::Relaxed);
 }
 
-/// `/proc/net/iptables` write grammar (kernel side of the `iptables` cmd):
-///   "F"                                  flush all rules
-///   "D <n>"                              delete 1-based rule number
-///   "A <proto|*> [dport N] [src ip/plen]" append a DROP rule
-///   "P <ACCEPT|DROP>"                    set the real chain policy (FW_POLICY —
-///                                         DROP catches every packet no rule hit)
+/// Which chain a ctl line targets: a builtin or a registered user chain.
+enum ChainSel {
+    In,
+    Out,
+    User(String),
+}
+
+/// Chain token → selector. Builtin names always resolve; a user name
+/// resolves only when registered — anything else is left for the proto
+/// parser, which is how the no-chain compat form (`A 6 dport 80 drop`)
+/// keeps landing on INPUT.
+fn fw_chain_sel(t: &str) -> Option<ChainSel> {
+    match t {
+        "IN" | "INPUT" => Some(ChainSel::In),
+        "OUT" | "OUTPUT" => Some(ChainSel::Out),
+        "FORWARD" => None, // reserved builtin — no forwarding plane here
+        n if FW_USER.lock().contains_key(n) => Some(ChainSel::User(String::from(n))),
+        _ => None,
+    }
+}
+
+/// Run `f` on the rules Vec behind a selector; None for a user chain
+/// that vanished between name resolution and use.
+fn fw_with_chain<R>(c: &ChainSel, f: impl FnOnce(&mut Vec<FwRule>) -> R) -> Option<R> {
+    match c {
+        ChainSel::In => Some(f(&mut FW.lock())),
+        ChainSel::Out => Some(f(&mut FW_OUT.lock())),
+        ChainSel::User(n) => FW_USER.lock().get_mut(n).map(f),
+    }
+}
+
+/// `iptables -N` name validation: ≤28 chars (the real netfilter limit),
+/// not numeric, not a builtin name, spec keyword, proto or target word —
+/// any of those would shadow the rule grammar in a ctl line.
+fn fw_name_ok(n: &str) -> bool {
+    const RSVD: &[&str] = &[
+        "IN", "OUT", "INPUT", "OUTPUT", "FORWARD", "PREROUTING", "POSTROUTING",
+        "icmp", "tcp", "udp", "all", "*", "dport", "multiport", "range", "src",
+        "state", "limit", "lburst", "log", "reject", "accept", "return", "drop",
+    ];
+    !n.is_empty()
+        && n.len() <= 28
+        && n.parse::<u64>().is_err()
+        && !RSVD.iter().any(|r| r.eq_ignore_ascii_case(n))
+}
+
+/// Number of rules anywhere that jump to `name` — the `-X` reference
+/// guard and the "(N references)" chain header in the listing.
+fn fw_refs(name: &str) -> usize {
+    let mut n = FW
+        .lock()
+        .iter()
+        .chain(FW_OUT.lock().iter())
+        .filter(|r| r.jump == name)
+        .count();
+    let u = FW_USER.lock();
+    for v in u.values() {
+        n += v.iter().filter(|r| r.jump == name).count();
+    }
+    n
+}
+
+/// `/proc/net/iptables` write grammar (kernel side of the `iptables` cmd).
+/// Chain words: `IN`/`INPUT`, `OUT`/`OUTPUT`, or any registered user
+/// chain name; absent = INPUT (compat with the no-chain emit form).
+///   "F [chain]"  flush all chains, or one
+///   "Z [chain]"  zero rule counters (all chains, or one)
+///   "N <name>"   create a user chain           "X [name]"  delete empty unreferenced chain(s)
+///   "E <o> <n>"  rename a user chain           "P [chain] <v>"  builtin policy only
+///   "A|I <ch> [n] <proto> <spec>"  append/insert rule
+///   "R <ch> <n> <proto> <spec>"    replace rule
+///   "D <ch> <n>" | "D <ch> <proto> <spec>"     delete by position / by spec
 /// Returns false on a parse miss.
+/// Post-op chain token resolution shared by D/R/P/A/I: the token may
+/// name a builtin or registered user chain; otherwise it stays as the
+/// operand (proto/policy) on the INPUT chain.
+fn fw_chain_tok<'a>(f: &mut core::str::SplitWhitespace<'a>) -> (ChainSel, Option<&'a str>) {
+    let t = f.next();
+    match t.and_then(fw_chain_sel) {
+        Some(c) => (c, f.next()),
+        None => (ChainSel::In, t),
+    }
+}
+
 pub fn iptables_ctl(line: &str) -> bool {
     let mut f = line.split_whitespace();
-    // Chain word: ops take an optional `OUT` (or `IN`) chain token right
-    // after the op letter; absent means INPUT. Bare F/Z flush all chains.
     match f.next() {
+        // `F` bare flushes every chain incl. user chains (real iptables
+        // -F semantics); `F <chain>` flushes just that one.
         Some("F") => match f.next() {
-            Some("OUT") => {
-                FW_OUT.lock().clear();
-                true
-            }
-            Some("IN") => {
-                FW.lock().clear();
-                true
-            }
-            _ => {
+            None => {
                 FW.lock().clear();
                 FW_OUT.lock().clear();
+                for v in FW_USER.lock().values_mut() {
+                    v.clear();
+                }
+                true
+            }
+            Some(t) => match fw_chain_sel(t) {
+                Some(c) => fw_with_chain(&c, |v| {
+                    v.clear();
+                    true
+                })
+                .unwrap_or(false),
+                None => false,
+            },
+        },
+        Some("Z") => match f.next() {
+            None => {
+                let z = |v: &mut Vec<FwRule>| {
+                    for r in v.iter_mut() {
+                        r.hits = 0;
+                        r.bytes = 0;
+                    }
+                };
+                z(&mut FW.lock());
+                z(&mut FW_OUT.lock());
+                for v in FW_USER.lock().values_mut() {
+                    z(v);
+                }
+                true
+            }
+            Some(t) => match fw_chain_sel(t) {
+                Some(c) => fw_with_chain(&c, |v| {
+                    for r in v.iter_mut() {
+                        r.hits = 0;
+                        r.bytes = 0;
+                    }
+                    true
+                })
+                .unwrap_or(false),
+                None => false,
+            },
+        },
+        // `N <name>` — create an empty user chain (must not exist).
+        Some("N") => match f.next() {
+            Some(n) if fw_name_ok(n) => {
+                let mut u = FW_USER.lock();
+                if u.contains_key(n) {
+                    false
+                } else {
+                    u.insert(String::from(n), Vec::new());
+                    true
+                }
+            }
+            _ => false,
+        },
+        // `X <name>` — delete an empty user chain nothing jumps to;
+        // bare `X` removes every chain that qualifies (real iptables).
+        Some("X") => match f.next() {
+            Some(n) => {
+                let ok = FW_USER.lock().get(n).map(|v| v.is_empty()) == Some(true)
+                    && fw_refs(n) == 0;
+                ok && FW_USER.lock().remove(n).is_some()
+            }
+            None => {
+                let names: Vec<String> = FW_USER
+                    .lock()
+                    .iter()
+                    .filter(|(_, v)| v.is_empty())
+                    .map(|(n, _)| n.clone())
+                    .collect();
+                for n in names {
+                    if fw_refs(&n) == 0 {
+                        FW_USER.lock().remove(&n);
+                    }
+                }
                 true
             }
         },
-        Some("Z") => {
-            let out = matches!(f.next(), Some("OUT"));
-            let ch = if out { &FW_OUT } else { &FW };
-            for r in ch.lock().iter_mut() {
-                r.hits = 0;
-                r.bytes = 0;
+        // `E <old> <new>` — rename a user chain; jumps keep working
+        // because netfilter refs the chain, not the name — so rewrite
+        // every jump field equal to `old`.
+        Some("E") => {
+            let (Some(o), Some(n)) = (f.next(), f.next()) else {
+                return false;
+            };
+            if !fw_name_ok(n) || FW_USER.lock().contains_key(n) {
+                return false;
+            }
+            let Some(v) = FW_USER.lock().remove(o) else {
+                return false;
+            };
+            FW_USER.lock().insert(String::from(n), v);
+            for r in FW.lock().iter_mut().chain(FW_OUT.lock().iter_mut()) {
+                if r.jump == o {
+                    r.jump = String::from(n);
+                }
+            }
+            for v in FW_USER.lock().values_mut() {
+                for r in v.iter_mut() {
+                    if r.jump == o {
+                        r.jump = String::from(n);
+                    }
+                }
             }
             true
         }
-        // `D <n>` deletes by 1-based position; `D <proto> <spec>`
-        // deletes the FIRST rule whose matcher+target equals the spec —
-        // real `iptables -D CHAIN <spec>` semantics.
+        // `D <chain> <n>` positional or `D <chain> <proto> <spec>` —
+        // spec deletes the FIRST rule whose matcher+target equals it.
         Some("D") => {
-            let mut t = f.next();
-            let out = t == Some("OUT");
-            if out {
-                t = f.next();
-            }
-            let ch = if out { &FW_OUT } else { &FW };
+            let (ch, t) = fw_chain_tok(&mut f);
             // Positional vs spec: a bare number with nothing after it is a
             // rule number; a proto token (numeric or named) followed by
             // more spec words is a spec delete.
@@ -938,12 +1186,15 @@ pub fn iptables_ctl(line: &str) -> bool {
                 && f.clone().next().is_none()
             {
                 let n: usize = t.and_then(|s| s.parse().ok()).unwrap_or(0);
-                let mut fw = ch.lock();
-                if n == 0 || n > fw.len() {
-                    return false;
-                }
-                fw.remove(n - 1);
-                return true;
+                return fw_with_chain(&ch, |fw| {
+                    if n == 0 || n > fw.len() {
+                        false
+                    } else {
+                        fw.remove(n - 1);
+                        true
+                    }
+                })
+                .unwrap_or(false);
             }
             let Some(proto) = fw_proto_tok(t) else {
                 return false;
@@ -951,23 +1202,19 @@ pub fn iptables_ctl(line: &str) -> bool {
             let Some(want) = fw_parse_spec(&mut f, proto) else {
                 return false;
             };
-            let mut fw = ch.lock();
-            match fw.iter().position(|r| fw_rule_eq(r, &want)) {
+            fw_with_chain(&ch, |fw| match fw.iter().position(|r| fw_rule_eq(r, &want)) {
                 Some(i) => {
                     fw.remove(i);
                     true
                 }
                 None => false,
-            }
+            })
+            .unwrap_or(false)
         }
-        // `R [OUT] <n> <proto> <spec>` — real `iptables -R`: replaces the
-        // 1-based rule wholesale (the replaced rule's counters reset).
+        // `R <chain> <n> <proto> <spec>` — real `iptables -R`: replaces
+        // the 1-based rule wholesale (the replaced rule's counters reset).
         Some("R") => {
-            let mut t = f.next();
-            let out = t == Some("OUT");
-            if out {
-                t = f.next();
-            }
+            let (ch, t) = fw_chain_tok(&mut f);
             let n: usize = t.and_then(|s| s.parse().ok()).unwrap_or(0);
             let Some(proto) = fw_proto_tok(f.next()) else {
                 return false;
@@ -975,21 +1222,33 @@ pub fn iptables_ctl(line: &str) -> bool {
             let Some(r) = fw_parse_spec(&mut f, proto) else {
                 return false;
             };
-            let ch = if out { &FW_OUT } else { &FW };
-            let mut fw = ch.lock();
-            if n == 0 || n > fw.len() {
-                return false;
+            if !r.jump.is_empty() && !FW_USER.lock().contains_key(&r.jump) {
+                return false; // -j to a chain that doesn't exist
             }
-            fw[n - 1] = r;
-            true
+            fw_with_chain(&ch, |fw| {
+                if n == 0 || n > fw.len() {
+                    false
+                } else {
+                    fw[n - 1] = r;
+                    true
+                }
+            })
+            .unwrap_or(false)
         }
+        // `P <chain> <v>` — policy is a builtin-chain concept; setting
+        // one on a user chain is an error, like real iptables.
         Some("P") => {
-            let mut t = f.next();
-            let out = t == Some("OUT");
-            if out {
-                t = f.next();
-            }
-            let pol = if out { &FW_OUT_POLICY } else { &FW_POLICY };
+            let t = f.next();
+            let (ch, t) = match t.and_then(fw_chain_sel) {
+                Some(c @ (ChainSel::In | ChainSel::Out)) => (c, f.next()),
+                Some(ChainSel::User(_)) => return false,
+                None => (ChainSel::In, t),
+            };
+            let pol = if matches!(ch, ChainSel::Out) {
+                &FW_OUT_POLICY
+            } else {
+                &FW_POLICY
+            };
             match t {
                 Some("ACCEPT") => {
                     *pol.lock() = false;
@@ -1003,36 +1262,36 @@ pub fn iptables_ctl(line: &str) -> bool {
             }
         }
         // `A` appends, `I <n>` inserts at 1-based position n — real
-        // iptables -I INPUT <n> ordering semantics. `OUT` after the op
-        // targets the OUTPUT chain (evaluated on locally-generated tx).
+        // iptables -I ordering semantics, on any chain.
         Some(op @ ("A" | "I")) => {
-            let out = if f.clone().next() == Some("OUT") {
-                f.next();
-                true
+            let (ch, t) = fw_chain_tok(&mut f);
+            let (ins, t) = if op == "I" {
+                (
+                    Some(t.and_then(|s| s.parse().ok()).unwrap_or(1).max(1)),
+                    f.next(),
+                )
             } else {
-                false
+                (None, t)
             };
-            let ins: Option<usize> = if op == "I" {
-                Some(f.next().and_then(|s| s.parse().ok()).unwrap_or(1).max(1))
-            } else {
-                None
-            };
-            let Some(proto) = fw_proto_tok(f.next()) else {
+            let Some(proto) = fw_proto_tok(t) else {
                 return false;
             };
             let Some(r) = fw_parse_spec(&mut f, proto) else {
                 return false;
             };
-            let ch = if out { &FW_OUT } else { &FW };
-            let mut fw = ch.lock();
-            match ins {
-                Some(n) => {
-                    let pos = (n - 1).min(fw.len());
-                    fw.insert(pos, r);
-                }
-                None => fw.push(r),
+            if !r.jump.is_empty() && !FW_USER.lock().contains_key(&r.jump) {
+                return false; // -j to a chain that doesn't exist
             }
-            true
+            fw_with_chain(&ch, |fw| {
+                match ins {
+                    Some(n) => {
+                        let pos = (n - 1).min(fw.len());
+                        fw.insert(pos, r);
+                    }
+                    None => fw.push(r),
+                }
+            })
+            .is_some()
         }
         _ => false,
     }
@@ -1067,6 +1326,7 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         lim_tokens: 5,
         lim_ms: 0,
         target: 0,
+        jump: String::new(),
         hits: 0,
         bytes: 0,
     };
@@ -1170,7 +1430,11 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
             "log" => r.target = 1,    // "... log" marks -j LOG
             "reject" => r.target = 2, // -j REJECT: refusal goes back
             "accept" => r.target = 3, // -j ACCEPT: terminal allow
-            _ => ok = false,
+            "return" => r.target = 4, // -j RETURN: leave the chain
+            "drop" => r.target = 0,
+            // any other trailing word is a `-j <name>` user-chain jump —
+            // the ctl ops reject it if the chain isn't registered.
+            n => r.jump = String::from(n),
         }
     }
     ok.then_some(r)
@@ -1189,6 +1453,7 @@ fn fw_rule_eq(a: &FwRule, b: &FwRule) -> bool {
         && a.limit_pps == b.limit_pps
         && a.limit_burst == b.limit_burst
         && a.target == b.target
+        && a.jump == b.jump
 }
 
 fn parse_ip(s: &str) -> Option<[u8; 4]> {
@@ -1387,9 +1652,14 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
                 if k.state != TcpState::Open {
                     continue;
                 }
+                // RTO from the RFC6298 estimator (400ms before the
+                // handshake's first RTT sample lands)
+                let rto = tcp_rto(k);
                 if let Some(u) = k.unacked.front_mut() {
-                    if now.saturating_sub(u.tx_ms) >= 400 {
+                    if now.saturating_sub(u.tx_ms) >= rto {
                         u.tx_ms = now;
+                        u.rtx = true;
+                        k.rtx += 1;
                         resend.push((
                             k.mac, k.rip, k.lport, k.rport, u.seq, k.rcv_nxt,
                             u.flags, u.payload.clone(), rx_win(k),
@@ -2530,6 +2800,35 @@ pub fn net_tcp() -> String {
     s
 }
 
+/// `/proc/net/tcpinfo` — per-conn TCP internals for `ss -i`: the
+/// RFC6298 rtt/rttvar estimates, current RTO, retransmit count, and
+/// live queue depths. One line: lport rport st srtt rttvar rto rtx
+/// unackedB rxqB.
+pub fn net_tcpinfo() -> String {
+    let mut s = String::from("lport rport st srtt rttvar rto rtx unacked rxq\n");
+    for k in TCP_SOCKS.lock().values() {
+        let txq: usize = k.unacked.iter().map(|u| u.payload.len()).sum();
+        s.push_str(&alloc::format!(
+            "{} {} {} {} {} {} {} {} {}\n",
+            k.lport,
+            k.rport,
+            match k.state {
+                TcpState::Open => "estab",
+                TcpState::SynSent => "syn-sent",
+                TcpState::SynRecv => "syn-recv",
+                TcpState::Closed => "closed",
+            },
+            k.srtt,
+            k.rttvar,
+            tcp_rto(k),
+            k.rtx,
+            txq,
+            k.q.iter().map(|c| c.len()).sum::<usize>(),
+        ));
+    }
+    s
+}
+
 /// Linux-style `/proc/net/udp` dump.
 /// Socket ownership table for `netstat -p` and /proc/net/owners:
 /// one line per socket as "{tcp|udp|listen} {lport} {owner-pid}".
@@ -2937,6 +3236,10 @@ pub struct TcpSock {
     wr_off: bool,         // shutdown(SHUT_WR): FIN sent, no more sends
     ka: bool,             // SO_KEEPALIVE: probe the peer after 15s idle
     ka_rx: u64,           // last rx (or probe) timestamp — keepalive clock
+    syn_ms: u64,          // outbound SYN tx time — first RTT sample
+    srtt: u64,            // smoothed RTT estimate ms (0 = none yet)
+    rttvar: u64,          // RTT variation ms — RFC6298 estimator
+    rtx: u32,             // total retransmitted segments (ss -i retrans)
 }
 
 /// A transmitted segment awaiting ACK — retransmitted by tcp_tick.
@@ -2945,6 +3248,30 @@ pub struct UnAck {
     flags: u8,
     payload: Vec<u8>,
     tx_ms: u64, // last transmit time (RTO clock)
+    rtx: bool,  // already retransmitted — Karn's algorithm skips it for RTT samples
+}
+
+/// Retransmit timeout from the RFC6298 estimator; 400ms until the
+/// handshake's first sample lands (the pre-estimator default).
+fn tcp_rto(k: &TcpSock) -> u64 {
+    if k.srtt == 0 {
+        400
+    } else {
+        (k.srtt + (4 * k.rttvar).max(200)).clamp(200, 60_000)
+    }
+}
+
+/// Feed one RTT sample (ms) into the RFC6298 srtt/rttvar estimator.
+fn tcp_rtt_sample(k: &mut TcpSock, sample: u64) {
+    let sample = sample.max(1);
+    if k.srtt == 0 {
+        k.srtt = sample;
+        k.rttvar = sample / 2;
+    } else {
+        let d = k.srtt.abs_diff(sample);
+        k.rttvar = (3 * k.rttvar + d) / 4;
+        k.srtt = (7 * k.srtt + sample) / 8;
+    }
 }
 
 /// Advertised receive window: shrinks as the in-order queue fills — real
@@ -2993,6 +3320,8 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
                 k.rcv_nxt = s.seq + 1;
                 k.snd_una = s.ack;
                 k.state = TcpState::Open;
+                // handshake RTT: the estimator's first sample
+                tcp_rtt_sample(k, now_ms().saturating_sub(k.syn_ms));
                 send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[], rx_win(k));
             } else if s.flags & TCP_RST != 0 {
                 k.rst = true;
@@ -3007,12 +3336,19 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
             }
             if s.ack > k.snd_una {
                 k.snd_una = s.ack;
-                // drain the retransmit queue: cumulatively-acked segs
+                // drain the retransmit queue: cumulatively-acked segs;
+                // each ACKed never-retransmitted seg feeds one RTT
+                // sample (Karn's algorithm — retransmits are skipped).
+                let mut sampled = false;
                 while let Some(u) = k.unacked.front() {
                     let end = u.seq.wrapping_add(u.payload.len() as u32).wrapping_add(
                         if u.flags & TCP_FIN != 0 { 1 } else { 0 },
                     );
                     if s.ack >= end {
+                        if !u.rtx && !sampled {
+                            tcp_rtt_sample(k, now_ms().saturating_sub(u.tx_ms));
+                            sampled = true;
+                        }
                         k.unacked.pop_front();
                     } else {
                         break;
@@ -3062,6 +3398,10 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
             wr_off: false,
             ka: false,
             ka_rx: now_ms(),
+            syn_ms: now_ms(),
+            srtt: 0,
+            rttvar: 0,
+            rtx: 0,
         },
     );
     let deadline = now_ms() + timeout_ms;
@@ -3154,6 +3494,10 @@ fn accept_syn(s: &TcpSeg, src_ip: [u8; 4]) {
             wr_off: false,
             ka: false,
             ka_rx: now_ms(),
+            syn_ms: 0,
+            srtt: 0,
+            rttvar: 0,
+            rtx: 0,
         },
     );
     send_tcp(mac, src_ip, s.dport, s.sport, isn, s.seq + 1, TCP_SYN | TCP_ACK, &[], 65535);
@@ -3218,6 +3562,7 @@ pub fn tcp_send(lport: u16, data: &[u8], timeout_ms: u64) -> Result<(), i64> {
                     flags: TCP_ACK | TCP_PSH,
                     payload: data[..sent_len].to_vec(),
                     tx_ms: now_ms(),
+                    rtx: false,
                 });
                 enqueued = true;
             }
@@ -3375,6 +3720,7 @@ pub fn tcp_send_nowait(cid: u16, data: &[u8]) -> Result<usize, i64> {
             flags: TCP_ACK | TCP_PSH,
             payload: data[..n].to_vec(),
             tx_ms: now_ms(),
+            rtx: false,
         });
         k.snd_nxt = seq.wrapping_add(n as u32);
     }
@@ -3396,6 +3742,7 @@ pub fn tcp_shutdown_wr(cid: u16) {
         flags: TCP_FIN | TCP_ACK,
         payload: Vec::new(),
         tx_ms: now_ms(),
+        rtx: false,
     });
     send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_FIN | TCP_ACK, &[], rx_win(k));
     k.snd_nxt = k.snd_nxt.wrapping_add(1); // FIN consumes one sequence number
