@@ -36,6 +36,33 @@ pub static ICMP_OUT_ECHOREP: AtomicU64 = AtomicU64::new(0);
 // net.ipv4 tunables (writable via /proc/sys/net/ipv4/*)
 static ICMP_IGNORE_ALL: AtomicU64 = AtomicU64::new(0);
 
+/// Real wire MTU (`ip link set eth0 mtu N`, `/proc/net/mtu`). Datagrams
+/// larger than this are dropped at the egress funnel — the stack has no
+/// IP fragmentation, so oversize sends die like a DF datagram — plus a
+/// real EMSGSIZE at the UDP socket API.
+static IFACE_MTU: AtomicU64 = AtomicU64::new(1500);
+/// TX drops caused by the MTU gate — surfaces as TX-DRP in
+/// /proc/net/dev, `ip -s link` and `ifconfig -s`.
+static IP_MTU_DROPS: AtomicU64 = AtomicU64::new(0);
+
+pub fn iface_mtu() -> u64 {
+    IFACE_MTU.load(Ordering::Relaxed)
+}
+
+/// `ip link set mtu` semantics: 68..=65535 (RFC 791 minimum).
+pub fn set_mtu(n: u64) -> bool {
+    if (68..=65535).contains(&n) {
+        IFACE_MTU.store(n, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+pub fn net_mtu() -> String {
+    alloc::format!("{}\n", iface_mtu())
+}
+
 /// `net.ipv4.ip_default_ttl` — real default TTL stamped into every IPv4
 /// packet that leaves without an explicit per-send override.
 static DEF_TTL: AtomicU64 = AtomicU64::new(64);
@@ -66,11 +93,12 @@ pub fn is_up() -> bool {
 /// `/proc/net/dev` body: real rx/tx counters for the virtio-net iface.
 pub fn net_dev() -> String {
     alloc::format!(
-        "Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n  eth0:{:>8}{:>8}    0    0    0     0          0         0 {:>8}{:>8}    0    0    0     0       0          0\n    lo:{:>8}{:>8}    0    0    0     0          0         0 {:>8}{:>8}    0    0    0     0       0          0\n",
+        "Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n  eth0:{:>8}{:>8}    0    0    0     0          0         0 {:>8}{:>8}    0 {:>4}    0     0       0          0\n    lo:{:>8}{:>8}    0    0    0     0          0         0 {:>8}{:>8}    0    0    0     0       0          0\n",
         RX_BYTES.load(Ordering::Relaxed),
         RX_PKTS.load(Ordering::Relaxed),
         TX_BYTES.load(Ordering::Relaxed),
         TX_PKTS.load(Ordering::Relaxed),
+        IP_MTU_DROPS.load(Ordering::Relaxed),
         LO_RX_BYTES.load(Ordering::Relaxed),
         LO_RX_PKTS.load(Ordering::Relaxed),
         LO_TX_BYTES.load(Ordering::Relaxed),
@@ -893,19 +921,66 @@ pub fn iptables_ctl(line: &str) -> bool {
             }
             true
         }
+        // `D <n>` deletes by 1-based position; `D <proto> <spec>`
+        // deletes the FIRST rule whose matcher+target equals the spec —
+        // real `iptables -D CHAIN <spec>` semantics.
         Some("D") => {
             let mut t = f.next();
             let out = t == Some("OUT");
             if out {
                 t = f.next();
             }
+            let ch = if out { &FW_OUT } else { &FW };
+            // Positional vs spec: a bare number with nothing after it is a
+            // rule number; a proto token (numeric or named) followed by
+            // more spec words is a spec delete.
+            if t.and_then(|s| s.parse::<usize>().ok()).is_some()
+                && f.clone().next().is_none()
+            {
+                let n: usize = t.and_then(|s| s.parse().ok()).unwrap_or(0);
+                let mut fw = ch.lock();
+                if n == 0 || n > fw.len() {
+                    return false;
+                }
+                fw.remove(n - 1);
+                return true;
+            }
+            let Some(proto) = fw_proto_tok(t) else {
+                return false;
+            };
+            let Some(want) = fw_parse_spec(&mut f, proto) else {
+                return false;
+            };
+            let mut fw = ch.lock();
+            match fw.iter().position(|r| fw_rule_eq(r, &want)) {
+                Some(i) => {
+                    fw.remove(i);
+                    true
+                }
+                None => false,
+            }
+        }
+        // `R [OUT] <n> <proto> <spec>` — real `iptables -R`: replaces the
+        // 1-based rule wholesale (the replaced rule's counters reset).
+        Some("R") => {
+            let mut t = f.next();
+            let out = t == Some("OUT");
+            if out {
+                t = f.next();
+            }
             let n: usize = t.and_then(|s| s.parse().ok()).unwrap_or(0);
+            let Some(proto) = fw_proto_tok(f.next()) else {
+                return false;
+            };
+            let Some(r) = fw_parse_spec(&mut f, proto) else {
+                return false;
+            };
             let ch = if out { &FW_OUT } else { &FW };
             let mut fw = ch.lock();
             if n == 0 || n > fw.len() {
                 return false;
             }
-            fw.remove(n - 1);
+            fw[n - 1] = r;
             true
         }
         Some("P") => {
@@ -942,142 +1017,178 @@ pub fn iptables_ctl(line: &str) -> bool {
             } else {
                 None
             };
-            let proto = match f.next() {
-                Some("*") | Some("all") => 0u8,
-                Some("icmp") => 1,
-                Some("tcp") => 6,
-                Some("udp") => 17,
-                Some(n) => n.parse().unwrap_or(0),
-                None => return false,
+            let Some(proto) = fw_proto_tok(f.next()) else {
+                return false;
             };
-            let mut r = FwRule {
-                proto, dport: 0, dports: Vec::new(), src: [0; 4], smask: [0; 4],
-                src_range: None, state: 0,
-                limit_pps: 0, limit_burst: 5, lim_tokens: 5, lim_ms: 0,
-                target: 0, hits: 0, bytes: 0,
+            let Some(r) = fw_parse_spec(&mut f, proto) else {
+                return false;
             };
-            let mut ok = true;
-            while let Some(k) = f.next() {
-                match k {
-                    "dport" => {
-                        r.dport = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                        if r.dport == 0 {
-                            ok = false;
-                        }
-                    }
-                    // `-m iprange --src-range <a>-<b>`
-                    "range" => {
-                        let spec = f.next().unwrap_or("");
-                        match spec.split_once('-') {
-                            Some((a, b)) => {
-                                match (parse_ip(a), parse_ip(b)) {
-                                    (Some(lo), Some(hi)) => {
-                                        let (lo, hi) = (
-                                            u32::from_be_bytes(lo),
-                                            u32::from_be_bytes(hi),
-                                        );
-                                        if lo <= hi {
-                                            r.src_range = Some((lo, hi));
-                                        } else {
-                                            ok = false;
-                                        }
-                                    }
-                                    _ => ok = false,
-                                }
-                            }
-                            None => ok = false,
-                        }
-                    }
-                    // `-m multiport --dports a,b,..` (15 max, like Linux)
-                    "multiport" => {
-                        r.dports = f
-                            .next()
-                            .unwrap_or("")
-                            .split(',')
-                            .filter_map(|s| s.parse::<u16>().ok())
-                            .take(15)
-                            .collect();
-                        if r.dports.is_empty() {
-                            ok = false;
-                        }
-                    }
-                    "src" => {
-                        let spec = f.next().unwrap_or("");
-                        let (ip, plen) = match spec.split_once('/') {
-                            Some((d, p)) => (d, p.parse::<u32>().unwrap_or(32)),
-                            None => (spec, 32),
-                        };
-                        if plen > 32 {
-                            ok = false;
-                            break;
-                        }
-                        let mask = if plen == 0 { 0u32 } else { u32::MAX << (32 - plen) };
-                        match parse_ip(ip) {
-                            Some(ip) => {
-                                r.src = ip;
-                                r.smask = mask.to_be_bytes();
-                            }
-                            None => ok = false,
-                        }
-                    }
-                    // `-m state --state NEW|ESTABLISHED[,...]` — real
-                    // conntrack-state match against the live flow tables.
-                    "state" => {
-                        let mut m = 0u8;
-                        for s in f.next().unwrap_or("").split(',') {
-                            match s {
-                                "NEW" => m |= 1,
-                                "ESTABLISHED" => m |= 2,
-                                "RELATED" => m |= 2, // lo/tracked ~= established here
-                                _ => {}
-                            }
-                        }
-                        if m == 0 {
-                            ok = false;
-                        } else {
-                            r.state = m;
-                        }
-                    }
-                    // `-m limit --limit N/s` — cap this rule's match rate;
-                    // `limit N` + optional `lburst B`.
-                    "limit" => {
-                        let v = f.next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
-                        if v == 0 {
-                            ok = false;
-                        } else {
-                            r.limit_pps = v;
-                        }
-                    }
-                    "lburst" => {
-                        let v = f.next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
-                        if v == 0 {
-                            ok = false;
-                        } else {
-                            r.limit_burst = v;
-                            r.lim_tokens = v;
-                        }
-                    }
-                    "log" => r.target = 1,    // "... log" marks -j LOG
-                    "reject" => r.target = 2, // -j REJECT: refusal goes back
-                    "accept" => r.target = 3, // -j ACCEPT: terminal allow
-                    _ => ok = false,
+            let ch = if out { &FW_OUT } else { &FW };
+            let mut fw = ch.lock();
+            match ins {
+                Some(n) => {
+                    let pos = (n - 1).min(fw.len());
+                    fw.insert(pos, r);
                 }
+                None => fw.push(r),
             }
-            if ok {
-                let ch = if out { &FW_OUT } else { &FW };
-                let mut fw = ch.lock();
-                match ins {
-                    Some(n) => {
-                        let pos = (n - 1).min(fw.len());
-                        fw.insert(pos, r);
-                    }
-                    None => fw.push(r),
-                }
-            }
-            ok
+            true
         }
         _ => false,
     }
+}
+
+/// Protocol token shared by the A/I/R/D rule ops.
+fn fw_proto_tok(t: Option<&str>) -> Option<u8> {
+    match t {
+        Some("*") | Some("all") => Some(0),
+        Some("icmp") => Some(1),
+        Some("tcp") => Some(6),
+        Some("udp") => Some(17),
+        Some(n) => Some(n.parse().unwrap_or(0)),
+        None => None,
+    }
+}
+
+/// Rule-spec tail parser (`dport`/`multiport`/`range`/`src`/`state`/
+/// `limit`/`lburst`/target words) shared by the A/I/R/D ops — returns
+/// None on any token it doesn't understand, like real iptables.
+fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Option<FwRule> {
+    let mut r = FwRule {
+        proto,
+        dport: 0,
+        dports: Vec::new(),
+        src: [0; 4],
+        smask: [0; 4],
+        src_range: None,
+        state: 0,
+        limit_pps: 0,
+        limit_burst: 5,
+        lim_tokens: 5,
+        lim_ms: 0,
+        target: 0,
+        hits: 0,
+        bytes: 0,
+    };
+    let mut ok = true;
+    while let Some(k) = f.next() {
+        match k {
+            "dport" => {
+                r.dport = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                if r.dport == 0 {
+                    ok = false;
+                }
+            }
+            // `-m iprange --src-range <a>-<b>`
+            "range" => {
+                let spec = f.next().unwrap_or("");
+                match spec.split_once('-') {
+                    Some((a, b)) => match (parse_ip(a), parse_ip(b)) {
+                        (Some(lo), Some(hi)) => {
+                            let (lo, hi) =
+                                (u32::from_be_bytes(lo), u32::from_be_bytes(hi));
+                            if lo <= hi {
+                                r.src_range = Some((lo, hi));
+                            } else {
+                                ok = false;
+                            }
+                        }
+                        _ => ok = false,
+                    },
+                    None => ok = false,
+                }
+            }
+            // `-m multiport --dports a,b,..` (15 max, like Linux)
+            "multiport" => {
+                r.dports = f
+                    .next()
+                    .unwrap_or("")
+                    .split(',')
+                    .filter_map(|s| s.parse::<u16>().ok())
+                    .take(15)
+                    .collect();
+                if r.dports.is_empty() {
+                    ok = false;
+                }
+            }
+            "src" => {
+                let spec = f.next().unwrap_or("");
+                let (ip, plen) = match spec.split_once('/') {
+                    Some((d, p)) => (d, p.parse::<u32>().unwrap_or(32)),
+                    None => (spec, 32),
+                };
+                if plen > 32 {
+                    ok = false;
+                    break;
+                }
+                let mask = if plen == 0 { 0u32 } else { u32::MAX << (32 - plen) };
+                match parse_ip(ip) {
+                    Some(ip) => {
+                        r.src = ip;
+                        r.smask = mask.to_be_bytes();
+                    }
+                    None => ok = false,
+                }
+            }
+            // `-m state --state NEW|ESTABLISHED[,...]` — real
+            // conntrack-state match against the live flow tables.
+            "state" => {
+                let mut m = 0u8;
+                for s in f.next().unwrap_or("").split(',') {
+                    match s {
+                        "NEW" => m |= 1,
+                        "ESTABLISHED" => m |= 2,
+                        "RELATED" => m |= 2, // lo/tracked ~= established here
+                        _ => {}
+                    }
+                }
+                if m == 0 {
+                    ok = false;
+                } else {
+                    r.state = m;
+                }
+            }
+            // `-m limit --limit N/s` — cap this rule's match rate;
+            // `limit N` + optional `lburst B`.
+            "limit" => {
+                let v = f.next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                if v == 0 {
+                    ok = false;
+                } else {
+                    r.limit_pps = v;
+                }
+            }
+            "lburst" => {
+                let v = f.next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                if v == 0 {
+                    ok = false;
+                } else {
+                    r.limit_burst = v;
+                    r.lim_tokens = v;
+                }
+            }
+            "log" => r.target = 1,    // "... log" marks -j LOG
+            "reject" => r.target = 2, // -j REJECT: refusal goes back
+            "accept" => r.target = 3, // -j ACCEPT: terminal allow
+            _ => ok = false,
+        }
+    }
+    ok.then_some(r)
+}
+
+/// Spec-equality for `D <spec>`: matcher fields + target, ignoring
+/// counters and live limiter state.
+fn fw_rule_eq(a: &FwRule, b: &FwRule) -> bool {
+    a.proto == b.proto
+        && a.dport == b.dport
+        && a.dports == b.dports
+        && a.src == b.src
+        && a.smask == b.smask
+        && a.src_range == b.src_range
+        && a.state == b.state
+        && a.limit_pps == b.limit_pps
+        && a.limit_burst == b.limit_burst
+        && a.target == b.target
 }
 
 fn parse_ip(s: &str) -> Option<[u8; 4]> {
@@ -1860,6 +1971,13 @@ pub fn arp_stat() -> String {
 /// Returns rtt in milliseconds, or None on timeout/unreachable.
 /// `ttl` stamps the echo request's IPv4 TTL; 0 = ip_default_ttl.
 pub fn ping_ttl(ip: [u8; 4], timeout_ms: u64, ttl: u8) -> Option<u64> {
+    ping_ttl_sz(ip, timeout_ms, ttl, 36)
+}
+
+/// `ping_ttl` with an explicit ICMP payload size (`ping -s N` — the
+/// real -s semantics: N bytes of patterned payload, so the wire
+/// datagram is 20+8+N). Capped at 1450 — no IP fragmentation.
+pub fn ping_ttl_sz(ip: [u8; 4], timeout_ms: u64, ttl: u8, size: usize) -> Option<u64> {
     if NET.lock().is_none() {
         sprintln!("[net] ping: no device");
         return None;
@@ -1875,9 +1993,11 @@ pub fn ping_ttl(ip: [u8; 4], timeout_ms: u64, ttl: u8) -> Option<u64> {
     );
     let id = 0xC050u16;
     let seq = 1u16;
-    let payload = b"cosmos-ping-payload-0123456789abcdef";
+    let size = size.clamp(1, 1450);
+    // same fill byte pattern as iputils ping (0x10,0x11,...)
+    let payload: Vec<u8> = (0..size).map(|i| 0x10 + (i % 56) as u8).collect();
     let t0 = now_ms();
-    send_icmp_echo_ttl(dst_mac, ip, id, seq, if ttl == 0 { def_ttl() } else { ttl }, payload);
+    send_icmp_echo_ttl(dst_mac, ip, id, seq, if ttl == 0 { def_ttl() } else { ttl }, &payload);
     loop {
         for (_src_ip, proto, p) in pump_rx() {
             if proto == 1 && p.len() >= 8 && p[0] == 0 && be16(&p[4..]) == id && be16(&p[6..]) == seq {
@@ -1933,6 +2053,12 @@ fn send_ip_src_ttl(
         LOOPBACK_Q.lock().push_back((src_ip, proto, payload.to_vec()));
         LO_TX_PKTS.fetch_add(1, Ordering::Relaxed);
         LO_TX_BYTES.fetch_add(payload.len() as u64, Ordering::Relaxed);
+        return;
+    }
+    // Real egress MTU: oversize datagrams are dropped and counted (no
+    // IP fragmentation — same fate as a DF send past the wire MTU).
+    if 20 + payload.len() as u64 > iface_mtu() {
+        IP_MTU_DROPS.fetch_add(1, Ordering::Relaxed);
         return;
     }
     let mut ip = Vec::with_capacity(20 + payload.len());
@@ -2650,6 +2776,10 @@ pub fn udp_send_ttl(
 ) -> Result<(), i64> {
     if !SOCKS.lock().contains_key(&lport) {
         return Err(-2); // not bound
+    }
+    // Real EMSGSIZE: datagram + headers past the wire MTU can't send.
+    if 28 + payload.len() as u64 > iface_mtu() {
+        return Err(-90);
     }
     let Some(mac) = next_hop(dst_ip, 1500) else {
         return Err(-3);

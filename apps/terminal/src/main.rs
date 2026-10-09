@@ -8038,6 +8038,8 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut jump = "DROP";
     let mut chain_out = false;
     let mut insert_at: Option<usize> = None;
+    let mut replace_at: Option<usize> = None;
+    let mut del_spec = false;
     let mut i = 0usize;
     while i < args.len() {
         match args[i] {
@@ -8119,19 +8121,31 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 state = String::from(args.get(i + 1).copied().unwrap_or(""));
                 i += 1;
             }
-            "-I" | "--insert" => {
-                // -I <chain> [rulenum]: chain is the next arg, then an
-                // optional 1-based insert position (default 1).
+            "-I" | "--insert" | "-R" | "--replace" => {
+                // -I <chain> [rulenum] / -R <chain> <rulenum>: chain is
+                // the next arg, then a 1-based position (insert defaults
+                // to 1, replace requires the number).
                 chain_out |= args.get(i + 1) == Some(&"OUTPUT");
                 i += 1; // consume the chain word
                 if let Some(n) = args.get(i + 1).and_then(|s| s.parse().ok()) {
-                    insert_at = Some(n);
+                    if args[i - 1].starts_with("-R") || args[i - 1] == "--replace" {
+                        replace_at = Some(n);
+                    } else {
+                        insert_at = Some(n);
+                    }
                     i += 1;
+                } else if args[i - 1].starts_with("-R") || args[i - 1] == "--replace" {
+                    return None; // -R needs the rulenum
                 } else {
                     insert_at = Some(1);
                 }
             }
-            "-A" | "-D" | "INPUT" | "OUTPUT" | "FORWARD" | "-i" | "-o" => {
+            "-D" | "--delete" => {
+                // -D <chain> <spec>: spec-delete mode — the kernel drops
+                // the first rule matching every parsed field.
+                del_spec = true;
+            }
+            "-A" | "INPUT" | "OUTPUT" | "FORWARD" | "-i" | "-o" => {
                 if args[i] == "OUTPUT" {
                     chain_out = true;
                 }
@@ -8143,11 +8157,21 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
         }
         i += 1;
     }
-    let mut line = match (insert_at, chain_out) {
-        (Some(n), true) => alloc::format!("I OUT {} {}", n, proto),
-        (Some(n), false) => alloc::format!("I {} {}", n, proto),
-        (None, true) => alloc::format!("A OUT {}", proto),
-        (None, false) => alloc::format!("A {}", proto),
+    let mut line = if del_spec {
+        if chain_out {
+            alloc::format!("D OUT {}", proto)
+        } else {
+            alloc::format!("D {}", proto)
+        }
+    } else {
+        match (insert_at, replace_at, chain_out) {
+            (Some(n), _, true) => alloc::format!("I OUT {} {}", n, proto),
+            (Some(n), _, false) => alloc::format!("I {} {}", n, proto),
+            (_, Some(n), true) => alloc::format!("R OUT {} {}", n, proto),
+            (_, Some(n), false) => alloc::format!("R {} {}", n, proto),
+            (_, _, true) => alloc::format!("A OUT {}", proto),
+            _ => alloc::format!("A {}", proto),
+        }
     };
     if dport != 0 {
         line.push_str(&alloc::format!(" dport {}", dport));
@@ -22707,6 +22731,7 @@ impl Term {
                 let mut quiet = false;
                 let mut ttl = 0u8;
                 let mut audible = false;
+                let mut size = 0u64;
                 let mut target: Option<&str> = None;
                 let mut i = 0usize;
                 while i < args.len() {
@@ -22747,6 +22772,16 @@ impl Term {
                             audible = true;
                             i += 1;
                         }
+                        "-s" => {
+                            // -s N: ICMP payload size — the wire datagram
+                            // is 20+8+N, gated by the real interface MTU
+                            size = args
+                                .get(i + 1)
+                                .and_then(|x| x.parse::<u64>().ok())
+                                .unwrap_or(0)
+                                .min(1450);
+                            i += 2;
+                        }
                         "-t" => {
                             // -t N: stamp the echo request's IPv4 TTL
                             ttl = args
@@ -22776,7 +22811,7 @@ impl Term {
                             | ((c as u32) << 8) | d as u32;
                         let mut got = 0u32;
                         for n in 0..cnt {
-                            match ustd::net_ping_ttl(packed, wto, ttl) {
+                            match ustd::net_ping_size(packed, wto, ttl, size) {
                                 Some(rtt) => {
                                     got += 1;
                                     if audible {
@@ -25626,7 +25661,16 @@ impl Term {
                             let (mtu, flg) = if dev == "lo" {
                                 (65536, "LRU")
                             } else {
-                                (1500, "BMRU")
+                                (ustd::read_all("/proc/net/mtu")
+                                    .ok()
+                                    .and_then(|d| {
+                                        String::from_utf8_lossy(&d)
+                                            .trim()
+                                            .parse::<u64>()
+                                            .ok()
+                                    })
+                                    .unwrap_or(1500),
+                                 "BMRU")
                             };
                             self.emit(&alloc::format!(
                                 "{:<7} {:<4} {:<4} {:<5} {:<6} {:<6} {:<6} {:<6} {:<6} {:<6} {:<5} {}",
@@ -31259,7 +31303,16 @@ impl Term {
                             let (mtu, flg) = if dev == "lo" {
                                 (65536, "LRU")
                             } else {
-                                (1500, "BMRU")
+                                (ustd::read_all("/proc/net/mtu")
+                                    .ok()
+                                    .and_then(|d| {
+                                        String::from_utf8_lossy(&d)
+                                            .trim()
+                                            .parse::<u64>()
+                                            .ok()
+                                    })
+                                    .unwrap_or(1500),
+                                 "BMRU")
                             };
                             self.emit(&alloc::format!(
                                 "{:<10} {:<5} {:<6} {:<7} {:<7} {:<7} {:<6} {:<7} {:<7} {:<6} {}",
@@ -31272,6 +31325,16 @@ impl Term {
                 }
                 let pos: Vec<&str> =
                     args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                if pos.len() >= 3 && pos[1] == "mtu" {
+                    // ifconfig eth0 mtu N — same real path as ip link
+                    match ustd::write_all("/proc/net/mtu", pos[2].as_bytes()) {
+                        Ok(()) => self.emit(&alloc::format!("eth0: mtu {}", pos[2])),
+                        Err(e) => {
+                            self.fail(&alloc::format!("ifconfig: mtu err {}", e))
+                        }
+                    }
+                    return;
+                }
                 if pos.len() >= 2 && (pos[1] == "up" || pos[1] == "down") {
                     match ustd::write_all("/proc/net/operstate", pos[1].as_bytes()) {
                         Ok(()) => self.emit(&alloc::format!("eth0: link {}", pos[1])),
@@ -34655,12 +34718,17 @@ impl Term {
                         self.fail("usage: iptables -P INPUT|OUTPUT ACCEPT|DROP");
                     }
                 } else if first == "-D" || first == "--delete" {
+                    // -D <chain> <rulenum> deletes by position; -D <chain>
+                    // <rule-spec> deletes the first rule matching every
+                    // field — real iptables spec-delete semantics.
                     let out = args.iter().any(|a| *a == "OUTPUT");
-                    let n = args
+                    let chain_pos = args
                         .iter()
-                        .copied()
-                        .skip(1)
-                        .find(|a| a.parse::<usize>().is_ok());
+                        .position(|a| *a == "INPUT" || *a == "OUTPUT")
+                        .unwrap_or(0);
+                    let n = args
+                        .get(chain_pos + 1)
+                        .and_then(|s| s.parse::<usize>().ok());
                     match n {
                         Some(n) => {
                             let line = if out {
@@ -34673,9 +34741,22 @@ impl Term {
                                 Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                             }
                         }
-                        None => self.fail("usage: iptables -D INPUT|OUTPUT <rulenum>"),
+                        None => match ipt_rule_from_args(&args) {
+                            Some(line) => {
+                                match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
+                                    Ok(_) => self.emit("rule deleted"),
+                                    Err(e) => self.fail(&alloc::format!(
+                                        "iptables: no matching rule ({})",
+                                        e
+                                    )),
+                                }
+                            }
+                            None => self.fail(
+                                "usage: iptables -D <chain> <rulenum>|<rule-spec>",
+                            ),
+                        },
                     }
-                } else if first == "-A" || first == "--append" || first == "-I" || first == "--insert" {
+                } else if first == "-A" || first == "--append" || first == "-I" || first == "--insert" || first == "-R" || first == "--replace" {
                     // pass args whole: -A/-I + chain + optional rulenum
                     // are part of the rule grammar
                     match ipt_rule_from_args(&args) {
@@ -38644,7 +38725,13 @@ impl Term {
                     let up = ustd::read_all("/proc/net/operstate")
                         .map(|d| String::from_utf8_lossy(&d).trim().to_string())
                         .unwrap_or_else(|_| String::from("down"));
-                    for (dev, mtu, flag) in [("eth0", 1500u32, "BROADCAST,MULTICAST,UP,LOWER_UP"), ("lo", 65536u32, "LOOPBACK,UP,LOWER_UP")] {
+                    let wire_mtu = ustd::read_all("/proc/net/mtu")
+                        .ok()
+                        .and_then(|d| {
+                            String::from_utf8_lossy(&d).trim().parse::<u32>().ok()
+                        })
+                        .unwrap_or(1500);
+                    for (dev, mtu, flag) in [("eth0", wire_mtu, "BROADCAST,MULTICAST,UP,LOWER_UP"), ("lo", 65536u32, "LOOPBACK,UP,LOWER_UP")] {
                         let mut f = [0u64; 16];
                         for l in devt.lines() {
                             if l.trim_start().starts_with(&alloc::format!("{}:", dev)) {
@@ -38702,18 +38789,38 @@ impl Term {
                 }
                 Some("l") | Some("link") => {
                     if args.get(1) == Some(&"set") {
-                        // ip link set eth0 up|down — same real path as ifconfig
+                        // ip link set eth0 up|down | mtu N — real paths:
+                        // carrier via operstate, mtu via /proc/net/mtu
                         let dev = args.get(2).copied().unwrap_or("eth0");
-                        let state = args.get(3).copied().unwrap_or("");
-                        self.run(&alloc::format!("ifconfig {} {}", dev, state));
+                        let key = args.get(3).copied().unwrap_or("");
+                        if key == "mtu" {
+                            let n = args.get(4).copied().unwrap_or("");
+                            match ustd::write_all("/proc/net/mtu", n.as_bytes()) {
+                                Ok(()) => self.emit(&alloc::format!(
+                                    "{}: mtu {}",
+                                    dev, n
+                                )),
+                                Err(e) => {
+                                    self.fail(&alloc::format!("ip: mtu err {}", e))
+                                }
+                            }
+                        } else {
+                            self.run(&alloc::format!("ifconfig {} {}", dev, key));
+                        }
                     } else {
                         let up = ustd::read_all("/proc/net/operstate")
                             .map(|d| String::from_utf8_lossy(&d).trim().to_string())
                             .unwrap_or_else(|_| String::from("down"));
+                        let mtu = ustd::read_all("/proc/net/mtu")
+                            .map(|d| {
+                                String::from_utf8_lossy(&d).trim().to_string()
+                            })
+                            .unwrap_or_else(|_| String::from("1500"));
                         if let Some((mac, ip)) = ustd::net_info() {
                             self.emit(&alloc::format!(
-                                "1: eth0: <{}> mtu 1500 state {}",
+                                "1: eth0: <{}> mtu {} state {}",
                                 if up == "up" { "UP,LOWER_UP" } else { "DOWN" },
+                                mtu,
                                 up.to_uppercase()
                             ));
                             self.emit(&alloc::format!(

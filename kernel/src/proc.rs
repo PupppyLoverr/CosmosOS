@@ -30,7 +30,7 @@ const FILES: &[&str] = &[
 /// files under /proc/net
 const NET_FILES: &[&str] = &[
     "tcp", "udp", "unix", "dev", "operstate", "owners", "route", "iptables",
-    "snmp", "nf_conntrack", "arp", "fib_trie", "tc", "dns", "neigh",
+    "snmp", "nf_conntrack", "arp", "fib_trie", "tc", "dns", "neigh", "mtu",
 ];
 
 /// files under /proc/sys/kernel
@@ -337,6 +337,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/net/tc" => net::tc_show(),
         "/proc/net/dns" => net::net_dns_stats(),
         "/proc/net/neigh" => net::net_neigh(),
+        "/proc/net/mtu" => net::net_mtu(),
         "/proc/net/operstate" => alloc::format!(
             "{}\n",
             if net::is_up() { "up" } else { "down" }
@@ -549,6 +550,16 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
             _ => return None,
         }
         return Some(buf.len());
+    }
+    if path == "/proc/net/mtu" {
+        // `ip link set eth0 mtu N` — one integer; 68..=65535 like a real nic
+        let s = String::from(String::from_utf8_lossy(buf));
+        let ok = s
+            .trim()
+            .parse::<u64>()
+            .map(|n| net::set_mtu(n))
+            .unwrap_or(false);
+        return ok.then_some(buf.len());
     }
     if path == "/proc/net/route" {
         // 'add <dest>/<plen> <gw|*>' / 'del <dest>[/<plen>]' per line
