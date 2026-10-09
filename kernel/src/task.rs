@@ -29,6 +29,7 @@ pub const CAP_SYS_ADMIN: u64 = 1 << 21;
 pub const CAP_SYS_NICE: u64 = 1 << 23;
 pub const CAP_SYS_TIME: u64 = 1 << 25;
 pub const CAP_SYS_BOOT: u64 = 1 << 27;
+pub const CAP_SYSLOG: u64 = 1 << 34;
 /// Linux CAP_LAST_CAP — every defined bit (no ambient set modelled).
 pub const CAP_ALL: u64 = (1u64 << 41) - 1;
 
@@ -2131,7 +2132,19 @@ pub fn mm_reserve(pml4_phys: u64, pages: u64) -> u64 {
     if base == 0 {
         return 0;
     }
-    let end = base + pages * 0x1000 + 0x1000; // guard page
+    // kernel.randomize_va_space >= 2: an entropy-fed gap slides every
+    // reservation's base like Linux mmap ASLR (0=off, 1=mild compat).
+    let gap = if crate::sysctl::randomize_va_space() >= 2 {
+        let mut b = [0u8; 8];
+        if crate::virtio_rng::fill(&mut b) == 0 {
+            0
+        } else {
+            ((u64::from_le_bytes(b) & 0x1FF) + 1) * 0x1000
+        }
+    } else {
+        0
+    };
+    let end = base + pages * 0x1000 + 0x1000 + gap; // guard page
     for t in s.tasks.iter_mut() {
         if t.pml4.map(|p| p.start_address().as_u64()) == Some(pml4_phys) {
             t.mmap_next = t.mmap_next.max(end);

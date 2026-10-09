@@ -69,6 +69,12 @@ pub fn read_at(path: &str, pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
         "smbios-tables" => return smbios_tables_read(pos, buf),
         "port" => return port_read(pos, buf),
         "kmsg" => {
+            // kernel.dmesg_restrict gates the ring to CAP_SYSLOG readers.
+            if crate::sysctl::dmesg_restrict() != 0
+                && !crate::task::capable_ns_dac(crate::task::CAP_SYSLOG)
+            {
+                return Err(-1); // EPERM
+            }
             // stream of the ring tail: pos 0 emits the whole tail, then EOF
             if pos != 0 {
                 return Ok(0);

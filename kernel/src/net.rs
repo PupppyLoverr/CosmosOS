@@ -3508,8 +3508,11 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>, u64)> {
     // ICMP: answer echo requests like a real host — wire or loopback;
     // net.ipv4.icmp_echo_ignore_all silences the responder.
     let ignore_all = ICMP_IGNORE_ALL.load(Ordering::Relaxed) != 0;
-    for (src_ip, proto, p, _) in &out {
-        if *proto == 1 && p.len() >= 8 && p[0] == 8 && !ignore_all {
+    let ignore_bcast = crate::sysctl::icmp_echo_ignore_bcast() != 0;
+    for (src_ip, proto, p, meta) in &out {
+        if *proto == 1 && p.len() >= 8 && p[0] == 8 && !ignore_all
+            && !(ignore_bcast && meta >> 63 != 0)
+        {
             icmp_echo_reply(*src_ip, p);
         }
     }
@@ -3871,6 +3874,38 @@ pub fn net_trace_tcp(
         }
     }
     hops
+}
+
+/// net.ipv4.ip_forward: re-emit a foreign-unicast IPv4 packet toward
+/// its route's next hop — TTL decrement + header-checksum rebuild. An
+/// ARP miss fires a request and drops this packet; the next one lands
+/// on a warm cache (a real router's resolution-drop, simplified).
+fn forward_frame(f: &[u8]) {
+    let ip = &f[14..];
+    let ihl = ((ip[0] & 0xF) as usize) * 4;
+    if ip[8] <= 1 {
+        return; // TTL exceeded
+    }
+    let dst: [u8; 4] = match ip[16..20].try_into() {
+        Ok(d) => d,
+        _ => return,
+    };
+    let Some(nh) = route_lookup(dst) else { return };
+    let mac = {
+        let c = ARP_CACHE.lock();
+        c.iter().find(|e| e.ip == nh).map(|e| e.mac)
+    };
+    let Some(mac) = mac else {
+        send_arp_request(nh);
+        return;
+    };
+    let mut pkt = ip.to_vec();
+    pkt[8] -= 1;
+    pkt[10] = 0;
+    pkt[11] = 0;
+    let c = csum(&pkt[..ihl]);
+    put16(&mut pkt[10..], c);
+    let _ = send_frame(mac, 0x0800, &pkt);
 }
 
 fn send_frame(dst: [u8; 6], ethertype: u16, payload: &[u8]) -> Result<(), ()> {
@@ -4237,6 +4272,15 @@ fn handle_frame(f: &[u8]) -> Option<([u8; 4], u8, Vec<u8>, u64)> {
             // unicast to us, or broadcast (DHCP replies arrive before we
             // own an address)
             if dst != our_ip() && dst != [255, 255, 255, 255] {
+                // net.ipv4.ip_forward: foreign unicast is routed back
+                // out — TTL--, checksum rebuild, next-hop emit.
+                if crate::sysctl::ip_forward() != 0
+                    && dst[0] != 127
+                    && !(224..=239).contains(&dst[0])
+                    && !is_bcast(dst)
+                {
+                    forward_frame(f);
+                }
                 return None;
             }
             let src: [u8; 4] = ip[12..16].try_into().ok()?;
@@ -4244,7 +4288,10 @@ fn handle_frame(f: &[u8]) -> Option<([u8; 4], u8, Vec<u8>, u64)> {
             // sender (f[6..12]) ride the tuple — `-m ttl`/`-m tos`/
             // `-m mac` match on what arrived on the wire.
             let smac: [u8; 6] = f[6..12].try_into().ok()?;
-            Some((src, ip[9], ip[ihl..].to_vec(), pkt_meta(ip[8], ip[1], smac)))
+            // meta bit 63 marks a wire-broadcast arrival — the echo
+            // responder below honors icmp_echo_ignore_broadcasts on it.
+            let bc = (dst == [255, 255, 255, 255]) as u64;
+            Some((src, ip[9], ip[ihl..].to_vec(), pkt_meta(ip[8], ip[1], smac) | (bc << 63)))
         }
         _ => None,
     }
