@@ -36,13 +36,13 @@ const NET_FILES: &[&str] = &[
 ];
 
 /// files under /proc/sys/kernel
-const SYS_FILES: &[&str] = &["hostname", "shmmax", "shmall", "shmmni", "ngroups_max", "cow_pages", "pid_max", "threads-max"];
+const SYS_FILES: &[&str] = &["hostname", "shmmax", "shmall", "shmmni", "ngroups_max", "sysrq", "dmesg_restrict", "randomize_va_space", "cow_pages", "pid_max", "threads-max"];
 
 /// files under /proc/sys/fs (fs/inotify/max_user_watches lives one deeper)
 const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size", "file-max", "file-nr"];
 
 /// files under /proc/sys/net/ipv4
-const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "ip_default_ttl", "ip_unprivileged_port_start"];
+const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward"];
 
 pub fn handles(path: &str) -> bool {
     path == "/proc" || path.starts_with("/proc/")
@@ -494,6 +494,12 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/sys/net/ipv4/ip_unprivileged_port_start" => {
             alloc::format!("{}\n", crate::sysctl::unpriv_port_start())
         }
+        "/proc/sys/net/ipv4/icmp_echo_ignore_broadcasts" => {
+            alloc::format!("{}\n", crate::sysctl::icmp_echo_ignore_bcast())
+        }
+        "/proc/sys/net/ipv4/ip_forward" => {
+            alloc::format!("{}\n", crate::sysctl::ip_forward())
+        }
         "/proc/sys/net/ipv4/ip_default_ttl" => net::net_def_ttl(),
         "/proc/swaps" => {
             // no swap devices in this kernel — header only, like an
@@ -679,6 +685,11 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
         .then_some(buf.len());
     }
     if path == "/proc/sysrq-trigger" {
+        // kernel.sysrq disables the trigger wholesale (0=off, like
+        // Linux's mask semantics reduced to its master switch).
+        if crate::sysctl::kernel_sysrq() == 0 {
+            return None;
+        }
         // sysrq reboot/poweroff are privileged — CAP_SYS_ADMIN.
         if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
             return None;
@@ -861,6 +872,16 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
         let Ok(v) = s.parse::<u64>() else { return None };
         return crate::sysctl::set("net/ipv4/ip_unprivileged_port_start", v)
             .then_some(buf.len());
+    }
+    if let Some(rel) = path.strip_prefix("/proc/sys/net/ipv4/") {
+        if rel == "icmp_echo_ignore_broadcasts" || rel == "ip_forward" {
+            let s = String::from(String::from_utf8_lossy(buf).trim());
+            let Ok(v) = s.parse::<u64>() else { return None };
+            return crate::sysctl::set(
+                &alloc::format!("net/ipv4/{}", rel), v,
+            )
+            .then_some(buf.len());
+        }
     }
     if let Some(rel) = path.strip_prefix("/proc/sys/") {
         // hostname is handled by its dedicated arm below; net/* above.

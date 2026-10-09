@@ -22,6 +22,11 @@ static INOTIFY_MAX_QUEUED: AtomicU64 = AtomicU64::new(16384);
 static EPOLL_MAX_WATCHES: AtomicU64 = AtomicU64::new(131072);
 static UNPRIV_PORT_START: AtomicU64 = AtomicU64::new(1024);
 static NGROUPS_MAX: AtomicU64 = AtomicU64::new(65536);
+static ICMP_ECHO_IGNORE_BCAST: AtomicU64 = AtomicU64::new(1);
+static IP_FORWARD: AtomicU64 = AtomicU64::new(0);
+static KERNEL_SYSRQ: AtomicU64 = AtomicU64::new(1);
+static DMESG_RESTRICT: AtomicU64 = AtomicU64::new(0);
+static RANDOMIZE_VA: AtomicU64 = AtomicU64::new(2);
 
 pub fn pid_max() -> u64 {
     PID_MAX.load(Ordering::Relaxed).clamp(1, 4_194_304)
@@ -80,6 +85,21 @@ pub fn unpriv_port_start() -> u64 {
 pub fn ngroups_max() -> u64 {
     NGROUPS_MAX.load(Ordering::Relaxed)
 }
+pub fn icmp_echo_ignore_bcast() -> u64 {
+    ICMP_ECHO_IGNORE_BCAST.load(Ordering::Relaxed)
+}
+pub fn ip_forward() -> u64 {
+    IP_FORWARD.load(Ordering::Relaxed)
+}
+pub fn kernel_sysrq() -> u64 {
+    KERNEL_SYSRQ.load(Ordering::Relaxed)
+}
+pub fn dmesg_restrict() -> u64 {
+    DMESG_RESTRICT.load(Ordering::Relaxed)
+}
+pub fn randomize_va_space() -> u64 {
+    RANDOMIZE_VA.load(Ordering::Relaxed)
+}
 
 /// sysctl name under /proc/sys → current value, or None when unknown.
 /// Names are given relative, e.g. "kernel/pid_max", "fs/nr_open".
@@ -109,6 +129,11 @@ pub fn get(name: &str) -> Option<u64> {
         "net/ipv4/ip_unprivileged_port_start" => {
             UNPRIV_PORT_START.load(Ordering::Relaxed).min(65535)
         }
+        "net/ipv4/icmp_echo_ignore_broadcasts" => ICMP_ECHO_IGNORE_BCAST.load(Ordering::Relaxed),
+        "net/ipv4/ip_forward" => IP_FORWARD.load(Ordering::Relaxed),
+        "kernel/sysrq" => KERNEL_SYSRQ.load(Ordering::Relaxed),
+        "kernel/dmesg_restrict" => DMESG_RESTRICT.load(Ordering::Relaxed),
+        "kernel/randomize_va_space" => RANDOMIZE_VA.load(Ordering::Relaxed),
         _ => return None,
     })
 }
@@ -145,6 +170,13 @@ pub fn set(name: &str, v: u64) -> bool {
         "net/ipv4/ip_unprivileged_port_start" if v <= 65535 => {
             UNPRIV_PORT_START.store(v, Ordering::Relaxed)
         }
+        "net/ipv4/icmp_echo_ignore_broadcasts" if v <= 1 => {
+            ICMP_ECHO_IGNORE_BCAST.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/ip_forward" if v <= 1 => IP_FORWARD.store(v, Ordering::Relaxed),
+        "kernel/sysrq" if v <= 1 << 16 => KERNEL_SYSRQ.store(v, Ordering::Relaxed),
+        "kernel/dmesg_restrict" if v <= 1 => DMESG_RESTRICT.store(v, Ordering::Relaxed),
+        "kernel/randomize_va_space" if v <= 2 => RANDOMIZE_VA.store(v, Ordering::Relaxed),
         _ => return false,
     }
     true

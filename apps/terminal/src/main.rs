@@ -20617,12 +20617,18 @@ impl Term {
                 let mut uid: Option<u32> = None;
                 let mut gid: Option<u32> = None;
                 let mut grps: Vec<u32> = Vec::new();
+                let mut cap_bit: Option<u64> = None;
                 let mut cmd0 = args.len();
                 let mut i = 0usize;
                 while i < args.len() {
                     match args[i] {
                         "--reuid" => {
                             uid = args.get(i + 1).and_then(|s| s.parse().ok());
+                            i += 1;
+                        }
+                        "--cap-drop" => {
+                            // drop one capability bit from effective+permitted
+                            cap_bit = args.get(i + 1).and_then(|s| s.parse().ok());
                             i += 1;
                         }
                         "--regid" => {
@@ -20648,7 +20654,7 @@ impl Term {
                 }
                 if cmd0 >= args.len() {
                     self.fail(
-                        "usage: setpriv [--reuid U] [--regid G] [--groups a,b] cmd...",
+                        "usage: setpriv [--reuid U] [--regid G] [--groups a,b] [--cap-drop bit] cmd...",
                     );
                     return;
                 }
@@ -20662,10 +20668,36 @@ impl Term {
                 if let Some(u) = uid {
                     ustd::setuid(u);
                 }
+                // --cap-drop N: clear one cap from effective+permitted
+                // (real SYS_CAPSET), run the command, then restore.
+                let saved_caps = if let Some(b) = cap_bit {
+                    if b >= 41 {
+                        self.fail("setpriv: --cap-drop needs a bit 0..40");
+                        return;
+                    }
+                    match ustd::capget(0) {
+                        Some([eff, prm, _bnd]) => {
+                            if !ustd::capset(eff & !(1 << b), prm & !(1 << b)) {
+                                self.fail("setpriv: capset failed");
+                                return;
+                            }
+                            Some([eff, prm])
+                        }
+                        None => {
+                            self.fail("setpriv: capget failed");
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let cmdline = args[cmd0..].join(" ");
                 let lines = self.run_captured(&cmdline);
                 ustd::setuid(ou);
                 ustd::setgid(og);
+                if let Some([eff, prm]) = saved_caps {
+                    let _ = ustd::capset(eff, prm);
+                }
                 for l in lines {
                     self.emit(&l);
                 }
@@ -38218,9 +38250,14 @@ impl Term {
                     "/proc/sys/fs/mqueue/queues_max",
                     "/proc/sys/fs/inotify/max_queued_events",
                     "/proc/sys/fs/epoll/max_user_watches",
+                    "/proc/sys/kernel/sysrq",
+                    "/proc/sys/kernel/dmesg_restrict",
+                    "/proc/sys/kernel/randomize_va_space",
                     "/proc/sys/net/ipv4/icmp_echo_ignore_all",
                     "/proc/sys/net/ipv4/ip_default_ttl",
                     "/proc/sys/net/ipv4/ip_unprivileged_port_start",
+                    "/proc/sys/net/ipv4/icmp_echo_ignore_broadcasts",
+                    "/proc/sys/net/ipv4/ip_forward",
                 ];
                 // `-N` prints names only, `-n`/`--values` values only —
                 // real sysctl output modes over the same key dump.

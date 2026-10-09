@@ -2060,11 +2060,18 @@ pub fn dispatch(ctx: &mut CpuContext) {
             }
         }
         shared::SYS_KLOG => {
+            // kernel.dmesg_restrict: reading the ring needs CAP_SYSLOG.
+            let allowed = crate::sysctl::dmesg_restrict() == 0
+                || task::with_current(|t| task::capable_in_ns(t, task::CAP_SYSLOG));
+            if !allowed {
+                (-1i64) as u64 // EPERM
+            } else {
             let mut v = alloc::vec![0u8; (a2 as usize).min(32 * 1024)];
             let n = crate::klog::read_tail(&mut v);
             match copy_out(a1, &v[..n]) {
                 Some(()) => n as u64,
                 None => ERR,
+            }
             }
         }
         shared::SYS_DF => match vfs::df() {
