@@ -9940,6 +9940,7 @@ struct Term {
     // open keep-alive conn: (sock, rip, rport, idle-deadline ms, reqs served)
     httpd_conn: Option<(ustd::TcpSock, [u8; 4], u16, u64, u32)>,
     nc: Option<ustd::TcpSock>,                         // `nc <ip> <port>` raw session
+    nc_crlf: bool,                                     // `nc -C`: Enter sends \r\n (CRLF EOL)
     nc_listen: Option<ustd::TcpListener>,              // `nc -l <port>` waiting for a client
     nc_udp: Option<(ustd::UdpSock, Option<([u8; 4], u16)>)>, // `nc -u`/`-lu` UDP session (peer learned)
     nc_keep: Option<u16>,                                  // `nc -l -k`: re-arm the listen port after disconnect
@@ -21797,6 +21798,7 @@ impl Term {
                 let mut conn_ms: u64 = 0; // --connect-timeout (0 = default)
                 let mut follow = false;
                 let mut max_redirs = 50u32;
+                let mut limit_bps = 0u64; // --limit-rate <bytes/s>
                 let mut resolve_map: Vec<(String, u16, String)> = Vec::new();
                 let mut ua: Option<String> = None;
                 let mut compressed = false;
@@ -21997,6 +21999,44 @@ impl Term {
                                 .unwrap_or(15)
                                 .saturating_mul(1000);
                         }
+                        "--limit-rate" => {
+                            // --limit-rate <n>[k|m]: real transfer
+                            // pacing — sleeps inside the recv loop so
+                            // bytes/elapsed never exceed the rate.
+                            let raw = args.get(i + 1).copied().unwrap_or("0");
+                            let (num, mul) = if let Some(n) =
+                                raw.strip_suffix('k')
+                            {
+                                (n, 1024u64)
+                            } else if let Some(n) = raw.strip_suffix('m')
+                            {
+                                (n, 1024u64 * 1024)
+                            } else {
+                                (raw, 1u64)
+                            };
+                            limit_bps = num
+                                .parse::<u64>()
+                                .unwrap_or(0)
+                                .saturating_mul(mul);
+                            i += 1;
+                        }
+                        _ if a.starts_with("--limit-rate=") => {
+                            let raw = &a[13..];
+                            let (num, mul) = if let Some(n) =
+                                raw.strip_suffix('k')
+                            {
+                                (n, 1024u64)
+                            } else if let Some(n) = raw.strip_suffix('m')
+                            {
+                                (n, 1024u64 * 1024)
+                            } else {
+                                (raw, 1u64)
+                            };
+                            limit_bps = num
+                                .parse::<u64>()
+                                .unwrap_or(0)
+                                .saturating_mul(mul);
+                        }
                         _ if !a.starts_with('-') => url = Some(a),
                         _ => {}
                     }
@@ -22169,6 +22209,18 @@ impl Term {
                     let mut resp: Vec<u8> = Vec::new();
                     while let Some(chunk) = sock.recv(4000) {
                         resp.extend_from_slice(&chunk);
+                        // --limit-rate: hold the transfer at the pace —
+                        // wait until bytes/elapsed no longer exceeds it.
+                        if limit_bps > 0 {
+                            let elapsed =
+                                ustd::uptime_ms().saturating_sub(t0);
+                            let want =
+                                (resp.len() as u64).saturating_mul(1000)
+                                    / limit_bps.max(1);
+                            if want > elapsed {
+                                ustd::sleep_ms(want - elapsed);
+                            }
+                        }
                         if ustd::uptime_ms() - t0 > max_ms || resp.len() > 1_000_000 {
                             break;
                         }
@@ -24316,6 +24368,16 @@ impl Term {
                                 .unwrap_or(0);
                             i += 2;
                         }
+                        // -4/-6: address family — we are IPv4-only, so
+                        // -4 is a real pass-through and -6 honestly
+                        // reports the missing family (like `ip -6`).
+                        "-4" => {
+                            i += 1;
+                        }
+                        "-6" => {
+                            self.fail("ping: inet6 not supported");
+                            return;
+                        }
                         "-q" | "-n" => {
                             quiet = args[i] == "-q";
                             i += 1;
@@ -24508,6 +24570,7 @@ impl Term {
                 let mut first = 1u8;
                 let mut basep = 0u16;
                 let mut wait_ms = 0u64;
+                let mut src_ip: Option<[u8; 4]> = None;
                 let mut probes = 1u8;
                 let mut icmp = false;
                 let mut tcp = false;
@@ -24577,6 +24640,12 @@ impl Term {
                             tcp = false;
                             i += 1;
                         }
+                        // -s <ip>: real source-address bind — every probe
+                        // datagram leaves with this src in its IP header.
+                        "-s" | "--source" => {
+                            src_ip = args.get(i + 1).and_then(|x| parse_ipv4(x));
+                            i += 2;
+                        }
                         a => {
                             target = Some(a);
                             i += 1;
@@ -24596,10 +24665,11 @@ impl Term {
                             s, ip[0], ip[1], ip[2], ip[3], maxh
                         ));
                         let mut ok = false;
-                        let hops = ustd::net_trace_proto(
+                        let hops = ustd::net_trace_src(
                             packed,
                             if tcp { 2 } else if icmp { 1 } else { 0 },
                             first, maxh, basep, wait_ms, probes,
+                            src_ip.map(u32::from_be_bytes).unwrap_or(0),
                         );
                         for (ttl, hop, reached) in hops {
                             match hop {
@@ -25308,6 +25378,8 @@ impl Term {
                 }
             }
             "nc" => {
+                // -C: real CRLF line endings on send (netcat -C).
+                self.nc_crlf = args.iter().any(|a| *a == "-C");
                 let zmode = args.iter().any(|a| a == &"-z" || a == &"-zv" || a == &"-vz");
                 let udp = args
                     .iter()
@@ -27714,6 +27786,27 @@ impl Term {
                 // `iptables -m state` matches against).
                 let first = args.first().copied().unwrap_or("-L");
                 match first {
+                    // -E/--event: real ct event stream — NEW/UPDATE/
+                    // DESTROY lines from the kernel ring, 500ms drain,
+                    // Esc stops (same watch mechanism as `ip monitor`).
+                    "-E" | "--event" => {
+                        self.watch = Some((String::from("conntrack evq"), 500, 0));
+                        self.emit(
+                            "watching conntrack events (500ms) -- Esc/Enter to stop",
+                        );
+                        return;
+                    }
+                    "evq" => {
+                        if let Ok(d) =
+                            ustd::read_all("/proc/net/conntrack_events")
+                        {
+                            let t = String::from_utf8_lossy(&d);
+                            for l in t.lines() {
+                                self.emit(l);
+                            }
+                        }
+                        return;
+                    }
                     "-L" | "--dump" | "-S" | "--stats" => {
                         // real conntrack filters: -p proto, -s/-d orig
                         // tuple, --reply-src/--reply-dst, --sport/--dport
@@ -43030,7 +43123,12 @@ impl Term {
                     }
                 }
                 x if x == KeyCode::Enter as u32 => {
-                    let _ = s.send(b"\r\n");
+                    // real nc: bare LF on Enter; -C sends CRLF.
+                    let _ = s.send(if self.nc_crlf {
+                        b"\r\n" as &[u8]
+                    } else {
+                        b"\n"
+                    });
                     self.cur.clear();
                     self.cx = 0;
                 }
@@ -45100,6 +45198,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         httpd: None,
         httpd_conn: None,
         nc: None,
+        nc_crlf: false,
         nc_listen: None,
         nc_udp: None,
         nc_keep: None,

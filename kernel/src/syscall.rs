@@ -2032,13 +2032,21 @@ pub fn dispatch(ctx: &mut CpuContext) {
             let b16 = (a5 & 0xFFFF) as u16;
             let base = if b16 == 0 { 33434 } else { b16 };
             let maxh = (a2 as u8).max(1).min(30);
+            // a1's high 32 bits carry the `traceroute -s` source bind:
+            // nonzero = override src address on every probe datagram.
+            let src_hi = (a1 >> 32) as u32;
+            let src = if src_hi == 0 {
+                None
+            } else {
+                Some(src_hi.to_be_bytes())
+            };
             let hops = match (a2 >> 16) & 0x3 {
-                1 => net::net_trace_icmp(ip, first, maxh, per, probes),
+                1 => net::net_trace_icmp(ip, first, maxh, per, probes, src),
                 2 => {
                     let dport = if b16 == 0 { 80 } else { b16 };
-                    net::net_trace_tcp(ip, first, maxh, per, dport, probes)
+                    net::net_trace_tcp(ip, first, maxh, per, dport, probes, src)
                 }
-                _ => net::net_trace(ip, first, maxh, per, base, probes),
+                _ => net::net_trace(ip, first, maxh, per, base, probes, src),
             };
             let mut buf = alloc::vec::Vec::with_capacity(hops.len() * 16);
             for (ttl, hop, reached) in hops {
