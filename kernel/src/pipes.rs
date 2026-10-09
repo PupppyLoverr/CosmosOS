@@ -23,6 +23,9 @@ pub struct Pipe {
     /// instead, since our open doesn't rendezvous like POSIX).
     pub readers_seen: bool,
     pub mtime: u64,
+    /// user-settable attribute bits (same layout as FAT: 0x01 = readonly);
+    /// readonly fifos reject open-for-write, like a file's r-bit
+    pub attr: u8,
 }
 
 static PIPES: Mutex<BTreeMap<String, Pipe>> = Mutex::new(BTreeMap::new());
@@ -88,9 +91,25 @@ pub fn create(path: &str) -> Result<(), i64> {
     }
     g.insert(
         String::from(path),
-        Pipe { buf: VecDeque::new(), writers: 0, readers: 0, readers_seen: false, mtime: crate::vfs::now_unix() },
+        Pipe { buf: VecDeque::new(), writers: 0, readers: 0, readers_seen: false, mtime: crate::vfs::now_unix(), attr: 0 },
     );
     Ok(())
+}
+
+/// current attribute bits on a named pipe (mkfifo -m / chattr on a fifo)
+pub fn attr(path: &str) -> u8 {
+    PIPES.lock().get(path).map(|p| p.attr).unwrap_or(0)
+}
+
+/// setattr on a named pipe — ENOENT when the path isn't a live pipe object
+pub fn set_attr(path: &str, attr: u8) -> Result<(), i64> {
+    match PIPES.lock().get_mut(path) {
+        Some(p) => {
+            p.attr = attr;
+            Ok(())
+        }
+        None => Err(-2),
+    }
 }
 
 /// open-role accounting: writer iff O_TRUNC|O_APPEND was requested

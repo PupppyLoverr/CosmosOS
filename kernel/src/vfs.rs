@@ -384,13 +384,31 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
             return Err(-1);
         }
     }
-    if crate::tmpfs::handles(&full) {
-        let pos = crate::tmpfs::open(&full, flags)?;
-        crate::notify::fire(&full, crate::notify::IN_ACCESS);
-        let Some(fdi) = alloc_fd() else { return Err(-24) };
+    // live pipe objects are exact-path entries — claim before the
+    // prefix-based tmpfs resolver so a fifo under /tmp isn't shadowed
+    if is_pipe {
+        if crate::pipes::is_dir(&full) {
+            return Err(-4);
+        }
+        // mkfifo-style create: O_CREATE on a missing /pipes path makes a
+        // pipe object, not a FAT file
+        if !crate::pipes::exists(&full) {
+            if flags & shared::O_CREATE == 0 {
+                return Err(-2);
+            }
+            crate::pipes::create(&full)?;
+        }
+        // writer = an fd opened for write (O_WRONLY|O_TRUNC|O_APPEND), i.e.
+        // `>` / `>>` opens; plain readers take the reader slot
+        let writer = flags & (shared::O_WRONLY | shared::O_TRUNC | shared::O_APPEND) != 0;
+        if writer && crate::pipes::attr(&full) & 0x01 != 0 {
+            return Err(-30); // EROFS: readonly fifo (mkfifo -m / chattr -w)
+        }
+        crate::pipes::open_role(&full, writer);
+        let Some(fdi) = alloc_fd() else { return Err(-24) }; // EMFILE
         let fd = fdi as i64;
         task::with_current(|t| {
-            t.fds[fd as usize] = Some(FileDesc { path: full, pos, flags });
+            t.fds[fd as usize] = Some(FileDesc { path: full, pos: 0, flags });
         });
         return Ok(fd);
     }
@@ -412,26 +430,13 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
         });
         return Ok(fd);
     }
-    if is_pipe {
-        if crate::pipes::is_dir(&full) {
-            return Err(-4);
-        }
-        // mkfifo-style create: O_CREATE on a missing /pipes path makes a
-        // pipe object, not a FAT file
-        if !crate::pipes::exists(&full) {
-            if flags & shared::O_CREATE == 0 {
-                return Err(-2);
-            }
-            crate::pipes::create(&full)?;
-        }
-        // writer = an fd opened for write (O_WRONLY|O_TRUNC|O_APPEND), i.e.
-        // `>` / `>>` opens; plain readers take the reader slot
-        let writer = flags & (shared::O_WRONLY | shared::O_TRUNC | shared::O_APPEND) != 0;
-        crate::pipes::open_role(&full, writer);
-        let Some(fdi) = alloc_fd() else { return Err(-24) }; // EMFILE
+    if crate::tmpfs::handles(&full) {
+        let pos = crate::tmpfs::open(&full, flags)?;
+        crate::notify::fire(&full, crate::notify::IN_ACCESS);
+        let Some(fdi) = alloc_fd() else { return Err(-24) };
         let fd = fdi as i64;
         task::with_current(|t| {
-            t.fds[fd as usize] = Some(FileDesc { path: full, pos: 0, flags });
+            t.fds[fd as usize] = Some(FileDesc { path: full, pos, flags });
         });
         return Ok(fd);
     }
@@ -853,7 +858,7 @@ pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
             return Ok(shared::Stat { size: 0, is_dir: 1, mtime: 0, attr: 0 });
         }
         return match crate::pipes::stat(&full) {
-            Some((sz, mt)) => Ok(shared::Stat { size: sz, is_dir: 0, mtime: mt, attr: 0x20 }),
+            Some((sz, mt)) => Ok(shared::Stat { size: sz, is_dir: 0, mtime: mt, attr: (0x20 | crate::pipes::attr(&full)) as u32 }),
             None => Err(-2),
         };
     }
@@ -1022,10 +1027,15 @@ pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
 pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    // pipe registry entries are exact-path objects; check them before the
+    // prefix-based tmpfs resolver so a fifo under /tmp still takes attrs
+    if crate::pipes::handles(&full) {
+        return crate::pipes::set_attr(&full, attr);
+    }
     if crate::tmpfs::handles(&full) {
         return crate::tmpfs::setattr(&full, attr);
     }
-    if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::pipes::handles(&full) || crate::cgroup::handles(&full) {
+    if crate::proc::handles(&full) || crate::dev::handles(&full) || crate::cgroup::handles(&full) {
         return Err(-4);
     }
     // vfat ownership: files are root:root, so a non-root caller gets
