@@ -981,7 +981,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
             } else {
                 None
             };
-            net::ping_ttl_pat(ip, a2.min(10_000), a3 as u8, if size == 0 { 36 } else { size }, (a5 & 0xff) as u8, (a3 >> 8) as u8, pat.as_deref())
+            net::ping_ttl_pat(ip, a2.min(10_000), a3 as u8, if size == 0 { 36 } else { size }, (a5 & 0xff) as u8, (a3 >> 8) as u8, pat.as_deref(), (a3 >> 16) & 1 == 1)
                 .unwrap_or(ERR)
         }
         shared::SYS_NET_DNS => {

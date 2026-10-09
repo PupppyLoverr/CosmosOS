@@ -8074,6 +8074,7 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut mac_spec = String::new();
     let mut icmpt_spec = String::new();
     let mut dscp_spec = String::new();
+    let mut syn_flag = false;
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
     let mut jump = "DROP";
@@ -8163,6 +8164,10 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             "--mac-source" => {
                 mac_spec = String::from(args.get(i + 1).copied().unwrap_or(""));
                 i += 1;
+            }
+            // `-m tcp --syn` — real SYN-only flag match (bare flag).
+            "--syn" => {
+                syn_flag = true;
             }
             // `-m icmp --icmp-type <name|n>` — real ICMP-type match;
             // names map to their real type codes.
@@ -8374,6 +8379,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !dscp_spec.is_empty() {
         line.push_str(&alloc::format!(" dscp {}", dscp_spec));
+    }
+    if syn_flag {
+        line.push_str(" syn");
     }
     if !iif.is_empty() {
         line.push_str(&alloc::format!(" iif {}", iif));
@@ -20928,6 +20936,8 @@ impl Term {
                 let mut follow = false;
                 let mut max_redirs = 50u32;
                 let mut resolve_map: Vec<(String, u16, String)> = Vec::new();
+                let mut ua: Option<String> = None;
+                let mut compressed = false;
                 let mut i = 0usize;
                 while i < args.len() {
                     let a = args[i];
@@ -20973,6 +20983,24 @@ impl Term {
                                 ));
                             }
                             i += 1;
+                        }
+                        "-A" | "--user-agent" => {
+                            // real curl flag — replaces the default
+                            // User-Agent on the wire.
+                            ua = args.get(i + 1).map(|u| String::from(*u));
+                            i += 1;
+                        }
+                        "-e" | "--referer" => {
+                            // real curl flag — Referer header.
+                            if let Some(r) = args.get(i + 1) {
+                                xhdrs.push(alloc::format!("Referer: {}", r));
+                            }
+                            i += 1;
+                        }
+                        "--compressed" => {
+                            // real curl flag — offer gzip/deflate and
+                            // decode the response on Content-Encoding.
+                            compressed = true;
                         }
                         "--resolve" => {
                             // real curl flag — host:port:addr overrides
@@ -21102,11 +21130,15 @@ impl Term {
                         })
                     });
                     let mut req = alloc::format!(
-                        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: cosmos-curl/1.0\r\nAccept: */*\r\nConnection: close\r\n",
+                        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: */*\r\nConnection: close\r\n",
                         m,
                         path,
-                        authority
+                        authority,
+                        ua.as_deref().unwrap_or("cosmos-curl/1.0")
                     );
+                    if compressed {
+                        req.push_str("Accept-Encoding: gzip, deflate\r\n");
+                    }
                     for h in &xhdrs {
                         req.push_str(h);
                         req.push_str("\r\n");
@@ -21219,6 +21251,28 @@ impl Term {
                     last_path = String::from(path);
                     head_v = resp[..split].to_vec();
                     body_v = resp[split..].to_vec();
+                    // --compressed: honor Content-Encoding — gunzip /
+                    // inflate the body through the real decoders.
+                    if compressed {
+                        let hh = String::from_utf8_lossy(&head_v).to_lowercase();
+                        if let Some(l) = hh.lines().find(|l| {
+                            l.starts_with("content-encoding:")
+                        }) {
+                            let enc = l["content-encoding:".len()..].trim();
+                            let dec = match enc {
+                                "gzip" => ustd::inflate::gzip_body(&body_v)
+                                    .ok()
+                                    .and_then(|o| ustd::inflate::inflate(&body_v[o..]).ok()),
+                                "deflate" => ustd::inflate::zlib_body(&body_v)
+                                    .ok()
+                                    .and_then(|b| ustd::inflate::inflate(b).ok()),
+                                _ => None,
+                            };
+                            if let Some(d) = dec {
+                                body_v = d;
+                            }
+                        }
+                    }
                     break;
                 }
                 let (head_b, body_b) = (head_v.as_slice(), body_v.as_slice());
@@ -23160,6 +23214,7 @@ impl Term {
                 let mut ts_stamp = false;
                 let mut ttl = 0u8;
                 let mut tos = 0u8;
+                let mut df = false;
                 let mut pat: Vec<u8> = Vec::new();
                 let mut audible = false;
                 let mut size = 0u64;
@@ -23248,6 +23303,22 @@ impl Term {
                             // first reply (or after `cnt` timeouts).
                             one_reply = true;
                             i += 1;
+                        }
+                        "-M" => {
+                            // -M <do|want|dont>: real iputils flag —
+                            // `do`/`want` stamp the DF bit on the wire
+                            // (`want`==pmtud, which is our only mode:
+                            // oversize is always dropped, never
+                            // fragmented).
+                            match args.get(i + 1).copied() {
+                                Some("do") | Some("want") => df = true,
+                                Some("dont") => df = false,
+                                _ => {
+                                    self.fail("ping: -M expects do|want|dont");
+                                    return;
+                                }
+                            }
+                            i += 2;
                         }
                         "-b" => {
                             // -b: allow a broadcast destination — real
@@ -23338,10 +23409,10 @@ impl Term {
                                 self.fail("ping: connect: Invalid argument");
                                 break;
                             }
-                            let r = if pat.is_empty() {
+                            let r = if pat.is_empty() && !df {
                                 ustd::net_ping_qos(packed, wto, ttl, size, iface, tos)
                             } else {
-                                ustd::net_ping_pat(packed, wto, ttl, size, iface, tos, &pat)
+                                ustd::net_ping_pat(packed, wto, ttl, size, iface, tos, &pat, df)
                             };
                             match r {
                                 Some(rtt) => {
