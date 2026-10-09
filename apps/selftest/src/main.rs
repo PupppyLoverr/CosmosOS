@@ -5494,6 +5494,73 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         a && blocked && ok
     });
 
+    check("ipt-string", {
+        // `-m string --string`: the DNS reply carries the queried name
+        // inside a length-prefixed label ("example" = 7 contiguous
+        // bytes). Dropping udp payloads containing it breaks the
+        // lookup while leaving icmp replies alone.
+        let _ = ustd::write_all("/proc/net/dns", b"F\n");
+        let a = ustd::write_all(
+            "/proc/net/iptables",
+            b"A IN udp string 6578616d706c65 drop\n",
+        )
+        .is_ok();
+        let blocked = ustd::net_dns("example.com").is_none();
+        let _ = ustd::write_all("/proc/net/iptables", b"F\n");
+        let _ = ustd::write_all("/proc/net/dns", b"F\n");
+        let ok = ustd::net_dns("example.com").is_some();
+        a && blocked && ok
+    });
+    check("ipt-u32", {
+        // `-m u32 "0&0xFF000000=0"` — a 4-byte BE word at offset 0 of
+        // the ICMP payload masked against the type byte: echo replies
+        // (type 0) match, echo requests (type 8) don't, so the ping
+        // fails on the inbound side only.
+        let a = ustd::write_all(
+            "/proc/net/iptables",
+            b"A IN icmp u32 0&0xFF000000=0 drop\n",
+        )
+        .is_ok();
+        let dropped = ustd::net_ping(0x0A00_0202, 1200).is_none();
+        let _ = ustd::write_all("/proc/net/iptables", b"F\n");
+        let ok = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        a && dropped && ok
+    });
+    check("ipt-statistic", {
+        // `-m statistic --mode nth --every 2`: every second inbound
+        // ICMP packet is dropped — of three pings the middle one must
+        // time out while its neighbors get replies.
+        let a = ustd::write_all("/proc/net/iptables", b"A IN icmp statnth 2 drop\n")
+            .is_ok();
+        let p1 = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        let p2 = ustd::net_ping(0x0A00_0202, 1200).is_none();
+        let p3 = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        let _ = ustd::write_all("/proc/net/iptables", b"F\n");
+        a && p1 && p2 && p3
+    });
+    check("ipt-tcpflags", {
+        // `-m tcp --tcp-flags SYN,ACK SYN,ACK` on INPUT: the SYN-ACK
+        // coming back from an outbound connect is dropped, so the
+        // +tcp DNS path cannot establish while plain UDP DNS still
+        // works.
+        let _ = ustd::write_all("/proc/net/dns", b"F\n");
+        let a = ustd::write_all(
+            "/proc/net/iptables",
+            b"A IN tcp tflags SYN,ACK SYN,ACK drop\n",
+        )
+        .is_ok();
+        let blocked =
+            ustd::TcpSock::connect_timeout(15357, [10, 0, 2, 3], 53, 2500).is_none();
+        let udp_ok = ustd::net_dns("example.com").is_some();
+        let _ = ustd::write_all("/proc/net/iptables", b"F\n");
+        let _ = ustd::write_all("/proc/net/dns", b"F\n");
+        // fresh local port: the dropped attempt's port may still be
+        // allocated by its retransmit timer.
+        let ok =
+            ustd::TcpSock::connect_timeout(15359, [10, 0, 2, 3], 53, 2500).is_some();
+        a && blocked && udp_ok && ok
+    });
+
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {
         // 4 MiB through write_all (virtio-blk -> FAT32)

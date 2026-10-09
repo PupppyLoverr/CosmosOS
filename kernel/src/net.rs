@@ -359,6 +359,14 @@ struct FwRule {
     recent_op: u8,        // `-m recent`: 0 = none, 1 = --set, 2 = --rcheck, 3 = --update
     recent_name: String,  // list name (real default: "DEFAULT")
     recent_secs: u64,     // --seconds N recency window (0 = any age)
+    needle: Vec<u8>,      // `-m string --string` — payload substring
+    u32_off: u16,         // `-m u32` — 4-byte BE word at offset (0xffff = unused)
+    u32_mask: u32,
+    u32_val: u32,
+    stat_every: u64,      // `-m statistic --mode nth --every N` (0 = unused)
+    stat_seen: u64,       // packets counted so far for nth
+    tf_mask: u8,          // `-m tcp --tcp-flags` mask (0 = unused)
+    tf_comp: u8,
     limit_pps: u16,       // 0 = unlimited; `-m limit --limit N/s` cap on rule hits
     comment: String,      // `-m comment --comment` — real per-rule annotation
     limit_burst: u16,     // bucket depth (real iptables default 5)
@@ -541,9 +549,10 @@ fn fw_verdict(
     smac: [u8; 6],
     itype: u8,
     syn: bool,
+    pl: &[u8],
 ) -> u8 {
     let mut fw = chain.lock();
-    match fw_eval(&mut *fw, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, syn, 0) {
+    match fw_eval(&mut *fw, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, syn, pl, 0) {
         // 255 = walked off the end of the builtin chain: policy decides
         255 => {
             if *policy.lock() {
@@ -579,6 +588,7 @@ fn fw_eval(
     smac: [u8; 6],
     itype: u8,
     syn: bool,
+    pl: &[u8],
     depth: u8,
 ) -> u8 {
     for r in chain.iter_mut() {
@@ -670,6 +680,52 @@ fn fw_eval(
                 }
             }
         }
+        // `-m string` — real payload substring match (raw and
+        // |hex bytes| forms both land here decoded).
+        if !r.needle.is_empty()
+            && (pl.len() < r.needle.len()
+                || !pl
+                    .windows(r.needle.len())
+                    .any(|w| w == r.needle.as_slice()))
+        {
+            continue;
+        }
+        // `-m u32` — a 4-byte big-endian word at the offset, masked
+        // then compared (the real xt_u32 semantics).
+        if r.u32_off != 0xffff {
+            let o = r.u32_off as usize;
+            let w = if o + 4 <= pl.len() {
+                u32::from_be_bytes([
+                    pl[o],
+                    pl[o + 1],
+                    pl[o + 2],
+                    pl[o + 3],
+                ])
+            } else {
+                0
+            };
+            if w & r.u32_mask != r.u32_val {
+                continue;
+            }
+        }
+        // `-m statistic --mode nth --every N` — every Nth packet
+        // matches (the counter lives on the rule itself).
+        if r.stat_every != 0 {
+            r.stat_seen = r.stat_seen.wrapping_add(1);
+            if r.stat_seen % r.stat_every != 0 {
+                continue;
+            }
+        }
+        // `-m tcp --tcp-flags <mask> <comp>` — the real flag compare:
+        // (flags & mask) == comp on a TCP segment (payload[13]).
+        if r.tf_mask != 0 {
+            if proto != 6 || pl.len() < 14 {
+                continue;
+            }
+            if pl[13] & r.tf_mask != r.tf_comp {
+                continue;
+            }
+        }
         // `-m multiport --dports`: real set match on the dest port
         if !r.dports.is_empty() && !r.dports.contains(&dport) {
             continue;
@@ -732,7 +788,7 @@ fn fw_eval(
                 continue; // loop guard — treat as no-match
             }
             let mut snap = FW_USER.lock().get(&r.jump).cloned().unwrap_or_default();
-            let v = fw_eval(&mut snap, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, syn, depth + 1);
+            let v = fw_eval(&mut snap, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, syn, pl, depth + 1);
             if let Some(u) = FW_USER.lock().get_mut(&r.jump) {
                 *u = snap;
             }
@@ -1055,6 +1111,46 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
         }
         _ => {}
     }
+    if !r.needle.is_empty() {
+        let mut h = String::new();
+        for b in &r.needle {
+            h.push_str(&alloc::format!("{:02x}", b));
+        }
+        out.push_str(&alloc::format!(" -m string --hex-string |{}|", h));
+    }
+    if r.u32_off != 0xffff {
+        out.push_str(&alloc::format!(
+            " -m u32 --u32 {}&0x{:x}=0x{:x}",
+            r.u32_off, r.u32_mask, r.u32_val
+        ));
+    }
+    if r.stat_every != 0 {
+        out.push_str(&alloc::format!(
+            " -m statistic --mode nth --every {}",
+            r.stat_every
+        ));
+    }
+    if r.tf_mask != 0 {
+        let names = |v: u8| -> String {
+            let mut n = String::new();
+            for (b, s) in [
+                (0x80u8, "CWR"), (0x40, "ECE"), (0x20, "URG"), (0x10, "ACK"),
+                (0x08, "PSH"), (0x04, "RST"), (0x02, "SYN"), (0x01, "FIN"),
+            ] {
+                if v & b != 0 {
+                    if !n.is_empty() {
+                        n.push(',');
+                    }
+                    n.push_str(s);
+                }
+            }
+            if n.is_empty() { String::from("NONE") } else { n }
+        };
+        out.push_str(&alloc::format!(
+            " -m tcp --tcp-flags {} {}",
+            names(r.tf_mask), names(r.tf_comp)
+        ));
+    }
     if r.limit_pps != 0 {
         out.push_str(&alloc::format!(" -m limit --limit {}/s", r.limit_pps));
         if r.limit_burst != 5 {
@@ -1211,6 +1307,24 @@ fn fmt_fw_rule(out: &mut String, i: usize, r: &FwRule) {
             "  recent: {} name: {} side: source",
             if r.recent_op == 1 { "SET" } else { "CHECK" },
             r.recent_name
+        ));
+    }
+    if !r.needle.is_empty() {
+        extra.push_str(&alloc::format!("  STRING match \"{}\"", String::from_utf8_lossy(&r.needle)));
+    }
+    if r.u32_off != 0xffff {
+        extra.push_str(&alloc::format!(
+            "  u32 0x{:x}:0x{:x} = 0x{:x}",
+            r.u32_off, r.u32_mask, r.u32_val
+        ));
+    }
+    if r.stat_every != 0 {
+        extra.push_str(&alloc::format!("  statistic mode nth every {}", r.stat_every));
+    }
+    if r.tf_mask != 0 {
+        extra.push_str(&alloc::format!(
+            "  tcp flags:0x{:02x}/0x{:02x}",
+            r.tf_mask, r.tf_comp
         ));
     }
     if r.len_hi != 0 {
@@ -1478,6 +1592,7 @@ fn fw_name_ok(n: &str) -> bool {
         "state", "limit", "lburst", "log", "reject", "accept", "return", "drop",
         "iif", "oif", "sport", "length", "comment", "ttl", "tos", "mac",
         "dscp", "icmpt", "syn", "rset", "rchk", "rupd", "sports", "dstrange",
+        "string", "u32", "statnth", "tflags",
     ];
     !n.is_empty()
         && n.len() <= 28
@@ -1871,6 +1986,14 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         recent_op: 0,
         recent_name: String::new(),
         recent_secs: 0,
+        needle: Vec::new(),
+        u32_off: 0xffff,
+        u32_mask: 0,
+        u32_val: 0,
+        stat_every: 0,
+        stat_seen: 0,
+        tf_mask: 0,
+        tf_comp: 0,
         limit_pps: 0,
         comment: String::new(),
         limit_burst: 5,
@@ -2151,6 +2274,79 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
                 r.recent_name = String::from(f.next().unwrap_or("DEFAULT"));
                 r.recent_secs = f.next().unwrap_or("0").parse().unwrap_or(0);
             }
+            // `-m string --string <txt>` — wire token `string <hex>`:
+            // the text travels hex-encoded so spaces never split it.
+            "string" => {
+                let h = f.next().unwrap_or("");
+                r.needle = (0..h.len())
+                    .step_by(2)
+                    .filter_map(|i| u8::from_str_radix(&h[i..(i + 2).min(h.len())], 16).ok())
+                    .collect();
+                if r.needle.is_empty() {
+                    ok = false;
+                }
+            }
+            // `-m u32 --u32 "<off>[&<mask>]=<val>"` — wire `u32 <spec>`
+            // with 0x-prefixed or decimal fields.
+            "u32" => {
+                let spec = f.next().unwrap_or("");
+                let num = |t: &str| -> Option<u32> {
+                    if let Some(h) = t.strip_prefix("0x") {
+                        u32::from_str_radix(h, 16).ok()
+                    } else {
+                        t.parse::<u32>().ok()
+                    }
+                };
+                let mut sides = spec.splitn(2, '=');
+                let lhs = sides.next().unwrap_or("");
+                let rhs = sides.next();
+                let (o, m) = match lhs.split_once('&') {
+                    Some((a, b)) => (num(a), num(b)),
+                    None => (num(lhs), Some(0xffff_ffff)),
+                };
+                match (o, m, rhs.and_then(num)) {
+                    (Some(o), Some(m), Some(v)) if o < 0xffff => {
+                        r.u32_off = o as u16;
+                        r.u32_mask = m;
+                        r.u32_val = v & m;
+                    }
+                    _ => ok = false,
+                }
+            }
+            // `-m statistic --mode nth --every N` — wire `statnth <n>`.
+            "statnth" => {
+                r.stat_every = f.next().unwrap_or("0").parse().unwrap_or(0);
+                if r.stat_every == 0 {
+                    ok = false;
+                }
+            }
+            // `-m tcp --tcp-flags <mask> <comp>` — wire `tflags <mask> <comp>`,
+            // flags as ALL/NONE/SYN/ACK/FIN/RST/URG/PSH/ECE/CWR csv.
+            "tflags" => {
+                let fl = |t: &str| -> u8 {
+                    t.split(',')
+                        .fold(0u8, |m, n| m | match n {
+                            "FIN" => 0x01,
+                            "SYN" => 0x02,
+                            "RST" => 0x04,
+                            "PSH" => 0x08,
+                            "ACK" => 0x10,
+                            "URG" => 0x20,
+                            "ECE" => 0x40,
+                            "CWR" => 0x80,
+                            "ALL" => 0xff,
+                            _ => 0,
+                        })
+                };
+                let m = fl(f.next().unwrap_or(""));
+                let c = fl(f.next().unwrap_or(""));
+                if m == 0 {
+                    ok = false;
+                } else {
+                    r.tf_mask = m;
+                    r.tf_comp = c;
+                }
+            }
             "log" => r.target = 1,    // "... log" marks -j LOG
             "reject" => r.target = 2, // -j REJECT: refusal goes back
             "accept" => r.target = 3, // -j ACCEPT: terminal allow
@@ -2189,6 +2385,13 @@ fn fw_rule_eq(a: &FwRule, b: &FwRule) -> bool {
         && a.recent_op == b.recent_op
         && a.recent_name == b.recent_name
         && a.recent_secs == b.recent_secs
+        && a.needle == b.needle
+        && a.u32_off == b.u32_off
+        && a.u32_mask == b.u32_mask
+        && a.u32_val == b.u32_val
+        && a.stat_every == b.stat_every
+        && a.tf_mask == b.tf_mask
+        && a.tf_comp == b.tf_comp
         && a.state == b.state
         && a.ttl_mode == b.ttl_mode
         && a.ttl_v == b.ttl_v
@@ -2341,7 +2544,7 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>, u64)> {
         let ifx = if is_loopback(*src_ip) { 2u8 } else { 1 };
         let itype = if *proto == 1 && !p.is_empty() { p[0] } else { 0xff };
         let syn = *proto == 6 && p.len() >= 14 && p[13] & 0x17 == 0x02;
-        let v = fw_verdict(&FW, &FW_POLICY, true, *src_ip, dst, *proto, sport, dport, st, ifx, p.len() as u64, meta_ttl(*meta), meta_tos(*meta), meta_mac(*meta), itype, syn);
+        let v = fw_verdict(&FW, &FW_POLICY, true, *src_ip, dst, *proto, sport, dport, st, ifx, p.len() as u64, meta_ttl(*meta), meta_tos(*meta), meta_mac(*meta), itype, syn, p);
         if v == 2 {
             // -j REJECT: a real refusal goes back — TCP_RST for TCP
             // (same wire shape as the unclaimed-port responder),
@@ -3222,7 +3425,7 @@ fn send_ip_src_qos(
     let oifx = if is_loopback(dst_ip) { 2u8 } else { 1 };
     let itype = if proto == 1 && !payload.is_empty() { payload[0] } else { 0xff };
     let syn = proto == 6 && payload.len() >= 14 && payload[13] & 0x17 == 0x02;
-    let v = fw_verdict(&FW_OUT, &FW_OUT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64, ttl, tos, [0; 6], itype, syn);
+    let v = fw_verdict(&FW_OUT, &FW_OUT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64, ttl, tos, [0; 6], itype, syn, payload);
     if v == 2 {
         out_reject(src_ip, dst_ip, proto, payload);
         return;
