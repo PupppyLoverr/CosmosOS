@@ -61,6 +61,18 @@ pub fn sc5(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64) -> u64 {
     unsafe { core::arch::asm!("int 0x80", inout("rax") nr => r, in("rdi") a, in("rsi") b, in("rdx") c, in("r8") d, in("r9") e, options(nostack, preserves_flags)) };
     r
 }
+#[inline(always)]
+pub fn sc6(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> u64 {
+    let r: u64;
+    unsafe { core::arch::asm!("int 0x80", inout("rax") nr => r, in("rdi") a, in("rsi") b, in("rdx") c, in("r8") d, in("r9") e, in("r10") f, options(nostack, preserves_flags)) };
+    r
+}
+#[inline(always)]
+pub fn sc7(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64) -> u64 {
+    let r: u64;
+    unsafe { core::arch::asm!("int 0x80", inout("rax") nr => r, in("rdi") a, in("rsi") b, in("rdx") c, in("r8") d, in("r9") e, in("r10") f, in("r11") g, options(nostack, preserves_flags)) };
+    r
+}
 
 const ERR: u64 = shared::SYS_ERR;
 pub fn is_err(v: u64) -> bool {
@@ -3300,4 +3312,55 @@ pub fn setreuid(r: u32, e: u32) -> i64 {
 /// setregid(r, e): either may be u32::MAX to keep.
 pub fn setregid(r: u32, e: u32) -> i64 {
     sc2(shared::SYS_SETREGID, r as u64, e as u64) as i64
+}
+
+// Batch 228 — tmpfs xattrs + kernel keyring.
+/// setxattr on a tmpfs path (user.* namespace only). 0 | -errno.
+pub fn setxattr(path: &str, name: &str, val: &[u8]) -> i64 {
+    sc6(shared::SYS_SETXATTR, path.as_ptr() as u64, path.len() as u64,
+        name.as_ptr() as u64, name.len() as u64,
+        val.as_ptr() as u64, val.len() as u64) as i64
+}
+/// getxattr -> bytes copied into buf, or the needed size when buf empty.
+pub fn getxattr(path: &str, name: &str, buf: &mut [u8]) -> i64 {
+    sc6(shared::SYS_GETXATTR, path.as_ptr() as u64, path.len() as u64,
+        name.as_ptr() as u64, name.len() as u64,
+        buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+/// listxattr -> NUL-separated names blob length.
+pub fn listxattr(path: &str, buf: &mut [u8]) -> i64 {
+    sc6(shared::SYS_LISTXATTR, path.as_ptr() as u64, path.len() as u64,
+        0, 0, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+pub fn removexattr(path: &str, name: &str) -> i64 {
+    sc4(shared::SYS_REMOVEXATTR, path.as_ptr() as u64, path.len() as u64,
+        name.as_ptr() as u64, name.len() as u64) as i64
+}
+/// add_key("user", desc, payload) -> serial | -errno.
+pub fn add_key(desc: &str, payload: &[u8]) -> i64 {
+    sc6(shared::SYS_ADD_KEY, "user".as_ptr() as u64, 4,
+        desc.as_ptr() as u64, desc.len() as u64,
+        payload.as_ptr() as u64, payload.len() as u64) as i64
+}
+/// request_key(desc) -> serial | -126.
+pub fn request_key(desc: &str) -> i64 {
+    sc2(shared::SYS_REQUEST_KEY, desc.as_ptr() as u64, desc.len() as u64) as i64
+}
+/// KEYCTL_READ(serial, buf) -> bytes | negative.
+pub fn keyctl_read(serial: u32, buf: &mut [u8]) -> i64 {
+    sc4(shared::SYS_KEYCTL, shared::KEYCTL_READ, serial as u64,
+        buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+/// KEYCTL_REVOKE(serial) -> 0 | negative.
+pub fn keyctl_revoke(serial: u32) -> i64 {
+    sc3(shared::SYS_KEYCTL, shared::KEYCTL_REVOKE, serial as u64, 0) as i64
+}
+/// KEYCTL_UNLINK(serial) -> 0 | negative.
+pub fn keyctl_unlink(serial: u32) -> i64 {
+    sc3(shared::SYS_KEYCTL, shared::KEYCTL_UNLINK, serial as u64, 0) as i64
+}
+/// KEYCTL_SEARCH(desc) -> serial | -126.
+pub fn keyctl_search(desc: &str) -> i64 {
+    sc4(shared::SYS_KEYCTL, shared::KEYCTL_SEARCH,
+        desc.as_ptr() as u64, desc.len() as u64, 0) as i64
 }

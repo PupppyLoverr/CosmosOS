@@ -3720,6 +3720,57 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    check("tmpfs-xattrs", {
+        // real user.* store on tmpfs nodes: set/replace/get/list/remove +
+        // ENOTSUP on FAT and EINVAL outside user.*.
+        let mut ok = match ustd::open("/tmp/xat", ustd::O_RDWR | ustd::O_CREATE) {
+            Ok(fd) => { ustd::close(fd); true }
+            _ => false,
+        };
+        ok = ok && ustd::setxattr("/tmp/xat", "user.note", b"hello") == 0;
+        // a too-small buffer gets ERANGE (real Linux semantics), a right-
+        // sized one gets the value
+        ok = ok && ustd::getxattr("/tmp/xat", "user.note", &mut [0u8; 2]) == -34;
+        let mut buf = [0u8; 64];
+        let n = ustd::getxattr("/tmp/xat", "user.note", &mut buf);
+        ok = ok && n == 5 && &buf[..5] == b"hello";
+        ok = ok && ustd::setxattr("/tmp/xat", "user.note", b"bye") == 0;
+        let n = ustd::getxattr("/tmp/xat", "user.note", &mut buf);
+        ok = ok && n == 3 && &buf[..3] == b"bye";
+        let n = ustd::listxattr("/tmp/xat", &mut buf);
+        ok = ok && n > 0 && buf[..n as usize].windows(10).any(|w| w == b"user.note\0");
+        ok = ok && match ustd::open("/xat-fat", ustd::O_RDWR | ustd::O_CREATE) {
+            Ok(fd) => { ustd::close(fd); true }
+            _ => false,
+        };
+        ok = ok && ustd::setxattr("/xat-fat", "user.x", b"v") == -95;
+        ok = ok && ustd::setxattr("/tmp/xat", "bad.name", b"v") == -22;
+        ok = ok && ustd::removexattr("/tmp/xat", "user.note") == 0;
+        ok = ok && ustd::getxattr("/tmp/xat", "user.note", &mut buf) == -61;
+        ok = ok && ustd::removexattr("/tmp/xat", "user.note") == -61;
+        ok
+    });
+    check("keyring", {
+        // real key objects: add/request round-trip, desc-replace, owner
+        // revoke/unlink semantics.
+        let serial = ustd::add_key("db.pw", b"s3cr3t");
+        let mut ok = serial > 0;
+        ok = ok && ustd::request_key("db.pw") == serial;
+        let mut buf = [0u8; 64];
+        ok = ok && ustd::keyctl_read(serial as u32, &mut buf) == 6
+            && &buf[..6] == b"s3cr3t";
+        // same-desc add replaces payload, same serial
+        ok = ok && ustd::add_key("db.pw", b"n3w") == serial;
+        ok = ok && ustd::keyctl_read(serial as u32, &mut buf) == 3
+            && &buf[..3] == b"n3w";
+        ok = ok && ustd::request_key("missing") == -126;
+        ok = ok && ustd::keyctl_revoke(serial as u32) == 0;
+        ok = ok && ustd::keyctl_read(serial as u32, &mut buf) == -128;
+        ok = ok && ustd::request_key("db.pw") == -126;
+        ok = ok && ustd::keyctl_unlink(serial as u32) == 0;
+        ok = ok && ustd::keyctl_unlink(serial as u32) == -126;
+        ok
+    });
     check("epoll-flags", {
         // EPOLLET fires once per ready level, EPOLLONESHOT until MOD
         // re-arms, EPOLLHUP surfaces on writer close, and the epoll fd

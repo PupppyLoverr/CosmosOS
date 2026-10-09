@@ -32,6 +32,7 @@ mod serial;
 mod shm;
 mod acct;
 mod perf;
+mod keys;
 mod cgroup;
 mod syscall;
 mod task;

@@ -29,6 +29,9 @@ pub struct Node {
     pub gid: u32,
     pub mode: u16,
     pub children: Vec<String>, // entry names (dirs only)
+    /// extended attributes — user.* name -> value bytes. Real storage on
+    /// the node; FAT files report ENOTSUP instead.
+    pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
 /// (uid, gid, mode) for a fresh node: creator creds + umask-masked mode.
@@ -293,6 +296,7 @@ pub fn mount(target: &str, opts: u64) -> Result<(), i64> {
             gid: cg,
             mode: cm,
             children: Vec::new(),
+            xattrs: Vec::new(),
         },
     );
     mg.tmpfs.push((String::from(target), opts));
@@ -470,6 +474,7 @@ pub fn open(path: &str, flags: u64) -> Result<u64, i64> {
                     gid: cg,
                     mode: cm,
                     children: Vec::new(),
+            xattrs: Vec::new(),
                 },
             );
             Ok(0)
@@ -685,6 +690,7 @@ pub fn mkdir(path: &str) -> Result<(), i64> {
             gid: cg,
             mode: cm,
             children: Vec::new(),
+            xattrs: Vec::new(),
         },
     );
     Ok(())
@@ -822,4 +828,92 @@ pub fn ifree() -> (u64, u64) {
     let used = ng.len() as u64;
     let free = QUOTA.saturating_sub(used_bytes(&ng)) / 64;
     (used, free.max(used))
+}
+
+// ---------------------------------------------------------------------------
+// extended attributes (setxattr/getxattr/listxattr/removexattr)
+// ---------------------------------------------------------------------------
+
+
+/// setxattr(path, name, val): create-or-replace. Requires write perm on the
+/// node (POSIX: the same right a write() would need). Bounds: name<=64B,
+/// value<=4KiB, at most 32 attrs per node.
+pub fn xattr_set(path: &str, name: &str, val: &[u8]) -> i64 {
+    if !any() {
+        return -95; // ENOTSUP
+    }
+    if name.is_empty() || name.len() > 64 || !name.starts_with("user.") {
+        return -22; // EINVAL: we only serve the user.* namespace
+    }
+    if val.len() > 4096 {
+        return -34; // ERANGE
+    }
+    if !may_write(path) {
+        return -13; // EACCES
+    }
+    let mut g = NODES.lock();
+    let Some(n) = g.get_mut(path) else { return -2 };
+    if let Some(slot) = n.xattrs.iter_mut().find(|(k, _)| k == name) {
+        slot.1.clear();
+        slot.1.extend_from_slice(val);
+        return 0;
+    }
+    if n.xattrs.len() >= 32 {
+        return -28; // ENOSPC
+    }
+    n.xattrs.push((alloc::string::String::from(name), val.to_vec()));
+    0
+}
+
+/// getxattr(path, name) -> value bytes | ENODATA(-61).
+pub fn xattr_get(path: &str, name: &str) -> Result<alloc::vec::Vec<u8>, i64> {
+    if !any() {
+        return Err(-95);
+    }
+    if !may_read(path) {
+        return Err(-13);
+    }
+    let g = NODES.lock();
+    let Some(n) = g.get(path) else { return Err(-2) };
+    match n.xattrs.iter().find(|(k, _)| k == name) {
+        Some((_, v)) => Ok(v.clone()),
+        None => Err(-61),
+    }
+}
+
+/// listxattr(path) -> NUL-separated names blob | ENOTSUP.
+pub fn xattr_list(path: &str) -> Result<alloc::vec::Vec<u8>, i64> {
+    if !any() {
+        return Err(-95);
+    }
+    if !may_read(path) {
+        return Err(-13);
+    }
+    let g = NODES.lock();
+    let Some(n) = g.get(path) else { return Err(-2) };
+    let mut out = alloc::vec::Vec::new();
+    for (k, _) in &n.xattrs {
+        out.extend_from_slice(k.as_bytes());
+        out.push(0);
+    }
+    Ok(out)
+}
+
+/// removexattr(path, name) -> 0 | ENODATA(-61).
+pub fn xattr_remove(path: &str, name: &str) -> i64 {
+    if !any() {
+        return -95;
+    }
+    if !may_write(path) {
+        return -13;
+    }
+    let mut g = NODES.lock();
+    let Some(n) = g.get_mut(path) else { return -2 };
+    let before = n.xattrs.len();
+    n.xattrs.retain(|(k, _)| k != name);
+    if n.xattrs.len() == before {
+        -61
+    } else {
+        0
+    }
 }
