@@ -91,7 +91,28 @@ pub fn our_ip() -> [u8; 4] {
 /// (ip, mac, permanent) — wire-learned entries are dynamic; `arp -s`/
 /// `/proc/net/arp` `add` installs permanent ones that traffic doesn't
 /// refresh.
-static ARP_CACHE: Mutex<Vec<([u8; 4], [u8; 6], bool)>> = Mutex::new(Vec::new());
+/// A learned (or pinned) neighbour entry. `learned_ms` feeds the NUD
+/// state shown by `ip neigh`: PERMANENT for static entries, REACHABLE
+/// while the answer is fresh (< 30 s), STALE past that — like a real
+/// neighbour table.
+struct ArpEnt {
+    ip: [u8; 4],
+    mac: [u8; 6],
+    perm: bool,
+    learned_ms: u64,
+}
+static ARP_CACHE: Mutex<Vec<ArpEnt>> = Mutex::new(Vec::new());
+
+/// NUD state name for `ip neigh` output.
+fn arp_state(e: &ArpEnt) -> &'static str {
+    if e.perm {
+        "PERMANENT"
+    } else if now_ms() - e.learned_ms < 30_000 {
+        "REACHABLE"
+    } else {
+        "STALE"
+    }
+}
 
 /// Loopback (`lo`): 127.0.0.0/8 and our own address deliver back into the
 /// stack instead of the wire. Queued, not dispatched inline — TX paths may
@@ -678,12 +699,27 @@ pub fn net_arp() -> String {
     let mut s = String::from(
         "IP address       HW type     Flags       HW address            Mask     Device\n",
     );
-    for (ip, mac, perm) in ARP_CACHE.lock().iter() {
+    for e in ARP_CACHE.lock().iter() {
         s.push_str(&alloc::format!(
             "{:<17}0x1         0x{:<2}        {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}     *        eth0\n",
-            alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
-            if *perm { 6 } else { 2 }, // ATF_COM|ATF_PERM vs ATF_COM
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            alloc::format!("{}.{}.{}.{}", e.ip[0], e.ip[1], e.ip[2], e.ip[3]),
+            if e.perm { 6 } else { 2 }, // ATF_COM|ATF_PERM vs ATF_COM
+            e.mac[0], e.mac[1], e.mac[2], e.mac[3], e.mac[4], e.mac[5],
+        ));
+    }
+    s
+}
+
+/// `/proc/net/neigh` — the neighbour table in `ip neigh` format, with
+/// real NUD states derived from each entry's learned time.
+pub fn net_neigh() -> String {
+    let mut s = String::new();
+    for e in ARP_CACHE.lock().iter() {
+        s.push_str(&alloc::format!(
+            "{}.{}.{}.{} dev eth0 lladdr {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} {}\n",
+            e.ip[0], e.ip[1], e.ip[2], e.ip[3],
+            e.mac[0], e.mac[1], e.mac[2], e.mac[3], e.mac[4], e.mac[5],
+            arp_state(e),
         ));
     }
     s
@@ -1175,7 +1211,7 @@ fn icmp_echo_reply(src_ip: [u8; 4], req: &[u8]) {
     } else {
         let mac = {
             let c = ARP_CACHE.lock();
-            c.iter().find(|e| e.0 == src_ip).map(|e| e.1)
+            c.iter().find(|e| e.ip == src_ip).map(|e| e.mac)
         };
         if let Some(mac) = mac {
             send_ip(mac, src_ip, 1, &rep);
@@ -1215,7 +1251,7 @@ fn icmp_port_unreach(sender: [u8; 4], orig_udp: &[u8]) {
     } else {
         let mac = {
             let c = ARP_CACHE.lock();
-            c.iter().find(|e| e.0 == sender).map(|e| e.1)
+            c.iter().find(|e| e.ip == sender).map(|e| e.mac)
         };
         if let Some(mac) = mac {
             send_ip(mac, sender, 1, &icmp);
@@ -1505,8 +1541,8 @@ pub fn net_arping(dst: [u8; 4], per_ms: u64) -> Option<(u64, u64)> {
     send_arp_request(dst);
     while now_ms() - t0 < per_ms.max(50) {
         let _ = pump_rx(); // drains the ring; ARP replies update ARP_CACHE
-        if let Some(e) = ARP_CACHE.lock().iter().find(|e| e.0 == dst) {
-            let m = e.1;
+        if let Some(e) = ARP_CACHE.lock().iter().find(|e| e.ip == dst) {
+            let m = e.mac;
             let mac = (m[0] as u64) << 40 | (m[1] as u64) << 32 | (m[2] as u64) << 24
                 | (m[3] as u64) << 16 | (m[4] as u64) << 8 | m[5] as u64;
             return Some((mac, now_ms() - t0));
@@ -1568,12 +1604,18 @@ fn handle_frame(f: &[u8]) -> Option<([u8; 4], u8, Vec<u8>)> {
             let target_ip: [u8; 4] = p[24..28].try_into().ok()?;
             // cache the sender (dynamic entries refresh; static ones hold)
             let mut c = ARP_CACHE.lock();
-            if let Some(e) = c.iter_mut().find(|e| e.0 == sender_ip) {
-                if !e.2 {
-                    e.1 = sender_mac;
+            if let Some(e) = c.iter_mut().find(|e| e.ip == sender_ip) {
+                if !e.perm {
+                    e.mac = sender_mac;
+                    e.learned_ms = now_ms();
                 }
             } else {
-                c.push((sender_ip, sender_mac, false));
+                c.push(ArpEnt {
+                    ip: sender_ip,
+                    mac: sender_mac,
+                    perm: false,
+                    learned_ms: now_ms(),
+                });
             }
             drop(c);
             if op == 1 && target_ip == our_ip() {
@@ -1610,8 +1652,8 @@ fn arp_resolve(ip: [u8; 4], ms: u64) -> Option<[u8; 6]> {
     }
     {
         let c = ARP_CACHE.lock();
-        if let Some(e) = c.iter().find(|e| e.0 == ip) {
-            return Some(e.1);
+        if let Some(e) = c.iter().find(|e| e.ip == ip) {
+            return Some(e.mac);
         }
     }
     let deadline = now_ms() + ms;
@@ -1620,8 +1662,8 @@ fn arp_resolve(ip: [u8; 4], ms: u64) -> Option<[u8; 6]> {
         let _ = pump_rx();
         {
             let c = ARP_CACHE.lock();
-            if let Some(e) = c.iter().find(|e| e.0 == ip) {
-                return Some(e.1);
+            if let Some(e) = c.iter().find(|e| e.ip == ip) {
+                return Some(e.mac);
             }
         }
         if now_ms() >= deadline {
@@ -1636,7 +1678,7 @@ fn arp_resolve(ip: [u8; 4], ms: u64) -> Option<[u8; 6]> {
 pub fn arp_del(ip: [u8; 4]) -> bool {
     let mut c = ARP_CACHE.lock();
     let n = c.len();
-    c.retain(|e| e.0 != ip);
+    c.retain(|e| e.ip != ip);
     c.len() != n
 }
 
@@ -1661,11 +1703,17 @@ pub fn arp_ctl(line: &str) -> bool {
             }
             let mac: [u8; 6] = [o[0], o[1], o[2], o[3], o[4], o[5]];
             let mut c = ARP_CACHE.lock();
-            if let Some(e) = c.iter_mut().find(|e| e.0 == ip) {
-                e.1 = mac;
-                e.2 = true;
+            if let Some(e) = c.iter_mut().find(|e| e.ip == ip) {
+                e.mac = mac;
+                e.perm = true;
+                e.learned_ms = now_ms();
             } else {
-                c.push((ip, mac, true));
+                c.push(ArpEnt {
+                    ip,
+                    mac,
+                    perm: true,
+                    learned_ms: now_ms(),
+                });
             }
             true
         }
@@ -1681,12 +1729,12 @@ pub fn arp_ctl(line: &str) -> bool {
 pub fn arp_stat() -> String {
     let c = ARP_CACHE.lock();
     let mut s = String::from("ip              mac\n");
-    for (ip, mac, perm) in c.iter() {
+    for e in c.iter() {
         s.push_str(&alloc::format!(
             "{}.{}.{}.{}\t{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}{}\n",
-            ip[0], ip[1], ip[2], ip[3],
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-            if *perm { "\tPERM" } else { "" }
+            e.ip[0], e.ip[1], e.ip[2], e.ip[3],
+            e.mac[0], e.mac[1], e.mac[2], e.mac[3], e.mac[4], e.mac[5],
+            if e.perm { "\tPERM" } else { "" }
         ));
     }
     if c.is_empty() {
