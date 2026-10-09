@@ -2116,18 +2116,26 @@ pub fn for_mm_peers(pml4_phys: u64, f: impl Fn(&mut Task)) {
 /// advanced past base + guard. Two threads of one mm can never hand
 /// out the same anonymous range. Returns the reserved base VA.
 pub fn mm_reserve(pml4_phys: u64, pages: u64) -> u64 {
-    // CommitLimit = totalram * vm.overcommit_ratio% under
-    // vm.overcommit_memory=2 (strict accounting, like Linux).
-    let commit_limit = if crate::sysctl::vm_overcommit_memory() == 2 {
-        mem::FRAME_ALLOC
-            .lock()
+    // One FRAME_ALLOC scope feeds both checks: CommitLimit =
+    // totalram * vm.overcommit_ratio% under vm.overcommit_memory=2
+    // (strict accounting), and the vm.min_free_kbytes watermark —
+    // a user reservation that would leave less than min_free free
+    // fails with ENOMEM, like Linux's zone watermark.
+    let (commit_limit, free_headroom) = {
+        let g = mem::FRAME_ALLOC.lock();
+        let (tot, used) = g
             .as_ref()
-            .map(|a| a.total_bytes())
-            .unwrap_or(0)
-            * crate::sysctl::vm_overcommit_ratio()
-            / 100
-    } else {
-        u64::MAX
+            .map(|a| (a.total_bytes(), a.used_bytes()))
+            .unwrap_or((0, 0));
+        let cl = if crate::sysctl::vm_overcommit_memory() == 2 {
+            tot * crate::sysctl::vm_overcommit_ratio() / 100
+        } else {
+            u64::MAX
+        };
+        let free = tot
+            .saturating_sub(used)
+            .saturating_sub(crate::sysctl::min_free_kbytes().saturating_mul(0x400));
+        (cl, free)
     };
     let mut g = SCHED.lock();
     let Some(s) = g.as_mut() else {
@@ -2151,6 +2159,9 @@ pub fn mm_reserve(pml4_phys: u64, pages: u64) -> u64 {
     }
     if committed.saturating_add(pages.saturating_mul(0x1000)) > commit_limit {
         return 0;
+    }
+    if pages.saturating_mul(0x1000) > free_headroom {
+        return 0; // ENOMEM: below the vm.min_free_kbytes watermark
     }
     // kernel.randomize_va_space >= 2: an entropy-fed gap slides every
     // reservation's base like Linux mmap ASLR (0=off, 1=mild compat).

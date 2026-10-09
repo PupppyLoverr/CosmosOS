@@ -28,6 +28,10 @@ static KPTR_RESTRICT: AtomicU64 = AtomicU64::new(0);
 static PROTECTED_SYMLINKS: AtomicU64 = AtomicU64::new(1);
 static LOCAL_PORT_LO: AtomicU64 = AtomicU64::new(49152);
 static LOCAL_PORT_HI: AtomicU64 = AtomicU64::new(65535);
+static UNPRIV_USERNS: AtomicU64 = AtomicU64::new(1);
+static MMAP_MIN_ADDR: AtomicU64 = AtomicU64::new(0x10000);
+static MIN_FREE_KB: AtomicU64 = AtomicU64::new(8192);
+static PROTECTED_FIFOS: AtomicU64 = AtomicU64::new(1);
 static ICMP_ECHO_IGNORE_BCAST: AtomicU64 = AtomicU64::new(1);
 static IP_FORWARD: AtomicU64 = AtomicU64::new(0);
 static KERNEL_SYSRQ: AtomicU64 = AtomicU64::new(1);
@@ -132,6 +136,26 @@ pub fn set_local_port_range(lo: u64, hi: u64) -> bool {
     LOCAL_PORT_HI.store(hi, Ordering::Relaxed);
     true
 }
+/// kernel.unprivileged_userns_clone (default 1): allow CLONE_NEWUSER
+/// unshare() from tasks without CAP_SYS_ADMIN.
+pub fn unpriv_userns_clone() -> u64 {
+    UNPRIV_USERNS.load(Ordering::Relaxed)
+}
+/// vm.mmap_min_addr (default 64KiB): floor for MAP_FIXED placements —
+/// CAP_SYS_RAWIO bypasses it like on Linux.
+pub fn mmap_min_addr() -> u64 {
+    MMAP_MIN_ADDR.load(Ordering::Relaxed)
+}
+/// vm.min_free_kbytes: userspace reservations must leave this much RAM
+/// free — a zone-watermark style deny in the reserve path.
+pub fn min_free_kbytes() -> u64 {
+    MIN_FREE_KB.load(Ordering::Relaxed)
+}
+/// fs.protected_fifos: 1 = block O_WRONLY opens of foreign fifos in
+/// sticky world-writable dirs, 2 = also gate read opens.
+pub fn protected_fifos() -> u64 {
+    PROTECTED_FIFOS.load(Ordering::Relaxed)
+}
 
 /// sysctl name under /proc/sys → current value, or None when unknown.
 /// Names are given relative, e.g. "kernel/pid_max", "fs/nr_open".
@@ -170,6 +194,11 @@ pub fn get(name: &str) -> Option<u64> {
         "vm/overcommit_ratio" => OVERCOMMIT_RATIO.load(Ordering::Relaxed),
         "kernel/kptr_restrict" => KPTR_RESTRICT.load(Ordering::Relaxed),
         "fs/protected_symlinks" => PROTECTED_SYMLINKS.load(Ordering::Relaxed),
+
+            "kernel/unprivileged_userns_clone" => UNPRIV_USERNS.load(Ordering::Relaxed),
+        "vm/mmap_min_addr" => MMAP_MIN_ADDR.load(Ordering::Relaxed),
+        "vm/min_free_kbytes" => MIN_FREE_KB.load(Ordering::Relaxed),
+        "fs/protected_fifos" => PROTECTED_FIFOS.load(Ordering::Relaxed),
 
         _ => return None,
     })
@@ -218,6 +247,14 @@ pub fn set(name: &str, v: u64) -> bool {
         "vm/overcommit_ratio" if v <= 100 => OVERCOMMIT_RATIO.store(v, Ordering::Relaxed),
         "kernel/kptr_restrict" if v <= 2 => KPTR_RESTRICT.store(v, Ordering::Relaxed),
         "fs/protected_symlinks" if v <= 1 => PROTECTED_SYMLINKS.store(v, Ordering::Relaxed),
+        "kernel/unprivileged_userns_clone" if v <= 1 => {
+            UNPRIV_USERNS.store(v, Ordering::Relaxed)
+        }
+        "vm/mmap_min_addr" if v <= 0x7e00_0000 => {
+            MMAP_MIN_ADDR.store(v, Ordering::Relaxed)
+        }
+        "vm/min_free_kbytes" if v <= 4_194_304 => MIN_FREE_KB.store(v, Ordering::Relaxed),
+        "fs/protected_fifos" if v <= 2 => PROTECTED_FIFOS.store(v, Ordering::Relaxed),
 
         _ => return false,
     }

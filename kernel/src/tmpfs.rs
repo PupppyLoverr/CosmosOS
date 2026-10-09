@@ -582,6 +582,13 @@ pub fn link_follow_denied(path: &str) -> bool {
         && eu != dir.uid
 }
 
+/// (is_dir, mode, owner-uid) of a tmpfs node — fs.protected_fifos reads
+/// the containing dir's sticky/world-writable bits through this.
+pub fn dir_meta(path: &str) -> Option<(bool, u16, u32)> {
+    let ng = NODES.lock();
+    ng.get(path).map(|n| (n.is_dir, n.mode, n.uid))
+}
+
 /// Raw symlink target — mirrors the FAT32 "LNK>" convention: a node
 /// with attr bit 0x40 whose body starts with "LNK>" names its target.
 /// None when the node isn't a link (also what dangling means).

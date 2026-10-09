@@ -407,11 +407,14 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
             }
             crate::pipes::create(&full)?;
         }
-        // writer = an fd opened for write (O_WRONLY|O_TRUNC|O_APPEND), i.e.
-        // `>` / `>>` opens; plain readers take the reader slot
-        let writer = flags & (shared::O_WRONLY | shared::O_TRUNC | shared::O_APPEND) != 0;
+        // writer = an fd opened for write (O_WRONLY|O_RDWR|O_TRUNC|O_APPEND), i.e.
+        // `>` / `>>` / O_RDWR opens; plain readers take the reader slot
+        let writer = flags & (shared::O_WRONLY | shared::O_RDWR | shared::O_TRUNC | shared::O_APPEND) != 0;
         if writer && crate::pipes::attr(&full) & 0x01 != 0 {
             return Err(-30); // EROFS: readonly fifo (mkfifo -m / chattr -w)
+        }
+        if crate::pipes::open_denied(&full, writer) {
+            return Err(-1); // EPERM: fs.protected_fifos
         }
         crate::pipes::open_role(&full, writer);
         let Some(fdi) = alloc_fd() else { return Err(-24) }; // EMFILE
@@ -782,7 +785,7 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
 /// so the matching release stays balanced.
 pub fn acquire_desc(f: &task::FileDesc) {
     if crate::pipes::handles(&f.path) {
-        let writer = f.flags & (shared::O_WRONLY | shared::O_TRUNC | shared::O_APPEND) != 0;
+        let writer = f.flags & (shared::O_WRONLY | shared::O_RDWR | shared::O_TRUNC | shared::O_APPEND) != 0;
         crate::pipes::open_role(&f.path, writer);
     }
     crate::sockpair::acquire(&f.path);
@@ -798,7 +801,7 @@ pub fn acquire_desc(f: &task::FileDesc) {
 /// says no other live desc references the path.
 fn release_desc_obj(f: &task::FileDesc, still_open: bool) {
     if crate::pipes::handles(&f.path) {
-        let writer = f.flags & (shared::O_WRONLY | shared::O_TRUNC | shared::O_APPEND) != 0;
+        let writer = f.flags & (shared::O_WRONLY | shared::O_RDWR | shared::O_TRUNC | shared::O_APPEND) != 0;
         crate::pipes::close_role(&f.path, writer);
     }
     // sockpair sides are counted — close decrements, drops at zero

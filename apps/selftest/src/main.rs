@@ -2077,6 +2077,101 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
     });
     check("sysrq-sync", ustd::write_all("/proc/sysrq-trigger", b"s").is_ok());
+    check("min-free-kbytes", {
+        // vm.min_free_kbytes: push the watermark past free RAM and a
+        // user mmap reservation must fail; restore and it succeeds.
+        if ustd::write_all("/proc/sys/vm/min_free_kbytes", b"4194304").is_err() {
+            false
+        } else {
+            let denied = ustd::mmap(0x10000).is_none();
+            let _ = ustd::write_all("/proc/sys/vm/min_free_kbytes", b"8192");
+            let mut ok = denied;
+            if let Some(p) = ustd::mmap(0x10000) {
+                unsafe { *p = 7 };
+                ok = ok && unsafe { *p } == 7 && ustd::munmap(p, 0x10000);
+            }
+            ok
+        }
+    });
+    check("mmap-min-addr", {
+        // vm.mmap_min_addr: a MAP_FIXED below the floor fails without
+        // CAP_SYS_RAWIO (bit 17) — probe in a forked child so the cap
+        // drop can never leak into the parent's stored cap_eff (root
+        // children inherit it, breaking every later DAC/caps check).
+        if ustd::write_all("/proc/sys/vm/mmap_min_addr", b"33554432").is_err() {
+            false
+        } else {
+            // Probe a genuinely-low VA (4 KiB < 32 MiB floor). Cap-drop
+            // must stay in a forked child: capset restore writes the
+            // stored cap_eff verbatim, and fork copies it to children.
+            let ok = match ustd::fork() {
+                0 => {
+                    let bit = 1u64 << 17;
+                    let ok = ustd::capget(0)
+                        .map(|c| ustd::capset(c[0] & !bit, c[1] & !bit))
+                        .unwrap_or(false)
+                        && ustd::mmap_fixed(0x1000, 0x1000).is_none();
+                    ustd::exit(if ok { 0 } else { 1 });
+                }
+                p if p > 0 => ustd::waitpid(p as u32, 5000).unwrap_or(-1) == 0,
+                _ => false,
+            };
+            let _ = ustd::write_all("/proc/sys/vm/mmap_min_addr", b"65536");
+            ok
+        }
+    });
+    check("userns-clone", {
+        // kernel.unprivileged_userns_clone: fork a child that drops
+        // CAP_SYS_ADMIN — knob off makes CLONE_NEWUSER unshare fail
+        // with EPERM, knob on lets it through.
+        match ustd::fork() {
+            0 => {
+                let bit = 1u64 << 21;
+                let ok = ustd::capget(0)
+                    .map(|c| ustd::capset(c[0] & !bit, c[1] & !bit))
+                    .unwrap_or(false)
+                    && ustd::write_all("/proc/sys/kernel/unprivileged_userns_clone", b"0").is_ok()
+                    && ustd::unshare(0x1000_0000) == -1
+                    && ustd::write_all("/proc/sys/kernel/unprivileged_userns_clone", b"1").is_ok()
+                    && ustd::unshare(0x1000_0000) == 0;
+                ustd::exit(if ok { 0 } else { 1 });
+            }
+            p if p > 0 => ustd::waitpid(p as u32, 5000).unwrap_or(-1) == 0,
+            _ => false,
+        }
+    });
+    check("protected-fifos", {
+        // fs.protected_fifos: a fifo in a sticky+world-writable dir
+        // rejects a writer who is neither the fifo's nor the dir's
+        // owner (v=1 gates writers; O_RDWR counts as write intent).
+        let setup = ustd::mkdir("/tmp/pfdir").is_ok()
+            && ustd::chmod("/tmp/pfdir", 0o1777) == 0
+            && ustd::mkfifo("/tmp/pfdir/pf") == 0;
+        setup && {
+            let denied = match ustd::fork() {
+                0 => {
+                    ustd::setuid(1000);
+                    let r = ustd::open("/tmp/pfdir/pf", ustd::O_RDWR);
+                    ustd::exit(if r.is_err() { 0 } else { 1 });
+                }
+                p if p > 0 => ustd::waitpid(p as u32, 5000).unwrap_or(-1) == 0,
+                _ => false,
+            };
+            let allowed = denied
+                && ustd::write_all("/proc/sys/fs/protected_fifos", b"0").is_ok()
+                && match ustd::fork() {
+                    0 => {
+                        ustd::setuid(1000);
+                        let r = ustd::open("/tmp/pfdir/pf", ustd::O_RDWR);
+                        ustd::exit(if r.is_ok() { 0 } else { 1 });
+                    }
+                    p if p > 0 => ustd::waitpid(p as u32, 5000).unwrap_or(-1) == 0,
+                    _ => false,
+                };
+            let _ = ustd::write_all("/proc/sys/fs/protected_fifos", b"1");
+            allowed
+        }
+    });
     check("dev-full-enospc", {
         ustd::write_all("/dev/full", b"x").err() == Some(-28)
     });
