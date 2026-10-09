@@ -237,6 +237,7 @@ pub fn thread_spawn(f: extern "C" fn(u64) -> i64, arg: u64) -> Result<u32, ()> {
 
 pub const FUTEX_WAIT: u64 = 0;
 pub const FUTEX_WAKE: u64 = 1;
+pub const FUTEX_REQUEUE: u64 = 3;
 
 /// Raw futex syscall. WAIT returns 0 woken, -11 EAGAIN (value differs),
 /// -110 ETIMEDOUT. WAKE returns the number of waiters woken.
@@ -258,6 +259,24 @@ pub fn futex_wait(uaddr: &core::sync::atomic::AtomicU64, val: u64) {
 /// Wake up to `n` waiters blocked on `uaddr`.
 pub fn futex_wake(uaddr: &core::sync::atomic::AtomicU64, n: u64) -> i64 {
     futex(uaddr, FUTEX_WAKE, n, 0)
+}
+
+/// FUTEX_REQUEUE: wake `wake` waiters on `a`, move up to `cap` of the
+/// rest onto `b`'s queue. Returns woken+moved.
+pub fn futex_requeue(
+    a: &core::sync::atomic::AtomicU64,
+    wake: u64,
+    b: &core::sync::atomic::AtomicU64,
+    cap: u64,
+) -> i64 {
+    sc5(
+        shared::SYS_FUTEX,
+        a as *const _ as u64,
+        FUTEX_REQUEUE,
+        wake,
+        cap,
+        b as *const _ as u64,
+    ) as i64
 }
 
 /// A real three-state futex mutex (glibc-style): 0 = free, 1 = locked
@@ -2911,6 +2930,12 @@ pub fn seccomp(mode: u64, allow: Option<&[u8; 32]>) -> i64 {
 /// kernel ORs OWNER_DIED (bit30) into each word and wakes its waiters.
 pub fn set_robust_list(head: u64) -> i64 {
     sc1(shared::SYS_SET_ROBUST_LIST, head) as i64
+}
+
+/// get_robust_list(out u64*) -> 0|err — reads back the registered head
+/// (0 when none was set).
+pub fn get_robust_list(out: &mut u64) -> i64 {
+    sc2(shared::SYS_GET_ROBUST_LIST, out as *mut u64 as u64, 0) as i64
 }
 
 /// statfs(path) -> {type,bsize,blocks,bfree} real FAT volume info.

@@ -496,6 +496,59 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         static W2: AtomicU64 = AtomicU64::new(3);
         ustd::futex(&W2, ustd::FUTEX_WAIT, 99, 1000) == -11
     });
+    check("futex-requeue", {
+        // REQUEUE wakes `wake` on A and moves `cap` of the rest to B —
+        // the moved waiters release on futex_wake(B), the leftover
+        // still needs futex_wake(A).
+        use core::sync::atomic::Ordering;
+        static A: AtomicU64 = AtomicU64::new(0);
+        static B: AtomicU64 = AtomicU64::new(0);
+        static START: AtomicU64 = AtomicU64::new(0);
+        static DONE: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn rq_waiter(_: u64) -> i64 {
+            START.fetch_add(1, Ordering::SeqCst);
+            if ustd::futex(&A, ustd::FUTEX_WAIT, 0, u64::MAX) == 0 {
+                DONE.fetch_add(1, Ordering::SeqCst);
+            }
+            0
+        }
+        let mut tids = [0u32; 3];
+        let mut ok = true;
+        for i in 0..3 {
+            match ustd::thread_spawn(rq_waiter, 0) {
+                Ok(t) => tids[i] = t,
+                Err(_) => ok = false,
+            }
+        }
+        // The futex claim lands inside the wait call — start-flag then
+        // a short gap covers flag→claim.
+        while START.load(Ordering::SeqCst) < 3 {
+            ustd::sleep_ms(10);
+        }
+        ustd::sleep_ms(80);
+        ok = ok && ustd::futex_requeue(&A, 1, &B, 1) == 2; // 1 woken + 1 moved
+        ok = ok && ustd::futex_wake(&B, 8) == 1;         // only the moved one
+        ok = ok && ustd::futex_wake(&A, 8) == 1;         // the leftover
+        for i in 0..3 {
+            let _ = ustd::waitpid(tids[i], 5000);
+        }
+        ok && DONE.load(Ordering::SeqCst) == 3
+    });
+    check("robust-list-get", {
+        // get_robust_list reads back the head set_robust_list installed
+        // — a spawned thread does set+get so the main task keeps none.
+        extern "C" fn grl(p: u64) -> i64 {
+            ustd::set_robust_list(p);
+            let mut out = u64::MAX;
+            let r = ustd::get_robust_list(&mut out);
+            (r == 0 && out == p) as i64
+        }
+        static HEAD: AtomicU64 = AtomicU64::new(0);
+        match ustd::thread_spawn(grl, &HEAD as *const _ as u64) {
+            Ok(tid) => ustd::waitpid(tid, 5000).unwrap_or(-1) == 1,
+            Err(_) => false,
+        }
+    });
     check("fork-exit-code", {
         // real fork: child resumes at this same instruction with 0
         match ustd::fork() {
