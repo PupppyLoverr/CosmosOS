@@ -25863,6 +25863,32 @@ impl Term {
                 }
                 let mut blen = 0usize;
                 let content = match popt {
+                    Some(p) if cmd == "head" && cbytes.is_some() => {
+                        // bounded read: `head -c N` on an infinite char
+                        // device (/dev/{zero,urandom,hwrng}) must stop at
+                        // N bytes — a full slurp runs until OOM
+                        match ustd::open(p, 0) {
+                            Ok(fd) => {
+                                let mut d = Vec::new();
+                                let want = cbytes.unwrap_or(0);
+                                let mut tmp = [0u8; 8192];
+                                while d.len() < want {
+                                    let n = (want - d.len()).min(8192);
+                                    match ustd::read(fd, &mut tmp[..n]) {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(k) => d.extend_from_slice(&tmp[..k]),
+                                    }
+                                }
+                                ustd::close(fd);
+                                blen = d.len();
+                                Some(String::from_utf8_lossy(&d).into_owned())
+                            }
+                            Err(e) => {
+                                self.fail(&alloc::format!("{}: {}: err {}", cmd, p, e));
+                                None
+                            }
+                        }
+                    }
                     Some(p) => match ustd::read_all(p) {
                         Ok(d) => {
                             blen = d.len();
@@ -38165,12 +38191,22 @@ impl Term {
                         "{}", mi.total_kb.saturating_sub(mi.used_kb))),
                     ("hw.ncpu", String::from("1")),
                 ];
-                // net.ipv4.* keys map to /proc/sys/net/ipv4/<name> procfiles
+                // every dotted key resolves into the /proc/sys tree —
+                // unknown names fail at procfs open (unknown key)
                 let sysfile = |key: &str| -> Option<String> {
-                    key.strip_prefix("net.ipv4.").map(|n| {
-                        alloc::format!("/proc/sys/net/ipv4/{}", n)
-                    })
+                    Some(alloc::format!("/proc/sys/{}", key.replace('.', "/")))
                 };
+                // paths sysctl -a dumps live (plus the kv table above)
+                const SYS_A: &[&str] = &[
+                    "/proc/sys/kernel/pid_max",
+                    "/proc/sys/kernel/threads-max",
+                    "/proc/sys/kernel/yama/ptrace_scope",
+                    "/proc/sys/fs/nr_open",
+                    "/proc/sys/fs/pipe-max-size",
+                    "/proc/sys/fs/inotify/max_user_watches",
+                    "/proc/sys/net/ipv4/icmp_echo_ignore_all",
+                    "/proc/sys/net/ipv4/ip_default_ttl",
+                ];
                 // `-N` prints names only, `-n`/`--values` values only —
                 // real sysctl output modes over the same key dump.
                 let names_only =
@@ -38260,8 +38296,42 @@ impl Term {
                     .filter(|a| !a.starts_with('-'))
                     .copied()
                     .collect();
-                match pos.first() {
+                // each positional arg is one key — `sysctl a b` dumps both
+                let mut handled_multi = false;
+                if pos.len() > 1 && pos.iter().all(|k| !k.contains('=')) {
+                    for k in &pos {
+                        let v = sysfile(k)
+                            .and_then(|p| {
+                                ustd::read_all(&p).ok().map(|d| {
+                                    String::from_utf8_lossy(&d).trim().to_string()
+                                })
+                            })
+                            .or_else(|| {
+                                kv.iter()
+                                    .find(|(kk, _)| *kk == *k)
+                                    .map(|(_, v)| v.clone())
+                            });
+                        match v {
+                            Some(v) => {
+                                if names_only {
+                                    self.emit(k);
+                                } else if vals_only {
+                                    self.emit(&v);
+                                } else {
+                                    self.emit(&alloc::format!("{} = {}", k, v));
+                                }
+                            }
+                            None => self.fail(&alloc::format!(
+                                "sysctl: {}: unknown key", k)),
+                        }
+                    }
+                    handled_multi = true;
+                }
+                match if handled_multi { None } else { pos.first() } {
                     None => {
+                        if handled_multi {
+                            return;
+                        }
                         for (k, v) in &kv {
                             if names_only {
                                 self.emit(k);
@@ -38271,20 +38341,17 @@ impl Term {
                                 self.emit(&alloc::format!("{} = {}", k, v));
                             }
                         }
-                        // live net.ipv4 keys from procfs
-                        if let Ok(d) = ustd::read_all(
-                            "/proc/sys/net/ipv4/icmp_echo_ignore_all",
-                        ) {
+                        // live /proc/sys keys from procfs
+                        for p in SYS_A {
+                            let Ok(d) = ustd::read_all(p) else { continue };
                             let v = String::from_utf8_lossy(&d).trim().to_string();
+                            let k = p.trim_start_matches("/proc/sys/").replace('/', ".");
                             if names_only {
-                                self.emit("net.ipv4.icmp_echo_ignore_all");
+                                self.emit(&k);
                             } else if vals_only {
                                 self.emit(&v);
                             } else {
-                                self.emit(&alloc::format!(
-                                    "net.ipv4.icmp_echo_ignore_all = {}",
-                                    v
-                                ));
+                                self.emit(&alloc::format!("{} = {}", k, v));
                             }
                         }
                     }
@@ -38324,17 +38391,17 @@ impl Term {
                         }
                     }
                     Some(k) => {
-                        let v = if let Some(p) = sysfile(k) {
-                            match ustd::read_all(&p) {
-                                Ok(d) => Some(
-                                    String::from_utf8_lossy(&d).trim().to_string()),
-                                Err(_) => None,
-                            }
-                        } else {
-                            kv.iter()
-                                .find(|(kk, _)| *kk == *k)
-                                .map(|(_, v)| v.clone())
-                        };
+                        let v = sysfile(k)
+                            .and_then(|p| {
+                                ustd::read_all(&p).ok().map(|d| {
+                                    String::from_utf8_lossy(&d).trim().to_string()
+                                })
+                            })
+                            .or_else(|| {
+                                kv.iter()
+                                    .find(|(kk, _)| *kk == *k)
+                                    .map(|(_, v)| v.clone())
+                            });
                         match v {
                             Some(v) => {
                                 if names_only {

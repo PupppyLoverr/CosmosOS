@@ -36,7 +36,10 @@ const NET_FILES: &[&str] = &[
 ];
 
 /// files under /proc/sys/kernel
-const SYS_FILES: &[&str] = &["hostname", "cow_pages"];
+const SYS_FILES: &[&str] = &["hostname", "cow_pages", "pid_max", "threads-max"];
+
+/// files under /proc/sys/fs (fs/inotify/max_user_watches lives one deeper)
+const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size"];
 
 /// files under /proc/sys/net/ipv4
 const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "ip_default_ttl"];
@@ -77,6 +80,9 @@ pub fn is_dir(path: &str) -> bool {
         || path == "/proc/net"
         || path == "/proc/sys"
         || path == "/proc/sys/kernel"
+        || path == "/proc/sys/kernel/yama"
+        || path == "/proc/sys/fs"
+        || path == "/proc/sys/fs/inotify"
         || path == "/proc/sys/net"
         || path == "/proc/sys/net/ipv4"
         || pid_of(path)
@@ -119,7 +125,16 @@ pub fn exists(path: &str) -> bool {
         }
         return NET_FILES.contains(&f);
     }
+    if let Some(f) = path.strip_prefix("/proc/sys/fs/") {
+        if let Some(n) = f.strip_prefix("inotify/") {
+            return n == "max_user_watches";
+        }
+        return FS_SYS_FILES.contains(&f);
+    }
     if let Some(f) = path.strip_prefix("/proc/sys/kernel/") {
+        if let Some(n) = f.strip_prefix("yama/") {
+            return n == "ptrace_scope";
+        }
         return SYS_FILES.contains(&f);
     }
     if let Some(f) = path.strip_prefix("/proc/sys/net/ipv4/") {
@@ -169,6 +184,13 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         return out;
     }
     if path == "/proc/sys/kernel" {
+        {
+            let mut de = shared::DirEntry::default();
+            de.name[..4].copy_from_slice(b"yama");
+            de.name_len = 4;
+            de.is_dir = 1;
+            out.push(de);
+        }
         for name in SYS_FILES {
             let mut de = shared::DirEntry::default();
             let nb = name.as_bytes();
@@ -181,8 +203,42 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         }
         return out;
     }
+    if path == "/proc/sys/kernel/yama" {
+        let mut de = shared::DirEntry::default();
+        de.name[..12].copy_from_slice(b"ptrace_scope");
+        de.name_len = 12;
+        out.push(de);
+        return out;
+    }
+    if path == "/proc/sys/fs/inotify" {
+        let mut de = shared::DirEntry::default();
+        de.name[..16].copy_from_slice(b"max_user_watches");
+        de.name_len = 16;
+        out.push(de);
+        return out;
+    }
+    if path == "/proc/sys/fs" {
+        {
+            let mut de = shared::DirEntry::default();
+            de.name[..7].copy_from_slice(b"inotify");
+            de.name_len = 7;
+            de.is_dir = 1;
+            out.push(de);
+        }
+        for name in FS_SYS_FILES {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            de.size = read_file(&alloc::format!("/proc/sys/fs/{}", name))
+                .map(|d| d.len() as u64)
+                .unwrap_or(0);
+            out.push(de);
+        }
+        return out;
+    }
     if path == "/proc/sys" {
-        for name in ["kernel", "net"] {
+        for name in ["kernel", "fs", "net"] {
             let mut de = shared::DirEntry::default();
             let nb = name.as_bytes();
             de.name[..nb.len()].copy_from_slice(nb);
@@ -366,6 +422,12 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         ),
         "/proc/net/owners" => net::net_owners(),
         "/proc/sys/kernel/hostname" => alloc::format!("{}\n", crate::syscall::hostname()),
+        "/proc/sys/kernel/pid_max" => return Some(alloc::format!("{}\n", crate::sysctl::get("kernel/pid_max").unwrap_or(0)).into_bytes()),
+        "/proc/sys/kernel/threads-max" => return Some(alloc::format!("{}\n", crate::sysctl::get("kernel/threads-max").unwrap_or(0)).into_bytes()),
+        "/proc/sys/kernel/yama/ptrace_scope" => return Some(alloc::format!("{}\n", crate::sysctl::get("kernel/yama/ptrace_scope").unwrap_or(0)).into_bytes()),
+        "/proc/sys/fs/nr_open" => return Some(alloc::format!("{}\n", crate::sysctl::get("fs/nr_open").unwrap_or(0)).into_bytes()),
+        "/proc/sys/fs/pipe-max-size" => return Some(alloc::format!("{}\n", crate::sysctl::get("fs/pipe-max-size").unwrap_or(0)).into_bytes()),
+        "/proc/sys/fs/inotify/max_user_watches" => return Some(alloc::format!("{}\n", crate::sysctl::get("fs/inotify/max_user_watches").unwrap_or(0)).into_bytes()),
         "/proc/sys/net/ipv4/icmp_echo_ignore_all" => net::net_icmp_ignore_all(),
         "/proc/sys/net/ipv4/ip_default_ttl" => net::net_def_ttl(),
         "/proc/swaps" => {
@@ -728,6 +790,17 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
         }
         net::set_def_ttl(v);
         return Some(buf.len());
+    }
+    if let Some(rel) = path
+        .strip_prefix("/proc/sys/")
+        .filter(|p| p.starts_with("kernel/") || p.starts_with("fs/"))
+    {
+        // hostname is handled by its dedicated arm below
+        if rel != "kernel/hostname" {
+            let v = String::from(String::from_utf8_lossy(buf).trim());
+            let Ok(n) = v.parse::<u64>() else { return None };
+            return crate::sysctl::set(rel, n).then_some(buf.len());
+        }
     }
     if path != "/proc/sys/kernel/hostname" {
         return None;

@@ -14,6 +14,11 @@ use spin::Mutex;
 
 pub const PIPE_CAP: usize = 64 * 1024;
 
+/// fs.pipe-max-size tunes the live cap downward (never above the const).
+fn pipe_cap() -> usize {
+    PIPE_CAP.min(crate::sysctl::fs_pipe_max())
+}
+
 pub struct Pipe {
     pub buf: VecDeque<u8>,
     pub writers: u32,
@@ -67,7 +72,7 @@ pub fn ready(path: &str, for_read: bool) -> bool {
             if for_read {
                 !p.buf.is_empty() || p.writers == 0
             } else {
-                p.buf.len() < PIPE_CAP || p.readers == 0
+                p.buf.len() < pipe_cap() || p.readers == 0
             }
         }
         // missing pipe: reads hit EOF, writes hit EPIPE — both "ready"
@@ -181,7 +186,7 @@ pub fn try_write(path: &str, data: &[u8]) -> Result<i64, i64> {
     if p.readers == 0 && p.readers_seen {
         return Err(-32);
     }
-    let space = PIPE_CAP.saturating_sub(p.buf.len());
+    let space = pipe_cap().saturating_sub(p.buf.len());
     if space == 0 {
         return Err(-11);
     }
@@ -206,7 +211,7 @@ pub fn tee(from: &str, to: &str, len: usize) -> Result<u64, i64> {
     let Some(src) = g.get(from) else { return Err(-22) };
     let take = src.buf.iter().take(len).copied().collect::<Vec<u8>>();
     let Some(dst) = g.get_mut(to) else { return Err(-22) };
-    let space = PIPE_CAP.saturating_sub(dst.buf.len());
+    let space = pipe_cap().saturating_sub(dst.buf.len());
     let n = take.len().min(space);
     dst.buf.extend(&take[..n]);
     dst.mtime = crate::vfs::now_unix();

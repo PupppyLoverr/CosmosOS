@@ -268,12 +268,13 @@ fn err_to_i64(e: fat32::Error) -> i64 {
 /// even when the vec has holes there.
 fn alloc_fd() -> Option<usize> {
     task::with_current(|t| {
+        let open_cap = t.rlim_nofile.min(crate::sysctl::fs_nr_open());
         for (i, f) in t.fds.iter().enumerate() {
-            if f.is_none() && (i as u64) < t.rlim_nofile {
+            if f.is_none() && (i as u64) < open_cap {
                 return Some(i);
             }
         }
-        if t.fds.len() as u64 >= t.rlim_nofile {
+        if t.fds.len() as u64 >= open_cap {
             return None;
         }
         t.fds.push(None);
