@@ -374,6 +374,8 @@ struct FwRule {
     time_hi: u64,         // --datestop unix secs (0 = open)
     connl_n: u32,         // `-m connlimit --connlimit-above N` (u32::MAX = unused)
     connl_mask: u8,       // --connlimit-mask bits
+    connb_lo: u64,        // `-m connbytes --connbytes LO[:HI]` (u64::MAX pair = unused)
+    connb_hi: u64,
     snat_to: Option<[u8; 4]>, // -j SNAT --to-source (nat POSTROUTING)
     limit_pps: u16,       // 0 = unlimited; `-m limit --limit N/s` cap on rule hits
     comment: String,      // `-m comment --comment` — real per-rule annotation
@@ -433,6 +435,8 @@ struct CtEnt {
     b_port: u16,
     seen_reply: bool,
     last_ms: u64,
+    pkts: u64,            // packets seen on this flow (both directions)
+    bytes: u64,           // IPv4 bytes on this flow — -m connbytes input
 }
 static CT: Mutex<Vec<CtEnt>> = Mutex::new(Vec::new());
 
@@ -463,7 +467,14 @@ fn ct_expire(ct: &mut Vec<CtEnt>) {
 /// Update the flow table for one packet and return its state bits
 /// (1 = NEW, 2 = ESTABLISHED). `sport/dport` are the packet's transport
 /// ports (0 when absent; ICMP uses the echo id as both ports).
-fn ct_update(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, proto: u8) -> u8 {
+fn ct_update(
+    src: [u8; 4],
+    dst: [u8; 4],
+    sport: u16,
+    dport: u16,
+    proto: u8,
+    plen: u64,
+) -> u8 {
     let now = now_ms();
     let mut ct = CT.lock();
     ct_expire(&mut *ct);
@@ -478,6 +489,8 @@ fn ct_update(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, proto: u8) -> u
                 e.seen_reply = true;
             }
             e.last_ms = now;
+            e.pkts += 1;
+            e.bytes += plen;
             return if e.seen_reply { 2 } else { 1 };
         }
     }
@@ -489,6 +502,8 @@ fn ct_update(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, proto: u8) -> u
         b_port: dport,
         seen_reply: false,
         last_ms: now,
+        pkts: 1,
+        bytes: plen,
     });
     if ct.len() > 512 {
         ct.remove(0); // drop the oldest entry — flows are cheap, memory isn't
@@ -508,6 +523,22 @@ fn pkt_ports(proto: u8, p: &[u8]) -> (u16, u16) {
     } else {
         (0, 0)
     }
+}
+
+/// Total bytes seen on the flow matching this tuple (either
+/// direction) — the `-m connbytes` matcher input.
+fn ct_bytes_for(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, proto: u8) -> u64 {
+    for e in CT.lock().iter() {
+        if e.proto != proto {
+            continue;
+        }
+        let fwd = e.a_ip == src && e.b_ip == dst && e.a_port == sport && e.b_port == dport;
+        let rev = e.b_ip == src && e.a_ip == dst && e.b_port == sport && e.a_port == dport;
+        if fwd || rev {
+            return e.bytes;
+        }
+    }
+    0
 }
 
 /// Observe an outbound frame for conntrack: parse the IPv4/transport
@@ -536,7 +567,7 @@ fn ct_observe_tx(f: &[u8]) {
     } else {
         (0, 0)
     };
-    let _ = ct_update(src, dst, sport, dport, proto);
+    let _ = ct_update(src, dst, sport, dport, proto, ip.len() as u64);
 }
 
 /// INPUT-chain verdict for this packet: 0 = let it through (no rule
@@ -784,6 +815,14 @@ fn fw_eval(
                 })
                 .count() as u32;
             if c <= r.connl_n {
+                continue;
+            }
+        }
+        // `-m connbytes --connbytes LO[:HI]` — the flow's real byte
+        // total (both directions) must fall in the window.
+        if r.connb_lo != u64::MAX {
+            let b = ct_bytes_for(src, dst, sport, dport, proto);
+            if b < r.connb_lo || b > r.connb_hi {
                 continue;
             }
         }
@@ -1356,6 +1395,12 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
             r.connl_n, r.connl_mask
         ));
     }
+    if r.connb_lo != u64::MAX {
+        out.push_str(&alloc::format!(
+            " -m connbytes --connbytes {}:{}",
+            r.connb_lo, r.connb_hi
+        ));
+    }
     if r.limit_pps != 0 {
         out.push_str(&alloc::format!(" -m limit --limit {}/s", r.limit_pps));
         if r.limit_burst != 5 {
@@ -1645,6 +1690,8 @@ pub fn net_conntrack() -> String {
             b, a, e.b_port, e.a_port,
             if e.seen_reply { "" } else { " [UNREPLIED]" },
         ));
+        // -o extended-style counters: real per-flow packets+bytes.
+        out.push_str(&alloc::format!(" packets={} bytes={}\n", e.pkts, e.bytes));
     }
     out
 }
@@ -2240,6 +2287,8 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         time_hi: 0,
         connl_n: u32::MAX,
         connl_mask: 32,
+        connb_lo: u64::MAX,
+        connb_hi: u64::MAX,
         snat_to: None,
         limit_pps: 0,
         comment: String::new(),
@@ -2379,7 +2428,9 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
             },
             // `-m state --state NEW|ESTABLISHED[,...]` — real
             // conntrack-state match against the live flow tables.
-            "state" => {
+            // `-m conntrack --ctstate` — the real module's spelling
+            // of the same NEW/ESTABLISHED matcher `state` gives.
+            "ctstate" | "state" => {
                 let mut m = 0u8;
                 for s in f.next().unwrap_or("").split(',') {
                     match s {
@@ -2619,6 +2670,20 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
                 r.connl_n = f.next().unwrap_or("0").parse().unwrap_or(0);
                 r.connl_mask = f.next().unwrap_or("32").parse().unwrap_or(32);
             }
+            "connbytes" => {
+                // `N` or `LO:HI` — the flow's byte total must fall in
+                // the window (bare N = N:).
+                let spec = f.next().unwrap_or("0");
+                let (lo, hi) = match spec.split_once(':') {
+                    Some((a, b)) => (
+                        a.parse().unwrap_or(0),
+                        b.parse().unwrap_or(u64::MAX),
+                    ),
+                    None => (spec.parse().unwrap_or(0), u64::MAX),
+                };
+                r.connb_lo = lo;
+                r.connb_hi = hi;
+            }
             // nat targets — valid only in the POSTROUTING table; the
             // ctl ops reject them everywhere else.
             "snat" => {
@@ -2829,7 +2894,7 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>, u64)> {
         // arrived for — 127.0.0.1 on lo, our address everywhere else —
         // so loopback flows pair with their tx counterparts.
         let dst = if is_loopback(*src_ip) { LOOPBACK_IP } else { our_ip() };
-        let st = ct_update(*src_ip, dst, sport, dport, *proto);
+        let st = ct_update(*src_ip, dst, sport, dport, *proto, p.len() as u64);
         // Arrival iface: loopback-queued packets always carry a local
         // source (127/8 or our own address); wire packets don't.
         let ifx = if is_loopback(*src_ip) { 2u8 } else { 1 };
@@ -4282,11 +4347,24 @@ pub fn net_tcp() -> String {
 /// live queue depths. One line: lport rport st srtt rttvar rto rtx
 /// unackedB rxqB.
 pub fn net_tcpinfo() -> String {
-    let mut s = String::from("lport rport st srtt rttvar rto rtx unacked rxq\n");
+    // Col 10 `rtx_in`: ms until the oldest unacked segment retransmits
+    // (its tx_ms + rto - now) — the live retrans-timer countdown that
+    // `ss -o` renders as timer:(retrans,...). 0 when nothing's armed.
+    let now = now_ms();
+    let mut s = String::from("lport rport st srtt rttvar rto rtx unacked rxq rtx_in\n");
     for k in TCP_SOCKS.lock().values() {
         let txq: usize = k.unacked.iter().map(|u| u.payload.len()).sum();
+        let rtx_in: u64 = k
+            .unacked
+            .front()
+            .map(|u| {
+                let rto = tcp_rto(k);
+                let el = now.saturating_sub(u.tx_ms);
+                rto.saturating_sub(el)
+            })
+            .unwrap_or(0);
         s.push_str(&alloc::format!(
-            "{} {} {} {} {} {} {} {} {}\n",
+            "{} {} {} {} {} {} {} {} {} {}\n",
             k.lport,
             k.rport,
             match k.state {
@@ -4301,6 +4379,7 @@ pub fn net_tcpinfo() -> String {
             k.rtx,
             txq,
             k.q.iter().map(|c| c.len()).sum::<usize>(),
+            rtx_in,
         ));
     }
     s

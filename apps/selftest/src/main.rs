@@ -5714,6 +5714,69 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::write_all(rec, b"F\n");
         a1 && a2 && n >= 2 && seeded && blocked && gone
     });
+    check("ipt-connbytes", {
+        // `-m connbytes --connbytes LO[:HI]` — matches on the flow's
+        // real byte total tracked in CT (both directions).
+        let ipt = "/proc/net/iptables";
+        let gw = 0x0A00_0202u32;
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let warm = ustd::net_ping(gw, 2000).is_some(); // seeds flow bytes
+        let a = ustd::write_all(ipt, b"A INPUT 1 connbytes 1: drop\n").is_ok();
+        let gated = ustd::net_ping(gw, 2000).is_none(); // bytes already > 1
+        let _ = ustd::write_all(ipt, b"F\n");
+        let b = ustd::write_all(
+            ipt,
+            b"A INPUT 1 connbytes 999999999: drop\n",
+        )
+        .is_ok();
+        let open = ustd::net_ping(gw, 2000).is_some(); // under the window
+        let ct = ustd::read_all("/proc/net/nf_conntrack")
+            .map(|d| String::from_utf8_lossy(&d).into_owned())
+            .unwrap_or_default();
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        warm
+            && a
+            && b
+            && gated
+            && open
+            && ct.contains("packets=")
+            && ct.contains("bytes=")
+    });
+    check("ipt-ctstate", {
+        // `-m conntrack --ctstate` — the real module spelling of the
+        // state matcher: an established flow's replies match
+        // ESTABLISHED, never NEW.
+        let ipt = "/proc/net/iptables";
+        let gw = 0x0A00_0202u32;
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let _ = ustd::net_ping(gw, 2000); // flow -> ESTABLISHED
+        let a = ustd::write_all(ipt, b"A INPUT 1 ctstate ESTABLISHED drop\n").is_ok();
+        let gated = ustd::net_ping(gw, 2000).is_none();
+        let _ = ustd::write_all(ipt, b"F\n");
+        let b = ustd::write_all(ipt, b"A INPUT 1 ctstate NEW drop\n").is_ok();
+        let open = ustd::net_ping(gw, 2000).is_some();
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        a && b && gated && open
+    });
+    check("tcpinfo-rtx", {
+        // /proc/net/tcpinfo col 10: live retrans countdown per conn.
+        ustd::read_all("/proc/net/tcpinfo")
+            .map(|d| {
+                String::from_utf8_lossy(&d)
+                    .lines()
+                    .skip(1)
+                    .filter(|l| !l.trim().is_empty())
+                    .all(|l| {
+                        l.split_whitespace().count() >= 10
+                            && l
+                                .split_whitespace()
+                                .nth(9)
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .is_some()
+                    })
+            })
+            .unwrap_or(true)
+    });
     check("proc-net-ino", {
         // Linux uid+ino tail on /proc/net/{tcp,udp}: every row ends
         // `0 <registry-key>` — parse the tail as a real number.
