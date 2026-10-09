@@ -373,6 +373,7 @@ struct FwRule {
     time_hi: u64,         // --datestop unix secs (0 = open)
     connl_n: u32,         // `-m connlimit --connlimit-above N` (u32::MAX = unused)
     connl_mask: u8,       // --connlimit-mask bits
+    snat_to: Option<[u8; 4]>, // -j SNAT --to-source (nat POSTROUTING)
     limit_pps: u16,       // 0 = unlimited; `-m limit --limit N/s` cap on rule hits
     comment: String,      // `-m comment --comment` — real per-rule annotation
     limit_burst: u16,     // bucket depth (real iptables default 5)
@@ -398,6 +399,11 @@ static IPT_RECENT: Mutex<BTreeMap<(String, u32), (u64, u64)>> =
     Mutex::new(BTreeMap::new());
 
 static FW: Mutex<Vec<FwRule>> = Mutex::new(Vec::new());
+/// nat table POSTROUTING chain (`iptables -t nat`): evaluated on the
+/// egress path after the filter OUTPUT verdict; a matching SNAT or
+/// MASQUERADE rule rewrites the source address actually emitted.
+static FW_NAT: Mutex<Vec<FwRule>> = Mutex::new(Vec::new());
+static FW_NAT_POLICY: Mutex<bool> = Mutex::new(false); // ACCEPT
 
 /// User-defined chains (`iptables -N`): evaluated by jump targets from
 /// builtin or other user chains; `X` deletes empty unreferenced ones.
@@ -556,9 +562,10 @@ fn fw_verdict(
     itype: u8,
     syn: bool,
     pl: &[u8],
+    nat: &mut Option<[u8; 4]>,
 ) -> u8 {
     let mut fw = chain.lock();
-    match fw_eval(&mut *fw, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, syn, pl, 0) {
+    match fw_eval(&mut *fw, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, syn, pl, 0, nat) {
         // 255 = walked off the end of the builtin chain: policy decides
         255 => {
             if *policy.lock() {
@@ -596,6 +603,7 @@ fn fw_eval(
     syn: bool,
     pl: &[u8],
     depth: u8,
+    nat: &mut Option<[u8; 4]>,
 ) -> u8 {
     for r in chain.iter_mut() {
         if r.proto != 0 && r.proto != proto {
@@ -832,7 +840,7 @@ fn fw_eval(
                 continue; // loop guard — treat as no-match
             }
             let mut snap = FW_USER.lock().get(&r.jump).cloned().unwrap_or_default();
-            let v = fw_eval(&mut snap, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, syn, pl, depth + 1);
+            let v = fw_eval(&mut snap, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, syn, pl, depth + 1, nat);
             if let Some(u) = FW_USER.lock().get_mut(&r.jump) {
                 *u = snap;
             }
@@ -864,6 +872,17 @@ fn fw_eval(
         }
         if r.target == 4 {
             return 255; // -j RETURN: leave this chain now
+        }
+        // nat POSTROUTING targets: first match wins; the rewrite is
+        // handed back through `nat` ([0;4] = MASQUERADE → caller
+        // substitutes the egress address), verdict stays ACCEPT.
+        if r.target == 5 {
+            *nat = r.snat_to;
+            return 0;
+        }
+        if r.target == 6 {
+            *nat = Some([0; 4]);
+            return 0;
         }
         return if r.target == 2 { 2 } else { 1 };
     }
@@ -940,6 +959,83 @@ pub fn net_iptables() -> String {
         }
     }
     out
+}
+
+/// `/proc/net/natsave` — iptables-save format for the nat table;
+/// `iptables -t nat -S` reads this. POSTROUTING is the only chain.
+pub fn net_natsave() -> String {
+    let mut out = String::from("*nat
+");
+    let (p, b) = FW_NAT
+        .lock()
+        .iter()
+        .fold((0u64, 0u64), |(p, b), r| (p + r.hits, b + r.bytes));
+    out.push_str(&alloc::format!(":POSTROUTING ACCEPT [{}:{}]
+", p, b));
+    for r in FW_NAT.lock().iter() {
+        out.push_str(&alloc::format!("[{}:{}] -A POSTROUTING", r.hits, r.bytes));
+        fmt_fw_spec(&mut out, r);
+        out.push('\n');
+    }
+    out.push_str("COMMIT\n");
+    out
+}
+
+/// `/proc/net/nat` — the nat table listing (POSTROUTING only here;
+/// PREROUTING has no inbound-NAT engine yet).
+pub fn net_nat() -> String {
+    let mut out = String::new();
+    fmt_fw_chain(&mut out, "POSTROUTING", &FW_NAT, &FW_NAT_POLICY);
+    out
+}
+
+/// `/proc/net/nat` write ops: `A POSTROUTING <proto> <spec>`,
+/// `D POSTROUTING <spec>`, `F` — SNAT/MASQUERADE rules only live
+/// here; filter chains reject them at add time.
+pub fn nat_ctl(line: &str) -> bool {
+    let mut f = line.split_whitespace();
+    match f.next() {
+        Some("F") | Some("/") => {
+            FW_NAT.lock().clear();
+            true
+        }
+        Some("A") => {
+            if f.next() != Some("POSTROUTING") {
+                return false;
+            }
+            let Some(proto) = fw_proto_tok(f.next()) else {
+                return false;
+            };
+            let Some(mut r) = fw_parse_spec(&mut f, proto) else {
+                return false;
+            };
+            // POSTROUTING: no -i/-m mac (no ingress iface), no jumps
+            // into filter user chains — real nat-table restrictions.
+            if r.iface != 0 || r.smac.is_some() || !r.jump.is_empty() {
+                return false;
+            }
+            r.hits = 0;
+            r.bytes = 0;
+            FW_NAT.lock().push(r);
+            true
+        }
+        Some("D") => {
+            if f.next() != Some("POSTROUTING") {
+                return false;
+            }
+            let Some(proto) = fw_proto_tok(f.next()) else {
+                return false;
+            };
+            let Some(r) = fw_parse_spec(&mut f, proto) else {
+                return false;
+            };
+            let mut g = FW_NAT.lock();
+            let before = g.len();
+            g.retain(|e| !fw_rule_eq(e, &r));
+            g.len() != before
+        }
+        _ => false,
+    }
 }
 
 /// `/proc/net/ipt_recent` — the Linux ipt_recent dump: one line per
@@ -1231,10 +1327,20 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
                 2 => "REJECT",
                 3 => "ACCEPT",
                 4 => "RETURN",
+                5 => "SNAT",
+                6 => "MASQUERADE",
                 _ => "DROP",
             })
         }
     ));
+    if r.target == 5 {
+        if let Some(ip) = r.snat_to {
+            out.push_str(&alloc::format!(
+                " --to-source {}.{}.{}.{}",
+                ip[0], ip[1], ip[2], ip[3]
+            ));
+        }
+    }
 }
 
 fn fmt_fw_chain(
@@ -1264,6 +1370,8 @@ fn fmt_fw_rule(out: &mut String, i: usize, r: &FwRule) {
             2 => "REJECT",
             3 => "ACCEPT",
             4 => "RETURN",
+            5 => "SNAT",
+            6 => "MASQUERADE",
             _ => "DROP",
         })
     };
@@ -1669,6 +1777,7 @@ fn fw_name_ok(n: &str) -> bool {
         "iif", "oif", "sport", "length", "comment", "ttl", "tos", "mac",
         "dscp", "icmpt", "syn", "rset", "rchk", "rupd", "sports", "dstrange",
         "string", "u32", "statnth", "tflags", "quota", "time", "connl",
+        "snat", "masq",
     ];
     !n.is_empty()
         && n.len() <= 28
@@ -2025,6 +2134,12 @@ fn fw_ifx(s: &str) -> Option<u8> {
 /// on OUTPUT (iptables rejects both at add time). User chains take
 /// either — they can be jumped to from both builtins.
 fn fw_dir_ok(ch: &ChainSel, r: &FwRule) -> bool {
+    // SNAT/MASQUERADE belong only to the nat table — a filter-chain
+    // add carrying one is rejected, like real iptables' per-table
+    // target sets.
+    if r.target >= 5 {
+        return false;
+    }
     match ch {
         ChainSel::In => r.oiface == 0,
         ChainSel::Out => r.iface == 0 && r.smac.is_none(),
@@ -2076,6 +2191,7 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         time_hi: 0,
         connl_n: u32::MAX,
         connl_mask: 32,
+        snat_to: None,
         limit_pps: 0,
         comment: String::new(),
         limit_burst: 5,
@@ -2446,6 +2562,18 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
                 r.connl_n = f.next().unwrap_or("0").parse().unwrap_or(0);
                 r.connl_mask = f.next().unwrap_or("32").parse().unwrap_or(32);
             }
+            // nat targets — valid only in the POSTROUTING table; the
+            // ctl ops reject them everywhere else.
+            "snat" => {
+                match f.next().and_then(parse_ip) {
+                    Some(ip) => {
+                        r.target = 5;
+                        r.snat_to = Some(ip);
+                    }
+                    None => ok = false,
+                }
+            }
+            "masq" => r.target = 6,
             "log" => r.target = 1,    // "... log" marks -j LOG
             "reject" => r.target = 2, // -j REJECT: refusal goes back
             "accept" => r.target = 3, // -j ACCEPT: terminal allow
@@ -2497,6 +2625,7 @@ fn fw_rule_eq(a: &FwRule, b: &FwRule) -> bool {
         && a.time_hi == b.time_hi
         && a.connl_n == b.connl_n
         && a.connl_mask == b.connl_mask
+        && a.snat_to == b.snat_to
         && a.state == b.state
         && a.ttl_mode == b.ttl_mode
         && a.ttl_v == b.ttl_v
@@ -2649,7 +2778,8 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>, u64)> {
         let ifx = if is_loopback(*src_ip) { 2u8 } else { 1 };
         let itype = if *proto == 1 && !p.is_empty() { p[0] } else { 0xff };
         let syn = *proto == 6 && p.len() >= 14 && p[13] & 0x17 == 0x02;
-        let v = fw_verdict(&FW, &FW_POLICY, true, *src_ip, dst, *proto, sport, dport, st, ifx, p.len() as u64, meta_ttl(*meta), meta_tos(*meta), meta_mac(*meta), itype, syn, p);
+        let mut nat_none = None;
+        let v = fw_verdict(&FW, &FW_POLICY, true, *src_ip, dst, *proto, sport, dport, st, ifx, p.len() as u64, meta_ttl(*meta), meta_tos(*meta), meta_mac(*meta), itype, syn, p, &mut nat_none);
         if v == 2 {
             // -j REJECT: a real refusal goes back — TCP_RST for TCP
             // (same wire shape as the unclaimed-port responder),
@@ -3530,7 +3660,8 @@ fn send_ip_src_qos(
     let oifx = if is_loopback(dst_ip) { 2u8 } else { 1 };
     let itype = if proto == 1 && !payload.is_empty() { payload[0] } else { 0xff };
     let syn = proto == 6 && payload.len() >= 14 && payload[13] & 0x17 == 0x02;
-    let v = fw_verdict(&FW_OUT, &FW_OUT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64, ttl, tos, [0; 6], itype, syn, payload);
+    let mut nat_sel = None;
+    let v = fw_verdict(&FW_OUT, &FW_OUT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64, ttl, tos, [0; 6], itype, syn, payload, &mut nat_sel);
     if v == 2 {
         out_reject(src_ip, dst_ip, proto, payload);
         return;
@@ -3538,6 +3669,50 @@ fn send_ip_src_qos(
     if v == 1 {
         return; // -j DROP: the datagram never leaves
     }
+    // nat POSTROUTING: a matching rule rewrites the real source the
+    // frame leaves with; the L4 pseudo-header checksum gets the
+    // RFC1624 incremental update so the packet still verifies.
+    let mut owned_payload: Vec<u8> = Vec::new();
+    let mut src_ip = src_ip;
+    {
+        let mut nat_sel = None;
+        let _ = fw_verdict(&FW_NAT, &FW_NAT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64, ttl, tos, [0; 6], itype, syn, payload, &mut nat_sel);
+        if let Some(t) = nat_sel {
+            let new_src = if t == [0; 4] { our_ip() } else { t };
+            if new_src != src_ip {
+                owned_payload = payload.to_vec();
+                let coff = match proto {
+                    6 => Some(16),   // TCP checksum field
+                    17 => Some(6),   // UDP checksum field
+                    _ => None,       // ICMP has no pseudo-header
+                };
+                if let Some(off) = coff {
+                    if owned_payload.len() >= off + 2 {
+                        let mut c = !u16::from_be_bytes([owned_payload[off], owned_payload[off + 1]]) as u32;
+                        for k in 0..2 {
+                            let ow = u16::from_be_bytes([src_ip[k * 2], src_ip[k * 2 + 1]]) as u32;
+                            let nw = u16::from_be_bytes([new_src[k * 2], new_src[k * 2 + 1]]) as u32;
+                            c = c + !ow + nw;
+                        }
+                        while c >> 16 != 0 {
+                            c = (c & 0xffff) + (c >> 16);
+                        }
+                        let f = !(c as u16);
+                        owned_payload[off] = (f >> 8) as u8;
+                        owned_payload[off + 1] = f as u8;
+                    }
+                }
+                src_ip = new_src;
+            }
+        }
+    }
+    // Rebind: the post-NAT payload (checksum-patched copy) or the
+    // untouched original — the shadowing keeps lifetimes honest.
+    let payload: &[u8] = if owned_payload.is_empty() {
+        payload
+    } else {
+        &owned_payload
+    };
     if is_loopback(dst_ip) {
         // lo: no ethernet, no ARP — the datagram re-enters rx as-is,
         // carrying the stamped TTL/TOS so `-m ttl`/`-m tos` see it;

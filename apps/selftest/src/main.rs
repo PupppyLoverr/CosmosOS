@@ -5613,6 +5613,50 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         s1_ok && a && blocked && ok
     });
 
+    check("ipt-nat", {
+        // `-t nat -A POSTROUTING -j SNAT --to-source`: the rule rewrites
+        // the real source address emitted on the wire — read it back
+        // out of the kernel pcap capture, not a counter.
+        let _ = ustd::pcap(0, &mut []); // start fresh capture
+        let a = ustd::write_all("/proc/net/nat", b"A POSTROUTING icmp snat 10.0.2.99\n")
+            .is_ok();
+        let _ = ustd::net_ping(0x0A00_0202, 1200); // reply may never return — fine
+        let mut buf = alloc::vec![0u8; 64 * 1024];
+        let got = ustd::pcap(4, &mut buf);
+        let buf = &buf[..got.max(0) as usize];
+        // Walk libpcap records: 24B global header, then per record a
+        // 16B {ts,ts,caplen,len} + frame (eth 14 + ipv4).
+        let mut nated = false;
+        if got > 24 {
+            let mut off = 24usize;
+            while off + 16 <= buf.len() {
+                let caplen = u32::from_le_bytes([
+                    buf[off + 8],
+                    buf[off + 9],
+                    buf[off + 10],
+                    buf[off + 11],
+                ]) as usize;
+                let fr = off + 16;
+                if fr + caplen > buf.len() || caplen < 14 + 20 {
+                    break;
+                }
+                if buf[fr + 12] == 0x08 && buf[fr + 13] == 0x00 {
+                    let ip = fr + 14;
+                    let proto = buf[ip + 9];
+                    let dst = &buf[ip + 16..ip + 20];
+                    let src = &buf[ip + 12..ip + 16];
+                    if proto == 1 && dst == [10, 0, 2, 2] && src == [10, 0, 2, 99] {
+                        nated = true;
+                    }
+                }
+                off = fr + caplen;
+            }
+        }
+        let f = ustd::write_all("/proc/net/nat", b"F\n").is_ok();
+        let ok = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        a && nated && f && ok
+    });
+
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {
         // 4 MiB through write_all (virtio-blk -> FAT32)

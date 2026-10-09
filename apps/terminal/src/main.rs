@@ -8107,6 +8107,7 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut time_armed = false;
     let mut connl_n = String::new();
     let mut connl_mask = String::from("32");
+    let mut snat_ip = String::new();
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
     let mut jump = "DROP";
@@ -8394,6 +8395,11 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 jump = args.get(i + 1).copied().unwrap_or("DROP");
                 i += 1;
             }
+            "--to-source" => {
+                // -j SNAT operand — the new egress source address.
+                snat_ip = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
             "-m" | "--match" => {
                 // `-m state|conntrack|limit` — module-specific options
                 // ride along via --state/--ctstate/--limit below
@@ -8601,6 +8607,13 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
         "REJECT" => line.push_str(" reject"),
         "ACCEPT" => line.push_str(" accept"),
         "RETURN" => line.push_str(" return"),
+        "SNAT" => {
+            if snat_ip.is_empty() {
+                return None; // SNAT requires --to-source
+            }
+            line.push_str(&alloc::format!(" snat {}", snat_ip));
+        }
+        "MASQUERADE" => line.push_str(" masq"),
         n => line.push_str(&alloc::format!(" {}", n)), // user chain jump
     }
     line.push('\n');
@@ -35928,12 +35941,18 @@ impl Term {
                 // always-on pkts/bytes columns.
                 let mut args2: Vec<&str> = Vec::with_capacity(args.len());
                 let mut bad_table: Option<&str> = None;
+                let mut nat_tbl = false;
                 let mut ti = 0usize;
                 while ti < args.len() {
                     match args[ti] {
                         "-t" | "--table" => {
                             match args.get(ti + 1).copied() {
                                 None | Some("filter") => {}
+                                // `-t nat` is a real second table: its
+                                // POSTROUTING rules live behind
+                                // /proc/net/nat and mangle egress
+                                // source addresses on the wire.
+                                Some("nat") => nat_tbl = true,
                                 Some(t) => bad_table = Some(t),
                             }
                             ti += 2;
@@ -35956,15 +35975,28 @@ impl Term {
                     return;
                 }
                 let args: &[&str] = &args2;
+                // -t nat: every rule op and listing goes to the nat
+                // table's own proc file — same wire grammar, separate
+                // chain state.
+                let fwfile = if nat_tbl {
+                    "/proc/net/nat"
+                } else {
+                    "/proc/net/iptables"
+                };
+                let savefile = if nat_tbl {
+                    "/proc/net/natsave"
+                } else {
+                    "/proc/net/iptsave"
+                };
                 let first = args.first().copied().unwrap_or("");
                 if first == "-S" || first == "--list-rules" {
                     // Real -S: save-format rule listing for EVERY chain —
                     // -P for builtins, -N for user chains, -A rules. The
                     // previous -S re-dumped only INPUT rows from -L.
-                    match ustd::read_all("/proc/net/iptsave") {
+                    match ustd::read_all(savefile) {
                         Ok(b) => {
                             for l in String::from_utf8_lossy(&b).lines() {
-                                if l == "*filter" || l == "COMMIT" {
+                                if l.starts_with('*') || l == "COMMIT" {
                                     continue;
                                 }
                                 if let Some(rest) = l.strip_prefix(':') {
@@ -35993,7 +36025,7 @@ impl Term {
                 } else if first.is_empty()
                     || matches!(first, "-L" | "--list" | "-n" | "-v" | "-nv" | "-vn")
                 {
-                    match ustd::read_all("/proc/net/iptables") {
+                    match ustd::read_all(fwfile) {
                         Ok(b) => self.emit_bin(&b),
                         Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                     }
@@ -36013,7 +36045,7 @@ impl Term {
                         l
                     }) {
                         Some(line) => match ustd::write_all(
-                            "/proc/net/iptables",
+                            fwfile,
                             line.as_bytes(),
                         ) {
                             Ok(_) => self.emit("rule exists"),
@@ -36028,7 +36060,7 @@ impl Term {
                     // user-defined chain — jumps resolve it by name
                     match args.get(1) {
                         Some(n) => match ustd::write_all(
-                            "/proc/net/iptables",
+                            fwfile,
                             alloc::format!("N {}\n", n).as_bytes(),
                         ) {
                             Ok(_) => self.emit(&alloc::format!("chain {} created", n)),
@@ -36043,7 +36075,7 @@ impl Term {
                         Some(n) => alloc::format!("X {}\n", n),
                         None => String::from("X\n"),
                     };
-                    match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
+                    match ustd::write_all(fwfile, line.as_bytes()) {
                         Ok(_) => self.emit("chain deleted"),
                         Err(e) => self.fail(&alloc::format!(
                             "iptables: chain is in use or not empty ({})",
@@ -36053,7 +36085,7 @@ impl Term {
                 } else if first == "-E" || first == "--rename-chain" {
                     match (args.get(1), args.get(2)) {
                         (Some(o), Some(n)) => match ustd::write_all(
-                            "/proc/net/iptables",
+                            fwfile,
                             alloc::format!("E {} {}\n", o, n).as_bytes(),
                         ) {
                             Ok(_) => self.emit(&alloc::format!(
@@ -36072,7 +36104,7 @@ impl Term {
                         Some("INPUT") => String::from("F IN\n"),
                         Some(n) => alloc::format!("F {}\n", n),
                     };
-                    match ustd::write_all("/proc/net/iptables", ch.as_bytes()) {
+                    match ustd::write_all(fwfile, ch.as_bytes()) {
                         Ok(_) => self.emit("iptables: rules flushed"),
                         Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                     }
@@ -36083,7 +36115,7 @@ impl Term {
                         Some("INPUT") => String::from("Z IN\n"),
                         Some(n) => alloc::format!("Z {}\n", n),
                     };
-                    match ustd::write_all("/proc/net/iptables", ch.as_bytes()) {
+                    match ustd::write_all(fwfile, ch.as_bytes()) {
                         Ok(_) => self.emit("iptables: counters zeroed"),
                         Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                     }
@@ -36104,7 +36136,7 @@ impl Term {
                         } else {
                             alloc::format!("P {}\n", verdict)
                         };
-                        match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
+                        match ustd::write_all(fwfile, line.as_bytes()) {
                             Ok(_) => self.emit(&alloc::format!(
                                 "Chain {} (policy {})",
                                 if out { "OUTPUT" } else { "INPUT" },
@@ -36133,14 +36165,14 @@ impl Term {
                     match n {
                         Some(n) => {
                             let line = alloc::format!("D {} {}\n", ct, n);
-                            match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
+                            match ustd::write_all(fwfile, line.as_bytes()) {
                                 Ok(_) => self.emit(&alloc::format!("rule {} deleted", n)),
                                 Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                             }
                         }
                         None => match ipt_rule_from_args(&args) {
                             Some(line) => {
-                                match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
+                                match ustd::write_all(fwfile, line.as_bytes()) {
                                     Ok(_) => self.emit("rule deleted"),
                                     Err(e) => self.fail(&alloc::format!(
                                         "iptables: no matching rule ({})",
@@ -36164,7 +36196,7 @@ impl Term {
                                 Some(n) => n,
                                 None => "INPUT",
                             };
-                            match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
+                            match ustd::write_all(fwfile, line.as_bytes()) {
                                 Ok(_) => self.emit(&alloc::format!("rule added to {}", ch)),
                                 Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                             }
