@@ -1038,6 +1038,95 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 }
             }
         }
+        shared::SYS_IOPL => {
+            // (level 0..3): set EFLAGS.IOPL on the caller's saved context —
+            // ring-3 port I/O works or #GP-faults on the real mechanism
+            if a1 > 3 {
+                (-22i64) as u64
+            } else if !task::capable(task::CAP_SYS_RAWIO) {
+                (-1i64) as u64
+            } else {
+                ctx.rflags = (ctx.rflags & !0x3000) | (a1 << 12);
+                0
+            }
+        }
+        shared::SYS_CLOCK_GETRES => {
+            // (clock_id 0/1, out {sec,nsec}) — real resolution = PIT tick
+            if a1 > shared::CLOCK_MONOTONIC {
+                (-22i64) as u64
+            } else {
+                let mut ts = alloc::vec![0u8; 16];
+                let ns: u64 = 1_000_000_000 / crate::timer::TICK_HZ;
+                ts[8..16].copy_from_slice(&ns.to_le_bytes());
+                if a2 == 0 || copy_out(a2, &ts).is_some() {
+                    0
+                } else {
+                    ERR
+                }
+            }
+        }
+        shared::SYS_VHANGUP => {
+            // SIGHUP the caller's controlling-tty session — ENOTTY if none
+            let ct = task::with_current(|t| t.ctty);
+            if ct == 0 {
+                (-25i64) as u64
+            } else {
+                task::signal_ctty(ct, 1);
+                0
+            }
+        }
+        shared::SYS_SIGTIMEDWAIT => {
+            // (set u64*, siginfo*, timespec*) — consume a pending signal in
+            // set (without running a handler); block until one arrives or
+            // the deadline passes (-11 EAGAIN)
+            match copy_in(a1, 8) {
+                Some(sb) => {
+                    let set = u64::from_le_bytes(sb[..8].try_into().unwrap());
+                    let timeout_ms = if a3 == 0 {
+                        u64::MAX
+                    } else {
+                        match copy_in(a3, 16) {
+                            Some(tb) => {
+                                let sec =
+                                    u64::from_le_bytes(tb[..8].try_into().unwrap());
+                                let nsec =
+                                    u64::from_le_bytes(tb[8..16].try_into().unwrap());
+                                sec.saturating_mul(1000) + nsec / 1_000_000
+                            }
+                            None => {
+                                ctx.rax = ERR;
+                                return;
+                            }
+                        }
+                    };
+                    if let Some(sig) = task::take_pending_sig(cur_id(), set) {
+                        if a2 != 0 {
+                            // siginfo: si_signo only (si_code=0)
+                            let mut ib = [0u8; 8];
+                            ib[..4].copy_from_slice(&sig.to_le_bytes());
+                            let _ = copy_out(a2, &ib);
+                        }
+                        task::with_current(|t| t.wait_timeout = 0);
+                        sig as u64
+                    } else {
+                        let dl = task::with_current(|t| {
+                            if t.wait_timeout == 0 {
+                                t.wait_timeout = task::ticks()
+                                    + timeout_ms.saturating_div(10).max(1);
+                            }
+                            t.wait_timeout
+                        });
+                        if task::ticks() >= dl {
+                            task::with_current(|t| t.wait_timeout = 0);
+                            (-11i64) as u64
+                        } else {
+                            block_reenter(ctx, dl, 0);
+                        }
+                    }
+                }
+                None => ERR,
+            }
+        }
         shared::SYS_CLOCK_NANOSLEEP => {
             // absolute deadline in ms; ticks run 10ms each. A past deadline
             // returns immediately (POSIX TIMER_ABSTIME).

@@ -3490,6 +3490,71 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         ok = ok && ustd::sched_getaffinity(0xdead) == -3;
         ok
     });
+    check("iopl-ports", {
+        // SYS_IOPL: real EFLAGS.IOPL — ring-3 `in`/`out` works at level 3
+        // and #GP-kills the task without it.
+        let mut ok = true;
+        // bounds: level must be 0..3
+        ok = ok && ustd::iopl(4) == -22;
+        // child without IOPL doing `in` dies on the real #GP path
+        match ustd::fork() {
+            0 => {
+                let _ = ustd::inb(0x64);
+                ustd::exit(42); // unreachable
+            }
+            c if c > 0 => {
+                // killed by #GP: raw exit -1 surfaces as Err from waitpid
+                ok = ok && match ustd::waitpid(c as u32, 5000) {
+                    Ok(42) => false,
+                    _ => true,
+                };
+            }
+            _ => ok = false,
+        }
+        // child with iopl(3) performs a real port read and exits 42
+        match ustd::fork() {
+            0 => {
+                let r = ustd::iopl(3);
+                let _status = ustd::inb(0x64);
+                ustd::exit(if r == 0 { 42 } else { 7 });
+            }
+            c if c > 0 => {
+                ok = ok && ustd::waitpid(c as u32, 5000).unwrap_or(-1) == 42;
+            }
+            _ => ok = false,
+        }
+        ok
+    });
+    check("clock-res", {
+        // clock_getres: real 10ms PIT resolution for clock 0/1, -22 else
+        ustd::clock_getres(0) == 10_000_000
+            && ustd::clock_getres(1) == 10_000_000
+            && ustd::clock_getres(9) == -22
+    });
+    check("sig-timedwait", {
+        // SYS_SIGTIMEDWAIT: empty set times out (-11 EAGAIN); a blocked
+        // signal sent by a child is consumed and its signo returned.
+        let mut ok = true;
+        // block sig 10 so the handler path can't consume it first
+        let _ = ustd::sigprocmask(0, 1 << 10);
+        // nothing pending: 60ms wait -> EAGAIN
+        ok = ok && ustd::sigtimedwait(1 << 10, Some(60)) == -11;
+        let me = ustd::getpid() as u32;
+        match ustd::fork() {
+            0 => {
+                ustd::sleep_ms(80);
+                let _ = ustd::kill2(me, 10);
+                ustd::exit(0);
+            }
+            c if c > 0 => {
+                // the signal arrives during the wait — consumed by the call
+                ok = ok && ustd::sigtimedwait(1 << 10, Some(2000)) == 10;
+                let _ = ustd::waitpid(c as u32, 3000);
+            }
+            _ => ok = false,
+        }
+        ok
+    });
     check("epoll-flags", {
         // EPOLLET fires once per ready level, EPOLLONESHOT until MOD
         // re-arms, EPOLLHUP surfaces on writer close, and the epoll fd

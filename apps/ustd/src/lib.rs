@@ -1153,6 +1153,58 @@ pub fn sched_getaffinity(pid: u32) -> i64 {
     }
 }
 
+/// iopl(level 0..3): real EFLAGS.IOPL — CAP_SYS_RAWIO.
+pub fn iopl(level: u64) -> i64 {
+    sc1(shared::SYS_IOPL, level) as i64
+}
+/// Raw port I/O primitives for the iopl gate (safe ports only).
+pub fn inb(port: u16) -> u8 {
+    let v: u8;
+    unsafe {
+        core::arch::asm!("in al, dx", in("dx") port, out("al") v);
+    }
+    v
+}
+pub fn outb(port: u16, v: u8) {
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") v);
+    }
+}
+/// clock_getres(clk 0/1) -> resolution ns | -22
+pub fn clock_getres(clk: u64) -> i64 {
+    let mut ts = [0u64; 2];
+    let r = sc2(shared::SYS_CLOCK_GETRES, clk, ts.as_mut_ptr() as u64) as i64;
+    if r < 0 {
+        r
+    } else {
+        (ts[0] * 1_000_000_000 + ts[1]) as i64
+    }
+}
+/// vhangup(): SIGHUP the caller's ctty session. -25 ENOTTY if none.
+pub fn vhangup() -> i64 {
+    sc0(shared::SYS_VHANGUP) as i64
+}
+/// sigtimedwait(set mask, timeout_ms or None=forever) -> signo | -11 | err
+pub fn sigtimedwait(set: u64, timeout_ms: Option<u64>) -> i64 {
+    let mut info = [0u64; 2];
+    let ts = match timeout_ms {
+        Some(ms) => [ms / 1000, (ms % 1000) * 1_000_000],
+        None => [u64::MAX, u64::MAX],
+    };
+    let tp = if timeout_ms.is_none() {
+        0u64
+    } else {
+        ts.as_ptr() as u64
+    };
+    sc4(
+        shared::SYS_SIGTIMEDWAIT,
+        &set as *const u64 as u64,
+        info.as_mut_ptr() as u64,
+        tp,
+        0,
+    ) as i64
+}
+
 /// chrt(pid, class): set scheduler class — SCHED_OTHER=0, SCHED_RT=1.
 pub fn chrt(pid: u32, class: u64) -> bool {
     sc2(shared::SYS_CHRT, pid as u64, class) == 0
