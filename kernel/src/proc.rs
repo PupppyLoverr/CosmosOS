@@ -30,7 +30,7 @@ const FILES: &[&str] = &[
 /// files under /proc/net
 const NET_FILES: &[&str] = &[
     "tcp", "udp", "unix", "dev", "operstate", "owners", "route", "iptables",
-    "snmp", "nf_conntrack", "arp", "fib_trie",
+    "snmp", "nf_conntrack", "arp", "fib_trie", "tc",
 ];
 
 /// files under /proc/sys/kernel
@@ -334,6 +334,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/net/nf_conntrack" => net::net_conntrack(),
         "/proc/net/arp" => net::net_arp(),
         "/proc/net/fib_trie" => net::net_fib_trie(),
+        "/proc/net/tc" => net::tc_show(),
         "/proc/net/operstate" => alloc::format!(
             "{}\n",
             if net::is_up() { "up" } else { "down" }
@@ -597,6 +598,19 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
                 continue;
             }
             ok &= net::ct_ctl(line);
+        }
+        return ok.then_some(buf.len());
+    }
+    if path == "/proc/net/tc" {
+        // 'add qdisc tbf rate <bps[k|m]>' / 'del' — the tc tool's ops.
+        let text = String::from(String::from_utf8_lossy(buf));
+        let mut ok = true;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            ok &= net::tc_ctl(line);
         }
         return ok.then_some(buf.len());
     }

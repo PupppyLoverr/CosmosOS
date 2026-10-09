@@ -1162,7 +1162,107 @@ fn send_frame(dst: [u8; 6], ethertype: u16, payload: &[u8]) -> Result<(), ()> {
     TX_BYTES.fetch_add(f.len() as u64, Ordering::Relaxed);
     crate::pcap::log_frame(&f); // TX frames hit the capture too (tcpdump sees both directions)
     ct_observe_tx(&f);          // and the conntrack flow table
+    if !tc_shape(f.len()) {
+        return Ok(()); // qdisc dropped the frame (backlog overflow)
+    }
     n.send(&f)
+}
+
+/// Token-bucket traffic shaper on the TX path (`tc qdisc add dev eth0 root
+/// tbf rate <bps>`). Tokens accumulate at `rate_bps`; a frame that can't be
+/// paid for waits — a real TBF delays — and is dropped once the wait would
+/// exceed 2 s (backlog overflow semantics).
+struct Tbf {
+    rate_bps: u64, // bytes per second
+    tokens: u64,
+    last_ms: u64,
+    pkts: u64,
+    bytes: u64,
+    drops: u64,
+}
+static TC_QDISC: Mutex<Option<Tbf>> = Mutex::new(None);
+
+fn tc_shape(len: usize) -> bool {
+    let mut g = TC_QDISC.lock();
+    let Some(t) = g.as_mut() else { return true };
+    let mut now = now_ms();
+    let burst = t.rate_bps.max(1514); // ~1s of credits, at least one MTU
+    t.tokens = (t.tokens + (now - t.last_ms) * t.rate_bps / 1000).min(burst);
+    t.last_ms = now;
+    let need = len as u64;
+    if t.tokens >= need {
+        t.tokens -= need;
+        t.pkts += 1;
+        t.bytes += need;
+        return true;
+    }
+    // Delay until the bucket refills; drop if the wait exceeds 2 s.
+    let deficit = need - t.tokens;
+    let wait = deficit * 1000 / t.rate_bps.max(1) + 1;
+    if wait > 2000 {
+        t.drops += 1;
+        return false; // backlog overflow — frame is dropped (no send)
+    }
+    let until = now + wait;
+    while now_ms() < until {
+        // syscall context runs IF=0 — halt with IRQs on for one tick so
+        // PIT fires and now_ms() advances (same as every net wait loop).
+        wait_irq();
+    }
+    now = now_ms();
+    t.last_ms = now;
+    t.tokens = 0;
+    t.pkts += 1;
+    t.bytes += need;
+    true
+}
+
+/// `/proc/net/tc` — Linux `tc -s qdisc`-style stats.
+pub fn tc_show() -> String {
+    let g = TC_QDISC.lock();
+    match g.as_ref() {
+        Some(t) => alloc::format!(
+            "qdisc tbf root dev eth0 rate {}bps burst {}b\n  Sent {} bytes {} pkt (dropped {}, overlimits 0)\n",
+            t.rate_bps, t.rate_bps.max(1514), t.bytes, t.pkts, t.drops
+        ),
+        None => String::from("qdisc noqueue dev eth0 (no shaping configured)\n"),
+    }
+}
+
+/// `/proc/net/tc` write grammar: `"add qdisc tbf rate <Bps>"`,
+/// `"add qdisc tbf rate <bps>[k|m]"`, `"del"`/`"clear"` remove shaping.
+pub fn tc_ctl(line: &str) -> bool {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    match f.as_slice() {
+        ["del"] | ["clear"] => {
+            *TC_QDISC.lock() = None;
+            true
+        }
+        ["add", "qdisc", "tbf", "rate", rate] => {
+            let (num, mult) = if let Some(r) = rate.strip_suffix('k') {
+                (r, 1000u64)
+            } else if let Some(r) = rate.strip_suffix('m') {
+                (r, 1_000_000u64)
+            } else {
+                (*rate, 1u64)
+            };
+            let Ok(base) = num.parse::<u64>() else { return false };
+            let rate_bps = base * mult;
+            if rate_bps == 0 {
+                return false;
+            }
+            *TC_QDISC.lock() = Some(Tbf {
+                rate_bps,
+                tokens: rate_bps.max(1514),
+                last_ms: now_ms(),
+                pkts: 0,
+                bytes: 0,
+                drops: 0,
+            });
+            true
+        }
+        _ => false,
+    }
 }
 
 fn send_arp_request(target: [u8; 4]) {
