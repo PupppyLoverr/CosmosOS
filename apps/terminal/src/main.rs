@@ -13871,6 +13871,8 @@ impl Term {
                 let mut by_ext = false;
                 let mut by_ver = false;
                 let mut unsorted = false;
+                let mut long_fmt = false;
+                let mut tstyle = 0u8; // --time-style: 0 gnu, 1 long-iso, 2 full-iso
                 let mut rev = false;
                 let mut rec = false;
                 let mut classify = false;
@@ -13885,11 +13887,30 @@ impl Term {
                         i += 1;
                         continue;
                     }
+                    if args[i] == "--full-time" {
+                        long_fmt = true;
+                        tstyle = 2;
+                        i += 1;
+                        continue;
+                    }
+                    if args[i] == "--time-style=full-iso" || args[i] == "--time-style=+full-iso" {
+                        long_fmt = true;
+                        tstyle = 2;
+                        i += 1;
+                        continue;
+                    }
+                    if args[i] == "--time-style=long-iso" || args[i] == "--time-style=+long-iso" {
+                        long_fmt = true;
+                        tstyle = 1;
+                        i += 1;
+                        continue;
+                    }
                     for c in args[i][1..].chars() {
                         match c {
                             'a' => show_all = true,
                             'S' => by_size = true,
                             't' => by_time = true,
+                            'l' => long_fmt = true,
                             'X' => by_ext = true,
                             'v' => by_ver = true,
                             'U' => unsorted = true,
@@ -14011,6 +14032,57 @@ impl Term {
                                 };
                                 let name = name.as_str();
                                 let is_link = e.attr & 0x40 != 0;
+                                if long_fmt {
+                                    // real `ls -l`: mode-col derived from the
+                                    // DOS attr byte + kind, real FAT mtime
+                                    // (--time-style picks the layout).
+                                    let mode = if e.is_dir != 0 {
+                                        "drwxr-xr-x"
+                                    } else if is_link {
+                                        "lrwxrwxrwx"
+                                    } else if e.attr & 0x01 != 0 {
+                                        "-r--r--r--"
+                                    } else {
+                                        "-rw-r--r--"
+                                    };
+                                    let (y, mo, d, h, mi, se) = epoch_to_dt(e.mtime);
+                                    let ts = match tstyle {
+                                        2 => alloc::format!(
+                                            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} +0000",
+                                            y, mo, d, h, mi, se
+                                        ),
+                                        1 => alloc::format!(
+                                            "{:04}-{:02}-{:02} {:02}:{:02}",
+                                            y, mo, d, h, mi
+                                        ),
+                                        _ => alloc::format!(
+                                            "{} {:2} {:02}:{:02}",
+                                            ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+                                                [(mo - 1) as usize],
+                                            d, h, mi
+                                        ),
+                                    };
+                                    let line = if is_link {
+                                        let tgt = ustd::readlink(&alloc::format!(
+                                            "{}{}{}",
+                                            dir,
+                                            if dir.ends_with('/') { "" } else { "/" },
+                                            name
+                                        ))
+                                        .unwrap_or_default();
+                                        alloc::format!(
+                                            "{} {:>8} {} {} -> {}",
+                                            mode, e.size, ts, name, tgt
+                                        )
+                                    } else {
+                                        alloc::format!(
+                                            "{} {:>8} {} {}",
+                                            mode, e.size, ts, name
+                                        )
+                                    };
+                                    self.emit(&line);
+                                    continue;
+                                }
                                 let mut line = if is_link {
                                     let tgt = ustd::readlink(&alloc::format!(
                                         "{}{}{}",
@@ -16014,12 +16086,13 @@ impl Term {
                 let paths = if paths.is_empty() { alloc::vec!["."] } else { paths };
                 fn flags(a: u32, dir: bool) -> String {
                     alloc::format!(
-                        "{}{}{}{}{}",
+                        "{}{}{}{}{}{}",
                         if a & 0x01 != 0 { "r" } else { "-" },
                         if a & 0x02 != 0 { "h" } else { "-" },
                         if a & 0x04 != 0 { "s" } else { "-" },
                         if dir || a & 0x10 != 0 { "d" } else { "-" },
-                        if a & 0x20 != 0 { "a" } else { "-" }
+                        if a & 0x20 != 0 { "a" } else { "-" },
+                        if a & 0x80 != 0 { "i" } else { "-" }
                     )
                 }
                 fn one(t: &mut Term, p: &str) {
@@ -16060,12 +16133,14 @@ impl Term {
                 }
             }
             "chattr" => {
-                // chattr [+-=][rhsa] <files...>: sets/clears real FAT attrs
-                // (r=0x01 h=0x02 s=0x04 a=0x20) via SYS_SETATTR
+                // chattr [+-=][rhsai] <files...>: sets/clears real FAT attrs
+                // (r=0x01 h=0x02 s=0x04 a=0x20 i=0x80) via SYS_SETATTR.
+                // i = immutable: the kernel rejects writes/unlinks/renames
+                // on marked files with EPERM (FS_IMMUTABLE_FL analogue).
                 let op = match args.first() {
                     Some(a) if a.starts_with('+') || a.starts_with('-') || a.starts_with('=') => *a,
                     _ => {
-                        self.fail("usage: chattr [+-=][rhsa] <file>...");
+                        self.fail("usage: chattr [+-=][rhsai] <file>...");
                         return;
                     }
                 };
@@ -16077,6 +16152,7 @@ impl Term {
                         b'h' => 0x02,
                         b's' => 0x04,
                         b'a' => 0x20,
+                        b'i' => 0x80,
                         _ => {
                             self.fail(&alloc::format!("chattr: bad flag '{}'", c as char));
                             return;
@@ -16085,7 +16161,7 @@ impl Term {
                 }
                 let files = &args[1..];
                 if files.is_empty() {
-                    self.fail("usage: chattr [+-=][rhsa] <file>...");
+                    self.fail("usage: chattr [+-=][rhsai] <file>...");
                     return;
                 }
                 for p in files {
@@ -27692,7 +27768,9 @@ impl Term {
                 }
                 let want_t = args.iter().any(|a| *a == "-T" || *a == "--ctime");
                 let strip = args.iter().any(|a| *a == "-t" || *a == "--notime");
-                let delta = args.iter().any(|a| *a == "-d" || *a == "--delta");
+                let delta = args.iter().any(|a| {
+                    *a == "-d" || *a == "--delta" || *a == "-e" || *a == "--reltime"
+                });
                 if args.iter().any(|a| *a == "-w" || *a == "--follow") {
                     self.watch = Some((String::from("dmesg -t"), 1000, 0));
                     self.emit("watching every 1000ms -- Esc/Enter to stop");
@@ -39615,6 +39693,35 @@ impl Term {
                         }
                     }
                     self.emit(&dom);
+                }
+                // -F/--file <path> (or bare filename arg): set the
+                // kernel hostname from the file's first line — real
+                // /proc/sys/kernel/hostname write like `hostname -F`.
+                Some(f) if *f == "-F" || *f == "--file" => {
+                    match args.get(1).and_then(|p| ustd::read_all(p).ok()) {
+                        Some(d) => {
+                            let h = String::from_utf8_lossy(&d)
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .trim()
+                                .to_string();
+                            if h.is_empty() {
+                                self.fail("hostname: empty hostname file");
+                            } else {
+                                let _ = ustd::write_all(
+                                    "/proc/sys/kernel/hostname",
+                                    h.as_bytes(),
+                                );
+                                self.host = h.clone();
+                                self.vars.insert(
+                                    String::from("HOSTNAME"),
+                                    h,
+                                );
+                            }
+                        }
+                        None => self.fail("hostname: cannot read file"),
+                    }
                 }
                 // -s/--short: nodename up to the first dot
                 Some(f) if *f == "-s" || *f == "--short" => {

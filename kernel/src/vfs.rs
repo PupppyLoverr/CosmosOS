@@ -193,7 +193,16 @@ pub fn read_range(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64>
 
 /// Path-based ranged write — loop backing files and kernel-internal
 /// writers. Ranged on every FS (fat32::write_at / tmpfs::write_range).
+/// Immutable attribute bit (0x80, `chattr +i` — the FS_IMMUTABLE_FL
+/// analogue): every mutating op on a marked file fails EPERM.
+fn immutable(path: &str) -> bool {
+    stat_path_nofollow(path).map(|s| s.attr & 0x80 != 0).unwrap_or(false)
+}
+
 pub fn write_range_path(path: &str, offset: u64, buf: &[u8]) -> Result<usize, i64> {
+    if immutable(path) {
+        return Err(-1);
+    }
     if crate::tmpfs::handles(path) {
         return crate::tmpfs::write_range(path, offset, buf);
     }
@@ -489,6 +498,15 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     const O_CREAT: u64 = shared::O_CREATE;
     const O_TRUNC: u64 = shared::O_TRUNC;
     const O_APPEND: u64 = shared::O_APPEND;
+    // FS_IMMUTABLE_FL check via the already-held FS lock (the generic
+    // immutable() helper would re-lock FS and deadlock here).
+    let is_imm = exists && is_fat
+        && fs.stat(&full).map(|st| st.attr & 0x80 != 0).unwrap_or(false);
+    if is_imm
+        && flags & (shared::O_WRONLY | shared::O_RDWR | O_TRUNC | O_APPEND) != 0
+    {
+        return Err(-1); // EPERM: FS_IMMUTABLE_FL
+    }
     if exists && flags & O_CREAT != 0 && flags & shared::O_EXCL != 0 {
         return Err(-17); // EEXIST
     }
@@ -699,6 +717,9 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
         }
     }
     if crate::tmpfs::handles(&path) {
+        if immutable(&path) {
+            return Err(-1);
+        }
         let sz = if flags & shared::O_APPEND != 0 {
             crate::tmpfs::stat(&path).map(|s| s.0).unwrap_or(pos)
         } else {
@@ -713,6 +734,9 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
         });
         task::io_charge(false, n);
         return Ok(n as i64);
+    }
+    if immutable(&path) {
+        return Err(-1);
     }
     const O_APPEND: u64 = shared::O_APPEND;
     let mut g = FS.lock();
@@ -1107,6 +1131,9 @@ pub fn remove(path: &str) -> Result<(), i64> {
         return r;
     }
     if crate::tmpfs::handles(&full) {
+        if immutable(&full) {
+            return Err(-1);
+        }
         let r = crate::tmpfs::remove(&full);
         if r.is_ok() {
             crate::notify::fire(&full, crate::notify::IN_DELETE);
@@ -1124,6 +1151,9 @@ pub fn remove(path: &str) -> Result<(), i64> {
     if task::cred().0 != 0 {
         return Err(-1);
     }
+    if immutable(&full) {
+        return Err(-1); // EPERM: FS_IMMUTABLE_FL
+    }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     fs.remove(&full).map_err(err_to_i64)?;
@@ -1138,6 +1168,9 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
     let ft = crate::tmpfs::handles(&f);
     let tt = crate::tmpfs::handles(&t2);
     if ft && tt {
+        if immutable(&f) || immutable(&t2) {
+            return Err(-1);
+        }
         return crate::tmpfs::rename(&f, &t2);
     }
     if ft != tt {
@@ -1158,6 +1191,9 @@ pub fn rename(from: &str, to: &str) -> Result<(), i64> {
     // the "other" bits only — writes are EPERM across the volume.
     if task::cred().0 != 0 {
         return Err(-1);
+    }
+    if immutable(&f) || immutable(&t2) {
+        return Err(-1); // EPERM: FS_IMMUTABLE_FL
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
@@ -1206,6 +1242,9 @@ pub fn truncate_path(path: &str, len: u64) -> Result<(), i64> {
     }
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if immutable(&full) {
+        return Err(-1);
+    }
     if crate::tmpfs::handles(&full) {
         return crate::tmpfs::truncate(&full, len);
     }
@@ -1241,6 +1280,9 @@ pub fn truncate_path(path: &str, len: u64) -> Result<(), i64> {
 pub fn write_all_path(path: &str, data: &[u8]) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if immutable(&full) {
+        return Err(-1);
+    }
     if crate::tmpfs::handles(&full) {
         crate::tmpfs::open(&full, shared::O_CREATE | shared::O_TRUNC | shared::O_WRONLY)?;
         crate::tmpfs::write_range(&full, 0, data)?;
