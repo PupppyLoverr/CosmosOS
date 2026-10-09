@@ -384,6 +384,7 @@ struct FwRule {
     hlimit_name: String,
     hlimit_above: bool,   // true = --hashlimit-above (match once over the rate)
     msocket: bool,        // `-m socket` — packet belongs to a local socket
+    ctdir: u8,            // `-m conntrack --ctdir` (1 ORIGINAL / 2 REPLY)
     atype_dst: u8,        // `-m addrtype --dst-type` (0 any,1 UNICAST,2 LOCAL,3 BROADCAST,4 MULTICAST)
     atype_src: u8,        // `--src-type` same map
     rpfilter: bool,       // `-m rpfilter` — a real route back to src exists
@@ -521,6 +522,26 @@ fn ct_update(
     });
     if ct.len() > 512 {
         ct.remove(0); // drop the oldest entry — flows are cheap, memory isn't
+    }
+    1
+}
+
+/// Packet direction against the live flow table, for `-m conntrack
+/// --ctdir`: 1 = ORIGINAL (matches the flow's initiator tuple, or no
+/// flow seen — a packet that creates the flow is the original dir),
+/// 2 = REPLY (matches the responder tuple).
+fn ct_dir(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, proto: u8) -> u8 {
+    let ct = CT.lock();
+    for e in ct.iter() {
+        if e.proto != proto {
+            continue;
+        }
+        if e.b_ip == src && e.a_ip == dst && e.b_port == sport && e.a_port == dport {
+            return 2;
+        }
+        if e.a_ip == src && e.b_ip == dst && e.a_port == sport && e.b_port == dport {
+            return 1;
+        }
     }
     1
 }
@@ -894,6 +915,9 @@ fn fw_eval(
         // exists locally (real transparent-proxy test): TCP checks
         // the established table + listeners on the local port, UDP
         // the bound-owner map.
+        if r.ctdir != 0 && ct_dir(src, dst, sport, dport, proto) != r.ctdir {
+            continue;
+        }
         if r.msocket {
             // real xt_socket: on egress the skb's own socket is the
             // sending one (sport); inbound it's the socket the packet
@@ -1557,6 +1581,12 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
     if r.rpfilter {
         out.push_str(" -m rpfilter");
     }
+    if r.ctdir != 0 {
+        out.push_str(&alloc::format!(
+            " -m conntrack --ctdir {}",
+            if r.ctdir == 2 { "REPLY" } else { "ORIGINAL" }
+        ));
+    }
     if r.limit_pps != 0 {
         out.push_str(&alloc::format!(" -m limit --limit {}/s", r.limit_pps));
         if r.limit_burst != 5 {
@@ -2028,7 +2058,7 @@ fn fw_name_ok(n: &str) -> bool {
         "iif", "oif", "sport", "length", "comment", "ttl", "tos", "mac",
         "dscp", "icmpt", "syn", "rset", "rchk", "rupd", "rrem", "rhitc", "sports", "dstrange",
         "string", "u32", "statnth", "tflags", "quota", "time", "connl", "ctstate", "connbytes", "ouid", "ogid",
-        "pkttype", "hlimit", "msocket", "addrtype", "rpfilter",
+        "pkttype", "hlimit", "msocket", "addrtype", "rpfilter", "ctdir",
         "snat", "masq",
     ];
     !n.is_empty()
@@ -2458,6 +2488,7 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         hlimit_name: String::new(),
         hlimit_above: false,
         msocket: false,
+        ctdir: 0,
         atype_dst: 0,
         atype_src: 0,
         rpfilter: false,
@@ -2857,6 +2888,12 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
             }
             "msocket" => {
                 r.msocket = true;
+            }
+            "ctdir" => {
+                r.ctdir = match f.next().unwrap_or("") {
+                    "REPLY" => 2,
+                    _ => 1,
+                };
             }
             "addrtype" => {
                 // `addrtype <src|dst> <UNICAST|LOCAL|BROADCAST|MULTICAST>`

@@ -8115,6 +8115,7 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut hlim_burst = String::new();
     let mut hlim_name = String::new();
     let mut msocket = false;
+    let mut ctdir = String::new();
     let mut atype_dst = String::new();
     let mut atype_src = String::new();
     let mut rpfilter = false;
@@ -8382,6 +8383,11 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             // `-m rpfilter` — reverse-path check (no arg).
             "-m" if args.get(i + 1) == Some(&"rpfilter") => {
                 rpfilter = true;
+                i += 1;
+            }
+            // `-m conntrack --ctdir ORIGINAL|REPLY`.
+            "--ctdir" => {
+                ctdir = String::from(args.get(i + 1).copied().unwrap_or("ORIGINAL"));
                 i += 1;
             }
             // `-m addrtype --src-type/--dst-type`.
@@ -8685,6 +8691,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if msocket {
         line.push_str(" msocket");
+    }
+    if !ctdir.is_empty() {
+        line.push_str(&alloc::format!(" ctdir {}", ctdir));
     }
     if !atype_dst.is_empty() {
         line.push_str(&alloc::format!(" addrtype dst {}", atype_dst));
@@ -26870,6 +26879,18 @@ impl Term {
                 }
             }
             "netstat" => {
+                // -c/--continuous: real re-dump every second, riding the
+                // watch machinery (Esc/Enter stops).
+                if args.iter().any(|a| *a == "-c" || *a == "--continuous") {
+                    let rest: Vec<&str> = args
+                        .iter()
+                        .copied()
+                        .filter(|a| *a != "-c" && *a != "--continuous")
+                        .collect();
+                    self.watch = Some((alloc::format!("netstat {}", rest.join(" ")), 1000, 0));
+                    self.emit("watching every 1000ms -- Esc/Enter to stop");
+                    return;
+                }
                 // netstat [-l] [-t] [-u] [-p] [-s]: -p joins /proc/net/owners ->
                 // real owning pid+program name per socket row;
                 // -s prints the /proc/net/snmp counter sections.
@@ -40483,15 +40504,39 @@ impl Term {
                 self.emit(&alloc::format!("\tTX: {} packets {} bytes", txp, txb));
             }
             "ip" => {
+                // `-4`/`-6` address family: IPv4 is the only stack, so
+                // -4 is a real no-op filter and -6 honestly reports
+                // the absence of an inet6 object set (like `ip -6` on
+                // an IPv4-only kernel).
+                let v6 = args.iter().any(|a| *a == "-6")
+                    || args
+                        .iter()
+                        .position(|a| *a == "-f" || *a == "-family")
+                        .and_then(|i| args.get(i + 1))
+                        .map(|f| f.starts_with("inet6"))
+                        .unwrap_or(false);
+                if v6 {
+                    self.fail("ip: inet6 address family not supported");
+                    return;
+                }
                 // `-br/--brief`/`-o/--oneline`: one line per object.
                 let brief = args.iter().any(|a| {
                     *a == "-br" || *a == "--brief" || *a == "-o" || *a == "--oneline"
                 });
+                let mut skip_f = false;
                 let args: Vec<&str> = args
                     .iter()
                     .copied()
                     .filter(|a| {
-                        *a != "-br" && *a != "--brief" && *a != "-o" && *a != "--oneline"
+                        if skip_f {
+                            skip_f = false;
+                            return false; // the family word after -f
+                        }
+                        if *a == "-f" || *a == "-family" {
+                            skip_f = true;
+                            return false;
+                        }
+                        *a != "-4" && *a != "-inet" && *a != "-br" && *a != "--brief" && *a != "-o" && *a != "--oneline"
                     })
                     .collect();
                 let args: &[&str] = &args;
