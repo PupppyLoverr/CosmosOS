@@ -4398,6 +4398,35 @@ pub fn futex_wake(key: u64, n: u64) -> u64 {
     woke
 }
 
+/// FUTEX_REQUEUE: wake `wake` waiters on key_a; move up to `cap` of the
+/// rest onto key_b's queue (a later futex_wake(key_b) releases them).
+/// Returns woken+moved (FUTEX_CMP_REQUEUE's count convention).
+pub fn futex_requeue(key_a: u64, wake: u64, key_b: u64, cap: u64) -> u64 {
+    let mut g = SCHED.lock();
+    let Some(s) = g.as_mut() else {
+        return 0;
+    };
+    let mut woke = 0u64;
+    let mut moved = 0u64;
+    for t in s.tasks.iter_mut() {
+        if t.wait_futex == key_a {
+            if woke < wake {
+                t.wait_futex = 0;
+                if t.state == State::Blocked {
+                    t.state = State::Running;
+                }
+                woke += 1;
+            } else if moved < cap {
+                t.wait_futex = key_b;
+                moved += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    woke + moved
+}
+
 /// `/proc/<pid>/limits`: Linux-format rlimit table (soft = hard here).
 pub fn pid_limits(pid: u32) -> Option<String> {
     let g = SCHED.lock();

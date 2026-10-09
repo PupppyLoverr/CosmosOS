@@ -207,7 +207,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
             Some(pid) => task::reported_child_pid(pid) as u64,
             None => ERR,
         },
-        shared::SYS_FUTEX => sys_futex(ctx, a1, a2, a3, a4),
+        shared::SYS_FUTEX => sys_futex(ctx, a1, a2, a3, a4, a5),
         shared::SYS_FORK => task::fork_current(ctx)
             .map(|p| task::reported_child_pid(p) as u64)
             .unwrap_or(ERR),
@@ -756,6 +756,17 @@ pub fn dispatch(ctx: &mut CpuContext) {
             } else {
                 ERR
             }
+        }
+        shared::SYS_GET_ROBUST_LIST => {
+            // (out u64*) -> 0 | err — the task's registered robust head
+            // (0 when none; Linux returns an empty list, not an error).
+            let head = task::with_current(|t| t.robust_list);
+            if copy_out(a1, &head.to_le_bytes()).is_none() {
+                ctx.rax = ERR;
+                return;
+            }
+            ctx.rax = 0;
+            return;
         }
         shared::SYS_SET_ROBUST_LIST => {
             task::with_current(|t| t.robust_list = a1);
@@ -4718,7 +4729,7 @@ fn sys_ipc_recv(ctx: &mut CpuContext, port: u64, buf: u64, buflen: u64, timeout_
 /// threads and any mapping of the same frame collide; unrelated
 /// processes' identical VAs can't). wait_timeout doubles as the
 /// re-entry marker; wait_futex is the claimed key a waker clears.
-fn sys_futex(ctx: &mut CpuContext, uaddr: u64, op: u64, val: u64, timeout_ms: u64) -> u64 {
+fn sys_futex(ctx: &mut CpuContext, uaddr: u64, op: u64, val: u64, timeout_ms: u64, uaddr2: u64) -> u64 {
     if uaddr & 7 != 0 {
         return ERR;
     }
@@ -4735,6 +4746,17 @@ fn sys_futex(ctx: &mut CpuContext, uaddr: u64, op: u64, val: u64, timeout_ms: u6
     if op == 1 {
         // FUTEX_WAKE(val = max waiters)
         return task::futex_wake(key, val);
+    }
+    if op == 3 {
+        // FUTEX_REQUEUE: wake `val` on uaddr, requeue up to
+        // `timeout_ms` (=val2, requeue cap) of the rest onto uaddr2.
+        if uaddr2 & 7 != 0 {
+            return (u64::MAX - 21) as u64; // -EINVAL
+        }
+        let Some(phys2) = elf::translate_user(pml4, uaddr2 & !0xfff) else {
+            return (u64::MAX - 13) as u64;
+        };
+        return task::futex_requeue(key, val, phys2 | (uaddr2 & 0xfff), timeout_ms);
     }
     if op != 0 {
         return (u64::MAX - 21) as u64; // -EINVAL
