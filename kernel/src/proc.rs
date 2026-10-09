@@ -30,7 +30,7 @@ const FILES: &[&str] = &[
 /// files under /proc/net
 const NET_FILES: &[&str] = &[
     "tcp", "udp", "unix", "dev", "operstate", "owners", "route", "iptables", "nat", "natsave",
-    "ipt_recent", "nfacct", "ipset",
+    "ipt_recent", "nfacct", "ipset", "mac",
     "snmp", "nf_conntrack", "arp", "fib_trie", "tc", "dns", "neigh", "mtu",
     "tcpinfo", "iptsave",
 ];
@@ -358,6 +358,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/net/ipt_recent" => net::net_ipt_recent(),
         "/proc/net/nfacct" => net::net_nfacct(),
         "/proc/net/ipset" => net::net_ipset(),
+        "/proc/net/mac" => net::net_mac(),
         "/proc/net/operstate" => alloc::format!(
             "{}\n",
             if net::is_up() { "up" } else { "down" }

@@ -6001,6 +6001,36 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         c1 && a1 && t1 && t2 && r1 && p1 && r2 && p2 && c2 && a2 && t3 && r3 && p3
     });
+    check("dmesg-ts", {
+        // klog stamps every record `[ secs.usecs ]` at the start of a
+        // line (real dmesg format) — find at least one stamped record.
+        let s = ustd::klog();
+        s.lines().any(|l| {
+            let l = l.trim_start();
+            l.starts_with('[')
+                && l.find(']')
+                    .map(|i| {
+                        let inner = l[1..i].trim();
+                        inner.split('.').count() == 2
+                            && inner.chars().all(|c| c.is_ascii_digit() || c == '.')
+                    })
+                    .unwrap_or(false)
+        })
+    });
+    check("ethtool-mac", {
+        // /proc/net/mac reports the real virtio device MAC (52:54:00:*
+        // on QEMU user-net) — a full MAC shape, not zeros.
+        ustd::read_all("/proc/net/mac")
+            .map(|d| {
+                let m = String::from_utf8_lossy(&d);
+                let m = m.trim();
+                m.len() == 17
+                    && m.chars().nth(2) == Some(':')
+                    && m.chars().nth(5) == Some(':')
+                    && m != "00:00:00:00:00:00"
+            })
+            .unwrap_or(false)
+    });
     check("ipt-rpfilter", {
         // `-m rpfilter`: while a route back to the gw exists the rule
         // matches and drops; with the subnet route gone there's no
