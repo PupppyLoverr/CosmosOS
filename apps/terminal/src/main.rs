@@ -9276,6 +9276,7 @@ struct Term {
     nc: Option<ustd::TcpSock>,                         // `nc <ip> <port>` raw session
     nc_listen: Option<ustd::TcpListener>,              // `nc -l <port>` waiting for a client
     nc_udp: Option<(ustd::UdpSock, Option<([u8; 4], u16)>)>, // `nc -u`/`-lu` UDP session (peer learned)
+    nc_keep: Option<u16>,                                  // `nc -l -k`: re-arm the listen port after disconnect
     snc_fd: Option<i64>,                               // `snc <ip> <port>` — socket-fd raw session
     udpecho_fd: Option<i64>,                           // `udpecho <port>` — UDP socket-fd echo server
     dgrecv_fd: Option<i64>,                            // `dgrecv <path>` — AF_UNIX datagram mailbox
@@ -23605,19 +23606,25 @@ impl Term {
                         }
                         _ => self.fail("usage: nc -u <host|a.b.c.d> <port>  |  nc -lu <port>"),
                     }
-                } else if args.first().map(|s| *s) == Some("-l") {
-                    match args.get(1).and_then(|s| s.parse::<u16>().ok()) {
+                } else if listen {
+                    // nc -l [-k] <port>: -k keeps the listener alive —
+                    // a remote close or Esc on the session re-arms
+                    // the accept instead of ending the listener.
+                    let keep = args.iter().any(|a| *a == "-k");
+                    match pos.first().and_then(|s| s.parse::<u16>().ok()) {
                         Some(port) => match ustd::TcpListener::bind(port) {
                             Some(l) => {
                                 self.emit(&alloc::format!(
-                                    "nc: listening on :{} -- Esc cancels",
-                                    port
+                                    "nc: listening on :{}{} -- Esc cancels",
+                                    port,
+                                    if keep { " (-k)" } else { "" }
                                 ));
                                 self.nc_listen = Some(l);
+                                self.nc_keep = if keep { Some(port) } else { None };
                             }
                             None => self.fail(&alloc::format!("nc: listen :{} failed", port)),
                         },
-                        None => self.fail("usage: nc -l <port>"),
+                        None => self.fail("usage: nc -l [-k] <port>"),
                     }
                 } else {
                     match (
@@ -38679,7 +38686,9 @@ impl Term {
                 }
                 Some("n") | Some("neigh") | Some("neighbour") => {
                     // ip neigh [add <ip> lladdr <mac> dev eth0] [del <ip>]
-                    // [flush [dev eth0]] — real ops through /proc/net/arp
+                    // [flush [dev eth0]] — real ops through /proc/net/arp;
+                    // `ip neigh [show]` prints /proc/net/neigh with real
+                    // NUD states (REACHABLE/STALE/PERMANENT).
                     match args.get(1).copied() {
                         Some("add") => {
                             // ip neigh add <ip> lladdr <mac> [dev eth0]
@@ -38715,7 +38724,19 @@ impl Term {
                                 self.fail("ip: arp flush failed");
                             }
                         }
-                        _ => self.run(&String::from("arp")),
+                        _ => {
+                            // ip neigh / ip neigh show — NUD states
+                            match ustd::read_all("/proc/net/neigh") {
+                                Ok(d) => {
+                                    let t =
+                                        String::from_utf8_lossy(&d).into_owned();
+                                    for l in t.lines() {
+                                        self.emit(l);
+                                    }
+                                }
+                                Err(e) => self.fail(&alloc::format!("ip: {}", e)),
+                            }
+                        }
                     }
                 }
                 _ => self.fail("usage: ip a|addr | ip l|link [set eth0 up|down] | ip r|route [add|del ...] | ip n|neigh"),
@@ -38766,6 +38787,26 @@ impl Term {
                 let only_udp = args.iter().any(|a| *a == "-u");
                 let only_l = args.iter().any(|a| *a == "-l" || *a == "--listening");
                 let want_p = args.iter().any(|a| *a == "-p");
+                // `ss state <name>[,..]` — real state filter on the
+                // /proc/net/tcp st column (01 Open, 02 SynSent, 03 SynRecv,
+                // 0A Listen, 07 Closed).
+                let want_state: Option<Vec<u8>> = args
+                    .iter()
+                    .position(|a| *a == "state")
+                    .and_then(|i| args.get(i + 1))
+                    .map(|s| {
+                        s.split(',')
+                            .filter_map(|n| match n {
+                                "established" | "estab" | "connected" => Some(0x01u8),
+                                "syn-sent" | "syn_sent" => Some(0x02),
+                                "syn-recv" | "syn_recv" => Some(0x03),
+                                "time-wait" | "time_wait" => Some(0x06),
+                                "closed" => Some(0x07),
+                                "listening" | "listen" => Some(0x0A),
+                                _ => None,
+                            })
+                            .collect()
+                    });
                 if only_unix {
                     self.emit("Netid  State      Local Address:Path  Peer");
                     if let Ok(d) = ustd::read_all("/proc/net/unix") {
@@ -38846,6 +38887,17 @@ impl Term {
                                 && l.split_whitespace().nth(3) != Some("0A")
                             {
                                 continue;
+                            }
+                            // state <name>: filter on the real st column
+                            if let Some(st) = &want_state {
+                                let code = l
+                                    .split_whitespace()
+                                    .nth(3)
+                                    .and_then(|h| u8::from_str_radix(h, 16).ok())
+                                    .unwrap_or(0);
+                                if !st.contains(&code) {
+                                    continue;
+                                }
                             }
                             self.emit(&alloc::format!(
                                 "tcp  {}{}", l.trim(), owner_field(l)
@@ -39696,6 +39748,15 @@ impl Term {
                     self.cur.clear();
                     self.cx = 0;
                     self.push_line("nc: closed");
+                    // -k: Esc on the session drops the conn but the
+                    // listener re-arms for the next client.
+                    if let Some(p) = self.nc_keep {
+                        self.nc_listen = ustd::TcpListener::bind(p);
+                        self.push_line(&alloc::format!(
+                            "nc: listening again on :{} (-k)",
+                            p
+                        ));
+                    }
                 }
                 x if x == KeyCode::Enter as u32 => {
                     let _ = s.send(b"\r\n");
@@ -39802,9 +39863,10 @@ impl Term {
             self.dirty_all = true;
             return;
         }
-        // nc -l: Esc cancels the pending listen
+        // nc -l: Esc cancels the pending listen (and -k re-arms)
         if self.nc_listen.is_some() && k.key == KeyCode::Escape as u32 {
             self.nc_listen = None;
+            self.nc_keep = None;
             self.push_line("nc: listen cancelled");
             self.dirty_all = true;
             return;
@@ -41708,6 +41770,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         nc: None,
         nc_listen: None,
         nc_udp: None,
+        nc_keep: None,
         snc_fd: None,
         udpecho_fd: None,
         dgrecv_fd: None,
@@ -42215,6 +42278,15 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             if !alive {
                 t.nc = None;
                 t.push_line("nc: remote closed the connection");
+                // -k: the listener survives the disconnect and
+                // re-arms for the next client.
+                if let Some(p) = t.nc_keep {
+                    t.nc_listen = ustd::TcpListener::bind(p);
+                    t.push_line(&alloc::format!(
+                        "nc: listening again on :{} (-k)",
+                        p
+                    ));
+                }
                 t.dirty_all = true;
             }
         }
