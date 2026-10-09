@@ -22485,10 +22485,13 @@ impl Term {
                 None => self.fail("usage: usleep <microseconds>"),
             },
             "ping" => {
-                // ping [-c N] [-i ms] [-w ms] host -- count mode + summary
+                // ping [-c N] [-i ms] [-w ms] [-q] [-n] host -- count mode +
+                // summary. -q suppresses the per-packet lines (summary only);
+                // -n is numeric-only output (which we already are).
                 let mut cnt = 1u32;
                 let mut gap = 800u64;
                 let mut wto = 2000u64;
+                let mut quiet = false;
                 let mut target: Option<&str> = None;
                 let mut i = 0usize;
                 while i < args.len() {
@@ -22515,6 +22518,10 @@ impl Term {
                                 .unwrap_or(2000);
                             i += 2;
                         }
+                        "-q" | "-n" => {
+                            quiet = args[i] == "-q";
+                            i += 1;
+                        }
                         a => {
                             target = Some(a);
                             i += 1;
@@ -22522,7 +22529,7 @@ impl Term {
                     }
                 }
                 let Some(s) = target else {
-                    self.fail("usage: ping [-c n] [-i ms] [-w ms] <host|a.b.c.d>");
+                    self.fail("usage: ping [-c n] [-i ms] [-w ms] [-q] <host|a.b.c.d>");
                     return;
                 };
                 match host_arg(s) {
@@ -22535,21 +22542,31 @@ impl Term {
                             match ustd::net_ping(packed, wto) {
                                 Some(rtt) => {
                                     got += 1;
-                                    self.emit(&alloc::format!(
-                                        "reply from {}.{}.{}.{}: seq={} time={}ms",
-                                        a, b, c, d, n, rtt
-                                    ));
+                                    if !quiet {
+                                        self.emit(&alloc::format!(
+                                            "reply from {}.{}.{}.{}: seq={} time={}ms",
+                                            a, b, c, d, n, rtt
+                                        ));
+                                    }
                                 }
-                                None => self.emit(&alloc::format!(
-                                    "ping {}.{}.{}.{}: seq={} timeout",
-                                    a, b, c, d, n
-                                )),
+                                None => {
+                                    if !quiet {
+                                        self.emit(&alloc::format!(
+                                            "ping {}.{}.{}.{}: seq={} timeout",
+                                            a, b, c, d, n
+                                        ));
+                                    }
+                                }
                             }
                             if n + 1 < cnt {
                                 ustd::sleep_ms(gap);
                             }
                         }
-                        if cnt > 1 {
+                        if cnt > 1 || quiet {
+                            self.emit(&alloc::format!(
+                                "--- {}.{}.{}.{} ping statistics ---",
+                                a, b, c, d
+                            ));
                             self.emit(&alloc::format!(
                                 "{} sent, {} received ({}% loss)",
                                 cnt, got, (cnt - got) * 100 / cnt
@@ -25254,6 +25271,11 @@ impl Term {
                         }
                         Err(e) => self.fail(&alloc::format!("netstat: err {}", e)),
                     }
+                    return;
+                }
+                if args.iter().any(|a| *a == "-r" || *a == "--route") {
+                    // netstat -r: kernel routing table, classic header
+                    self.route_show(true);
                     return;
                 }
                 let only_l = args.iter().any(|a| *a == "-l");
@@ -32676,6 +32698,29 @@ impl Term {
                     }
                     Err(e) => self.fail(&alloc::format!("nstat: err {}", e)),
                 }
+                // /proc/net/snmp section pairs → "Name<Tab>value" lines,
+                // exactly what GNU nstat parses on a real Linux box.
+                if let Ok(d) = ustd::read_all("/proc/net/snmp") {
+                    let lines: Vec<String> = String::from_utf8_lossy(&d)
+                        .lines()
+                        .map(|l| String::from(l))
+                        .collect();
+                    let mut i = 0;
+                    while i + 1 < lines.len() {
+                        let h: Vec<&str> = lines[i].split_whitespace().collect();
+                        let v: Vec<&str> = lines[i + 1].split_whitespace().collect();
+                        i += 2;
+                        if h.len() < 2 || h[0] != v.first().copied().unwrap_or("") {
+                            continue;
+                        }
+                        for (k, val) in h.iter().zip(v.iter()).skip(1) {
+                            self.emit(&alloc::format!(
+                                "{}{:<18} {}",
+                                h[0].trim_end_matches(':'), k, val
+                            ));
+                        }
+                    }
+                }
             }
             "xclip" | "xsel" => {
                 // real kernel clipboard: -i loads stdin/file, -o prints it
@@ -37835,7 +37880,21 @@ impl Term {
                 }
             }
             "ethtool" => {
-                // ethtool [dev]: link state + real driver/rx/tx counters
+                // ethtool [dev]: link state + real driver/rx/tx counters.
+                // -i prints driver ident; -S prints the stat-name rows.
+                if args.iter().any(|a| *a == "-i" || *a == "--driver") {
+                    self.emit("driver: virtio-net");
+                    self.emit("version: 1.0");
+                    self.emit("firmware-version: ");
+                    self.emit("bus-info: virtio-pci (0000:00:04.0)");
+                    self.emit("supports-statistics: yes");
+                    self.emit("supports-test: no");
+                    self.emit("supports-eeprom-access: no");
+                    self.emit("supports-register-dump: no");
+                    self.emit("supports-priv-flags: no");
+                    return;
+                }
+                let stats = args.iter().any(|a| *a == "-S" || *a == "--statistics");
                 let up = ustd::read_all("/proc/net/operstate")
                     .map(|d| String::from_utf8_lossy(&d).trim().to_string())
                     .unwrap_or_else(|_| String::from("unknown"));
@@ -37862,6 +37921,15 @@ impl Term {
                             txp = f[9];
                         }
                     }
+                }
+                if stats {
+                    // ethtool -S: NIC stat rows from the same live counters
+                    self.emit("NIC statistics:");
+                    self.emit(&alloc::format!("     rx_bytes: {}", rxb));
+                    self.emit(&alloc::format!("     rx_packets: {}", rxp));
+                    self.emit(&alloc::format!("     tx_bytes: {}", txb));
+                    self.emit(&alloc::format!("     tx_packets: {}", txp));
+                    return;
                 }
                 self.emit("Settings for eth0:");
                 self.emit("\tDriver: virtio-net");
@@ -37926,6 +37994,16 @@ impl Term {
                                 self.fail("route: invalid or unrouteable spec");
                             }
                         }
+                        Some("get") => {
+                            // ip route get <ip>: real longest-prefix lookup
+                            // over /proc/net/route + the kernel's lo/bcast
+                            // delivery rules.
+                            let Some(dst) = args.get(2).copied() else {
+                                self.fail("usage: ip route get <ip>");
+                                return;
+                            };
+                            self.ip_route_get(dst);
+                        }
                         _ => self.route_show(false),
                     }
                 }
@@ -37935,6 +38013,44 @@ impl Term {
                 _ => self.fail("usage: ip a|addr | ip l|link [set eth0 up|down] | ip r|route [add|del ...] | ip n|neigh"),
             },
             "ss" => {
+                // -s: socket summary — real counts over /proc/net dumps
+                if args.iter().any(|a| *a == "-s" || *a == "--summary") {
+                    let rows = |p: &str| -> usize {
+                        ustd::read_all(p)
+                            .map(|d| {
+                                String::from_utf8_lossy(&d)
+                                    .lines()
+                                    .skip(1)
+                                    .filter(|l| !l.trim().is_empty())
+                                    .count()
+                            })
+                            .unwrap_or(0)
+                    };
+                    let (ntcp, nudp, nunix) = (
+                        rows("/proc/net/tcp"),
+                        rows("/proc/net/udp"),
+                        rows("/proc/net/unix"),
+                    );
+                    let listen = {
+                        let mut n = 0usize;
+                        if let Ok(d) = ustd::read_all("/proc/net/tcp") {
+                            for l in String::from_utf8_lossy(&d).lines().skip(1) {
+                                if l.contains(" 0A ") || l.contains("LISTEN") {
+                                    n += 1;
+                                }
+                            }
+                        }
+                        n
+                    };
+                    self.emit(&alloc::format!(
+                        "Total: {} (kernel 0)", ntcp + nudp + nunix
+                    ));
+                    self.emit(&alloc::format!("TCP:   {} (estab {}, closed 0, listen {})", ntcp, ntcp - listen, listen));
+                    self.emit(&alloc::format!("UDP:   {}", nudp));
+                    self.emit(&alloc::format!("RAW:   0"));
+                    self.emit(&alloc::format!("UNIX:  {}", nunix));
+                    return;
+                }
                 // socket snapshot over the kernel's /proc/net dumps;
                 // -p joins /proc/net/owners (hex local port -> real pid)
                 let only_unix = args.iter().any(|a| *a == "-x");
@@ -40190,6 +40306,77 @@ impl Term {
                     self.emit(&alloc::format!("{}/{} via {} dev {}", dest, plen, gw, dev));
                 }
             }
+        }
+    }
+
+    /// `ip route get <ip>`: longest-prefix match over the real
+    /// /proc/net/route table, plus the kernel's delivery rules — 127/8 and
+    /// our own address are local (dev lo), subnet/.255 and 255.255.255.255
+    /// are broadcast. Prints iproute2-style `via <gw> dev <dev> src <ip>`.
+    fn ip_route_get(&mut self, dst: &str) {
+        let oct: Vec<u8> = dst
+            .split('.')
+            .filter_map(|o| o.parse::<u8>().ok())
+            .collect();
+        if oct.len() != 4 {
+            self.fail(&alloc::format!("ip: bad address '{}'", dst));
+            return;
+        }
+        let (a, b, c, d) = (oct[0], oct[1], oct[2], oct[3]);
+        let my = ustd::net_info().map(|(_, i)| i).unwrap_or([0, 0, 0, 0]);
+        if a == 127 || [a, b, c, d] == my {
+            self.emit(&alloc::format!(
+                "local {}.{}.{}.{} dev lo src 127.0.0.1", a, b, c, d
+            ));
+            return;
+        }
+        let my_bcast = a == my[0] && b == my[1] && c == my[2] && d == 255;
+        if (a, b, c, d) == (255, 255, 255, 255) || my_bcast {
+            self.emit(&alloc::format!(
+                "broadcast {}.{}.{}.{} dev eth0 src {}.{}.{}.{}",
+                a, b, c, d, my[0], my[1], my[2], my[3]
+            ));
+            return;
+        }
+        let dip = ((a as u32) << 24) | ((b as u32) << 16) | ((c as u32) << 8) | d as u32;
+        let Ok(data) = ustd::read_all("/proc/net/route") else {
+            self.fail("ip: /proc/net/route unavailable");
+            return;
+        };
+        // LPM over the kernel table (hex fields are little-endian dwords)
+        let mut best: Option<(u32, String, String)> = None; // (plen, gw_dot, dev)
+        for l in String::from_utf8_lossy(&data).lines().skip(1) {
+            let f: Vec<&str> = l.split('\t').collect();
+            if f.len() < 8 {
+                continue;
+            }
+            let h2u = |h: &str| u32::from_str_radix(h, 16).unwrap_or(0);
+            let (dev, dest, gw, mask) =
+                (f[0], h2u(f[1]), h2u(f[2]), h2u(f[7]));
+            let mask_be = mask.swap_bytes();
+            let plen = mask_be.count_ones();
+            let dest_be = dest.swap_bytes();
+            if dip & mask_be == dest_be & mask_be {
+                let dot = |v: u32| alloc::format!(
+                    "{}.{}.{}.{}", v >> 24, (v >> 16) & 255, (v >> 8) & 255, v & 255
+                );
+                if best.as_ref().map(|(p, _, _)| plen > *p).unwrap_or(true) {
+                    best = Some((plen, dot(gw.swap_bytes()), String::from(dev)));
+                }
+            }
+        }
+        match best {
+            Some((_, gw, dev)) if gw == "0.0.0.0" => self.emit(&alloc::format!(
+                "{}.{}.{}.{} dev {} src {}.{}.{}.{}",
+                a, b, c, d, dev, my[0], my[1], my[2], my[3]
+            )),
+            Some((_, gw, dev)) => self.emit(&alloc::format!(
+                "{}.{}.{}.{} via {} dev {} src {}.{}.{}.{}",
+                a, b, c, d, gw, dev, my[0], my[1], my[2], my[3]
+            )),
+            None => self.fail(&alloc::format!(
+                "ip: {}.{}.{}.{}: no route to host", a, b, c, d
+            )),
         }
     }
 
