@@ -597,7 +597,11 @@ pub fn kill(pid: u32) -> bool {
 /// Ping an IPv4 host (a.b.c.d packed big-endian into u32).
 /// Returns round-trip ms, or None on timeout / no device.
 pub fn net_ping(ip: u32, timeout_ms: u64) -> Option<u64> {
-    let r = sc2(shared::SYS_NET_PING, ip as u64, timeout_ms);
+    net_ping_ttl(ip, timeout_ms, 0)
+}
+/// Ping with an explicit IPv4 TTL on the echo request (0 = ip_default_ttl).
+pub fn net_ping_ttl(ip: u32, timeout_ms: u64, ttl: u8) -> Option<u64> {
+    let r = sc3(shared::SYS_NET_PING, ip as u64, timeout_ms, ttl as u64);
     if r == u64::MAX { None } else { Some(r) }
 }
 /// Resolve a hostname to an IPv4 address via a real DNS query (UDP/53).

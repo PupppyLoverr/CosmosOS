@@ -19572,6 +19572,7 @@ impl Term {
                     }
                     i += 1;
                 }
+                let verbose = args.iter().any(|a| *a == "-v");
                 let Some(f) = file else {
                     self.fail("usage: tcpdump -r <file.pcap> [-c N]");
                     return;
@@ -19675,6 +19676,13 @@ impl Term {
                             let sip = ipstr(fr, 26);
                             let dip = ipstr(fr, 30);
                             let tlen = be16(fr, 16) as usize;
+                            // -v: real per-frame IPv4 TTL, like tcpdump -v's
+                            // "(ttl N, ...)" parenthetical
+                            let ttl_s = if verbose {
+                                alloc::format!("ttl {}, ", fr[22])
+                            } else {
+                                String::new()
+                            };
                             match proto {
                                 6 if fr.len() >= 14 + ihl + 20 => {
                                     let p = 14 + ihl;
@@ -19697,17 +19705,17 @@ impl Term {
                                     let payl =
                                         tlen.saturating_sub(ihl + 20);
                                     self.emit(&alloc::format!(
-                                        "{} IP {}.{} > {}.{}: Flags [{}], seq {}, ack {}, win {}, length {}",
+                                        "{} IP {}.{} > {}.{}: Flags [{}], {}seq {}, ack {}, win {}, length {}",
                                         ts_s, sip, sport, dip, dport,
-                                        fs, seq, ack, win, payl
+                                        fs, ttl_s, seq, ack, win, payl
                                     ));
                                 }
                                 17 if fr.len() >= 14 + ihl + 8 => {
                                     let p = 14 + ihl;
                                     self.emit(&alloc::format!(
-                                        "{} IP {}.{} > {}.{}: UDP, length {}",
+                                        "{} IP {}.{} > {}.{}: UDP, {}length {}",
                                         ts_s, sip, be16(fr, p),
-                                        dip, be16(fr, p + 2),
+                                        dip, be16(fr, p + 2), ttl_s,
                                         tlen.saturating_sub(ihl + 8)
                                     ));
                                 }
@@ -19726,8 +19734,8 @@ impl Term {
                                         _ => "icmp",
                                     };
                                     self.emit(&alloc::format!(
-                                        "{} IP {} > {}: ICMP {}, id {}, seq {}, length {}",
-                                        ts_s, sip, dip, tn,
+                                        "{} IP {} > {}: ICMP {}, {}id {}, seq {}, length {}",
+                                        ts_s, sip, dip, tn, ttl_s,
                                         be16(fr, p + 4),
                                         be16(fr, p + 6),
                                         tlen.saturating_sub(ihl + 8)
@@ -22492,6 +22500,7 @@ impl Term {
                 let mut gap = 800u64;
                 let mut wto = 2000u64;
                 let mut quiet = false;
+                let mut ttl = 0u8;
                 let mut target: Option<&str> = None;
                 let mut i = 0usize;
                 while i < args.len() {
@@ -22518,6 +22527,14 @@ impl Term {
                                 .unwrap_or(2000);
                             i += 2;
                         }
+                        "-t" => {
+                            // -t N: stamp the echo request's IPv4 TTL
+                            ttl = args
+                                .get(i + 1)
+                                .and_then(|x| x.parse::<u8>().ok())
+                                .unwrap_or(0);
+                            i += 2;
+                        }
                         "-q" | "-n" => {
                             quiet = args[i] == "-q";
                             i += 1;
@@ -22539,7 +22556,7 @@ impl Term {
                             | ((c as u32) << 8) | d as u32;
                         let mut got = 0u32;
                         for n in 0..cnt {
-                            match ustd::net_ping(packed, wto) {
+                            match ustd::net_ping_ttl(packed, wto, ttl) {
                                 Some(rtt) => {
                                     got += 1;
                                     if !quiet {
@@ -25314,7 +25331,7 @@ impl Term {
                     }
                     return;
                 }
-                let only_l = args.iter().any(|a| *a == "-l");
+                let only_l = args.iter().any(|a| *a == "-l" || *a == "--listening");
                 let tf = args.iter().any(|a| *a == "-t");
                 let uf = args.iter().any(|a| *a == "-u");
                 let want_p = args.iter().any(|a| *a == "-p");
@@ -34194,6 +34211,11 @@ impl Term {
                         Ok(_) => self.emit("iptables: rules flushed"),
                         Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                     }
+                } else if first == "-Z" || first == "--zero" {
+                    match ustd::write_all("/proc/net/iptables", b"Z\n") {
+                        Ok(_) => self.emit("iptables: counters zeroed"),
+                        Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
+                    }
                 } else if first == "-P" || first == "--policy" {
                     let verdict = args
                         .iter()
@@ -38303,6 +38325,7 @@ impl Term {
                 let only_unix = args.iter().any(|a| *a == "-x");
                 let only_tcp = args.iter().any(|a| *a == "-t");
                 let only_udp = args.iter().any(|a| *a == "-u");
+                let only_l = args.iter().any(|a| *a == "-l" || *a == "--listening");
                 let want_p = args.iter().any(|a| *a == "-p");
                 if only_unix {
                     self.emit("Netid  State      Local Address:Path  Peer");
@@ -38377,6 +38400,12 @@ impl Term {
                         let t = String::from_utf8_lossy(&d);
                         for l in t.lines().skip(1) {
                             if l.trim().is_empty() {
+                                continue;
+                            }
+                            // -l: LISTEN rows only (st field 3, hex 0A)
+                            if only_l
+                                && l.split_whitespace().nth(3) != Some("0A")
+                            {
                                 continue;
                             }
                             self.emit(&alloc::format!(

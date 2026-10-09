@@ -36,6 +36,22 @@ pub static ICMP_OUT_ECHOREP: AtomicU64 = AtomicU64::new(0);
 // net.ipv4 tunables (writable via /proc/sys/net/ipv4/*)
 static ICMP_IGNORE_ALL: AtomicU64 = AtomicU64::new(0);
 
+/// `net.ipv4.ip_default_ttl` — real default TTL stamped into every IPv4
+/// packet that leaves without an explicit per-send override.
+static DEF_TTL: AtomicU64 = AtomicU64::new(64);
+
+fn def_ttl() -> u8 {
+    DEF_TTL.load(Ordering::Relaxed) as u8
+}
+
+pub fn set_def_ttl(v: u64) {
+    DEF_TTL.store(v.clamp(1, 255), Ordering::Relaxed);
+}
+
+pub fn net_def_ttl() -> String {
+    alloc::format!("{}\n", DEF_TTL.load(Ordering::Relaxed))
+}
+
 /// Administrative interface state (`ifconfig eth0 up/down`). When down the
 /// rx pump drops every frame and transmit requests fail — a real carrier
 /// flag, not cosmetic.
@@ -246,6 +262,7 @@ struct FwRule {
     src: [u8; 4],         // [0;4] = anywhere
     smask: [u8; 4],
     hits: u64,
+    bytes: u64,
 }
 
 static FW: Mutex<Vec<FwRule>> = Mutex::new(Vec::new());
@@ -253,8 +270,10 @@ static FW: Mutex<Vec<FwRule>> = Mutex::new(Vec::new());
 /// INPUT chain policy: false = ACCEPT (default-allow), true = DROP.
 static FW_POLICY: Mutex<bool> = Mutex::new(false);
 
-/// true => drop this packet (a rule matched, or policy DROP)
-fn fw_dropped(src: [u8; 4], proto: u8, dport: u16) -> bool {
+/// true => drop this packet (a rule matched, or policy DROP).
+/// `plen` is the IPv4 payload length — it feeds the real per-rule
+/// byte counter shown by `iptables -L -v`.
+fn fw_dropped(src: [u8; 4], proto: u8, dport: u16, plen: u64) -> bool {
     let mut fw = FW.lock();
     for r in fw.iter_mut() {
         if r.proto != 0 && r.proto != proto {
@@ -271,6 +290,7 @@ fn fw_dropped(src: [u8; 4], proto: u8, dport: u16) -> bool {
             }
         }
         r.hits += 1;
+        r.bytes += plen;
         return true;
     }
     *FW_POLICY.lock()
@@ -279,7 +299,7 @@ fn fw_dropped(src: [u8; 4], proto: u8, dport: u16) -> bool {
 /// `/proc/net/iptables` — `iptables -L -n` listing (INPUT chain).
 pub fn net_iptables() -> String {
     let mut out = alloc::format!(
-        "Chain INPUT (policy {})\nnum  pkts target  prot  source       destination\n",
+        "Chain INPUT (policy {})\nnum  pkts bytes target  prot  source       destination\n",
         if *FW_POLICY.lock() { "DROP" } else { "ACCEPT" }
     );
     for (i, r) in FW.lock().iter().enumerate() {
@@ -301,9 +321,10 @@ pub fn net_iptables() -> String {
             String::new()
         };
         out.push_str(&alloc::format!(
-            "{:<4} {:<5} {:<8} {:<6} {:<12} 0.0.0.0/0{}\n",
+            "{:<4} {:<5} {:<6} {:<8} {:<6} {:<12} 0.0.0.0/0{}\n",
             i + 1,
             r.hits,
+            r.bytes,
             "DROP",
             proto,
             src,
@@ -475,6 +496,13 @@ pub fn iptables_ctl(line: &str) -> bool {
             FW.lock().clear();
             true
         }
+        Some("Z") => {
+            for r in FW.lock().iter_mut() {
+                r.hits = 0;
+                r.bytes = 0;
+            }
+            true
+        }
         Some("D") => {
             let n: usize = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             let mut fw = FW.lock();
@@ -504,7 +532,7 @@ pub fn iptables_ctl(line: &str) -> bool {
                 Some(n) => n.parse().unwrap_or(0),
                 None => return false,
             };
-            let mut r = FwRule { proto, dport: 0, src: [0; 4], smask: [0; 4], hits: 0 };
+            let mut r = FwRule { proto, dport: 0, src: [0; 4], smask: [0; 4], hits: 0, bytes: 0 };
             let mut ok = true;
             while let Some(k) = f.next() {
                 match k {
@@ -679,7 +707,7 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
         } else {
             0
         };
-        !fw_dropped(*src_ip, *proto, dport)
+        !fw_dropped(*src_ip, *proto, dport, p.len() as u64)
     });
     IP_IN_DELIV.fetch_add(out.len() as u64, Ordering::Relaxed);
     // ICMP: answer echo requests like a real host — wire or loopback;
@@ -893,6 +921,7 @@ fn send_frame(dst: [u8; 6], ethertype: u16, payload: &[u8]) -> Result<(), ()> {
     }
     TX_PKTS.fetch_add(1, Ordering::Relaxed);
     TX_BYTES.fetch_add(f.len() as u64, Ordering::Relaxed);
+    crate::pcap::log_frame(&f); // TX frames hit the capture too (tcpdump sees both directions)
     n.send(&f)
 }
 
@@ -932,7 +961,7 @@ fn send_arp_reply(dst_mac: [u8; 6], dst_ip: [u8; 4]) {
     let _ = send_frame(dst_mac, 0x0806, &p);
 }
 
-fn send_icmp_echo(dst_mac: [u8; 6], dst_ip: [u8; 4], id: u16, seq: u16, payload: &[u8]) {
+fn send_icmp_echo_ttl(dst_mac: [u8; 6], dst_ip: [u8; 4], id: u16, seq: u16, ttl: u8, payload: &[u8]) {
     ICMP_OUT_ECHOREQ.fetch_add(1, Ordering::Relaxed);
     let mut icmp = Vec::with_capacity(8 + payload.len());
     icmp.push(8); // echo request
@@ -943,7 +972,7 @@ fn send_icmp_echo(dst_mac: [u8; 6], dst_ip: [u8; 4], id: u16, seq: u16, payload:
     icmp.extend_from_slice(payload);
     let c = csum(&icmp);
     put16(&mut icmp[2..], c);
-    send_ip(dst_mac, dst_ip, 1, &icmp);
+    send_ip_src_ttl(our_ip(), dst_mac, dst_ip, 1, ttl, &icmp);
 }
 
 /// Handle one ethernet frame: ARP cache/reply, or deliver an IPv4 payload.
@@ -1095,7 +1124,8 @@ pub fn arp_stat() -> String {
 
 /// `ping <ip>`: ARP-resolve, send one ICMP echo request, wait for the reply.
 /// Returns rtt in milliseconds, or None on timeout/unreachable.
-pub fn ping(ip: [u8; 4], timeout_ms: u64) -> Option<u64> {
+/// `ttl` stamps the echo request's IPv4 TTL; 0 = ip_default_ttl.
+pub fn ping_ttl(ip: [u8; 4], timeout_ms: u64, ttl: u8) -> Option<u64> {
     if NET.lock().is_none() {
         sprintln!("[net] ping: no device");
         return None;
@@ -1113,7 +1143,7 @@ pub fn ping(ip: [u8; 4], timeout_ms: u64) -> Option<u64> {
     let seq = 1u16;
     let payload = b"cosmos-ping-payload-0123456789abcdef";
     let t0 = now_ms();
-    send_icmp_echo(dst_mac, ip, id, seq, payload);
+    send_icmp_echo_ttl(dst_mac, ip, id, seq, if ttl == 0 { def_ttl() } else { ttl }, payload);
     loop {
         for (_src_ip, proto, p) in pump_rx() {
             if proto == 1 && p.len() >= 8 && p[0] == 0 && be16(&p[4..]) == id && be16(&p[6..]) == seq {
@@ -1135,7 +1165,7 @@ fn send_ip(dst_mac: [u8; 6], dst_ip: [u8; 4], proto: u8, payload: &[u8]) {
 }
 
 fn send_ip_src(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], proto: u8, payload: &[u8]) {
-    send_ip_src_ttl(src_ip, dst_mac, dst_ip, proto, 64, payload)
+    send_ip_src_ttl(src_ip, dst_mac, dst_ip, proto, def_ttl(), payload)
 }
 
 fn send_ip_src_ttl(
@@ -1179,7 +1209,7 @@ fn send_ip_src_ttl(
 
 /// UDP send (IPv4 UDP checksum is optional — 0 means "none").
 fn send_udp(dst_mac: [u8; 6], dst_ip: [u8; 4], sport: u16, dport: u16, payload: &[u8]) {
-    send_udp_ttl(dst_mac, dst_ip, sport, dport, payload, 64)
+    send_udp_ttl(dst_mac, dst_ip, sport, dport, payload, def_ttl())
 }
 
 fn send_udp_ttl(
@@ -1761,7 +1791,7 @@ pub fn udp_peek(lport: u16) -> Option<([u8; 4], u16, Vec<u8>)> {
 
 /// Send a datagram from `lport` to `dst_ip:dst_port` (real ARP next-hop).
 pub fn udp_send(lport: u16, dst_ip: [u8; 4], dport: u16, payload: &[u8]) -> Result<(), i64> {
-    udp_send_ttl(lport, dst_ip, dport, payload, 64)
+    udp_send_ttl(lport, dst_ip, dport, payload, def_ttl())
 }
 
 /// `udp_send` with an explicit TTL — SO_IP_TTL / traceroute-grade probes.
