@@ -2313,7 +2313,13 @@ fn sys_mmap(size: u64, flags: u64, addr: u64) -> u64 {
     let fixed = flags & 1 != 0;
     // MAP_FIXED bound: inside the user mmap region — below the stack/argv
     // zone (USER_STACK region sits at ~0x7e00_0000+)
-    if fixed && (addr & 0xfff != 0 || addr >= 0x7e00_0000 || addr < 0x10_0000) {
+    // vm.mmap_min_addr: MAP_FIXED below the floor needs CAP_SYS_RAWIO.
+    let floor = if task::capable(task::CAP_SYS_RAWIO) {
+        0
+    } else {
+        crate::sysctl::mmap_min_addr()
+    };
+    if fixed && (addr & 0xfff != 0 || addr >= 0x7e00_0000 || addr < floor) {
         return 0;
     }
     // RLIMIT_AS (res 9): the new range must fit the task's total mapped
@@ -3866,7 +3872,13 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
 /// SYS_UNSHARE(flags): CLONE_NEWNS gives the task a private mount
 /// namespace — mounts/binds/unmounts stop propagating to the parent.
 fn sys_unshare(flags: u64) -> u64 {
-    if !task::capable(task::CAP_SYS_ADMIN) {
+    // kernel.unprivileged_userns_clone: a non-admin caller may unshare
+    // only a fresh user namespace (flags == exactly CLONE_NEWUSER) while
+    // the knob is on — every other combination needs CAP_SYS_ADMIN.
+    let admin = task::capable(task::CAP_SYS_ADMIN);
+    let unpriv_userns = crate::sysctl::unpriv_userns_clone() == 1
+        && flags == shared::CLONE_NEWUSER;
+    if !admin && !unpriv_userns {
         return (-1i64) as u64; // EPERM
     }
     let want = shared::CLONE_NEWNS

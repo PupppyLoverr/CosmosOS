@@ -31,6 +31,8 @@ pub struct Pipe {
     /// user-settable attribute bits (same layout as FAT: 0x01 = readonly);
     /// readonly fifos reject open-for-write, like a file's r-bit
     pub attr: u8,
+    /// euid at create — fs.protected_fifos compares openers against it
+    pub uid: u32,
 }
 
 static PIPES: Mutex<BTreeMap<String, Pipe>> = Mutex::new(BTreeMap::new());
@@ -96,9 +98,35 @@ pub fn create(path: &str) -> Result<(), i64> {
     }
     g.insert(
         String::from(path),
-        Pipe { buf: VecDeque::new(), writers: 0, readers: 0, readers_seen: false, mtime: crate::vfs::now_unix(), attr: 0 },
+        Pipe { buf: VecDeque::new(), writers: 0, readers: 0, readers_seen: false, mtime: crate::vfs::now_unix(), attr: 0, uid: crate::task::cred().0 },
     );
     Ok(())
+}
+
+/// fs.protected_fifos: an open of a fifo in a sticky, world-writable dir
+/// is denied unless the opener owns the fifo, owns the dir, is root, or
+/// holds CAP_FOWNER. v=1 gates O_WRONLY opens only, v=2 reads too.
+pub fn open_denied(path: &str, writer: bool) -> bool {
+    let v = crate::sysctl::protected_fifos();
+    if v == 0 || (v == 1 && !writer) {
+        return false;
+    }
+    let (eu, _eg) = crate::task::cred();
+    if eu == 0 || crate::task::capable_ns_dac(crate::task::CAP_FOWNER) {
+        return false;
+    }
+    let Some(owner) = PIPES.lock().get(path).map(|p| p.uid) else {
+        return false;
+    };
+    let parent = match path.rfind('/') {
+        Some(0) => "/",
+        Some(i) => &path[..i],
+        None => return false,
+    };
+    let Some((is_dir, mode, duid)) = crate::tmpfs::dir_meta(parent) else {
+        return false;
+    };
+    is_dir && mode & 0o1000 != 0 && mode & 0o002 != 0 && eu != owner && eu != duid
 }
 
 /// current attribute bits on a named pipe (mkfifo -m / chattr on a fifo)

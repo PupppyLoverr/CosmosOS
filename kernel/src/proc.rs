@@ -36,10 +36,10 @@ const NET_FILES: &[&str] = &[
 ];
 
 /// files under /proc/sys/kernel
-const SYS_FILES: &[&str] = &["hostname", "shmmax", "shmall", "shmmni", "ngroups_max", "sysrq", "dmesg_restrict", "randomize_va_space", "kptr_restrict", "cow_pages", "pid_max", "threads-max"];
+const SYS_FILES: &[&str] = &["hostname", "shmmax", "shmall", "shmmni", "ngroups_max", "sysrq", "dmesg_restrict", "randomize_va_space", "kptr_restrict", "unprivileged_userns_clone", "cow_pages", "pid_max", "threads-max"];
 
 /// files under /proc/sys/fs (fs/inotify/max_user_watches lives one deeper)
-const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size", "file-max", "file-nr", "protected_symlinks"];
+const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size", "file-max", "file-nr", "protected_symlinks", "protected_fifos"];
 
 /// files under /proc/sys/net/ipv4
 const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range"];
@@ -151,7 +151,9 @@ pub fn exists(path: &str) -> bool {
     if let Some(f) = path.strip_prefix("/proc/sys/vm/") {
         return f == "max_map_count"
             || f == "overcommit_memory"
-            || f == "overcommit_ratio";
+            || f == "overcommit_ratio"
+            || f == "mmap_min_addr"
+            || f == "min_free_kbytes";
     }
     if let Some(f) = path.strip_prefix("/proc/sys/kernel/") {
         if let Some(n) = f.strip_prefix("yama/") {
@@ -250,7 +252,7 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         return out;
     }
     if path == "/proc/sys/vm" {
-        for name in ["max_map_count", "overcommit_memory", "overcommit_ratio"] {
+        for name in ["max_map_count", "overcommit_memory", "overcommit_ratio", "mmap_min_addr", "min_free_kbytes"] {
             let mut de = shared::DirEntry::default();
             let nb = name.as_bytes();
             de.name[..nb.len()].copy_from_slice(nb);
