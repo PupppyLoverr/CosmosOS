@@ -1972,21 +1972,23 @@ pub fn dispatch(ctx: &mut CpuContext) {
             // a2 packs max_hops in the low byte; bit16 selects ICMP-mode
             // probes (traceroute -I — echo requests instead of UDP).
             // a5 packs opts: [0..16]=base port (0 → 33434, -p),
-            // [16..24]=first hop (-f), [24..]=per-hop wait ms (-w).
+            // [16..24]=first hop (-f), [24..56]=per-hop wait ms (-w),
+            // [56..64]=probes per hop (-q).
             let first = ((a5 >> 16) & 0xFF) as u8;
-            let per = match a5 >> 24 {
+            let per = match (a5 >> 24) & 0xFFFF_FFFF {
                 0 => 900, // unset → the historical default
                 v => v.max(50).min(30_000),
             };
+            let probes = ((a5 >> 56) as u8).max(1);
             let base = {
                 let b = (a5 & 0xFFFF) as u16;
                 if b == 0 { 33434 } else { b }
             };
             let maxh = (a2 as u8).max(1).min(30);
             let hops = if a2 & (1 << 16) != 0 {
-                net::net_trace_icmp(ip, first, maxh, per)
+                net::net_trace_icmp(ip, first, maxh, per, probes)
             } else {
-                net::net_trace(ip, first, maxh, per, base)
+                net::net_trace(ip, first, maxh, per, base, probes)
             };
             let mut buf = alloc::vec::Vec::with_capacity(hops.len() * 16);
             for (ttl, hop, reached) in hops {

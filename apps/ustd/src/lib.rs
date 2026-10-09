@@ -2622,10 +2622,11 @@ pub fn net_trace(
     ip: u32,
     max_hops: u8,
 ) -> alloc::vec::Vec<(u8, Option<([u8; 4], u64)>, bool)> {
-    net_trace_opts(ip, false, 1, max_hops, 0, 0)
+    net_trace_opts(ip, false, 1, max_hops, 0, 0, 1)
 }
 /// Traceroute with real options: `icmp` = -I probes, `first_hop` = -f,
-/// `base_port` = -p (0 → 33434), `per_ms` = -w wait per hop (0 → 900).
+/// `base_port` = -p (0 → 33434), `per_ms` = -w wait per hop (0 → 900),
+/// `probes` = -q datagrams sent per hop.
 pub fn net_trace_opts(
     ip: u32,
     icmp: bool,
@@ -2633,9 +2634,11 @@ pub fn net_trace_opts(
     max_hops: u8,
     base_port: u16,
     per_ms: u64,
+    probes: u8,
 ) -> alloc::vec::Vec<(u8, Option<([u8; 4], u64)>, bool)> {
     let mut buf = [0u8; 16 * 30];
-    let a5 = (base_port as u64) | ((first_hop as u64) << 16) | (per_ms << 24);
+    let a5 = (base_port as u64) | ((first_hop as u64) << 16) | (per_ms << 24)
+        | ((probes as u64) << 56);
     let n = sc5(
         shared::SYS_NET_TRACE,
         ip as u64,
@@ -2665,7 +2668,7 @@ pub fn net_trace_icmp(
     ip: u32,
     max_hops: u8,
 ) -> alloc::vec::Vec<(u8, Option<([u8; 4], u64)>, bool)> {
-    net_trace_opts(ip, true, 1, max_hops, 0, 0)
+    net_trace_opts(ip, true, 1, max_hops, 0, 0, 1)
 }
 
 /// fd-based TCP socket — poll/read/write/close all work on it.

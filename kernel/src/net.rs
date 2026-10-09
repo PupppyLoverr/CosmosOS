@@ -320,6 +320,8 @@ struct FwRule {
     smask: [u8; 4],
     src_range: Option<(u32, u32)>, // `-m iprange --src-range a-b` (be u32 bounds)
     sport: u16,           // `--sport` source-port match: 0 = any
+    len_lo: u32,          // `-m length --length A[:B]` — payload-size match
+    len_hi: u32,          // (len_hi == 0 => unlimited upper bound)
     iface: u8,            // `-i` in-interface: 0 = any, 1 = eth0, 2 = lo
     oiface: u8,           // `-o` out-interface: same encoding
     state: u8,            // 0 = any; bit0 = NEW, bit1 = ESTABLISHED
@@ -547,6 +549,11 @@ fn fw_eval(
             continue;
         }
         if r.dport != 0 && r.dport != dport {
+            continue;
+        }
+        // `-m length --length`: real match on the packet's transport
+        // payload length (plen is bytes as seen at the hook).
+        if r.len_hi != 0 && (plen < r.len_lo as u64 || plen > r.len_hi as u64) {
             continue;
         }
         // `-m multiport --dports`: real set match on the dest port
@@ -786,6 +793,16 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
     if r.sport != 0 {
         out.push_str(&alloc::format!(" --sport {}", r.sport));
     }
+    if r.len_hi != 0 {
+        if r.len_lo == r.len_hi {
+            out.push_str(&alloc::format!(" -m length --length {}", r.len_lo));
+        } else {
+            out.push_str(&alloc::format!(
+                " -m length --length {}:{}",
+                r.len_lo, r.len_hi
+            ));
+        }
+    }
     if let Some((lo, hi)) = r.src_range {
         let (lo, hi) = (lo.to_be_bytes(), hi.to_be_bytes());
         out.push_str(&alloc::format!(
@@ -921,6 +938,13 @@ fn fmt_fw_rule(out: &mut String, i: usize, r: &FwRule) {
     }
     if r.sport != 0 {
         extra.push_str(&alloc::format!("  spt:{}", r.sport));
+    }
+    if r.len_hi != 0 {
+        if r.len_lo == r.len_hi {
+            extra.push_str(&alloc::format!("  length {}", r.len_lo));
+        } else {
+            extra.push_str(&alloc::format!("  length {}:{}", r.len_lo, r.len_hi));
+        }
     }
     if r.limit_pps != 0 {
         extra.push_str(&alloc::format!(
@@ -1175,7 +1199,7 @@ fn fw_name_ok(n: &str) -> bool {
         "IN", "OUT", "INPUT", "OUTPUT", "FORWARD", "PREROUTING", "POSTROUTING",
         "icmp", "tcp", "udp", "all", "*", "dport", "multiport", "range", "src",
         "state", "limit", "lburst", "log", "reject", "accept", "return", "drop",
-        "iif", "oif", "sport",
+        "iif", "oif", "sport", "length",
     ];
     !n.is_empty()
         && n.len() <= 28
@@ -1551,6 +1575,8 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         smask: [0; 4],
         src_range: None,
         sport: 0,
+        len_lo: 0,
+        len_hi: 0,
         iface: 0,
         oiface: 0,
         state: 0,
@@ -1577,6 +1603,22 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
                 r.sport = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                 if r.sport == 0 {
                     ok = false;
+                }
+            }
+            // `-m length --length <a>[:<b>]` — real packet-size match
+            // on the transport payload length.
+            "length" => {
+                let spec = f.next().unwrap_or("");
+                let (a, b) = match spec.split_once(':') {
+                    Some((a, b)) => (a, b),
+                    None => (spec, spec), // bare N => exact length
+                };
+                match (a.parse::<u32>(), b.parse::<u32>()) {
+                    (Ok(lo), Ok(hi)) if lo <= hi => {
+                        r.len_lo = lo;
+                        r.len_hi = hi;
+                    }
+                    _ => ok = false,
                 }
             }
             // `-m iprange --src-range <a>-<b>`
@@ -1701,6 +1743,8 @@ fn fw_rule_eq(a: &FwRule, b: &FwRule) -> bool {
         && a.smask == b.smask
         && a.src_range == b.src_range
         && a.sport == b.sport
+        && a.len_lo == b.len_lo
+        && a.len_hi == b.len_hi
         && a.iface == b.iface
         && a.oiface == b.oiface
         && a.state == b.state
@@ -2033,19 +2077,24 @@ pub fn net_trace(
     max_hops: u8,
     per_ms: u64,
     base_port: u16,
+    probes: u8,
 ) -> Vec<(u8, Option<([u8; 4], u64)>, bool)> {
     let mut hops = Vec::new();
     let Some(mac) = next_hop(dst, 1500) else {
         return hops;
     };
     let first = first_hop.max(1).min(30);
+    let probes = probes.max(1).min(10);
     for ttl in first..=max_hops.min(30).max(first) {
         // `-p`: the UDP probe base port is real — dport = base + ttl,
         // and the ICMP matcher keys on the quoted dport so a non-
-        // default base still matches.
+        // default base still matches. `-q`: `probes` real datagrams
+        // leave per hop; the first answer back is the reported RTT.
         let dport = base_port.wrapping_add(ttl as u16);
         let t0 = now_ms();
-        send_udp_ttl(mac, dst, TRACER_SPORT, dport, b"cosmos-trace", ttl);
+        for _ in 0..probes {
+            send_udp_ttl(mac, dst, TRACER_SPORT, dport, b"cosmos-trace", ttl);
+        }
         let mut hit: Option<([u8; 4], bool)> = None;
         while now_ms() - t0 < per_ms && hit.is_none() {
             for (src_ip, proto, p) in pump_rx() {
@@ -2101,15 +2150,19 @@ pub fn net_trace_icmp(
     first_hop: u8,
     max_hops: u8,
     per_ms: u64,
+    probes: u8,
 ) -> Vec<(u8, Option<([u8; 4], u64)>, bool)> {
     let mut hops = Vec::new();
     let Some(mac) = next_hop(dst, 1500) else {
         return hops;
     };
     let first = first_hop.max(1).min(30);
+    let probes = probes.max(1).min(10);
     for ttl in first..=max_hops.min(30).max(first) {
         let t0 = now_ms();
-        send_icmp_echo_ttl(mac, dst, TRACER_EID, ttl as u16, ttl, b"cosmos-trace-icmp");
+        for _ in 0..probes {
+            send_icmp_echo_ttl(mac, dst, TRACER_EID, ttl as u16, ttl, b"cosmos-trace-icmp");
+        }
         let mut hit: Option<([u8; 4], bool)> = None;
         while now_ms() - t0 < per_ms && hit.is_none() {
             for (src_ip, proto, p) in pump_rx() {
