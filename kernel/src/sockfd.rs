@@ -473,7 +473,7 @@ pub fn listen(id: u64, backlog: usize) -> i64 {
         }
     }
     let lp = m.get(&id).unwrap().lport;
-    match crate::net::tcp_listen(lp) {
+    match crate::net::tcp_listen(lp, backlog) {
         Ok(()) => {
             m.get_mut(&id).unwrap().kind = Kind::TcpListener;
             0

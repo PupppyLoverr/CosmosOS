@@ -1091,7 +1091,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
             net::tcp_close(a1 as u16);
             0
         }
-        shared::SYS_NET_TCP_LISTEN => match net::tcp_listen(a1 as u16) {
+        shared::SYS_NET_TCP_LISTEN => match net::tcp_listen(a1 as u16, 128) {
             Ok(()) => 0,
             Err(_) => ERR,
         },
@@ -3889,6 +3889,14 @@ fn sys_unshare(flags: u64) -> u64 {
         | shared::CLONE_NEWUSER;
     if flags & !want != 0 {
         return (-22i64) as u64; // EINVAL: unsupported share bits
+    }
+    // user.max_user_namespaces: per-creator cap on live userns
+    // (0 = unlimited) — the Linux ucounts analogue.
+    if flags & shared::CLONE_NEWUSER != 0 {
+        let max = crate::sysctl::max_user_namespaces();
+        if max != 0 && task::userns_count_by(task::cred().0) >= max as usize {
+            return (-1i64) as u64; // EPERM
+        }
     }
     if flags & shared::CLONE_NEWNS != 0 {
         task::unshare_ns();

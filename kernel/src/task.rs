@@ -2644,6 +2644,16 @@ pub fn unshare_userns() {
     with_current(|t| t.user_ns = id);
 }
 
+/// How many user namespaces `euid` created — the count
+/// user.max_user_namespaces caps (the Linux ucounts analogue).
+pub fn userns_count_by(euid: u32) -> usize {
+    USERNS
+        .lock()
+        .values()
+        .filter(|u| u.lock().owner == euid)
+        .count()
+}
+
 /// setns on a userns object — caller moves in directly.
 pub fn set_userns(arc: alloc::sync::Arc<spin::Mutex<UserNs>>) {
     let id = arc.lock().id;

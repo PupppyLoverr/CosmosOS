@@ -2273,6 +2273,53 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         ustd::close(s);
         ok
     });
+    check("somaxconn", {
+        // net.core.somaxconn: the accept queue is bounded by
+        // min(listen backlog, somaxconn) — at qlen 1 a second
+        // completing handshake is refused with RST instead of
+        // queueing a conn nobody can accept.
+        let mut ok = ustd::write_all("/proc/sys/net/core/somaxconn", b"1").is_ok();
+        let l = ustd::TcpFd::listen(19090);
+        if ok && l.is_ok() {
+            let l = l.unwrap();
+            let c1 = ustd::TcpFd::connect([127, 0, 0, 1], 19090);
+            let c2 = ustd::TcpFd::connect([127, 0, 0, 1], 19090);
+            ok = c1.is_ok() && l.accept().is_ok();
+            // the second conn never queued — nonblocking accept is EAGAIN
+            ustd::fcntl(l.0, ustd::F_SETFL, ustd::O_NONBLOCK);
+            ok = ok && l.accept().is_err();
+            // and its side was refused: either connect caught the RST
+            // (ECONNREFUSED) or the fd it returned is already dead
+            let mut b = [0u8; 8];
+            ok = ok && match c2 {
+                Ok(fd) => fd.read(&mut b).is_err(),
+                Err(_) => true,
+            };
+            // restore the default — a fresh connect queues + accepts
+            let w2 = ustd::write_all("/proc/sys/net/core/somaxconn", b"4096").is_ok();
+            let c3 = ustd::TcpFd::connect([127, 0, 0, 1], 19090).is_ok();
+            let pw = ustd::poll(&[l.0 as u32], &[1], 2000);
+            let a3 = l.accept();
+            ok = ok && w2 && c3 && pw > 0 && a3.is_ok();
+        }
+        ok
+    });
+    check("userns-max", {
+        // user.max_user_namespaces: per-creator userns cap — at 1 a
+        // uid-1000 child's second CLONE_NEWUSER unshare gets EPERM.
+        ustd::write_all("/proc/sys/user/max_user_namespaces", b"1").is_ok()
+            && match ustd::fork() {
+                0 => {
+                    ustd::setuid(1000);
+                    let one = ustd::unshare(0x1000_0000) == 0;
+                    let two = ustd::unshare(0x1000_0000) == -1;
+                    ustd::exit(if one && two { 0 } else { 1 });
+                }
+                p if p > 0 => ustd::waitpid(p as u32, 5000).unwrap_or(-1) == 0,
+                _ => false,
+            }
+            && ustd::write_all("/proc/sys/user/max_user_namespaces", b"0").is_ok()
+    });
     check("dev-mem", {
         ustd::open("/dev/mem", 0)
             .map(|fd| {

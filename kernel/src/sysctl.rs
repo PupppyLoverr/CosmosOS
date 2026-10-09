@@ -34,6 +34,8 @@ static MIN_FREE_KB: AtomicU64 = AtomicU64::new(8192);
 static PROTECTED_FIFOS: AtomicU64 = AtomicU64::new(1);
 static PROTECTED_REGULAR: AtomicU64 = AtomicU64::new(0);
 static UNIX_MAX_QLEN: AtomicU64 = AtomicU64::new(64);
+static SOMAXCONN: AtomicU64 = AtomicU64::new(4096);
+static USER_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static ICMP_ECHO_IGNORE_BCAST: AtomicU64 = AtomicU64::new(1);
 static IP_FORWARD: AtomicU64 = AtomicU64::new(0);
 static KERNEL_SYSRQ: AtomicU64 = AtomicU64::new(1);
@@ -169,6 +171,16 @@ pub fn protected_regular() -> u64 {
 pub fn unix_max_dgram_qlen() -> u64 {
     UNIX_MAX_QLEN.load(Ordering::Relaxed)
 }
+/// net.core.somaxconn: per-listener accept-queue bound — the cap on
+/// queued completed handshakes is min(listen backlog, this value).
+pub fn somaxconn() -> u64 {
+    SOMAXCONN.load(Ordering::Relaxed)
+}
+/// user.max_user_namespaces: per-creator userns cap (Linux ucounts).
+/// 0 = unlimited, matching kernels that ship the knob unbounded.
+pub fn max_user_namespaces() -> u64 {
+    USER_NS_MAX.load(Ordering::Relaxed)
+}
 
 /// sysctl name under /proc/sys → current value, or None when unknown.
 /// Names are given relative, e.g. "kernel/pid_max", "fs/nr_open".
@@ -214,6 +226,8 @@ pub fn get(name: &str) -> Option<u64> {
         "fs/protected_fifos" => PROTECTED_FIFOS.load(Ordering::Relaxed),
         "fs/protected_regular" => PROTECTED_REGULAR.load(Ordering::Relaxed),
         "net/unix/max_dgram_qlen" => UNIX_MAX_QLEN.load(Ordering::Relaxed),
+        "net/core/somaxconn" => SOMAXCONN.load(Ordering::Relaxed),
+        "user/max_user_namespaces" => USER_NS_MAX.load(Ordering::Relaxed),
 
         _ => return None,
     })
@@ -275,6 +289,12 @@ pub fn set(name: &str, v: u64) -> bool {
         }
         "net/unix/max_dgram_qlen" if (1..=1024).contains(&v) => {
             UNIX_MAX_QLEN.store(v, Ordering::Relaxed)
+        }
+        "net/core/somaxconn" if (1..=65535).contains(&v) => {
+            SOMAXCONN.store(v, Ordering::Relaxed)
+        }
+        "user/max_user_namespaces" if v <= 65535 => {
+            USER_NS_MAX.store(v, Ordering::Relaxed)
         }
 
         _ => return false,
