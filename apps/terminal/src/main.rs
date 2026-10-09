@@ -20067,12 +20067,27 @@ impl Term {
                 // tcpdump -r <file.pcap> [-c N] — real libpcap decoder:
                 // per-record timestamp + eth/ARP/IPv4/ICMP/UDP/TCP fields.
                 let mut file: Option<&str> = None;
+                let mut wfile: Option<&str> = None;
+                let mut iface: Option<&str> = None;
                 let mut cap = usize::MAX;
                 let mut i = 0usize;
                 while i < args.len() {
                     match args[i] {
                         "-r" => {
                             file = args.get(i + 1).copied();
+                            i += 1;
+                        }
+                        "-w" => {
+                            wfile = args.get(i + 1).copied();
+                            i += 1;
+                        }
+                        "-i" | "--interface" => {
+                            // -i <iface>: live decode of the kernel
+                            // pcap ring. `lo` frames never reach the
+                            // tap (loopback bypasses the wire path),
+                            // so -i lo decodes an empty capture — the
+                            // real behavior on this stack.
+                            iface = args.get(i + 1).copied();
                             i += 1;
                         }
                         "-c" => {
@@ -20105,14 +20120,71 @@ impl Term {
                 // -A: real tcpdump flag — payload as printable ASCII
                 // (control bytes become dots), after the decoded line.
                 let show_atxt = args.iter().any(|a| *a == "-A");
-                let Some(f) = file else {
-                    self.fail("usage: tcpdump -r <file.pcap> [-c N]");
+                // Source: -r file, or the live kernel capture ring when
+                // -i/-w is given (ustd::pcap(4) = libpcap byte dump).
+                let live = file.is_none() && (iface.is_some() || wfile.is_some());
+                let d: Vec<u8> = if let Some(f) = file {
+                    match ustd::read_all(f) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            self.fail(&alloc::format!("tcpdump: {}: err", f));
+                            return;
+                        }
+                    }
+                } else if live {
+                    let mut buf = alloc::vec![0u8; 250 * 1024];
+                    let n = ustd::pcap(4, &mut buf);
+                    if n < 0 {
+                        self.fail("tcpdump: live capture unavailable");
+                        return;
+                    }
+                    if iface == Some("lo") {
+                        // real EN10MB pcap header, zero records — lo
+                        // traffic bypasses the wire tap on this stack.
+                        let mut h = alloc::vec![
+                            0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0,
+                            0, 0, 0, 0, 0, 0, 0, 0,
+                            0xff, 0xff, 0x00, 0x00, 1, 0, 0, 0,
+                        ];
+                        h
+                    } else {
+                        buf[..n as usize].to_vec()
+                    }
+                } else {
+                    self.fail("usage: tcpdump -r <file.pcap> | -i <iface> | -w <out.pcap> [-c N]");
                     return;
                 };
-                let Ok(d) = ustd::read_all(f) else {
-                    self.fail(&alloc::format!("tcpdump: {}: err", f));
+                if let Some(f) = wfile {
+                    // -w: real tcpdump flag — the captured records go
+                    // straight to a libpcap file.
+                    match ustd::write_all(f, &d) {
+                        Ok(_) => {
+                            let mut i = 24usize;
+                            let mut cnt = 0u64;
+                            while i + 16 <= d.len() {
+                                let cl = u32::from_le_bytes(
+                                    [d[i + 8], d[i + 9], d[i + 10], d[i + 11]],
+                                ) as usize;
+                                i += 16 + cl;
+                                cnt += 1;
+                            }
+                            self.emit(&alloc::format!(
+                                "tcpdump: {} packets captured -> {}",
+                                cnt, f
+                            ));
+                        }
+                        Err(e) => self.fail(&alloc::format!(
+                            "tcpdump: {}: err {}", f, e)),
+                    }
                     return;
-                };
+                }
+                if let Some(i_) = iface {
+                    self.emit(&alloc::format!(
+                        "tcpdump: listening on {}, link-type EN10MB (Ethernet)",
+                        i_
+                    ));
+                }
+                let f = file.unwrap_or("<live>");
                 if d.len() < 24 || &d[0..4] != b"\xd4\xc3\xb2\xa1" {
                     self.fail(&alloc::format!(
                         "tcpdump: {}: not a pcap file",
@@ -21134,6 +21206,21 @@ impl Term {
                                     ddata.as_deref().unwrap_or(""),
                                     enc
                                 ));
+                            }
+                            i += 1;
+                        }
+                        "-b" | "--cookie" => {
+                            // real curl flag — literal Cookie: header
+                            // on the wire ("name=v" or "n1=v1; n2=v2").
+                            if let Some(c) = args.get(i + 1) {
+                                xhdrs.push(alloc::format!("Cookie: {}", c));
+                            }
+                            i += 1;
+                        }
+                        "-r" | "--range" => {
+                            // real curl flag — Range: bytes=<spec>.
+                            if let Some(r) = args.get(i + 1) {
+                                xhdrs.push(alloc::format!("Range: bytes={}", r));
                             }
                             i += 1;
                         }
@@ -23392,6 +23479,7 @@ impl Term {
                 let mut cnt = 1u32;
                 let mut gap = 800u64;
                 let mut wto = 2000u64;
+                let mut deadline_ms = 0u64; // -w: real run deadline (0 = none)
                 let mut quiet = false;
                 let mut one_reply = false;
                 let mut bcast = false;
@@ -23424,10 +23512,14 @@ impl Term {
                             i += 2;
                         }
                         "-w" => {
-                            wto = args
+                            // -w N: real iputils flag — overall deadline
+                            // in SECONDS (distinct from -W's per-reply
+                            // wait). The loop exits when it expires.
+                            deadline_ms = args
                                 .get(i + 1)
-                                .and_then(|x| x.parse().ok())
-                                .unwrap_or(2000);
+                                .and_then(|x| x.parse::<f64>().ok())
+                                .map(|v| (v * 1000.0) as u64)
+                                .unwrap_or(0);
                             i += 2;
                         }
                         "-W" => {
@@ -23586,7 +23678,14 @@ impl Term {
                         let packed = ((a as u32) << 24) | ((b as u32) << 16)
                             | ((c as u32) << 8) | d as u32;
                         let mut got = 0u32;
+                        let run_t0 = ustd::uptime_ms();
                         for n in 0..cnt {
+                            // -w: the whole run ends at the deadline.
+                            if deadline_ms != 0
+                                && ustd::uptime_ms() - run_t0 >= deadline_ms
+                            {
+                                break;
+                            }
                             // `ping -I eth0 127.x`: loopback can't
                             // leave the wire iface — real iputils
                             // fails with EINVAL, not a timeout.
@@ -26638,9 +26737,65 @@ impl Term {
                 let first = args.first().copied().unwrap_or("-L");
                 match first {
                     "-L" | "--dump" | "-S" | "--stats" => {
+                        // real conntrack filters: -p proto, -s/-d orig
+                        // tuple, --reply-src/--reply-dst, --sport/--dport
+                        let getv = |flags: &[&str]| -> Option<String> {
+                            args.iter()
+                                .position(|a| flags.contains(a))
+                                .and_then(|i| args.get(i + 1))
+                                .map(|s| String::from(*s))
+                        };
+                        let fproto = getv(&["-p", "--proto", "--protocol"]);
+                        let fsrc = getv(&["-s", "--src", "--orig-src", "--source"]);
+                        let fdst = getv(&["-d", "--dst", "--orig-dst", "--destination"]);
+                        let frsrc = getv(&["--reply-src"]);
+                        let frdst = getv(&["--reply-dst"]);
+                        let fsport = getv(&["--sport", "--orig-port-src"]);
+                        let fdport = getv(&["--dport", "--orig-port-dst"]);
                         match ustd::read_all("/proc/net/nf_conntrack") {
                             Ok(d) => {
                                 for l in String::from_utf8_lossy(&d).lines() {
+                                    let f: Vec<&str> =
+                                        l.split_whitespace().collect();
+                                    if f.len() < 12 {
+                                        self.emit(l);
+                                        continue;
+                                    }
+                                    if let Some(p) = &fproto {
+                                        if f[0] != p {
+                                            continue;
+                                        }
+                                    }
+                                    if let Some(v) = &fsrc {
+                                        if f[4] != alloc::format!("src={}", v).as_str() {
+                                            continue;
+                                        }
+                                    }
+                                    if let Some(v) = &fdst {
+                                        if f[5] != alloc::format!("dst={}", v).as_str() {
+                                            continue;
+                                        }
+                                    }
+                                    if let Some(v) = &fsport {
+                                        if f[6] != alloc::format!("sport={}", v).as_str() {
+                                            continue;
+                                        }
+                                    }
+                                    if let Some(v) = &fdport {
+                                        if f[7] != alloc::format!("dport={}", v).as_str() {
+                                            continue;
+                                        }
+                                    }
+                                    if let Some(v) = &frsrc {
+                                        if f[8] != alloc::format!("src={}", v).as_str() {
+                                            continue;
+                                        }
+                                    }
+                                    if let Some(v) = &frdst {
+                                        if f[9] != alloc::format!("dst={}", v).as_str() {
+                                            continue;
+                                        }
+                                    }
                                     self.emit(l);
                                 }
                             }
@@ -40137,6 +40292,9 @@ impl Term {
                 // -i/--info: internal tcp state per conn — rtt/rto/
                 // retransmits from the kernel estimator (tcpinfo dump).
                 let want_i = args.iter().any(|a| *a == "-i" || *a == "--info");
+                // -m/--memory: real ss flag — per-socket queue memory,
+                // from the real tx_queue/rx_queue columns.
+                let want_m = args.iter().any(|a| *a == "-m" || *a == "--memory");
                 let mut tinfo: alloc::collections::BTreeMap<u64, Vec<String>> =
                     Default::default();
                 if want_i {
@@ -40216,8 +40374,20 @@ impl Term {
                                     continue;
                                 }
                             }
+                            let mem = if want_m {
+                                // fields: sl local rem st txq rxq ...
+                                let f: Vec<&str> =
+                                    l.split_whitespace().collect();
+                                alloc::format!(
+                                    "  skmem:(r{},w{})",
+                                    f.get(5).copied().unwrap_or("0"),
+                                    f.get(4).copied().unwrap_or("0"),
+                                )
+                            } else {
+                                String::new()
+                            };
                             self.emit(&alloc::format!(
-                                "tcp  {}{}", l.trim(), owner_field(l)
+                                "tcp  {}{}{}", l.trim(), mem, owner_field(l)
                             ));
                             // -i: the estimator's real numbers under the
                             // conn — rto/rtt/var + retransmit + queue
