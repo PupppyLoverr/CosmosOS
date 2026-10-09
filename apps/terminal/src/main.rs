@@ -7749,6 +7749,23 @@ fn dns_read_name(pkt: &[u8], pos: usize, depth: usize) -> Option<(String, usize)
 /// Real dig: build a wire-format DNS query, send it through UdpSock,
 /// parse the answer section. Returns display lines.
 fn dig_query(name: &str, qtype: u16, use_tcp: bool) -> Result<Vec<String>, String> {
+    dig_query_to(name, qtype, use_tcp, 3000, 1)
+}
+
+/// `+time`/`+tries` variant: retries the whole exchange on timeout —
+/// the real dig behavior (default 3s, 1 try on this build).
+fn dig_query_to(name: &str, qtype: u16, use_tcp: bool, t_ms: u64, tries: u32) -> Result<Vec<String>, String> {
+    let mut last = String::from("dig: no answer (timeout)");
+    for _ in 0..tries {
+        match dig_query_once(name, qtype, use_tcp, t_ms) {
+            Ok(v) => return Ok(v),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+fn dig_query_once(name: &str, qtype: u16, use_tcp: bool, t_ms: u64) -> Result<Vec<String>, String> {
     let mut q = Vec::with_capacity(64);
     q.extend_from_slice(&0x1a2bu16.to_be_bytes()); // id
     q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
@@ -7762,7 +7779,7 @@ fn dig_query(name: &str, qtype: u16, use_tcp: bool) -> Result<Vec<String>, Strin
     // `+tcp`: the same wire message over TCP/53 with the RFC 1035
     // two-byte length prefix — real stream transport, not UDP.
     let p = if use_tcp {
-        let sock = ustd::TcpSock::connect_timeout(15354, [10, 0, 2, 3], 53, 3000)
+        let sock = ustd::TcpSock::connect_timeout(15354, [10, 0, 2, 3], 53, t_ms)
             .ok_or_else(|| String::from("dig: tcp connect failed"))?;
         let mut m = Vec::with_capacity(q.len() + 2);
         m.extend_from_slice(&(q.len() as u16).to_be_bytes());
@@ -7779,7 +7796,7 @@ fn dig_query(name: &str, qtype: u16, use_tcp: bool) -> Result<Vec<String>, Strin
                 }
             }
             let chunk = sock
-                .recv(3000)
+                .recv(t_ms)
                 .ok_or_else(|| String::from("dig: no answer (timeout)"))?;
             buf.extend_from_slice(&chunk);
             if buf.len() > 66_000 {
@@ -7792,7 +7809,7 @@ fn dig_query(name: &str, qtype: u16, use_tcp: bool) -> Result<Vec<String>, Strin
         sock.send_to([10, 0, 2, 3], 53, &q)
             .ok_or_else(|| String::from("dig: send failed"))?;
         let (_, _, p) = sock
-            .recv_from(3000)
+            .recv_from(t_ms)
             .ok_or_else(|| String::from("dig: no answer (timeout)"))?;
         p
     };
@@ -8075,6 +8092,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut icmpt_spec = String::new();
     let mut dscp_spec = String::new();
     let mut syn_flag = false;
+    let mut recent_op = "";
+    let mut recent_name = String::from("DEFAULT");
+    let mut recent_secs = String::new();
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
     let mut jump = "DROP";
@@ -8168,6 +8188,19 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             // `-m tcp --syn` — real SYN-only flag match (bare flag).
             "--syn" => {
                 syn_flag = true;
+            }
+            // `-m recent` — real src-tracking list: --set records,
+            // --rcheck/--update gate on the --seconds window.
+            "--set" => recent_op = "rset",
+            "--rcheck" => recent_op = "rchk",
+            "--update" => recent_op = "rupd",
+            "--name" => {
+                recent_name = String::from(args.get(i + 1).copied().unwrap_or("DEFAULT"));
+                i += 1;
+            }
+            "--seconds" => {
+                recent_secs = String::from(args.get(i + 1).copied().unwrap_or("0"));
+                i += 1;
             }
             // `-m icmp --icmp-type <name|n>` — real ICMP-type match;
             // names map to their real type codes.
@@ -8382,6 +8415,18 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if syn_flag {
         line.push_str(" syn");
+    }
+    if !recent_op.is_empty() {
+        if recent_op == "rset" {
+            line.push_str(&alloc::format!(" rset {}", recent_name));
+        } else {
+            line.push_str(&alloc::format!(
+                " {} {} {}",
+                recent_op,
+                recent_name,
+                if recent_secs.is_empty() { "0" } else { &recent_secs }
+            ));
+        }
     }
     if !iif.is_empty() {
         line.push_str(&alloc::format!(" iif {}", iif));
@@ -9319,6 +9364,20 @@ fn mkdir_parents(path: &str) {
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// %-encoding per RFC 3986 (the `urlencode` command's codec, shared
+/// with `curl --data-urlencode`).
+fn urlenc_str(src: &str) -> String {
+    let mut o = String::new();
+    for b in src.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            o.push(b as char);
+        } else {
+            o.push_str(&alloc::format!("%{:02X}", b));
+        }
+    }
+    o
+}
 
 fn b64_encode(data: &[u8]) -> String {
     let mut out = String::new();
@@ -20006,6 +20065,13 @@ impl Term {
                             i += 1;
                         }
                         "-n" | "-q" | "-e" | "-v" | "-tt" | "-ttt" | "-x" | "-X" | "-A" => {}
+                        "-D" => {
+                            // -D: real tcpdump flag — list the capture
+                            // interfaces and exit.
+                            self.emit("1.lo");
+                            self.emit("2.eth0");
+                            return;
+                        }
                         _ => {}
                     }
                     i += 1;
@@ -20964,7 +21030,15 @@ impl Term {
                             i += 1;
                         }
                         "-d" | "--data" | "--data-ascii" => {
-                            ddata = args.get(i + 1).map(|s| String::from(*s));
+                            // repeated -d concatenates (real curl: '&'-joined)
+                            if let Some(d) = args.get(i + 1) {
+                                if let Some(prev) = &mut ddata {
+                                    prev.push('&');
+                                    prev.push_str(d);
+                                } else {
+                                    ddata = Some(String::from(*d));
+                                }
+                            }
                             i += 1;
                         }
                         "-H" | "--header" => {
@@ -20988,6 +21062,28 @@ impl Term {
                             // real curl flag — replaces the default
                             // User-Agent on the wire.
                             ua = args.get(i + 1).map(|u| String::from(*u));
+                            i += 1;
+                        }
+                        "--data-urlencode" => {
+                            // real curl flag — the value is URL-encoded
+                            // (a leading 'name=' or '@file' honored).
+                            if let Some(d) = args.get(i + 1) {
+                                let enc: String = if let Some((n, v)) =
+                                    d.split_once('=')
+                                {
+                                    alloc::format!("{}={}", n, urlenc_str(v))
+                                } else if let Some(p) = d.strip_prefix('@') {
+                                    let b = ustd::read_all(p).unwrap_or_default();
+                                    urlenc_str(&String::from_utf8_lossy(&b))
+                                } else {
+                                    urlenc_str(d)
+                                };
+                                ddata = Some(alloc::format!(
+                                    "{}{}",
+                                    ddata.as_deref().unwrap_or(""),
+                                    enc
+                                ));
+                            }
                             i += 1;
                         }
                         "-e" | "--referer" => {
@@ -31148,7 +31244,22 @@ impl Term {
                 // `+tcp`: real dig option — the query goes over TCP/53
                 // (RFC 1035 2-byte length-prefixed stream).
                 let use_tcp = args.iter().any(|a| *a == "+tcp");
-                match dig_query(name, qt, use_tcp) {
+                // `+time=N` (secs) / `+tries=N`: real dig options —
+                // per-try recv deadline and retry count on timeout.
+                let t_ms = args
+                    .iter()
+                    .find_map(|a| a.strip_prefix("+time="))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(3)
+                    .max(1)
+                    * 1000;
+                let tries = args
+                    .iter()
+                    .find_map(|a| a.strip_prefix("+tries="))
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(1)
+                    .max(1);
+                match dig_query_to(name, qt, use_tcp, t_ms, tries) {
                     Ok(lines) => {
                         for l in lines {
                             if short {
