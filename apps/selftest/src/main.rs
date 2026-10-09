@@ -2398,6 +2398,39 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                 .unwrap_or(false)
             && ustd::write_all("/proc/sys/net/ipv4/ip_nonlocal_bind", b"0").is_ok()
     });
+    check("tcp-syn-retries", {
+        // net.ipv4.tcp_syn_retries: cap on SYN sends during connect() —
+        // with the knob at 1 and an OUTPUT DROP on the probe port,
+        // connect() is ETIMEDOUT after the retry budget (~2s), far
+        // inside its 6s deadline.
+        let mut ok = ustd::write_all("/proc/sys/net/ipv4/tcp_syn_retries", b"1").is_ok()
+            && ustd::write_all("/proc/net/iptables", b"A OUT tcp dport 54321 drop\n").is_ok();
+        if ok {
+            let t0 = ustd::uptime_ms();
+            ok = matches!(ustd::TcpFd::connect([10, 0, 2, 2], 54321), Err(-110))
+                && (ustd::uptime_ms() - t0) < 5000;
+        }
+        ok && ustd::write_all("/proc/net/iptables", b"F OUT\n").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_syn_retries", b"6").is_ok()
+    });
+    check("tcp-tw-knobs", {
+        // net.ipv4.tcp_max_tw_buckets / tcp_fin_timeout /
+        // tcp_keepalive_{time,intvl,probes}: the TIME_WAIT + keepalive
+        // knobs round-trip through the proc files.
+        ustd::write_all("/proc/sys/net/ipv4/tcp_max_tw_buckets", b"8").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_fin_timeout", b"1").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_keepalive_time", b"30").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_keepalive_intvl", b"2").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_keepalive_probes", b"4").is_ok()
+            && ustd::read_all("/proc/sys/net/ipv4/tcp_max_tw_buckets")
+                .map(|d| String::from_utf8_lossy(&d).trim() == "8")
+                .unwrap_or(false)
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_max_tw_buckets", b"4096").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_fin_timeout", b"2").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_keepalive_time", b"15").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_keepalive_intvl", b"1").is_ok()
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_keepalive_probes", b"9").is_ok()
+    });
     check("domainname-sysctl", {
         // kernel.domainname: a real UTS-scoped string sysctl — round
         // trip through the proc file; empty restores the "(none)" value.

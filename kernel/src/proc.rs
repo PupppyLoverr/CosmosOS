@@ -56,7 +56,7 @@ const USER_SYS_FILES: &[&str] = &[
 ];
 
 /// files under /proc/sys/net/ipv4
-const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "tcp_wmem", "tcp_rmem", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range", "ip_nonlocal_bind"];
+const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "tcp_wmem", "tcp_rmem", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range", "ip_nonlocal_bind", "tcp_syn_retries", "tcp_fin_timeout", "tcp_max_tw_buckets", "tcp_keepalive_time", "tcp_keepalive_intvl", "tcp_keepalive_probes"];
 
 /// files under /proc/sys/net/ipv4/conf/all — a single-NIC box has one
 /// real per-interface sysctl set, surfaced as `all`.
@@ -1091,11 +1091,10 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
             .then_some(buf.len());
     }
     if let Some(rel) = path.strip_prefix("/proc/sys/net/ipv4/") {
-        if rel == "icmp_echo_ignore_broadcasts"
-            || rel == "ip_forward"
-            || rel == "ip_nonlocal_bind"
-            || rel.starts_with("conf/")
-        {
+        // every remaining flat or conf/* name forwards to the generic
+        // sysctl table — the multi-value files (tcp_wmem/tcp_rmem,
+        // ip_local_port_range) have their dedicated arms above.
+        if true {
             let s = String::from(String::from_utf8_lossy(buf).trim());
             let Ok(v) = s.parse::<u64>() else { return None };
             return crate::sysctl::set(
