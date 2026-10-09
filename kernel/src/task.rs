@@ -2249,6 +2249,8 @@ static NEXT_NS_ID: core::sync::atomic::AtomicU64 =
 pub struct MountNs {
     /// Stable inode-style id shown by /proc/<pid>/ns/mntns.
     pub id: u64,
+    /// Creator's euid — ucounts accounting for max_mnt_namespaces.
+    pub owner: u32,
     /// (mount path, opts) — MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC.
     pub tmpfs: Vec<(String, u64)>,
     /// (target, source, opts) bind aliases — longest-target-prefix first.
@@ -2257,10 +2259,17 @@ pub struct MountNs {
     pub detached: Vec<String>,
 }
 
+impl Drop for MountNs {
+    fn drop(&mut self) {
+        ns_live_dec(NsKind::Mnt, self.owner);
+    }
+}
+
 impl MountNs {
     fn new() -> Self {
         MountNs {
             id: NEXT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+            owner: 0,
             tmpfs: Vec::new(),
             binds: Vec::new(),
             detached: Vec::new(),
@@ -2281,6 +2290,14 @@ pub struct UtsNs {
     /// Stable inode-style id shown by /proc/<pid>/ns/uts.
     pub id: u64,
     pub hostname: String,
+    /// Creator's euid — ucounts accounting for max_uts_namespaces.
+    pub owner: u32,
+}
+
+impl Drop for UtsNs {
+    fn drop(&mut self) {
+        ns_live_dec(NsKind::Uts, self.owner);
+    }
 }
 
 static GLOBAL_UTS: spin::Once<alloc::sync::Arc<spin::Mutex<UtsNs>>> = spin::Once::new();
@@ -2291,6 +2308,7 @@ pub fn global_uts() -> alloc::sync::Arc<spin::Mutex<UtsNs>> {
             alloc::sync::Arc::new(spin::Mutex::new(UtsNs {
                 id: NEXT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
                 hostname: String::from("cosmos"),
+                owner: 0,
             }))
         })
         .clone()
@@ -2341,19 +2359,25 @@ pub fn ns_of() -> alloc::sync::Arc<spin::Mutex<MountNs>> {
 /// CLONE_NEWNS: deep-copy the mount tables into a private namespace —
 /// later mounts/binds/unmounts by this task don't touch the parent's.
 pub fn unshare_ns() {
+    let euid = cred().0;
     with_current(|t| {
         let mut copy = t.ns.lock().clone();
         // a new namespace object gets a fresh mntns id
         copy.id = NEXT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        copy.owner = euid;
+        ns_live_inc(NsKind::Mnt, euid);
         t.ns = alloc::sync::Arc::new(spin::Mutex::new(copy));
     });
 }
 
 /// unshare(CLONE_NEWUTS): the task's nodename becomes private.
 pub fn unshare_uts() {
+    let euid = cred().0;
     with_current(|t| {
         let mut copy = t.uts.lock().clone();
         copy.id = NEXT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        copy.owner = euid;
+        ns_live_inc(NsKind::Uts, euid);
         t.uts = alloc::sync::Arc::new(spin::Mutex::new(copy));
     });
 }
@@ -2363,9 +2387,17 @@ pub fn unshare_uts() {
 /// no registry entry — the global `Task.id` space is its pid space).
 pub struct PidNs {
     pub id: u64,
+    /// Creator's euid — ucounts accounting for max_pid_namespaces.
+    pub owner: u32,
     pub parent: u64,
     /// next virtual pid to hand out inside this namespace
     pub next_vpid: u32,
+}
+
+impl Drop for PidNs {
+    fn drop(&mut self) {
+        ns_live_dec(NsKind::Pid, self.owner);
+    }
 }
 
 /// Pid-namespace registry: id -> the shared object (nsfd pins keep it
@@ -2400,11 +2432,14 @@ pub fn alloc_nspid(ns: u64) -> u32 {
 pub fn unshare_pidns() {
     let me_ns = with_current(|t| t.pid_ns);
     let id = NEXT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let euid = cred().0;
     let ns = alloc::sync::Arc::new(spin::Mutex::new(PidNs {
         id,
+        owner: euid,
         parent: me_ns,
         next_vpid: 1,
     }));
+    ns_live_inc(NsKind::Pid, euid);
     PIDNS.lock().insert(id, ns);
     with_current(|t| t.child_ns = id);
 }
@@ -2437,8 +2472,15 @@ pub fn pid_ns_of(pid: u32) -> u64 {
 /// caller — matching the pidns model.
 pub struct TimeNs {
     pub id: u64,
+    /// Creator's euid — ucounts accounting for max_time_namespaces.
+    pub owner: u32,
     pub parent: u64,
     pub off_ticks: i64,
+}
+impl Drop for TimeNs {
+    fn drop(&mut self) {
+        ns_live_dec(NsKind::Time, self.owner);
+    }
 }
 static TIMENS: spin::Mutex<BTreeMap<u64, alloc::sync::Arc<spin::Mutex<TimeNs>>>> =
     spin::Mutex::new(BTreeMap::new());
@@ -2448,6 +2490,13 @@ static NEXT_TNS: AtomicU64 = AtomicU64::new(1);
 /// unshare(CLONE_NEWIPC) moves the caller immediately (unlike pidns).
 pub struct IpcNs {
     pub id: u64,
+    /// Creator's euid — ucounts accounting for max_ipc_namespaces.
+    pub owner: u32,
+}
+impl Drop for IpcNs {
+    fn drop(&mut self) {
+        ns_live_dec(NsKind::Ipc, self.owner);
+    }
 }
 static IPCNS: spin::Mutex<BTreeMap<u64, alloc::sync::Arc<spin::Mutex<IpcNs>>>> =
     spin::Mutex::new(BTreeMap::new());
@@ -2459,11 +2508,16 @@ pub fn unshare_timens() {
     let id = NEXT_TNS.fetch_add(1, Ordering::Relaxed);
     TIMENS.lock().insert(
         id,
-        alloc::sync::Arc::new(spin::Mutex::new(TimeNs {
-            id,
-            parent: me,
-            off_ticks: 0,
-        })),
+        {
+            let euid = cred().0;
+            ns_live_inc(NsKind::Time, euid);
+            alloc::sync::Arc::new(spin::Mutex::new(TimeNs {
+                id,
+                owner: euid,
+                parent: me,
+                off_ticks: 0,
+            }))
+        },
     );
     with_current(|t| t.child_tns = id);
 }
@@ -2577,7 +2631,11 @@ pub fn unshare_ipcns() {
     let id = NEXT_INS.fetch_add(1, Ordering::Relaxed);
     IPCNS.lock().insert(
         id,
-        alloc::sync::Arc::new(spin::Mutex::new(IpcNs { id })),
+        {
+            let euid = cred().0;
+            ns_live_inc(NsKind::Ipc, euid);
+            alloc::sync::Arc::new(spin::Mutex::new(IpcNs { id, owner: euid }))
+        },
     );
     with_current(|t| t.ipc_ns = id);
 }
@@ -2646,6 +2704,55 @@ pub fn unshare_userns() {
 
 /// How many user namespaces `euid` created — the count
 /// user.max_user_namespaces caps (the Linux ucounts analogue).
+/// Namespace kind for the user.max_*_namespaces ucounts knobs.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NsKind {
+    Mnt,
+    Uts,
+    Pid,
+    Ipc,
+    Time,
+}
+
+impl NsKind {
+    fn idx(self) -> u8 {
+        match self {
+            NsKind::Mnt => 0,
+            NsKind::Uts => 1,
+            NsKind::Pid => 2,
+            NsKind::Ipc => 3,
+            NsKind::Time => 4,
+        }
+    }
+}
+
+/// Live-namespace counts keyed by (kind, creator euid) — the ucounts
+/// analogue: unshare increments, Drop of the ns object decrements.
+static NS_LIVE: spin::Mutex<BTreeMap<(u8, u32), usize>> = spin::Mutex::new(BTreeMap::new());
+
+pub fn ns_live_inc(kind: NsKind, owner: u32) {
+    *NS_LIVE.lock().entry((kind.idx(), owner)).or_insert(0) += 1;
+}
+
+fn ns_live_dec(kind: NsKind, owner: u32) {
+    let mut m = NS_LIVE.lock();
+    if let Some(c) = m.get_mut(&(kind.idx(), owner)) {
+        *c = c.saturating_sub(1);
+        if *c == 0 {
+            m.remove(&(kind.idx(), owner));
+        }
+    }
+}
+
+/// Live namespace count created by `euid` for `kind`.
+pub fn ns_count_by(kind: NsKind, euid: u32) -> usize {
+    NS_LIVE
+        .lock()
+        .get(&(kind.idx(), euid))
+        .copied()
+        .unwrap_or(0)
+}
+
 pub fn userns_count_by(euid: u32) -> usize {
     USERNS
         .lock()

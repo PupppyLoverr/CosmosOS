@@ -36,6 +36,11 @@ static PROTECTED_REGULAR: AtomicU64 = AtomicU64::new(0);
 static UNIX_MAX_QLEN: AtomicU64 = AtomicU64::new(64);
 static SOMAXCONN: AtomicU64 = AtomicU64::new(4096);
 static USER_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static MNT_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static UTS_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static PID_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static IPC_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static TIME_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static ICMP_ECHO_IGNORE_BCAST: AtomicU64 = AtomicU64::new(1);
 static IP_FORWARD: AtomicU64 = AtomicU64::new(0);
 static KERNEL_SYSRQ: AtomicU64 = AtomicU64::new(1);
@@ -181,6 +186,26 @@ pub fn somaxconn() -> u64 {
 pub fn max_user_namespaces() -> u64 {
     USER_NS_MAX.load(Ordering::Relaxed)
 }
+/// user.max_mnt_namespaces — per-creator live mount-ns cap (0 = no cap).
+pub fn max_mnt_namespaces() -> u64 {
+    MNT_NS_MAX.load(Ordering::Relaxed)
+}
+/// user.max_uts_namespaces — per-creator live uts-ns cap (0 = no cap).
+pub fn max_uts_namespaces() -> u64 {
+    UTS_NS_MAX.load(Ordering::Relaxed)
+}
+/// user.max_pid_namespaces — per-creator live pid-ns cap (0 = no cap).
+pub fn max_pid_namespaces() -> u64 {
+    PID_NS_MAX.load(Ordering::Relaxed)
+}
+/// user.max_ipc_namespaces — per-creator live ipc-ns cap (0 = no cap).
+pub fn max_ipc_namespaces() -> u64 {
+    IPC_NS_MAX.load(Ordering::Relaxed)
+}
+/// user.max_time_namespaces — per-creator live time-ns cap (0 = no cap).
+pub fn max_time_namespaces() -> u64 {
+    TIME_NS_MAX.load(Ordering::Relaxed)
+}
 
 /// sysctl name under /proc/sys → current value, or None when unknown.
 /// Names are given relative, e.g. "kernel/pid_max", "fs/nr_open".
@@ -228,6 +253,11 @@ pub fn get(name: &str) -> Option<u64> {
         "net/unix/max_dgram_qlen" => UNIX_MAX_QLEN.load(Ordering::Relaxed),
         "net/core/somaxconn" => SOMAXCONN.load(Ordering::Relaxed),
         "user/max_user_namespaces" => USER_NS_MAX.load(Ordering::Relaxed),
+        "user/max_mnt_namespaces" => MNT_NS_MAX.load(Ordering::Relaxed),
+        "user/max_uts_namespaces" => UTS_NS_MAX.load(Ordering::Relaxed),
+        "user/max_pid_namespaces" => PID_NS_MAX.load(Ordering::Relaxed),
+        "user/max_ipc_namespaces" => IPC_NS_MAX.load(Ordering::Relaxed),
+        "user/max_time_namespaces" => TIME_NS_MAX.load(Ordering::Relaxed),
 
         _ => return None,
     })
@@ -295,6 +325,21 @@ pub fn set(name: &str, v: u64) -> bool {
         }
         "user/max_user_namespaces" if v <= 65535 => {
             USER_NS_MAX.store(v, Ordering::Relaxed)
+        }
+        "user/max_mnt_namespaces" if v <= 65535 => {
+            MNT_NS_MAX.store(v, Ordering::Relaxed)
+        }
+        "user/max_uts_namespaces" if v <= 65535 => {
+            UTS_NS_MAX.store(v, Ordering::Relaxed)
+        }
+        "user/max_pid_namespaces" if v <= 65535 => {
+            PID_NS_MAX.store(v, Ordering::Relaxed)
+        }
+        "user/max_ipc_namespaces" if v <= 65535 => {
+            IPC_NS_MAX.store(v, Ordering::Relaxed)
+        }
+        "user/max_time_namespaces" if v <= 65535 => {
+            TIME_NS_MAX.store(v, Ordering::Relaxed)
         }
 
         _ => return false,

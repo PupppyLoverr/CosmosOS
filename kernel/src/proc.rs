@@ -45,7 +45,14 @@ const NET_UNIX_FILES: &[&str] = &["max_dgram_qlen"];
 /// files under /proc/sys/net/core
 const NET_CORE_FILES: &[&str] = &["somaxconn"];
 /// files under /proc/sys/user
-const USER_SYS_FILES: &[&str] = &["max_user_namespaces"];
+const USER_SYS_FILES: &[&str] = &[
+    "max_user_namespaces",
+    "max_mnt_namespaces",
+    "max_uts_namespaces",
+    "max_pid_namespaces",
+    "max_ipc_namespaces",
+    "max_time_namespaces",
+];
 
 /// files under /proc/sys/net/ipv4
 const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range"];
