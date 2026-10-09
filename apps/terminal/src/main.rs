@@ -8414,7 +8414,7 @@ fn mkisofs_build(
     // root dir sector: "." ".." then root children + subdir records
     let mut root_dir: Vec<u8> = Vec::new();
     iso_dirrec(&mut root_dir, lba_root, 2048, true, &[0], d7);
-    iso_dirrec(&mut root_dir, lba_root, 2048, true, &[1, 1], d7);
+    iso_dirrec(&mut root_dir, lba_root, 2048, true, &[1], d7);
     for (i, (name, _)) in files.iter().enumerate() {
         iso_dirrec(
             &mut root_dir,
@@ -8440,7 +8440,7 @@ fn mkisofs_build(
     for (i, (_, ch)) in dirs.iter().enumerate() {
         let mut dsec: Vec<u8> = Vec::new();
         iso_dirrec(&mut dsec, dir_lbas[i], 2048, true, &[0], d7);
-        iso_dirrec(&mut dsec, lba_root, 2048, true, &[1, 1], d7);
+        iso_dirrec(&mut dsec, lba_root, 2048, true, &[1], d7);
         for (j, (name, _)) in ch.iter().enumerate() {
             iso_dirrec(
                 &mut dsec,
@@ -8707,6 +8707,116 @@ impl FatVol {
                 return None;
             }
             clus = fc;
+        }
+        None
+    }
+}
+
+/// Read-only ISO9660 volume descriptor — isols/isocat walk dirs and
+/// extract file extents; pairs with the mkisofs writer for round-trip.
+struct IsoVol {
+    fd: i64,
+    root_lba: u32,
+    root_size: u32,
+    volid: String,
+    nsec: u32,
+}
+
+fn iso_vol_open(img: &str) -> Option<IsoVol> {
+    let fd = ustd::open(img, ustd::O_RDONLY).ok()?;
+    let mut pvd = [0u8; 2048];
+    if !pread_all(fd, 16 * 2048, &mut pvd)
+        || pvd[0] != 1
+        || &pvd[1..6] != b"CD001"
+    {
+        ustd::close(fd);
+        return None;
+    }
+    let nsec = u32::from_le_bytes([pvd[80], pvd[81], pvd[82], pvd[83]]);
+    let volid =
+        String::from_utf8_lossy(&pvd[40..72]).trim().to_string();
+    // inline root dir record at 156: lba@2..6 LE, size@10..14 LE
+    let root_lba = u32::from_le_bytes([
+        pvd[158], pvd[159], pvd[160], pvd[161],
+    ]);
+    let root_size = u32::from_le_bytes([
+        pvd[166], pvd[167], pvd[168], pvd[169],
+    ]);
+    Some(IsoVol { fd, root_lba, root_size, volid, nsec })
+}
+
+impl IsoVol {
+    /// Dump (name, is_dir, lba, size) rows for the dir extent at lba/size.
+    /// Names carry the raw ISO id — `;1` version suffix stripped for files.
+    fn dir(&self, lba: u32, size: u32) -> Vec<(String, bool, u32, u32)> {
+        let mut out = Vec::new();
+        let nsec = (size + 2047) / 2048;
+        let mut d = alloc::vec![0u8; (nsec * 2048) as usize];
+        if !pread_all(self.fd, lba as u64 * 2048, &mut d) {
+            return out;
+        }
+        let mut i = 0usize;
+        while i < size as usize && i + 34 <= d.len() {
+            let len = d[i] as usize;
+            if len == 0 {
+                i = (i / 2048 + 1) * 2048; // records don't cross sectors
+                continue;
+            }
+            if i + len > d.len() {
+                break;
+            }
+            let e = &d[i..i + len];
+            let elba =
+                u32::from_le_bytes([e[2], e[3], e[4], e[5]]);
+            let esz = u32::from_le_bytes([e[10], e[11], e[12], e[13]]);
+            let is_dir = e[25] & 0x02 != 0;
+            let nlen = e[32] as usize;
+            i += len; // advance BEFORE the . / .. skip below
+            if (nlen == 1 && (e[33] == 0 || e[33] == 1))
+                || (nlen == 2 && e[33] == 1 && e[34] == 1)
+            {
+                continue; // . and .. (both encodings)
+            }
+            let nm = String::from_utf8_lossy(
+                &e[33..33 + nlen.min(len.saturating_sub(33))],
+            )
+            .to_string();
+            out.push((nm, is_dir, elba, esz));
+        }
+        out
+    }
+    /// Resolve a /-separated path inside the image.
+    fn find(&self, path: &str) -> Option<(u32, u32, bool)> {
+        let comps: Vec<(String, String)> = path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| (iso_name(s, true), iso_name(s, false)))
+            .collect();
+        if comps.is_empty() {
+            return Some((self.root_lba, self.root_size, true));
+        }
+        let mut lba = self.root_lba;
+        let mut size = self.root_size;
+        for (i, (dfrm, ffrm)) in comps.iter().enumerate() {
+            let mut hit = None;
+            for (nm, is_dir, elba, esz) in self.dir(lba, size) {
+                // dirs store bare ISO ids; files carry the ;1 form
+                if nm.eq_ignore_ascii_case(dfrm)
+                    || nm.eq_ignore_ascii_case(ffrm)
+                {
+                    hit = Some((elba, esz, is_dir));
+                    break;
+                }
+            }
+            let (elba, esz, is_dir) = hit?;
+            if i + 1 == comps.len() {
+                return Some((elba, esz, is_dir));
+            }
+            if !is_dir {
+                return None;
+            }
+            lba = elba;
+            size = esz;
         }
         None
     }
@@ -12522,7 +12632,7 @@ impl Term {
             "mkfs", "mkfs.vfat", "blkid", "vol", "fsck", "fsck.vfat",
             "wipefs", "isosize", "losetup", "fatlabel", "volname",
             "badblocks", "mkisofs", "genisoimage", "xorrisofs",
-            "filefrag", "freefrag",
+            "filefrag", "freefrag", "isols", "isocat", "fatls", "fatget",
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look", "fmt",
         "pwck", "grpck", "pathchk", "nslookup", "b2sum",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
@@ -31666,6 +31776,286 @@ impl Term {
                     }
                 }
             }
+            "isols" => {
+                // isols <img.iso> [dir]: list ISO9660 contents — real dir
+                // record walk (`;1` version names shown as stored).
+                let img = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .copied()
+                    .unwrap_or("");
+                if img.is_empty() {
+                    self.fail("usage: isols <img.iso> [dir]");
+                    return;
+                }
+                let v = match iso_vol_open(img) {
+                    Some(v) => v,
+                    None => {
+                        self.fail(&alloc::format!(
+                            "isols: {}: not ISO9660",
+                            img
+                        ));
+                        return;
+                    }
+                };
+                self.emit(&alloc::format!(
+                    "{}: volume '{}' ({} sectors)",
+                    img, v.volid, v.nsec
+                ));
+                let dir = args.get(1).copied().unwrap_or("/");
+                match v.find(dir) {
+                    Some((lba, size, true)) => {
+                        for (nm, is_dir, _, esz) in v.dir(lba, size) {
+                            self.emit(&alloc::format!(
+                                "{}{}{}",
+                                nm,
+                                if is_dir { "/" } else { "" },
+                                if is_dir {
+                                    String::new()
+                                } else {
+                                    alloc::format!(" ({} B)", esz)
+                                }
+                            ));
+                        }
+                    }
+                    Some((_, _, false)) => {
+                        self.emit(&alloc::format!("{}: file", dir));
+                    }
+                    None => {
+                        self.fail(&alloc::format!(
+                            "isols: {}: not found",
+                            dir
+                        ));
+                    }
+                }
+                ustd::close(v.fd);
+            }
+            "isocat" => {
+                // isocat <img.iso> <isofile> [out]: extract a file's real
+                // extent bytes to stdout (or a host file with `out`).
+                let pos: Vec<&str> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .copied()
+                    .collect();
+                if pos.len() < 2 {
+                    self.fail("usage: isocat <img.iso> <isofile> [out]");
+                    return;
+                }
+                let v = match iso_vol_open(pos[0]) {
+                    Some(v) => v,
+                    None => {
+                        self.fail(&alloc::format!(
+                            "isocat: {}: not ISO9660",
+                            pos[0]
+                        ));
+                        return;
+                    }
+                };
+                match v.find(pos[1]) {
+                    Some((lba, size, false)) => {
+                        let nsec = (size + 2047) / 2048;
+                        let mut d = alloc::vec![0u8; (nsec * 2048) as usize];
+                        let ok = pread_all(v.fd, lba as u64 * 2048, &mut d);
+                        ustd::close(v.fd);
+                        if !ok {
+                            self.fail("isocat: extent read failed");
+                            return;
+                        }
+                        let data = &d[..size as usize];
+                        match pos.get(2) {
+                            Some(out) => {
+                                match ustd::open(
+                                    out,
+                                    ustd::O_WRONLY
+                                        | ustd::O_CREATE
+                                        | ustd::O_TRUNC,
+                                ) {
+                                    Ok(fd) => {
+                                        let w = ustd::write(fd, data);
+                                        ustd::close(fd);
+                                        match w {
+                                            Err(e) => self.fail(
+                                                &alloc::format!(
+                                                    "isocat: write: {}",
+                                                    e
+                                                ),
+                                            ),
+                                            Ok(_) => self.emit(
+                                                &alloc::format!(
+                                                    "{} -> {} ({} bytes)",
+                                                    pos[1], out, size
+                                                ),
+                                            ),
+                                        }
+                                    }
+                                    Err(e) => self.fail(&alloc::format!(
+                                        "isocat: {}: err {}",
+                                        out, e
+                                    )),
+                                }
+                            }
+                            None => self.emit(
+                                &String::from_utf8_lossy(data),
+                            ),
+                        }
+                    }
+                    Some((_, _, true)) => {
+                        ustd::close(v.fd);
+                        self.fail(&alloc::format!(
+                            "isocat: {}: is a directory",
+                            pos[1]
+                        ));
+                    }
+                    None => {
+                        ustd::close(v.fd);
+                        self.fail(&alloc::format!(
+                            "isocat: {}: not found",
+                            pos[1]
+                        ));
+                    }
+                }
+            }
+            "fatls" => {
+                // fatls <img> [dir]: LFN-aware listing of a FAT image.
+                let img = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .copied()
+                    .unwrap_or("/dev/vda");
+                let v = match fat_vol_open(img) {
+                    Some(v) => v,
+                    None => {
+                        self.fail(&alloc::format!(
+                            "fatls: {}: not a FAT image",
+                            img
+                        ));
+                        return;
+                    }
+                };
+                let dir = args.get(1).copied().unwrap_or("/");
+                match v.find(dir) {
+                    Some((fc, _, true)) => {
+                        for (n, attr, _, sz) in v.dir_entries(fc) {
+                            self.emit(&alloc::format!(
+                                "{}{}{}",
+                                n,
+                                if attr & 0x10 != 0 { "/" } else { "" },
+                                if attr & 0x10 != 0 {
+                                    String::new()
+                                } else {
+                                    alloc::format!(" ({} B)", sz)
+                                }
+                            ));
+                        }
+                    }
+                    Some((_, sz, false)) => self.emit(&alloc::format!(
+                        "{}: file ({} B)",
+                        dir, sz
+                    )),
+                    None => self.fail(&alloc::format!(
+                        "fatls: {}: not found",
+                        dir
+                    )),
+                }
+                ustd::close(v.fd);
+            }
+            "fatget" => {
+                // fatget <img> <in-img-file> [out]: extract a file's bytes
+                // via its cluster chain — real on-disk data.
+                let pos: Vec<&str> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .copied()
+                    .collect();
+                if pos.len() < 2 {
+                    self.fail("usage: fatget <img> <file> [out]");
+                    return;
+                }
+                let v = match fat_vol_open(pos[0]) {
+                    Some(v) => v,
+                    None => {
+                        self.fail(&alloc::format!(
+                            "fatget: {}: not a FAT image",
+                            pos[0]
+                        ));
+                        return;
+                    }
+                };
+                match v.find(pos[1]) {
+                    Some((fc, size, false)) => {
+                        let kib = (v.spc * v.bps) as usize;
+                        let mut data: Vec<u8> = Vec::new();
+                        let mut read_ok = true;
+                        for c in v.chain(fc) {
+                            let mut d = alloc::vec![0u8; kib];
+                            if !pread_all(v.fd, v.clus_off(c), &mut d) {
+                                read_ok = false;
+                                break;
+                            }
+                            data.extend_from_slice(&d);
+                        }
+                        ustd::close(v.fd);
+                        if !read_ok {
+                            self.fail("fatget: cluster read failed");
+                            return;
+                        }
+                        data.truncate(size as usize);
+                        match pos.get(2) {
+                            Some(out) => {
+                                match ustd::open(
+                                    out,
+                                    ustd::O_WRONLY
+                                        | ustd::O_CREATE
+                                        | ustd::O_TRUNC,
+                                ) {
+                                    Ok(fd) => {
+                                        let w = ustd::write(fd, &data);
+                                        ustd::close(fd);
+                                        match w {
+                                            Err(e) => self.fail(
+                                                &alloc::format!(
+                                                    "fatget: write: {}",
+                                                    e
+                                                ),
+                                            ),
+                                            Ok(_) => self.emit(
+                                                &alloc::format!(
+                                                    "{} -> {} ({} bytes)",
+                                                    pos[1],
+                                                    out,
+                                                    data.len()
+                                                ),
+                                            ),
+                                        }
+                                    }
+                                    Err(e) => self.fail(&alloc::format!(
+                                        "fatget: {}: err {}",
+                                        out, e
+                                    )),
+                                }
+                            }
+                            None => self.emit(
+                                &String::from_utf8_lossy(&data),
+                            ),
+                        }
+                    }
+                    Some((_, _, true)) => {
+                        ustd::close(v.fd);
+                        self.fail(&alloc::format!(
+                            "fatget: {}: is a directory",
+                            pos[1]
+                        ));
+                    }
+                    None => {
+                        ustd::close(v.fd);
+                        self.fail(&alloc::format!(
+                            "fatget: {}: not found",
+                            pos[1]
+                        ));
+                    }
+                }
+            }
             "halt" => ustd::poweroff(),
             "tput" => match args.first() {
                 Some(&"cols") => self.emit(&alloc::format!("{}", COLS)),
@@ -35982,7 +36372,7 @@ impl Term {
         "losetup", "fsck", "fsck.vfat", "fsck.fat", "dosfsck", "wipefs",
         "isosize", "sar", "swaps", "fatlabel", "volname", "badblocks",
         "mkisofs", "genisoimage", "xorrisofs", "filefrag", "freefrag",
-        "ifstat", "mountpoint",
+        "ifstat", "mountpoint", "isols", "isocat", "fatls", "fatget",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
