@@ -33491,12 +33491,26 @@ impl Term {
                     }
                 }
             }
-            "dhcp" => match ustd::net_dhcp() {
-                Some(ip) => self.emit(&alloc::format!(
-                    "dhcp: lease {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]
-                )),
-                None => self.fail("dhcp: no response (net down or no server)"),
-            },
+            "dhcp" => {
+                // dhcp -r/--release: real DHCPRELEASE — the kernel tells
+                // the server the lease is over and drops the address.
+                if args.iter().any(|a| {
+                    *a == "-r" || *a == "--release" || *a == "-x"
+                }) {
+                    if ustd::net_dhcp_release() {
+                        self.emit("dhcp: released");
+                    } else {
+                        self.fail("dhcp: no lease to release");
+                    }
+                    return;
+                }
+                match ustd::net_dhcp() {
+                    Some(ip) => self.emit(&alloc::format!(
+                        "dhcp: lease {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]
+                    )),
+                    None => self.fail("dhcp: no response (net down or no server)"),
+                }
+            }
             "ifconfig" => {
                 // ifconfig [eth0 [up|down]] — 'up'/'down' flip the real link
                 // state through /proc/net/operstate (drops rx, fails tx).
@@ -37711,10 +37725,15 @@ impl Term {
                 let mut cnt = 1u32;
                 let mut deadline_ms = 0u64;
                 let mut gratuit = false;
+                let mut dad = false;
                 let mut target: Option<&str> = None;
                 let mut i = 0usize;
                 while i < args.len() {
                     match args[i] {
+                        "-D" => {
+                            dad = true;
+                            i += 1;
+                        }
                         "-c" => {
                             cnt = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1).min(64);
                             i += 2;
@@ -37759,6 +37778,32 @@ impl Term {
                 let t0 = ustd::uptime_ms();
                 // -w without -c probes until the deadline (real arping
                 // treats count as unbounded once -w is set).
+                if dad {
+                    // DAD: any reply means the address is in use.
+                    let mut dup = false;
+                    for _ in 0..cnt.max(1) {
+                        if let Some((m, _rtt)) = ustd::net_arping(ip, 1200) {
+                            dup = true;
+                            self.emit(&alloc::format!(
+                                "reply from [{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}]",
+                                m[0], m[1], m[2], m[3], m[4], m[5]
+                            ));
+                            break;
+                        }
+                    }
+                    if dup {
+                        self.fail(&alloc::format!(
+                            "arping: {}.{}.{}.{} is in use (DAD)",
+                            ip[0], ip[1], ip[2], ip[3]
+                        ));
+                    } else {
+                        self.emit(&alloc::format!(
+                            "{}.{}.{}.{} is free (no DAD replies)",
+                            ip[0], ip[1], ip[2], ip[3]
+                        ));
+                    }
+                    return;
+                }
                 let limit = if deadline_ms > 0 { u32::MAX } else { cnt };
                 let mut sent = 0u32;
                 for _ in 0..limit {
@@ -38257,6 +38302,8 @@ impl Term {
                 };
                 // paths sysctl -a dumps live (plus the kv table above)
                 const SYS_A: &[&str] = &[
+                    "/proc/sys/kernel/hostname",
+                    "/proc/sys/kernel/domainname",
                     "/proc/sys/kernel/pid_max",
                     "/proc/sys/kernel/threads-max",
                     "/proc/sys/kernel/yama/ptrace_scope",
@@ -41695,8 +41742,8 @@ impl Term {
                 }
                 Some("r") | Some("route") => {
                     match args.get(1).copied() {
-                        Some("add") | Some("del") => {
-                            // ip route {add,del} <dest>/<plen> [via gw]
+                        Some("add") | Some("del") | Some("replace") => {
+                            // ip route {add,del,replace} <dest>/<plen> [via gw]
                             let op = args.get(1).copied().unwrap_or("");
                             let Some(dest) = args.get(2).copied() else {
                                 self.fail("usage: ip route {add,del} <dest>/<plen> [via <gw>]");
@@ -41707,8 +41754,8 @@ impl Term {
                             } else {
                                 "*"
                             };
-                            let line = if op == "add" {
-                                alloc::format!("add {} {}", dest, gw)
+                            let line = if op == "add" || op == "replace" {
+                                alloc::format!("{} {} {}", op, dest, gw)
                             } else {
                                 alloc::format!("del {}", dest)
                             };
@@ -41744,10 +41791,10 @@ impl Term {
                     // `ip neigh [show]` prints /proc/net/neigh with real
                     // NUD states (REACHABLE/STALE/PERMANENT).
                     match args.get(1).copied() {
-                        Some("add") => {
-                            // ip neigh add <ip> lladdr <mac> [dev eth0]
+                        Some("add") | Some("replace") | Some("change") => {
+                            // ip neigh {add,replace,change} <ip> lladdr <mac> [dev eth0]
                             let (Some(ip), _) = (args.get(2).copied(), 0) else {
-                                self.fail("usage: ip neigh add <ip> lladdr <mac>");
+                                self.fail("usage: ip neigh {add,replace,change} <ip> lladdr <mac>");
                                 return;
                             };
                             let mac = args

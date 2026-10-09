@@ -1083,6 +1083,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
             0
         }
         shared::SYS_NET_DHCP => net::dhcp().map(|ip| u32::from_be_bytes(ip) as u64).unwrap_or(ERR),
+        shared::SYS_NET_DHCP_RELEASE => if net::dhcp_release() { 0 } else { ERR },
         shared::SYS_NET_TCP_OPEN => {
             let ip = [(a2>>24) as u8,(a2>>16) as u8,(a2>>8) as u8,a2 as u8];
             // a4 = caller's connect timeout in ms; 0 keeps the 4s default

@@ -895,6 +895,11 @@ pub fn clip_get() -> Vec<u8> {
     buf
 }
 
+/// Send a real DHCPRELEASE and drop the lease (interface unconfigured).
+pub fn net_dhcp_release() -> bool {
+    sc0(shared::SYS_NET_DHCP_RELEASE) == 0
+}
+
 /// Re-run a real DHCP DISCOVER/OFFER/REQUEST/ACK; returns the leased ip.
 pub fn net_dhcp() -> Option<[u8; 4]> {
     let r = sc0(shared::SYS_NET_DHCP);

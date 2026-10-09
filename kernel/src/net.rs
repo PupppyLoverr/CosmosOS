@@ -282,7 +282,9 @@ pub fn net_route() -> String {
 pub fn route_ctl(line: &str) -> bool {
     let mut f = line.split_whitespace();
     let add = match f.next() {
-        Some("add") => true,
+        // `replace` = upsert (same retain+push path below; RTM_NEWROUTE
+        // with NLM_F_REPLACE).
+        Some("add") | Some("replace") => true,
         Some("del") => return route_del(f.next().unwrap_or("")),
         // 'flush' rebuilds the table from defaults (lo + connected + gw) —
         // same effect as `ip route flush` on an unpopulated box.
@@ -4346,7 +4348,9 @@ pub fn arp_del(ip: [u8; 4]) -> bool {
 pub fn arp_ctl(line: &str) -> bool {
     let mut f = line.split_whitespace();
     match f.next() {
-        Some("add") => {
+        // `replace`/`change` land here too: install-or-update is the
+        // same mutation for a permanent neigh entry.
+        Some("add") | Some("replace") | Some("change") => {
             let (Some(ip), Some(macs)) = (f.next(), f.next()) else {
                 return false;
             };
@@ -5295,6 +5299,10 @@ fn dhcp_recv(want_type: u8, deadline: u64) -> Option<([u8; 4], Option<[u8; 4]>)>
     None
 }
 
+/// The active DHCP lease: (ip, server-id from the OFFER — slirp's
+/// DHCP server is 10.0.2.4 when the option is absent).
+static DHCP_LEASE: Mutex<Option<([u8; 4], [u8; 4])>> = Mutex::new(None);
+
 /// Real DHCP lease. On success updates `our_ip()` and logs the lease.
 pub fn dhcp() -> Option<[u8; 4]> {
     // DISCOVER -> OFFER
@@ -5308,12 +5316,42 @@ pub fn dhcp() -> Option<[u8; 4]> {
     dhcp_send(&dhcp_packet(3, Some(offer), server));
     let (ack_ip, _) = dhcp_recv(5, now_ms() + 3000)?;
     *CUR_IP.lock() = ack_ip;
+    *DHCP_LEASE.lock() = Some((ack_ip, server.or(Some([10, 0, 2, 4])).unwrap_or([10, 0, 2, 4])));
     routes_invalidate(); // rebuild synthesized routes on the new lease
     sprintln!(
         "[net] dhcp lease {}.{}.{}.{}",
         ack_ip[0], ack_ip[1], ack_ip[2], ack_ip[3]
     );
     Some(ack_ip)
+}
+
+/// DHCPRELEASE (msg type 7): tell the server the lease is over and drop
+/// the address — the interface ends unconfigured like a real release.
+/// Err(false) when there is no lease to release.
+pub fn dhcp_release() -> bool {
+    let Some((ip, server)) = DHCP_LEASE.lock().take() else {
+        return false;
+    };
+    let mut pkt = dhcp_packet(7, None, Some(server));
+    // ciaddr lives at byte 12 (op/htype/hlen/hops + xid + secs + flags).
+    pkt[12..16].copy_from_slice(&ip);
+    let mut udp = Vec::with_capacity(8 + pkt.len());
+    udp.extend_from_slice(&68u16.to_be_bytes());
+    udp.extend_from_slice(&67u16.to_be_bytes());
+    udp.extend_from_slice(&((8 + pkt.len()) as u16).to_be_bytes());
+    udp.extend_from_slice(&[0u8; 2]);
+    udp.extend_from_slice(&pkt);
+    // RFC 2131: the release goes unicast to the server; broadcast MAC
+    // reaches slirp regardless of ARP state.
+    send_ip_src(ip, [0xFF; 6], server, 17, &udp);
+    *CUR_IP.lock() = [0, 0, 0, 0];
+    routes_invalidate();
+    sprintln!(
+        "[net] dhcp release {}.{}.{}.{} (server {}.{}.{}.{})",
+        ip[0], ip[1], ip[2], ip[3],
+        server[0], server[1], server[2], server[3]
+    );
+    true
 }
 
 // ---------------------------------------------------------------------------
