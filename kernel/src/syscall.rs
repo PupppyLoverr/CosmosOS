@@ -1159,6 +1159,63 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 fd as u64
             })
         }
+        shared::SYS_PERF_EVENT_OPEN => {
+            // ({type u32, config u32}*, pid, cpu, group_fd, flags): per-task
+            // counters on a UP box — cpu must be -1, group_fd must be -1.
+            if (a3 as i64) != -1 || (a4 as i64) != -1 {
+                ctx.rax = (-22i64) as u64; // EINVAL
+                return;
+            }
+            let Some(d) = copy_in(a1, 8) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let typ = u32::from_le_bytes(d[0..4].try_into().unwrap());
+            let cfg = u32::from_le_bytes(d[4..8].try_into().unwrap());
+            match crate::perf::create(a2 as u32, typ as u8, cfg as u8) {
+                Ok(path) => task::with_current(|t| {
+                    let Some(fd) = alloc_slot(t) else { return ERR; };
+                    t.fds[fd] = Some(task::FileDesc {
+                        path,
+                        pos: 0,
+                        flags: shared::O_RDONLY
+                            | (a5 & (shared::O_NONBLOCK | shared::O_CLOEXEC)),
+                    });
+                    fd as u64
+                }),
+                Err(e) => e as u64,
+            }
+        }
+        shared::SYS_MEMBARRIER => {
+            // UP machine: every barrier is already satisfied. QUERY returns
+            // the supported mask; PRIVATE_EXPEDITED requires registration
+            // first (per-task bit, -1 EPERM otherwise) — Linux semantics.
+            match a1 {
+                0 => 0b110011, // QUERY: SHARED|PRIVATE_EXPEDITED+REGISTER
+                1 => 0,        // SHARED
+                4 => {
+                    if crate::task::memb_registered() {
+                        0 // PRIVATE_EXPEDITED: ordering already guaranteed
+                    } else {
+                        (-1i64) as u64 // EPERM: needs REGISTER_PRIVATE_EXPEDITED
+                    }
+                }
+                5 => {
+                    crate::task::memb_register();
+                    0 // REGISTER_PRIVATE_EXPEDITED
+                }
+                _ => (-22i64) as u64,
+            }
+        }
+        shared::SYS_SETREUID => {
+            // (ruid, euid; u32::MAX keeps) — suid tracks euid per POSIX
+            let s = if a2 != u32::MAX as u64 { a2 } else { u32::MAX as u64 };
+            sys_setresid(a1, a2, s, false)
+        }
+        shared::SYS_SETREGID => {
+            let s = if a2 != u32::MAX as u64 { a2 } else { u32::MAX as u64 };
+            sys_setresid(a1, a2, s, true)
+        }
         shared::SYS_CLOCK_NANOSLEEP => {
             // absolute deadline in ms; ticks run 10ms each. A past deadline
             // returns immediately (POSIX TIMER_ABSTIME).
@@ -3045,6 +3102,9 @@ fn fd_read_once(fd: usize, buf: &mut [u8]) -> Result<usize, i64> {
     if crate::signalfd::handles(&path) {
         return crate::signalfd::try_read(&path, buf);
     }
+    if crate::perf::handles(&path) {
+        return crate::perf::try_read(&path, buf);
+    }
     if crate::sockfd::handles(&path) {
         return crate::sockfd::try_read(&path, buf);
     }
@@ -3363,6 +3423,24 @@ fn sys_seek(fd: u64, off: u64, whence: u64) -> u64 {
             };
             size + off
         }
+        shared::SEEK_DATA => {
+            // dense files only: offset < size is data, else ENXIO
+            let mut g = vfs::FS.lock();
+            match g.as_mut().and_then(|fs| fs.stat(&path).ok()) {
+                Some(st) if off < st.size => off,
+                Some(_) => return (-6i64) as u64,
+                None => return ERR,
+            }
+        }
+        shared::SEEK_HOLE => {
+            // the first hole is EOF for a dense file
+            let mut g = vfs::FS.lock();
+            match g.as_mut().and_then(|fs| fs.stat(&path).ok()) {
+                Some(st) if off < st.size => st.size,
+                Some(_) => return (-6i64) as u64,
+                None => return ERR,
+            }
+        }
         _ => return ERR,
     };
     match vfs::seek(fd as i64, new) {
@@ -3465,6 +3543,8 @@ pub fn fd_ready(path: &str, ev: u32) -> bool {
         ev & 1 != 0 && crate::timerfd::ready(path)
     } else if crate::signalfd::handles(path) {
         ev & 1 != 0 && crate::signalfd::ready(path)
+    } else if crate::perf::handles(path) {
+        true
     } else if crate::eventfd::handles(path) {
         (ev & 1 != 0 && crate::eventfd::ready(path, true))
             || (ev & 2 != 0 && crate::eventfd::ready(path, false))

@@ -145,6 +145,9 @@ pub struct Task {
     pub filemaps: Vec<FileMap>, // file-backed regions for demand paging
     pub min_flt: u64,       // minor faults: zero-fill/bss/stack demand pages
     pub maj_flt: u64,       // major faults: pages read in from the image file
+    pub n_switches: u64,    // times this task was scheduled in (PERF ctx-sw)
+    pub tsc_in: u64,        // TSC at last switch-in (0 = never scheduled)
+    pub tsc_used: u64,      // TSC accumulated on-cpu across all switches-out
     pub stack_min: u64,     // this task's demand-grow stack region (0 = none)
     pub stack_max: u64,
     pub rbytes: u64,         // bytes read via vfs (/proc/<pid>/io)
@@ -374,6 +377,9 @@ pub fn init() {
         filemaps: Vec::new(),
         min_flt: 0,
         maj_flt: 0,
+        n_switches: 0,
+        tsc_in: 0,
+        tsc_used: 0,
         stack_min: 0,
         stack_max: 0,
         rbytes: 0,
@@ -566,6 +572,7 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
                 if let Some(i) =
                     s.tasks.iter().position(|t| t.state == State::Running && !crate::cgroup::throttled(t.cgroup))
                 {
+                    account_switch(s, i);
                     s.cur = i;
                     activate(&s.tasks[i]);
                     return s.tasks[i].saved_rsp;
@@ -573,6 +580,7 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
                 return saved;
             }
         };
+        account_switch(s, next);
         s.cur = next;
         activate(&s.tasks[next]);
         let rsp = s.tasks[next].saved_rsp;
@@ -584,6 +592,51 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
         }
         // delivery killed or stopped it — scan again
     }
+}
+
+/// Context-switch accounting: charge TSC to the outgoing task and credit a
+/// switch to the incoming one. Called right before `s.cur = next`.
+fn account_switch(s: &mut Sched, next: usize) {
+    let prev = s.cur;
+    if prev == next {
+        return;
+    }
+    let now = unsafe { core::arch::x86_64::_rdtsc() };
+    {
+        let p = &mut s.tasks[prev];
+        if p.tsc_in != 0 {
+            p.tsc_used = p.tsc_used.saturating_add(now.saturating_sub(p.tsc_in));
+        }
+    }
+    {
+        let n = &mut s.tasks[next];
+        n.tsc_in = now;
+        n.n_switches += 1;
+    }
+}
+
+/// Live per-task counters for perf_event fds. `typ` 0 = hardware
+/// (cycles), 1 = software (cpu_clock/task_clock, page_faults,
+/// context_switches, minor/major faults). None = dead target or
+/// unsupported config (caller reports EINVAL/ESRCH).
+pub fn perf_counter(pid: u32, typ: u8, cfg: u8) -> Option<u64> {
+    let g = SCHED.lock();
+    let s = g.as_ref()?;
+    let t = s.tasks.iter().find(|t| t.id == pid && t.state != State::Dead)?;
+    Some(match (typ, cfg) {
+        // cycles: banked tsc_used plus the live slice since last switch-in
+        (0, 0) => {
+            let now = unsafe { core::arch::x86_64::_rdtsc() };
+            let live = if t.tsc_in == 0 { 0 } else { now.saturating_sub(t.tsc_in) };
+            t.tsc_used.saturating_add(live)
+        }
+        (1, 0) | (1, 1) => t.cpu_ticks.saturating_mul(10_000_000), // 10ms ticks -> ns
+        (1, 2) => t.min_flt + t.maj_flt,                          // page faults
+        (1, 3) => t.n_switches,                                   // ctx switches
+        (1, 5) => t.min_flt,                                      // minor faults
+        (1, 6) => t.maj_flt,                                      // major faults
+        _ => return None,
+    })
 }
 
 fn activate(t: &Task) {
@@ -638,6 +691,7 @@ pub fn yield_ctx(ctx: *mut CpuContext) -> ! {
             }
             if let Some((_, bi)) = best {
                 {
+                    account_switch(s, bi);
                     s.cur = bi;
                     activate(&s.tasks[s.cur]);
                     let rsp = s.tasks[s.cur].saved_rsp;
@@ -661,6 +715,7 @@ pub fn yield_ctx(ctx: *mut CpuContext) -> ! {
             if let Some(i) =
                 s.tasks.iter().position(|t| t.state == State::Running && !crate::cgroup::throttled(t.cgroup))
             {
+                account_switch(s, i);
                 s.cur = i;
                 activate(&s.tasks[i]);
                 let rsp = s.tasks[i].saved_rsp;
@@ -927,6 +982,9 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         filemaps,
         min_flt: 0,
         maj_flt: 0,
+        n_switches: 0,
+        tsc_in: 0,
+        tsc_used: 0,
         stack_min: USER_STACK_MIN,
         stack_max: USER_STACK_TOP,
         rbytes: 0,
@@ -1089,6 +1147,9 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         filemaps: Vec::new(),
         min_flt: 0,
         maj_flt: 0,
+        n_switches: 0,
+        tsc_in: 0,
+        tsc_used: 0,
         stack_min: 0,
         stack_max: 0,
         rbytes: 0,
@@ -1334,6 +1395,9 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         filemaps,
         min_flt: 0,
         maj_flt: 0,
+        n_switches: 0,
+        tsc_in: 0,
+        tsc_used: 0,
         stack_min: slot,
         stack_max: stack_top,
         rbytes: 0,
@@ -1960,6 +2024,9 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         filemaps,
         min_flt: 0,
         maj_flt: 0,
+        n_switches: 0,
+        tsc_in: 0,
+        tsc_used: 0,
         stack_min: smin,
         stack_max: smax,
         rbytes: 0,
@@ -3624,6 +3691,21 @@ pub fn sys_setfsid(v: u64, group: bool) -> i64 {
         }
         cur as i64
     })
+}
+
+/// membarrier REGISTER_PRIVATE_EXPEDITED — the per-caller registration bit
+/// that PRIVATE_EXPEDITED checks (Linux: EPERM without it). On a UP machine
+/// both commands are ordering-only, so the bit lives as a task flag.
+static MEMB_SET: spin::Mutex<alloc::vec::Vec<u32>> = spin::Mutex::new(alloc::vec::Vec::new());
+pub fn memb_register() {
+    let pid = current_id();
+    let mut g = MEMB_SET.lock();
+    if !g.contains(&pid) {
+        g.push(pid);
+    }
+}
+pub fn memb_registered() -> bool {
+    MEMB_SET.lock().contains(&current_id())
 }
 
 /// creds of another task by pid — /proc/<pid>/status.

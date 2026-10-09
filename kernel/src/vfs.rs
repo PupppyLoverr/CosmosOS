@@ -838,6 +838,7 @@ fn release_desc_obj(f: &task::FileDesc, still_open: bool) {
     crate::epoll::close_obj(&f.path);
     crate::sockfd::close_obj(&f.path);
     crate::pidfd::close_obj(&f.path);
+    crate::perf::release(&f.path);
     crate::nsfd::release(&f.path);
 }
 

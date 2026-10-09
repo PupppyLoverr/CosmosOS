@@ -3641,6 +3641,85 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::close(iw);
         ok
     });
+    check("perf-open", {
+        // real counters behind an fd: cycles + ctx-switches accumulate
+        // since the open; faults grow when fresh demand pages are touched.
+        let mut ok = true;
+        let cyc = ustd::perf_event_open(0, 0, 0);
+        let swx = ustd::perf_event_open(1, 3, 0);
+        let flt = ustd::perf_event_open(1, 2, 0);
+        ok = ok && cyc >= 0 && swx >= 0 && flt >= 0;
+        // unknown config -> EINVAL/ESRCH, dead pid -> err
+        ok = ok && ustd::perf_event_open(0, 9, 0) < 0;
+        ok = ok && ustd::perf_event_open(1, 0, 99999) < 0;
+        // a scheduling point + a real demand-paged file fault (maj_flt)
+        let _ = ustd::sleep_ms(30);
+        let _ = ustd::write_all("/tmp/perf-file", &[0u8; 4096]);
+        if let Ok(fdf) = ustd::open("/tmp/perf-file", 0) {
+            if let Some(p) = ustd::mmap_file(fdf, 4096, 0) {
+                let _v = unsafe { core::ptr::read_volatile(p) };
+            }
+            let _ = ustd::close(fdf);
+        }
+        ok = ok && ustd::perf_read(cyc).unwrap_or(0) > 0;
+        ok = ok && ustd::perf_read(swx).unwrap_or(0) >= 1;
+        ok = ok && ustd::perf_read(flt).unwrap_or(0) >= 1;
+        let _ = ustd::close(cyc);
+        let _ = ustd::close(swx);
+        let _ = ustd::close(flt);
+        ok
+    });
+    check("seek-data-hole", {
+        // dense-file SEEK_DATA/SEEK_HOLE semantics + ENXIO past EOF
+        // SEEK_DATA/HOLE stat the FAT file (tmpfs /tmp isn't in the FS table)
+        let _ = ustd::write_all("/seek-dh", b"0123456789abcdef");
+        let fd = ustd::open("/seek-dh", 0).unwrap_or(-1);
+        let mut ok = fd >= 0;
+        ok = ok && ustd::seek(fd, 0, shared::SEEK_DATA) == Ok(0);
+        ok = ok && ustd::seek(fd, 4, shared::SEEK_DATA) == Ok(4);
+        ok = ok && ustd::seek(fd, 4, shared::SEEK_HOLE) == Ok(16);
+        ok = ok && ustd::seek(fd, 16, shared::SEEK_DATA) == Err(-6);
+        let _ = ustd::close(fd);
+        ok
+    });
+    check("membarrier", {
+        // QUERY mask, then PRIVATE_EXPEDITED is EPERM until REGISTER runs
+        let q = ustd::membarrier(0);
+        q > 0
+            && ustd::membarrier(4) == -1
+            && ustd::membarrier(5) == 0
+            && ustd::membarrier(4) == 0
+            && ustd::membarrier(1) == 0
+            && ustd::membarrier(99) == -22
+    });
+    check("setre-ids", {
+        // 2-arg reuid/regid honor the u32::MAX keep rule + suid tracking
+        let mut ok = ustd::setreuid(u32::MAX, u32::MAX) == 0;
+        match ustd::fork() {
+            0 => {
+                // setgid FIRST while still privileged; a gid move after the
+                // euid drop legitimately EPERMs (cap_eff is empty)
+                if ustd::setregid(u32::MAX, 600) != 0 {
+                    ustd::exit(9);
+                }
+                if ustd::getegid() != 600 {
+                    ustd::exit(8);
+                }
+                if ustd::setreuid(u32::MAX, 500) != 0 {
+                    ustd::exit(7);
+                }
+                if ustd::geteuid() != 500 {
+                    ustd::exit(6);
+                }
+                ustd::exit(42);
+            }
+            c if c > 0 => {
+                ok = ok && ustd::waitpid(c as u32, 5000).map(|v| v == 42).unwrap_or(false)
+            }
+            _ => ok = false,
+        }
+        ok
+    });
     check("epoll-flags", {
         // EPOLLET fires once per ready level, EPOLLONESHOT until MOD
         // re-arms, EPOLLHUP surfaces on writer close, and the epoll fd
