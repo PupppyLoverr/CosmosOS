@@ -42,6 +42,10 @@ const SYS_FILES: &[&str] = &["hostname", "shmmax", "shmall", "shmmni", "ngroups_
 const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size", "file-max", "file-nr", "protected_symlinks", "protected_fifos", "protected_regular"];
 /// files under /proc/sys/net/unix
 const NET_UNIX_FILES: &[&str] = &["max_dgram_qlen"];
+/// files under /proc/sys/net/core
+const NET_CORE_FILES: &[&str] = &["somaxconn"];
+/// files under /proc/sys/user
+const USER_SYS_FILES: &[&str] = &["max_user_namespaces"];
 
 /// files under /proc/sys/net/ipv4
 const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range"];
@@ -99,6 +103,8 @@ pub fn is_dir(path: &str) -> bool {
         || path == "/proc/sys/net"
         || path == "/proc/sys/net/ipv4"
         || path == "/proc/sys/net/unix"
+        || path == "/proc/sys/net/core"
+        || path == "/proc/sys/user"
         || pid_of(path)
             .map(|p| task::pids().contains(&p) && path.matches('/').count() == 2)
             .unwrap_or(false)
@@ -172,6 +178,12 @@ pub fn exists(path: &str) -> bool {
     }
     if let Some(f) = path.strip_prefix("/proc/sys/net/unix/") {
         return NET_UNIX_FILES.contains(&f);
+    }
+    if let Some(f) = path.strip_prefix("/proc/sys/net/core/") {
+        return NET_CORE_FILES.contains(&f);
+    }
+    if let Some(f) = path.strip_prefix("/proc/sys/user/") {
+        return USER_SYS_FILES.contains(&f);
     }
     FILES.contains(&path.trim_start_matches("/proc/"))
 }
@@ -319,7 +331,7 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         return out;
     }
     if path == "/proc/sys" {
-        for name in ["kernel", "fs", "net", "vm"] {
+        for name in ["kernel", "fs", "net", "user", "vm"] {
             let mut de = shared::DirEntry::default();
             let nb = name.as_bytes();
             de.name[..nb.len()].copy_from_slice(nb);
@@ -330,7 +342,7 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         return out;
     }
     if path == "/proc/sys/net" {
-        for (nb, nl) in [(b"ipv4" as &[u8], 4usize), (b"unix", 4)] {
+        for (nb, nl) in [(b"ipv4" as &[u8], 4usize), (b"unix", 4), (b"core", 4)] {
             let mut de = shared::DirEntry::default();
             de.name[..nl].copy_from_slice(nb);
             de.name_len = nl as u8;
@@ -351,6 +363,26 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
     }
     if path == "/proc/sys/net/unix" {
         for name in NET_UNIX_FILES {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            out.push(de);
+        }
+        return out;
+    }
+    if path == "/proc/sys/net/core" {
+        for name in NET_CORE_FILES {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            out.push(de);
+        }
+        return out;
+    }
+    if path == "/proc/sys/user" {
+        for name in USER_SYS_FILES {
             let mut de = shared::DirEntry::default();
             let nb = name.as_bytes();
             de.name[..nb.len()].copy_from_slice(nb);
@@ -926,6 +958,18 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
         let s = String::from(String::from_utf8_lossy(buf).trim());
         let Ok(v) = s.parse::<u64>() else { return None };
         return crate::sysctl::set(&alloc::format!("net/unix/{}", rel), v)
+            .then_some(buf.len());
+    }
+    if let Some(rel) = path.strip_prefix("/proc/sys/net/core/") {
+        let s = String::from(String::from_utf8_lossy(buf).trim());
+        let Ok(v) = s.parse::<u64>() else { return None };
+        return crate::sysctl::set(&alloc::format!("net/core/{}", rel), v)
+            .then_some(buf.len());
+    }
+    if let Some(rel) = path.strip_prefix("/proc/sys/user/") {
+        let s = String::from(String::from_utf8_lossy(buf).trim());
+        let Ok(v) = s.parse::<u64>() else { return None };
+        return crate::sysctl::set(&alloc::format!("user/{}", rel), v)
             .then_some(buf.len());
     }
     if let Some(rel) = path.strip_prefix("/proc/sys/net/ipv4/") {

@@ -5471,9 +5471,13 @@ fn dispatch(src_ip: [u8; 4], proto: u8, p: Vec<u8>) -> bool {
             let mut t = TCP_SOCKS.lock();
             // accepted conns are matched by (rip, rport, lport) — the map
             // key is synthetic so many clients can share one listener port
+            // Closed conns can't own a 4-tuple anymore — skip them so a
+            // reused ephemeral port demuxes to the new conn rather than
+            // shadowing its ACKs onto the dead entry.
             match t
                 .values_mut()
-                .find(|k| k.rip == src_ip && k.rport == s.sport && k.lport == s.dport)
+                .find(|k| k.rip == src_ip && k.rport == s.sport && k.lport == s.dport
+                    && k.state != TcpState::Closed)
             {
                 Some(k) => {
                     tcp_feed(k, &s);
@@ -5558,6 +5562,10 @@ pub struct TcpSock {
     srtt: u64,            // smoothed RTT estimate ms (0 = none yet)
     rttvar: u64,          // RTT variation ms — RFC6298 estimator
     rtx: u32,             // total retransmitted segments (ss -i retrans)
+    /// Timestamp the conn entered Closed — the entry lingers as a
+    /// TIME_WAIT guard so its port can't be reused while wire segments
+    /// for the dead 4-tuple may still be in flight.
+    closed_ms: u64,
 }
 
 /// A transmitted segment awaiting ACK — retransmitted by tcp_tick.
@@ -5609,6 +5617,9 @@ static LISTEN_OWNERS: Mutex<BTreeMap<u16, u32>> = Mutex::new(BTreeMap::new());
 static UDP_OWNERS: Mutex<BTreeMap<u16, u32>> = Mutex::new(BTreeMap::new());
 static ACCEPTED: Mutex<BTreeMap<u16, VecDeque<(u16, [u8; 4], u16)>>> =
     Mutex::new(BTreeMap::new());
+/// listen() backlog per port — the per-listener half of the
+/// min(backlog, net.core.somaxconn) accept-queue cap.
+static BACKLOG: Mutex<BTreeMap<u16, usize>> = Mutex::new(BTreeMap::new());
 static NEXT_CID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x8000);
 
 fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
@@ -5618,6 +5629,7 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
             if s.flags & TCP_RST != 0 {
                 k.rst = true;
                 k.state = TcpState::Closed;
+                k.closed_ms = now_ms();
             } else if s.flags & TCP_ACK != 0 && s.ack == k.snd_nxt {
                 k.snd_una = s.ack;
                 k.state = TcpState::Open;
@@ -5626,11 +5638,28 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
                     k.rcv_nxt += s.payload.len() as u32;
                     send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[], rx_win(k));
                 }
-                ACCEPTED
+                // accept queue: bounded by min(listen backlog,
+                // net.core.somaxconn) — a full queue refuses the
+                // completing handshake with RST rather than queueing
+                // a conn nobody will ever accept.
+                let cap = BACKLOG
                     .lock()
-                    .entry(k.lport)
-                    .or_default()
-                    .push_back((k.cid, k.rip, k.rport));
+                    .get(&k.lport)
+                    .copied()
+                    .unwrap_or(128)
+                    .min(crate::sysctl::somaxconn() as usize);
+                let mut ag = ACCEPTED.lock();
+                let q = ag.entry(k.lport).or_default();
+if q.len() < cap {
+                    q.push_back((k.cid, k.rip, k.rport));
+                } else {
+                    drop(ag);
+                    send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt,
+                        k.rcv_nxt, TCP_RST, &[], 0);
+                    k.state = TcpState::Closed;
+                k.closed_ms = now_ms();
+                    k.rst = true;
+                }
             }
         }
         TcpState::SynSent => {
@@ -5644,12 +5673,14 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
             } else if s.flags & TCP_RST != 0 {
                 k.rst = true;
                 k.state = TcpState::Closed;
+                k.closed_ms = now_ms();
             }
         }
         TcpState::Open => {
             if s.flags & TCP_RST != 0 {
                 k.rst = true;
                 k.state = TcpState::Closed;
+                k.closed_ms = now_ms();
                 return;
             }
             if s.ack > k.snd_una {
@@ -5680,6 +5711,7 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
             if s.flags & TCP_FIN != 0 {
                 k.rcv_nxt += 1;
                 k.state = TcpState::Closed;
+                k.closed_ms = now_ms();
             }
             // ack whatever we consumed (dup acks are fine)
             send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[], rx_win(k));
@@ -5690,6 +5722,7 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
 
 /// SYN handshake -> Open. Err(-1) lport bound, Err(-2) no route/timeout/refused.
 pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result<(), i64> {
+    tcp_tw_sweep();
     if TCP_SOCKS.lock().contains_key(&lport) {
         return Err(-1);
     }
@@ -5720,6 +5753,7 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
             srtt: 0,
             rttvar: 0,
             rtx: 0,
+            closed_ms: 0,
         },
     );
     let deadline = now_ms() + timeout_ms;
@@ -5766,19 +5800,21 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
 }
 
 /// Mark `lport` as listening for inbound TCP connections.
-pub fn tcp_listen(lport: u16) -> Result<(), i64> {
+pub fn tcp_listen(lport: u16, backlog: usize) -> Result<(), i64> {
     if TCP_SOCKS.lock().contains_key(&lport) || !LISTENERS.lock().insert(lport) {
         return Err(-1);
     }
     LISTEN_OWNERS
         .lock()
         .insert(lport, crate::task::with_current(|t| t.id));
+    BACKLOG.lock().insert(lport, backlog.max(1));
     Ok(())
 }
 
 pub fn tcp_unlisten(lport: u16) {
     LISTENERS.lock().remove(&lport);
     LISTEN_OWNERS.lock().remove(&lport);
+    BACKLOG.lock().remove(&lport);
     ACCEPTED.lock().remove(&lport);
 }
 
@@ -5816,6 +5852,7 @@ fn accept_syn(s: &TcpSeg, src_ip: [u8; 4]) {
             srtt: 0,
             rttvar: 0,
             rtx: 0,
+            closed_ms: 0,
         },
     );
     send_tcp(mac, src_ip, s.dport, s.sport, isn, s.seq + 1, TCP_SYN | TCP_ACK, &[], 65535);
@@ -5956,9 +5993,32 @@ pub fn tcp_recv(lport: u16, timeout_ms: u64) -> Option<Vec<u8>> {
 /// FIN + drop the socket (close is fire-and-forget — the peer's side is
 /// already Closed or will be once our FIN lands).
 pub fn tcp_close(lport: u16) {
-    if let Some(k) = TCP_SOCKS.lock().remove(&lport) {
-        send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_FIN | TCP_ACK, &[], rx_win(&k));
+    // TIME_WAIT: mark the conn Closed but keep the map entry — the port
+    // stays allocated (~2s) so a fresh bind/connect can't reuse the
+    // 4-tuple while the old conn's FIN/RST are still on the wire.
+    let mut send_fin = None;
+    {
+        let mut t = TCP_SOCKS.lock();
+        if let Some(k) = t.get_mut(&lport) {
+            if k.state != TcpState::Closed {
+                send_fin = Some((k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, rx_win(k)));
+            }
+            k.state = TcpState::Closed;
+            k.closed_ms = now_ms();
+        }
     }
+    if let Some((mac, rip, lp, rp, sn, rn, w)) = send_fin {
+        send_tcp(mac, rip, lp, rp, sn, rn, TCP_FIN | TCP_ACK, &[], w);
+    }
+}
+
+/// Sweep TIME_WAIT entries older than the linger window.
+fn tcp_tw_sweep() {
+    const TW_MS: u64 = 2000;
+    let now = now_ms();
+    TCP_SOCKS
+        .lock()
+        .retain(|_, k| !(k.state == TcpState::Closed && now.saturating_sub(k.closed_ms) >= TW_MS));
 }
 
 // ---- socket-fd support (kernel/src/sockfd.rs rides these) ----
