@@ -38542,6 +38542,11 @@ impl Term {
                     "/proc/sys/net/ipv4/icmp_msgs_per_sec",
                     "/proc/sys/net/ipv4/icmp_msgs_burst",
                     "/proc/sys/net/netfilter/nf_conntrack_max",
+                    "/proc/sys/net/netfilter/nf_conntrack_icmp_timeout",
+                    "/proc/sys/net/netfilter/nf_conntrack_udp_timeout",
+                    "/proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream",
+                    "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_sent",
+                    "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established",
                 ];
                 // `-N` prints names only, `-n`/`--values` values only —
                 // real sysctl output modes over the same key dump.
