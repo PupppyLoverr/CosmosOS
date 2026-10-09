@@ -643,17 +643,22 @@ pub fn net_ping_pat(
     iface: u8,
     tos: u8,
     pat: &[u8],
+    df: bool,
 ) -> Option<u64> {
     let plen = pat.len().min(16) as u64;
     let r = sc5(
         shared::SYS_NET_PING,
         ip as u64,
         timeout_ms,
-        (ttl as u64) | ((tos as u64) << 8),
+        (ttl as u64) | ((tos as u64) << 8) | ((df as u64) << 16),
         (size & 0xffff_ffff) | (plen << 32),
         iface as u64 | ((pat.as_ptr() as u64) << 8),
     );
     if r == u64::MAX { None } else { Some(r) }
+}
+/// `ping -M do` — plain ping with the DF bit stamped on the wire.
+pub fn net_ping_df(ip: u32, timeout_ms: u64) -> Option<u64> {
+    net_ping_pat(ip, timeout_ms, 0, 56, 0, 0, &[], true)
 }
 /// Resolve a hostname to an IPv4 address via a real DNS query (UDP/53).
 pub fn net_dns(name: &str) -> Option<[u8; 4]> {

@@ -353,6 +353,7 @@ struct FwRule {
     smac: Option<[u8; 6]>,// `-m mac --mac-source` — L2 sender (INPUT)
     dscp: u8,             // `-m dscp --dscp N` — 0xff = unused
     icmp_type: u8,        // `-m icmp --icmp-type N` — 0xff = unused
+    tcp_syn: bool,        // `-m tcp --syn` — SYN-only segment match
     limit_pps: u16,       // 0 = unlimited; `-m limit --limit N/s` cap on rule hits
     comment: String,      // `-m comment --comment` — real per-rule annotation
     limit_burst: u16,     // bucket depth (real iptables default 5)
@@ -527,9 +528,10 @@ fn fw_verdict(
     tos: u8,
     smac: [u8; 6],
     itype: u8,
+    syn: bool,
 ) -> u8 {
     let mut fw = chain.lock();
-    match fw_eval(&mut *fw, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, 0) {
+    match fw_eval(&mut *fw, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, syn, 0) {
         // 255 = walked off the end of the builtin chain: policy decides
         255 => {
             if *policy.lock() {
@@ -564,6 +566,7 @@ fn fw_eval(
     tos: u8,
     smac: [u8; 6],
     itype: u8,
+    syn: bool,
     depth: u8,
 ) -> u8 {
     for r in chain.iter_mut() {
@@ -623,6 +626,12 @@ fn fw_eval(
         if r.icmp_type != 0xff && itype != r.icmp_type {
             continue;
         }
+        // `-m tcp --syn` (== --tcp-flags SYN,RST,ACK,FIN SYN): the
+        // caller computes it from flags byte 13 — proto!=6 never
+        // carries syn=true.
+        if r.tcp_syn && !syn {
+            continue;
+        }
         // `-m multiport --dports`: real set match on the dest port
         if !r.dports.is_empty() && !r.dports.contains(&dport) {
             continue;
@@ -672,7 +681,7 @@ fn fw_eval(
                 continue; // loop guard — treat as no-match
             }
             let mut snap = FW_USER.lock().get(&r.jump).cloned().unwrap_or_default();
-            let v = fw_eval(&mut snap, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, depth + 1);
+            let v = fw_eval(&mut snap, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, syn, depth + 1);
             if let Some(u) = FW_USER.lock().get_mut(&r.jump) {
                 *u = snap;
             }
@@ -924,6 +933,9 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
     if r.icmp_type != 0xff {
         out.push_str(&alloc::format!(" -m icmp --icmp-type {}", r.icmp_type));
     }
+    if r.tcp_syn {
+        out.push_str(" -m tcp --syn");
+    }
     if r.limit_pps != 0 {
         out.push_str(&alloc::format!(" -m limit --limit {}/s", r.limit_pps));
         if r.limit_burst != 5 {
@@ -1050,6 +1062,9 @@ fn fmt_fw_rule(out: &mut String, i: usize, r: &FwRule) {
     }
     if r.icmp_type != 0xff {
         extra.push_str(&alloc::format!("  icmptype {}", r.icmp_type));
+    }
+    if r.tcp_syn {
+        extra.push_str("  tcp flags:0x17/0x02");
     }
     if r.len_hi != 0 {
         if r.len_lo == r.len_hi {
@@ -1315,7 +1330,7 @@ fn fw_name_ok(n: &str) -> bool {
         "icmp", "tcp", "udp", "all", "*", "dport", "multiport", "range", "src",
         "state", "limit", "lburst", "log", "reject", "accept", "return", "drop",
         "iif", "oif", "sport", "length", "comment", "ttl", "tos", "mac",
-        "dscp", "icmpt",
+        "dscp", "icmpt", "syn",
     ];
     !n.is_empty()
         && n.len() <= 28
@@ -1703,6 +1718,7 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         smac: None,
         dscp: 0xff,
         icmp_type: 0xff,
+        tcp_syn: false,
         limit_pps: 0,
         comment: String::new(),
         limit_burst: 5,
@@ -1933,6 +1949,8 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
                     r.lim_tokens = v;
                 }
             }
+            // `-m tcp --syn` — bare flag token like the targets.
+            "syn" => r.tcp_syn = true,
             "log" => r.target = 1,    // "... log" marks -j LOG
             "reject" => r.target = 2, // -j REJECT: refusal goes back
             "accept" => r.target = 3, // -j ACCEPT: terminal allow
@@ -1965,6 +1983,7 @@ fn fw_rule_eq(a: &FwRule, b: &FwRule) -> bool {
         && a.smac == b.smac
         && a.dscp == b.dscp
         && a.icmp_type == b.icmp_type
+        && a.tcp_syn == b.tcp_syn
         && a.state == b.state
         && a.ttl_mode == b.ttl_mode
         && a.ttl_v == b.ttl_v
@@ -2116,7 +2135,8 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>, u64)> {
         // source (127/8 or our own address); wire packets don't.
         let ifx = if is_loopback(*src_ip) { 2u8 } else { 1 };
         let itype = if *proto == 1 && !p.is_empty() { p[0] } else { 0xff };
-        let v = fw_verdict(&FW, &FW_POLICY, true, *src_ip, dst, *proto, sport, dport, st, ifx, p.len() as u64, meta_ttl(*meta), meta_tos(*meta), meta_mac(*meta), itype);
+        let syn = *proto == 6 && p.len() >= 14 && p[13] & 0x17 == 0x02;
+        let v = fw_verdict(&FW, &FW_POLICY, true, *src_ip, dst, *proto, sport, dport, st, ifx, p.len() as u64, meta_ttl(*meta), meta_tos(*meta), meta_mac(*meta), itype, syn);
         if v == 2 {
             // -j REJECT: a real refusal goes back — TCP_RST for TCP
             // (same wire shape as the unclaimed-port responder),
@@ -2688,11 +2708,11 @@ fn send_icmp_echo_ttl(dst_mac: [u8; 6], dst_ip: [u8; 4], id: u16, seq: u16, ttl:
 /// Echo request with an explicit source address (`ping -I <iface>` —
 /// the iface picks the source IP; routing still follows the dst).
 fn send_icmp_echo_src(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], id: u16, seq: u16, ttl: u8, payload: &[u8]) {
-    send_icmp_echo_qos(src_ip, dst_mac, dst_ip, id, seq, 0, ttl, payload)
+    send_icmp_echo_qos(src_ip, dst_mac, dst_ip, id, seq, 0, ttl, payload, false)
 }
 
 /// Echo request carrying a real IPv4 TOS/DSCP byte (`ping -Q`).
-fn send_icmp_echo_qos(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], id: u16, seq: u16, tos: u8, ttl: u8, payload: &[u8]) {
+fn send_icmp_echo_qos(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], id: u16, seq: u16, tos: u8, ttl: u8, payload: &[u8], df: bool) {
     ICMP_OUT_ECHOREQ.fetch_add(1, Ordering::Relaxed);
     let mut icmp = Vec::with_capacity(8 + payload.len());
     icmp.push(8); // echo request
@@ -2703,7 +2723,7 @@ fn send_icmp_echo_qos(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], id: u1
     icmp.extend_from_slice(payload);
     let c = csum(&icmp);
     put16(&mut icmp[2..], c);
-    send_ip_src_qos(src_ip, dst_mac, dst_ip, 1, tos, ttl, &icmp);
+    send_ip_src_qos(src_ip, dst_mac, dst_ip, 1, tos, ttl, &icmp, df);
 }
 
 /// Handle one ethernet frame: ARP cache/reply, or deliver an IPv4 payload.
@@ -2894,12 +2914,12 @@ pub fn ping_ttl_sz(ip: [u8; 4], timeout_ms: u64, ttl: u8, size: usize) -> Option
 /// like real ping — so `-I lo <remote>` sends a wire packet nobody can
 /// answer (timeout), and `-I eth0 <127.x>` is unroutable (EINVAL).
 pub fn ping_ttl_if(ip: [u8; 4], timeout_ms: u64, ttl: u8, size: usize, iface: u8, tos: u8) -> Option<u64> {
-    ping_ttl_pat(ip, timeout_ms, ttl, size, iface, tos, None)
+    ping_ttl_pat(ip, timeout_ms, ttl, size, iface, tos, None, false)
 }
 
 /// `ping -p` — like ping_ttl_if but the ICMP payload is the caller's
 /// byte pattern repeated (`iputils` fills 0x10.. when -p is absent).
-pub fn ping_ttl_pat(ip: [u8; 4], timeout_ms: u64, ttl: u8, size: usize, iface: u8, tos: u8, pat: Option<&[u8]>) -> Option<u64> {
+pub fn ping_ttl_pat(ip: [u8; 4], timeout_ms: u64, ttl: u8, size: usize, iface: u8, tos: u8, pat: Option<&[u8]>, df: bool) -> Option<u64> {
     if NET.lock().is_none() {
         sprintln!("[net] ping: no device");
         return None;
@@ -2933,7 +2953,7 @@ pub fn ping_ttl_pat(ip: [u8; 4], timeout_ms: u64, ttl: u8, size: usize, iface: u
         _ => (0..size).map(|i| 0x10 + (i % 56) as u8).collect(),
     };
     let t0 = now_ms();
-    send_icmp_echo_qos(src, dst_mac, ip, id, seq, tos, if ttl == 0 { def_ttl() } else { ttl }, &payload);
+    send_icmp_echo_qos(src, dst_mac, ip, id, seq, tos, if ttl == 0 { def_ttl() } else { ttl }, &payload, df);
     loop {
         for (_src_ip, proto, p, _pkt_meta) in pump_rx() {
             if proto == 1 && p.len() >= 8 && p[0] == 0 && be16(&p[4..]) == id && be16(&p[6..]) == seq {
@@ -2966,7 +2986,7 @@ fn send_ip_src_ttl(
     ttl: u8,
     payload: &[u8],
 ) {
-    send_ip_src_qos(src_ip, dst_mac, dst_ip, proto, 0, ttl, payload)
+    send_ip_src_qos(src_ip, dst_mac, dst_ip, proto, 0, ttl, payload, false)
 }
 
 /// The real egress funnel — `tos` stamps the IPv4 DS byte (`ping -Q`,
@@ -2981,6 +3001,7 @@ fn send_ip_src_qos(
     tos: u8,
     ttl: u8,
     payload: &[u8],
+    df: bool,
 ) {
     IP_OUT_REQ.fetch_add(1, Ordering::Relaxed);
     match proto {
@@ -2995,7 +3016,8 @@ fn send_ip_src_qos(
     // Egress iface: destinations on a local address leave via lo.
     let oifx = if is_loopback(dst_ip) { 2u8 } else { 1 };
     let itype = if proto == 1 && !payload.is_empty() { payload[0] } else { 0xff };
-    let v = fw_verdict(&FW_OUT, &FW_OUT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64, ttl, tos, [0; 6], itype);
+    let syn = proto == 6 && payload.len() >= 14 && payload[13] & 0x17 == 0x02;
+    let v = fw_verdict(&FW_OUT, &FW_OUT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64, ttl, tos, [0; 6], itype, syn);
     if v == 2 {
         out_reject(src_ip, dst_ip, proto, payload);
         return;
@@ -3023,7 +3045,8 @@ fn send_ip_src_qos(
     ip.push(tos); // DS field — real TOS/DSCP byte on the wire
     ip.extend_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
     ip.extend_from_slice(&1u16.to_be_bytes());
-    ip.extend_from_slice(&[0u8; 2]);
+    // flags+frag-off field: `ping -M do` stamps the real DF bit.
+    ip.extend_from_slice(&[if df { 0x40 } else { 0 }, 0]);
     ip.push(ttl);
     ip.push(proto);
     ip.extend_from_slice(&[0u8; 2]);

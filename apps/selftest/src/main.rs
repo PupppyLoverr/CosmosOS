@@ -5340,7 +5340,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         // `ping -p`: the caller's byte pattern fills the ICMP payload —
         // the kernel pcap proves the 0xAA fill on the wire.
         let _ = ustd::pcap(0, &mut []);
-        let _ = ustd::net_ping_pat(0x0A00_0202, 400, 0, 16, 0, 0, &[0xAA; 4]);
+        let _ = ustd::net_ping_pat(0x0A00_0202, 400, 0, 16, 0, 0, &[0xAA; 4], false);
         let _ = ustd::pcap(1, &mut []);
         let mut cap = alloc::vec![0u8; 262_144];
         let n = ustd::pcap(4, &mut cap);
@@ -5400,6 +5400,56 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let passed = ustd::net_ping_qos(0x7F00_0001, 600, 0, 0, 0, 0).is_some();
         let _ = ustd::write_all("/proc/net/iptables", b"F OUT\n");
         a && dropped && b && passed
+    });
+    check("ipt-syn", {
+        // `-m tcp --syn`: matches SYN-only segments. Dropping SYN on
+        // OUTPUT kills the connect (handshake never leaves) while
+        // ICMP sails past it.
+        let a = ustd::write_all("/proc/net/iptables", b"A OUT tcp syn drop
+").is_ok();
+        let dropped = ustd::TcpSock::connect_timeout(15357, [10, 0, 2, 3], 53, 900).is_none();
+        let passed = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        let _ = ustd::write_all("/proc/net/iptables", b"F OUT
+");
+        let c = ustd::TcpSock::connect_timeout(15358, [10, 0, 2, 3], 53, 2500).is_some();
+        a && dropped && passed && c
+    });
+    check("ping-df", {
+        // `ping -M do` stamps the DF bit on the IPv4 frag field —
+        // the kernel pcap proves the wire byte (fr[20]&0x40).
+        let _ = ustd::pcap(0, &mut []);
+        // lo bypasses send_frame (raw queue, no header build) — the
+        // DF bit only exists on the wire path, so ping the gateway.
+        let _ = ustd::net_ping_df(0x0A00_0202, 1500);
+        let _ = ustd::pcap(1, &mut []);
+        let mut cap = [0u8; 65536];
+        let n = ustd::pcap(4, &mut cap);
+        let d: &[u8] = if n > 0 { &cap[..n as usize] } else { &[] };
+        let mut i = 24usize;
+        let mut seen = false;
+        while i + 16 <= d.len() {
+            let cl = u32::from_le_bytes([d[i + 8], d[i + 9], d[i + 10], d[i + 11]]) as usize;
+            i += 16;
+            if i + cl > d.len() {
+                break;
+            }
+            let fr = &d[i..i + cl];
+            i += cl;
+            // IPv4 ICMP echo request whose frag field carries DF
+            if fr.len() >= 14 + 20 + 8
+                && fr[12] == 0x08
+                && fr[13] == 0x00
+                && fr[14] >> 4 == 4
+                && fr[23] == 1
+                && fr[14 + 9] == 1
+            {
+                let ihl = (fr[14] & 0xf) as usize * 4;
+                if fr.len() >= 14 + ihl + 8 && fr[14 + ihl] == 8 {
+                    seen = fr[20] & 0x40 != 0;
+                }
+            }
+        }
+        seen
     });
 
     // --- performance baseline: real durations (tick = 10ms resolution) ---
