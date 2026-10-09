@@ -257,7 +257,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
             } else if a1 == 16 {
                 // PR_GET_NAME: NUL-padded 16-byte task name out
                 match task::sched_fields(0) {
-                    Some((_, _, name, _, _)) => {
+                    Some((_, _, _, name, ..)) => {
                         let mut b = [0u8; 16];
                         let nb = name.as_bytes();
                         b[..nb.len().min(15)].copy_from_slice(&nb[..nb.len().min(15)]);
@@ -272,7 +272,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
             } else if a1 == 2 {
                 // PR_GET_PDEATHSIG: *int = pdeathsig
                 match task::sched_fields(0) {
-                    Some((_, _, _, ds, _)) => {
+                    Some((_, _, _, _, ds, ..)) => {
                         if copy_out(a2, &(ds as u32).to_le_bytes()).is_some() {
                             0
                         } else {
@@ -805,7 +805,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 ERR
             } else {
                 match task::sched_fields(a2 as u32) {
-                    Some((nice, _, _, _, _)) => nice as i64 as u64,
+                    Some((nice, ..)) => nice as i64 as u64,
                     None => (-3i64) as u64,
                 }
             }
@@ -820,7 +820,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_SCHED_GETSCHEDULER => {
             // (pid) -> 0=SCHED_OTHER | 1=SCHED_RT | -3 ESRCH
             match task::sched_fields(a1 as u32) {
-                Some((_, rt, _, _, _)) => {
+                Some((_, rt, ..)) => {
                     if rt {
                         shared::SCHED_RT
                     } else {
@@ -834,8 +834,8 @@ pub fn dispatch(ctx: &mut CpuContext) {
             // (pid, out u64 sched_priority) — rt tasks read back 99,
             // normal tasks 0 (Linux convention).
             match task::sched_fields(a1 as u32) {
-                Some((_, rt, _, _, _)) => {
-                    let pr: u64 = if rt { 99 } else { 0 };
+                Some((_, rt, rt_prio, ..)) => {
+                    let pr: u64 = if rt { rt_prio as u64 } else { 0 };
                     if copy_out(a2, &pr.to_le_bytes()).is_none() {
                         ERR
                     } else {
@@ -865,13 +865,54 @@ pub fn dispatch(ctx: &mut CpuContext) {
             // utime is the real per-task cpu_ticks; no user/system split
             // or child accumulation yet, so the other three read 0.
             let mut b = alloc::vec![0u8; 32];
-            if let Some((_, _, _, _, ticks)) = task::sched_fields(0) {
+            if let Some((_, _, _, _, _, ticks, _)) = task::sched_fields(0) {
                 b[0..8].copy_from_slice(&ticks.to_le_bytes());
             }
             if copy_out(a1, &b).is_some() {
                 task::ticks()
             } else {
                 ERR
+            }
+        }
+        shared::SYS_SCHED_SETSCHEDULER => {
+            // (pid, policy, const u32* sched_priority)
+            match copy_in(a3, 4) {
+                Some(b) => task::sched_set(
+                    a1 as u32,
+                    a2,
+                    u32::from_le_bytes(b[..4].try_into().unwrap()),
+                ) as u64,
+                None => ERR,
+            }
+        }
+        shared::SYS_SCHED_SETPARAM => match copy_in(a2, 4) {
+            Some(b) => task::sched_setparam(
+                a1 as u32,
+                u32::from_le_bytes(b[..4].try_into().unwrap()),
+            ) as u64,
+            None => ERR,
+        },
+        shared::SYS_SCHED_GET_PRIORITY_MIN => match task::sched_prio_range(a1) {
+            Some((lo, _)) => lo as u64,
+            None => (-22i64) as u64,
+        },
+        shared::SYS_SCHED_GET_PRIORITY_MAX => match task::sched_prio_range(a1) {
+            Some((_, hi)) => hi as u64,
+            None => (-22i64) as u64,
+        },
+        shared::SYS_SCHED_RR_GET_INTERVAL => {
+            // real PIT quantum: 1/TICK_HZ in {sec, nsec}
+            if task::sched_fields(a1 as u32).is_none() {
+                (-3i64) as u64
+            } else {
+                let mut ts = alloc::vec![0u8; 16];
+                let ns: u64 = 1_000_000_000 / crate::timer::TICK_HZ;
+                ts[8..16].copy_from_slice(&ns.to_le_bytes());
+                if copy_out(a2, &ts).is_some() {
+                    0
+                } else {
+                    ERR
+                }
             }
         }
         shared::SYS_STATFS => match copy_str(a1, a2) {

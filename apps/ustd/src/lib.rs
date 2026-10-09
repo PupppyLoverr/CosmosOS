@@ -1073,6 +1073,49 @@ pub fn get_pdeathsig() -> u32 {
     v
 }
 
+/// sched_setscheduler(pid, policy, prio): OTHER(0)+prio0 or RT(1/2)+prio1..99.
+pub fn sched_setscheduler(pid: u32, policy: u64, prio: u32) -> i64 {
+    sc3(
+        shared::SYS_SCHED_SETSCHEDULER,
+        pid as u64,
+        policy,
+        &prio as *const u32 as u64,
+    ) as i64
+}
+/// sched_setparam(pid, prio): rt 1..99, other 0.
+pub fn sched_setparam(pid: u32, prio: u32) -> i64 {
+    sc2(
+        shared::SYS_SCHED_SETPARAM,
+        pid as u64,
+        &prio as *const u32 as u64,
+    ) as i64
+}
+/// sched_get_priority_min/max(policy) -> bound | -22
+pub fn sched_get_priority_min(policy: u64) -> i64 {
+    sc1(shared::SYS_SCHED_GET_PRIORITY_MIN, policy) as i64
+}
+pub fn sched_get_priority_max(policy: u64) -> i64 {
+    sc1(shared::SYS_SCHED_GET_PRIORITY_MAX, policy) as i64
+}
+/// sched_rr_get_interval(pid) -> interval ns (real PIT quantum) | -1
+pub fn sched_rr_get_interval(pid: u32) -> i64 {
+    let mut ts = [0u64; 2];
+    if sc2(shared::SYS_SCHED_RR_GET_INTERVAL, pid as u64, ts.as_mut_ptr() as u64)
+        != 0
+    {
+        return -1;
+    }
+    (ts[0] * 1_000_000_000 + ts[1]) as i64
+}
+/// prctl PR_GET_DUMPABLE -> 0|1|2 | err
+pub fn get_dumpable() -> i64 {
+    sc5(shared::SYS_PRCTL, 3, 0, 0, 0, 0) as i64
+}
+/// prctl PR_SET_DUMPABLE(0|1|2) -> 0 | -22
+pub fn set_dumpable(v: u64) -> i64 {
+    sc5(shared::SYS_PRCTL, 4, v, 0, 0, 0) as i64
+}
+
 /// chrt(pid, class): set scheduler class — SCHED_OTHER=0, SCHED_RT=1.
 pub fn chrt(pid: u32, class: u64) -> bool {
     sc2(shared::SYS_CHRT, pid as u64, class) == 0

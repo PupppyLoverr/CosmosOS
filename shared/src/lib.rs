@@ -322,6 +322,11 @@ pub const SYS_SCHED_GETSCHEDULER: u64 = 260; // (pid) -> 0=OTHER|1=RT | err -3
 pub const SYS_SCHED_GETPARAM: u64 = 261;     // (pid, out u64 sched_priority) -> 0 | err
 pub const SYS_GETCPU: u64 = 262;             // (out u32 cpu, out u32 node) -> 0 | err
 pub const SYS_TIMES: u64 = 263;              // (out u64[4] tms) -> 0 | err
+pub const SYS_SCHED_SETSCHEDULER: u64 = 264; // (pid, policy, param u32*) -> 0 | err
+pub const SYS_SCHED_SETPARAM: u64 = 265;     // (pid, param u32*) -> 0 | err
+pub const SYS_SCHED_GET_PRIORITY_MIN: u64 = 266; // (policy) -> min | -22
+pub const SYS_SCHED_GET_PRIORITY_MAX: u64 = 267; // (policy) -> max | -22
+pub const SYS_SCHED_RR_GET_INTERVAL: u64 = 268;  // (pid, out u64[2] ts) -> 0 | err
 /// MS_MOVE: move a mount point instead of creating one
 pub const MS_MOVE: u64 = 0x2000;
 /// CLONE_NEWUTS: unshare the UTS namespace (hostname)
@@ -444,6 +449,8 @@ pub const PROT_WRITE: u64 = 2;
 pub const PROT_EXEC: u64 = 4;
 pub const SCHED_OTHER: u64 = 0;
 pub const SCHED_RT: u64 = 1;
+pub const SCHED_FIFO: u64 = 1; // treated as SCHED_RT (one real-time class)
+pub const SCHED_RR: u64 = 2;   // treated as SCHED_RT
 pub const SYS_ERR: u64 = u64::MAX;
 
 // open flags
