@@ -2387,6 +2387,7 @@ pub fn pidfd_read(fd: i64) -> Option<i64> {
 }
 
 pub const F_DUPFD: u64 = shared::F_DUPFD;
+pub const F_GETFD: u64 = shared::F_GETFD;
 pub const F_GETFL: u64 = shared::F_GETFL;
 pub const F_SETFL: u64 = shared::F_SETFL;
 pub const O_NONBLOCK: u64 = shared::O_NONBLOCK;
@@ -2448,6 +2449,9 @@ pub fn writev(fd: i64, iovs: &[(*const u8, usize)]) -> i64 {
 
 pub const SOCK_STREAM: u64 = shared::SOCK_STREAM;
 pub const SOCK_DGRAM: u64 = shared::SOCK_DGRAM;
+/// socket()/accept4() creation flags (== O_NONBLOCK/O_CLOEXEC).
+pub const SOCK_NONBLOCK: u64 = shared::SOCK_NONBLOCK;
+pub const SOCK_CLOEXEC: u64 = shared::SOCK_CLOEXEC;
 
 /// socket(type) -> real fd bound to a kernel socket object (/socket/{id}).
 /// The fd works with read/write/poll/epoll/close like any other.
@@ -2521,8 +2525,13 @@ pub fn listen(fd: i64, backlog: u64) -> i64 {
 /// accept -> (connfd, peer ip, peer port); peer fields are zeroed when
 /// peer_out isn't wanted... here always returned (kernel writes [ip4|port2]).
 pub fn accept(fd: i64) -> Result<(i64, [u8; 4], u16), i64> {
+    accept4(fd, 0)
+}
+/// accept4(fd, SOCK_NONBLOCK|SOCK_CLOEXEC) — the accepted descriptor is
+/// created with the flags set atomically.
+pub fn accept4(fd: i64, flags: u64) -> Result<(i64, [u8; 4], u16), i64> {
     let mut peer = [0u8; 8];
-    let r = sc2(shared::SYS_ACCEPT, fd as u64, peer.as_mut_ptr() as u64) as i64;
+    let r = sc3(shared::SYS_ACCEPT4, fd as u64, peer.as_mut_ptr() as u64, flags) as i64;
     if r < 0 {
         return Err(r);
     }
