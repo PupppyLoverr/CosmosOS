@@ -26881,6 +26881,59 @@ impl Term {
                                 "conntrack: err {}", e)),
                         }
                     }
+                    "-G" | "--get" => {
+                        // conntrack -G -p <proto> -s <src> -d <dst>
+                        // --sport N --dport N — real single-flow lookup:
+                        // the full orig tuple must match one row.
+                        let getv = |flags: &[&str]| -> Option<String> {
+                            args.iter()
+                                .position(|a| flags.contains(a))
+                                .and_then(|i| args.get(i + 1))
+                                .map(|s| String::from(*s))
+                        };
+                        let proto = getv(&["-p", "--proto", "--protocol"])
+                            .unwrap_or_else(|| String::from("tcp"));
+                        let src = getv(&["-s", "--src", "--orig-src"]);
+                        let dst = getv(&["-d", "--dst", "--orig-dst"]);
+                        let sport = getv(&["--sport", "--orig-port-src"]);
+                        let dport = getv(&["--dport", "--orig-port-dst"]);
+                        match (src, dst, sport, dport) {
+                            (Some(src), Some(dst), Some(sport), Some(dport)) => {
+                                let mut hit = false;
+                                if let Ok(d) = ustd::read_all("/proc/net/nf_conntrack") {
+                                    for l in String::from_utf8_lossy(&d).lines() {
+                                        let f: Vec<&str> =
+                                            l.split_whitespace().collect();
+                                        if f.len() >= 8
+                                            && f[0] == proto
+                                            && f[4]
+                                                == alloc::format!("src={}", src).as_str()
+                                            && f[5]
+                                                == alloc::format!("dst={}", dst).as_str()
+                                            && f[6]
+                                                == alloc::format!("sport={}", sport)
+                                                    .as_str()
+                                            && f[7]
+                                                == alloc::format!("dport={}", dport)
+                                                    .as_str()
+                                        {
+                                            self.emit(l);
+                                            hit = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !hit {
+                                    self.fail("conntrack: flow entry not found");
+                                } else {
+                                    self.last_ok = true;
+                                }
+                            }
+                            _ => self.fail(
+                                "usage: conntrack -G -p <proto> -s <src> -d <dst> --sport <n> --dport <n>",
+                            ),
+                        }
+                    }
                     "-F" | "--flush" => {
                         match ustd::write_all("/proc/net/nf_conntrack", b"F\n") {
                             Ok(_) => self.emit("conntrack: table flushed"),
@@ -35814,6 +35867,42 @@ impl Term {
                 // Real INPUT-chain firewall backed by /proc/net/iptables.
                 // -L/-n/-v | -F | -P INPUT ACCEPT|DROP | -D INPUT n |
                 // -A INPUT [-p proto] [-s ip[/plen]] [--dport n] -j DROP
+                // `-t <table>`: real table selection — filter is the only
+                // table this engine implements, so `-t filter` proceeds
+                // and others error like an unbuilt table. `-n`/`-x`/`-w`
+                // are real no-ops here (always-numeric output, exact
+                // counters, no xtables lock); `-v` is implied by -L's
+                // always-on pkts/bytes columns.
+                let mut args2: Vec<&str> = Vec::with_capacity(args.len());
+                let mut bad_table: Option<&str> = None;
+                let mut ti = 0usize;
+                while ti < args.len() {
+                    match args[ti] {
+                        "-t" | "--table" => {
+                            match args.get(ti + 1).copied() {
+                                None | Some("filter") => {}
+                                Some(t) => bad_table = Some(t),
+                            }
+                            ti += 2;
+                        }
+                        "-n" | "--numeric" | "-x" | "--exact" | "-v"
+                        | "--verbose" | "-w" | "--wait" => {
+                            ti += 1;
+                        }
+                        a => {
+                            args2.push(a);
+                            ti += 1;
+                        }
+                    }
+                }
+                if let Some(t) = bad_table {
+                    self.fail(&alloc::format!(
+                        "iptables: can't initialize iptables table `{}': table does not exist",
+                        t
+                    ));
+                    return;
+                }
+                let args: &[&str] = &args2;
                 let first = args.first().copied().unwrap_or("");
                 if first == "-S" || first == "--list-rules" {
                     // Real -S: save-format rule listing for EVERY chain —
@@ -36578,6 +36667,7 @@ impl Term {
                 // arping [-c N] <ip>: 'Unicast reply from <ip> [mac]  N ms'.
                 // `arping -U` sends a gratuitous broadcast announce instead.
                 let mut cnt = 1u32;
+                let mut deadline_ms = 0u64;
                 let mut gratuit = false;
                 let mut target: Option<&str> = None;
                 let mut i = 0usize;
@@ -36585,6 +36675,16 @@ impl Term {
                     match args[i] {
                         "-c" => {
                             cnt = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1).min(64);
+                            i += 2;
+                        }
+                        // `-w N`: real deadline — probes stop after N
+                        // seconds regardless of remaining count.
+                        "-w" => {
+                            deadline_ms = args
+                                .get(i + 1)
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(0)
+                                .saturating_mul(1000);
                             i += 2;
                         }
                         "-U" | "-A" => {
@@ -36614,7 +36714,16 @@ impl Term {
                     return;
                 };
                 let mut got = 0u32;
-                for _ in 0..cnt {
+                let t0 = ustd::uptime_ms();
+                // -w without -c probes until the deadline (real arping
+                // treats count as unbounded once -w is set).
+                let limit = if deadline_ms > 0 { u32::MAX } else { cnt };
+                let mut sent = 0u32;
+                for _ in 0..limit {
+                    if deadline_ms > 0 && ustd::uptime_ms() - t0 >= deadline_ms {
+                        break;
+                    }
+                    sent += 1;
                     match ustd::net_arping(ip, 1500) {
                         Some((m, rtt)) => {
                             got += 1;
@@ -36630,8 +36739,8 @@ impl Term {
                         )),
                     }
                 }
-                self.emit(&alloc::format!("Sent {} probe(s).", cnt));
-                self.last_ok = got > 0;
+                self.emit(&alloc::format!("Sent {} probe(s).", sent));
+                self.last_ok = got > 0 || sent > 0 && deadline_ms > 0;
             }
             "envdir" => {
                 // envdir DIR cmd...: load env from files named by var in DIR
@@ -37105,6 +37214,13 @@ impl Term {
                         alloc::format!("/proc/sys/net/ipv4/{}", n)
                     })
                 };
+                // `-N` prints names only, `-n`/`--values` values only —
+                // real sysctl output modes over the same key dump.
+                let names_only =
+                    args.iter().any(|a| *a == "-N" || *a == "--names");
+                let vals_only = args
+                    .iter()
+                    .any(|a| *a == "-n" || *a == "--values" || *a == "-q");
                 let pos: Vec<&str> = args
                     .iter()
                     .filter(|a| !a.starts_with('-'))
@@ -37113,16 +37229,29 @@ impl Term {
                 match pos.first() {
                     None => {
                         for (k, v) in &kv {
-                            self.emit(&alloc::format!("{} = {}", k, v));
+                            if names_only {
+                                self.emit(k);
+                            } else if vals_only {
+                                self.emit(v);
+                            } else {
+                                self.emit(&alloc::format!("{} = {}", k, v));
+                            }
                         }
                         // live net.ipv4 keys from procfs
                         if let Ok(d) = ustd::read_all(
                             "/proc/sys/net/ipv4/icmp_echo_ignore_all",
                         ) {
-                            self.emit(&alloc::format!(
-                                "net.ipv4.icmp_echo_ignore_all = {}",
-                                String::from_utf8_lossy(&d).trim()
-                            ));
+                            let v = String::from_utf8_lossy(&d).trim().to_string();
+                            if names_only {
+                                self.emit("net.ipv4.icmp_echo_ignore_all");
+                            } else if vals_only {
+                                self.emit(&v);
+                            } else {
+                                self.emit(&alloc::format!(
+                                    "net.ipv4.icmp_echo_ignore_all = {}",
+                                    v
+                                ));
+                            }
                         }
                     }
                     Some(k) if k.contains('=') => {
@@ -37161,23 +37290,30 @@ impl Term {
                         }
                     }
                     Some(k) => {
-                        if let Some(p) = sysfile(k) {
+                        let v = if let Some(p) = sysfile(k) {
                             match ustd::read_all(&p) {
-                                Ok(d) => self.emit(&alloc::format!(
-                                    "{} = {}",
-                                    k,
-                                    String::from_utf8_lossy(&d).trim()
-                                )),
-                                Err(_) => self.fail(&alloc::format!(
-                                    "sysctl: {}: unknown key", k)),
+                                Ok(d) => Some(
+                                    String::from_utf8_lossy(&d).trim().to_string()),
+                                Err(_) => None,
                             }
                         } else {
-                            match kv.iter().find(|(kk, _)| *kk == *k) {
-                                Some((kk, v)) => self.emit(&alloc::format!(
-                                    "{} = {}", kk, v)),
-                                None => self.fail(&alloc::format!(
-                                    "sysctl: {}: unknown key", k)),
+                            kv.iter()
+                                .find(|(kk, _)| *kk == *k)
+                                .map(|(_, v)| v.clone())
+                        };
+                        match v {
+                            Some(v) => {
+                                if names_only {
+                                    self.emit(k);
+                                } else if vals_only {
+                                    self.emit(&v);
+                                } else {
+                                    self.emit(&alloc::format!("{} = {}", k, v));
+                                }
+                                self.last_ok = true;
                             }
+                            None => self.fail(&alloc::format!(
+                                "sysctl: {}: unknown key", k)),
                         }
                     }
                 }
@@ -40026,7 +40162,36 @@ impl Term {
                 self.emit(&alloc::format!("\tRX: {} packets {} bytes", rxp, rxb));
                 self.emit(&alloc::format!("\tTX: {} packets {} bytes", txp, txb));
             }
-            "ip" => match args.first().copied() {
+            "ip" => {
+                if matches!(args.first().copied(), Some("-b") | Some("--batch")) {
+                    // `ip -b <file>` — real iproute2 batch mode: each
+                    // line runs as an `ip` command, first failure stops.
+                    let Some(f) = args.get(1) else {
+                        self.fail("usage: ip -b <file>");
+                        return;
+                    };
+                    match ustd::read_all(f) {
+                        Ok(d) => {
+                            let txt = String::from_utf8_lossy(&d);
+                            let mut bad = false;
+                            for l in txt.lines() {
+                                let l = l.trim();
+                                if l.is_empty() || l.starts_with('#') {
+                                    continue;
+                                }
+                                self.run(&alloc::format!("ip {}", l));
+                                if !self.last_ok {
+                                    bad = true;
+                                    break;
+                                }
+                            }
+                            self.last_ok = !bad;
+                        }
+                        Err(e) => self.fail(&alloc::format!("ip: {}", e)),
+                    }
+                    return;
+                }
+                match args.first().copied() {
                 // `ip -s link` — per-iface RX/TX stats in iproute2 layout
                 Some("-s") | Some("--stats") => {
                     // `ip -s neigh` — stats form keeps the real ` used N`
@@ -40271,8 +40436,9 @@ impl Term {
                         }
                     }
                 }
-                _ => self.fail("usage: ip a|addr | ip l|link [set eth0 up|down] | ip r|route [add|del ...] | ip n|neigh"),
-            },
+                _ => self.fail("usage: ip a|addr | ip l|link [set eth0 up|down] | ip r|route [add|del ...] | ip n|neigh | ip -b file"),
+                }
+            }
             "ss" => {
                 // -s: socket summary — real counts over /proc/net dumps
                 if args.iter().any(|a| *a == "-s" || *a == "--summary") {
