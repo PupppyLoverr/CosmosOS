@@ -268,6 +268,10 @@ struct FwRule {
     src: [u8; 4],         // [0;4] = anywhere
     smask: [u8; 4],
     state: u8,            // 0 = any; bit0 = NEW, bit1 = ESTABLISHED
+    limit_pps: u16,       // 0 = unlimited; `-m limit --limit N/s` cap on rule hits
+    limit_burst: u16,     // bucket depth (real iptables default 5)
+    lim_tokens: u16,      // match-time bucket (packet units)
+    lim_ms: u64,          // last bucket refill
     hits: u64,
     bytes: u64,
 }
@@ -402,6 +406,22 @@ fn fw_dropped(
                 continue;
             }
         }
+        // `-m limit`: a token bucket on the rule match itself — packets
+        // over the rate skip this rule and fall through to the next
+        // rule/policy, exactly like real iptables.
+        if r.limit_pps != 0 {
+            let now = now_ms();
+            let refill =
+                ((now - r.lim_ms) * r.limit_pps as u64 / 1000).min(255) as u16;
+            if refill != 0 {
+                r.lim_tokens = (r.lim_tokens + refill).min(r.limit_burst);
+                r.lim_ms = now;
+            }
+            if r.lim_tokens == 0 {
+                continue; // over the limit — rule does not match
+            }
+            r.lim_tokens -= 1;
+        }
         r.hits += 1;
         r.bytes += plen;
         return true;
@@ -441,6 +461,12 @@ pub fn net_iptables() -> String {
                     2 => "ESTABLISHED",
                     _ => "NEW,ESTABLISHED",
                 }
+            ));
+        }
+        if r.limit_pps != 0 {
+            extra.push_str(&alloc::format!(
+                "  limit: avg {}/sec burst {}",
+                r.limit_pps, r.limit_burst
             ));
         }
         out.push_str(&alloc::format!(
@@ -683,7 +709,11 @@ pub fn iptables_ctl(line: &str) -> bool {
                 Some(n) => n.parse().unwrap_or(0),
                 None => return false,
             };
-            let mut r = FwRule { proto, dport: 0, src: [0; 4], smask: [0; 4], state: 0, hits: 0, bytes: 0 };
+            let mut r = FwRule {
+                proto, dport: 0, src: [0; 4], smask: [0; 4], state: 0,
+                limit_pps: 0, limit_burst: 5, lim_tokens: 5, lim_ms: 0,
+                hits: 0, bytes: 0,
+            };
             let mut ok = true;
             while let Some(k) = f.next() {
                 match k {
@@ -728,6 +758,25 @@ pub fn iptables_ctl(line: &str) -> bool {
                             ok = false;
                         } else {
                             r.state = m;
+                        }
+                    }
+                    // `-m limit --limit N/s` — cap this rule's match rate;
+                    // `limit N` + optional `lburst B`.
+                    "limit" => {
+                        let v = f.next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                        if v == 0 {
+                            ok = false;
+                        } else {
+                            r.limit_pps = v;
+                        }
+                    }
+                    "lburst" => {
+                        let v = f.next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                        if v == 0 {
+                            ok = false;
+                        } else {
+                            r.limit_burst = v;
+                            r.lim_tokens = v;
                         }
                     }
                     _ => ok = false,
