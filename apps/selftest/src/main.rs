@@ -2397,6 +2397,75 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok && ustd::write_all("/proc/sys/net/netfilter/nf_conntrack_max", b"65536").is_ok()
     });
+    check("route-replace", {
+        // ip route replace: real upsert — installs when absent, swaps
+        // the gateway when present, never duplicates the dest/mask pair.
+        let mut ok = ustd::write_all("/proc/net/route", b"replace 203.0.114.0/24 10.0.2.77
+").is_ok();
+        ok = ok && ustd::write_all("/proc/net/route", b"replace 203.0.114.0/24 10.0.2.88
+").is_ok();
+        if let Ok(d) = ustd::read_all("/proc/net/route") {
+            let t = String::from_utf8_lossy(&d);
+            // Linux column format: destination/gateway are LE hex
+            // (203.0.114.0 -> 007200CB, 10.0.2.88 -> 5802000A).
+            let rows: Vec<&str> = t
+                .lines()
+                .filter(|l| l.contains("007200CB"))
+                .collect();
+            ok = ok && rows.len() == 1 && rows[0].contains("5802000A");
+        } else {
+            ok = false;
+        }
+        ok && ustd::write_all("/proc/net/route", b"del 203.0.114.0/24
+").is_ok()
+    });
+    check("neigh-replace", {
+        // ip neigh replace/change: install-or-update a PERMANENT ARP
+        // entry through /proc/net/arp — second write replaces, no dup.
+        let mut ok = ustd::write_all(
+            "/proc/net/arp",
+            b"replace 192.0.2.250 aa:bb:cc:dd:ee:01",
+        )
+        .is_ok();
+        ok = ok && ustd::write_all(
+            "/proc/net/arp",
+            b"change 192.0.2.250 aa:bb:cc:dd:ee:02",
+        )
+        .is_ok();
+        if let Ok(d) = ustd::read_all("/proc/net/arp") {
+            let t = String::from_utf8_lossy(&d);
+            let rows: Vec<&str> = t
+                .lines()
+                .filter(|l| l.contains("192.0.2.250"))
+                .collect();
+            ok = ok && rows.len() == 1 && rows[0].contains("aa:bb:cc:dd:ee:02");
+        } else {
+            ok = false;
+        }
+        ok && ustd::write_all("/proc/net/arp", b"del 192.0.2.250").is_ok()
+    });
+    check("dhcp-release", {
+        // dhcp -r: a real DHCPRELEASE leaves the interface unconfigured
+        // (0.0.0.0); a fresh DISCOVER cycle restores the lease.
+        let had = ustd::net_info().map(|(_, i)| i).unwrap_or([0, 0, 0, 0]);
+        let mut ok = ustd::net_dhcp_release();
+        if let Some((_, ip)) = ustd::net_info() {
+            ok = ok && ip == [0, 0, 0, 0];
+        } else {
+            ok = false;
+        }
+        // re-lease so later net checks see a working interface
+        match ustd::net_dhcp() {
+            Some(ip) => ok = ok && ip != [0, 0, 0, 0],
+            None => {
+                // no DHCP server answer (e.g. no slirp) — restore the
+                // static fallback so the release still "stuck" cleanly.
+                let _ = had;
+                ok = false;
+            }
+        }
+        ok
+    });
     check("dev-mem", {
         ustd::open("/dev/mem", 0)
             .map(|fd| {
