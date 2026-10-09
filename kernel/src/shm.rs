@@ -31,8 +31,21 @@ pub fn init() {
 /// Create a shm region of `size` bytes owned by `owner`. Returns id.
 pub fn create(size: u64, owner: u32) -> Option<u32> {
     let pages = size.div_ceil(0x1000);
-    if pages == 0 || pages > 4096 {
+    // kernel.shmmax bounds a single segment.
+    if pages == 0 || size > crate::sysctl::shmmax() {
         return None;
+    }
+    {
+        // kernel.shmmni (segment count) + kernel.shmall (total pages);
+        // check before allocating so a refused create leaks no frames.
+        let g = SHM.lock();
+        let r = g.as_ref()?;
+        let used: u64 = r.map.values().map(|s| s.frames.len() as u64).sum();
+        if r.map.len() as u64 >= crate::sysctl::shmmni()
+            || used.saturating_add(pages) > crate::sysctl::shmall()
+        {
+            return None;
+        }
     }
     let mut frames = Vec::new();
     for _ in 0..pages {

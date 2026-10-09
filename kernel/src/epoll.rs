@@ -24,6 +24,8 @@ struct Interest {
 }
 
 struct Ep {
+    /// creator's uid — fs.epoll.max_user_watches charges per user
+    owner: u32,
     /// fd-number (as registered) -> interest
     interests: BTreeMap<u32, Interest>,
 }
@@ -46,23 +48,39 @@ pub fn exists(path: &str) -> bool {
     }
 }
 
-pub fn create() -> Result<String, i64> {
+pub fn create(owner: u32) -> Result<String, i64> {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    EPOLLS.lock().insert(id, Ep { interests: BTreeMap::new() });
+    EPOLLS.lock().insert(
+        id,
+        Ep {
+            owner,
+            interests: BTreeMap::new(),
+        },
+    );
     Ok(alloc::format!("/epoll/{}", id))
 }
 
 /// ctl(epfd_path, op, fdnum, fd_path, events):
 /// ADD registers (fails EEXIST-style -17 when the fdnum is already in the
 /// set), DEL removes, MOD replaces the event mask + path.
-pub fn ctl(epfd_path: &str, op: u64, fdnum: u32, fd_path: &str, events: u32) -> i64 {
+pub fn ctl(epfd_path: &str, op: u64, fdnum: u32, fd_path: &str, events: u32, uid: u32) -> i64 {
     let Some(id) = id_of(epfd_path) else { return -9 };
     let mut g = EPOLLS.lock();
+    // fs.epoll.max_user_watches: total interests across every
+    // epoll instance this user owns (Linux per-user accounting).
+    let watched: u64 = g
+        .values()
+        .filter(|x| x.owner == uid)
+        .map(|x| x.interests.len() as u64)
+        .sum();
     let Some(e) = g.get_mut(&id) else { return -9 };
     match op {
         EPOLL_CTL_ADD => {
             if e.interests.contains_key(&fdnum) {
                 return -17;
+            }
+            if watched >= crate::sysctl::epoll_max_watches() {
+                return -28; // ENOSPC
             }
             e.interests.insert(
                 fdnum,

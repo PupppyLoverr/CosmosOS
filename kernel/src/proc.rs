@@ -36,13 +36,13 @@ const NET_FILES: &[&str] = &[
 ];
 
 /// files under /proc/sys/kernel
-const SYS_FILES: &[&str] = &["hostname", "cow_pages", "pid_max", "threads-max"];
+const SYS_FILES: &[&str] = &["hostname", "shmmax", "shmall", "shmmni", "ngroups_max", "cow_pages", "pid_max", "threads-max"];
 
 /// files under /proc/sys/fs (fs/inotify/max_user_watches lives one deeper)
 const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size", "file-max", "file-nr"];
 
 /// files under /proc/sys/net/ipv4
-const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "ip_default_ttl"];
+const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "ip_default_ttl", "ip_unprivileged_port_start"];
 
 pub fn handles(path: &str) -> bool {
     path == "/proc" || path.starts_with("/proc/")
@@ -85,6 +85,8 @@ pub fn is_dir(path: &str) -> bool {
         || path == "/proc/sys/vm"
         || path == "/proc/sys/fs"
         || path == "/proc/sys/fs/inotify"
+        || path == "/proc/sys/fs/mqueue"
+        || path == "/proc/sys/fs/epoll"
         || path == "/proc/sys/net"
         || path == "/proc/sys/net/ipv4"
         || pid_of(path)
@@ -129,6 +131,12 @@ pub fn exists(path: &str) -> bool {
     }
     if let Some(f) = path.strip_prefix("/proc/sys/fs/") {
         if let Some(n) = f.strip_prefix("inotify/") {
+            return n == "max_user_watches" || n == "max_queued_events";
+        }
+        if let Some(n) = f.strip_prefix("mqueue/") {
+            return ["msg_max", "msgsize_max", "queues_max"].contains(&n);
+        }
+        if let Some(n) = f.strip_prefix("epoll/") {
             return n == "max_user_watches";
         }
         return FS_SYS_FILES.contains(&f);
@@ -243,6 +251,26 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         return out;
     }
     if path == "/proc/sys/fs/inotify" {
+        for name in ["max_user_watches", "max_queued_events"] {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            out.push(de);
+        }
+        return out;
+    }
+    if path == "/proc/sys/fs/mqueue" {
+        for name in ["msg_max", "msgsize_max", "queues_max"] {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            out.push(de);
+        }
+        return out;
+    }
+    if path == "/proc/sys/fs/epoll" {
         let mut de = shared::DirEntry::default();
         de.name[..16].copy_from_slice(b"max_user_watches");
         de.name_len = 16;
@@ -250,10 +278,11 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         return out;
     }
     if path == "/proc/sys/fs" {
-        {
+        for dname in ["inotify", "mqueue", "epoll"] {
             let mut de = shared::DirEntry::default();
-            de.name[..7].copy_from_slice(b"inotify");
-            de.name_len = 7;
+            let nb = dname.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
             de.is_dir = 1;
             out.push(de);
         }
@@ -462,6 +491,9 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/net/owners" => net::net_owners(),
         "/proc/sys/kernel/hostname" => alloc::format!("{}\n", crate::syscall::hostname()),
         "/proc/sys/net/ipv4/icmp_echo_ignore_all" => net::net_icmp_ignore_all(),
+        "/proc/sys/net/ipv4/ip_unprivileged_port_start" => {
+            alloc::format!("{}\n", crate::sysctl::unpriv_port_start())
+        }
         "/proc/sys/net/ipv4/ip_default_ttl" => net::net_def_ttl(),
         "/proc/swaps" => {
             // no swap devices in this kernel — header only, like an
@@ -823,6 +855,12 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
         }
         net::set_def_ttl(v);
         return Some(buf.len());
+    }
+    if path == "/proc/sys/net/ipv4/ip_unprivileged_port_start" {
+        let s = String::from(String::from_utf8_lossy(buf).trim());
+        let Ok(v) = s.parse::<u64>() else { return None };
+        return crate::sysctl::set("net/ipv4/ip_unprivileged_port_start", v)
+            .then_some(buf.len());
     }
     if let Some(rel) = path.strip_prefix("/proc/sys/") {
         // hostname is handled by its dedicated arm below; net/* above.
