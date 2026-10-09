@@ -319,6 +319,7 @@ struct FwRule {
     src: [u8; 4],         // [0;4] = anywhere
     smask: [u8; 4],
     src_range: Option<(u32, u32)>, // `-m iprange --src-range a-b` (be u32 bounds)
+    sport: u16,           // `--sport` source-port match: 0 = any
     iface: u8,            // `-i` in-interface: 0 = any, 1 = eth0, 2 = lo
     oiface: u8,           // `-o` out-interface: same encoding
     state: u8,            // 0 = any; bit0 = NEW, bit1 = ESTABLISHED
@@ -486,14 +487,14 @@ fn fw_verdict(
     src: [u8; 4],
     dst: [u8; 4],
     proto: u8,
-    _sport: u16,
+    sport: u16,
     dport: u16,
     st: u8,
     iface: u8,
     plen: u64,
 ) -> u8 {
     let mut fw = chain.lock();
-    match fw_eval(&mut *fw, inbound, src, dst, proto, dport, st, iface, plen, 0) {
+    match fw_eval(&mut *fw, inbound, src, dst, proto, sport, dport, st, iface, plen, 0) {
         // 255 = walked off the end of the builtin chain: policy decides
         255 => {
             if *policy.lock() {
@@ -519,6 +520,7 @@ fn fw_eval(
     src: [u8; 4],
     dst: [u8; 4],
     proto: u8,
+    sport: u16,
     dport: u16,
     st: u8,
     iface: u8,
@@ -527,6 +529,12 @@ fn fw_eval(
 ) -> u8 {
     for r in chain.iter_mut() {
         if r.proto != 0 && r.proto != proto {
+            continue;
+        }
+        // `--sport`: real source-port match (icmp packets carry 0,
+        // so a sport rule on udp/tcp can never match icmp — same as
+        // Linux).
+        if r.sport != 0 && r.sport != sport {
             continue;
         }
         // `-i`/`-o`: the iface the packet arrived/leaves on (1 eth0,
@@ -590,7 +598,7 @@ fn fw_eval(
                 continue; // loop guard — treat as no-match
             }
             let mut snap = FW_USER.lock().get(&r.jump).cloned().unwrap_or_default();
-            let v = fw_eval(&mut snap, inbound, src, dst, proto, dport, st, iface, plen, depth + 1);
+            let v = fw_eval(&mut snap, inbound, src, dst, proto, sport, dport, st, iface, plen, depth + 1);
             if let Some(u) = FW_USER.lock().get_mut(&r.jump) {
                 *u = snap;
             }
@@ -775,6 +783,9 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
     if r.oiface != 0 {
         out.push_str(if r.oiface == 2 { " -o lo" } else { " -o eth0" });
     }
+    if r.sport != 0 {
+        out.push_str(&alloc::format!(" --sport {}", r.sport));
+    }
     if let Some((lo, hi)) = r.src_range {
         let (lo, hi) = (lo.to_be_bytes(), hi.to_be_bytes());
         out.push_str(&alloc::format!(
@@ -907,6 +918,9 @@ fn fmt_fw_rule(out: &mut String, i: usize, r: &FwRule) {
     }
     if r.oiface != 0 {
         extra.push_str(if r.oiface == 2 { "  out:lo" } else { "  out:eth0" });
+    }
+    if r.sport != 0 {
+        extra.push_str(&alloc::format!("  spt:{}", r.sport));
     }
     if r.limit_pps != 0 {
         extra.push_str(&alloc::format!(
@@ -1161,7 +1175,7 @@ fn fw_name_ok(n: &str) -> bool {
         "IN", "OUT", "INPUT", "OUTPUT", "FORWARD", "PREROUTING", "POSTROUTING",
         "icmp", "tcp", "udp", "all", "*", "dport", "multiport", "range", "src",
         "state", "limit", "lburst", "log", "reject", "accept", "return", "drop",
-        "iif", "oif",
+        "iif", "oif", "sport",
     ];
     !n.is_empty()
         && n.len() <= 28
@@ -1536,6 +1550,7 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         src: [0; 4],
         smask: [0; 4],
         src_range: None,
+        sport: 0,
         iface: 0,
         oiface: 0,
         state: 0,
@@ -1554,6 +1569,13 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
             "dport" => {
                 r.dport = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                 if r.dport == 0 {
+                    ok = false;
+                }
+            }
+            // `--sport <n>` — real source-port match on tcp/udp.
+            "sport" => {
+                r.sport = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                if r.sport == 0 {
                     ok = false;
                 }
             }
@@ -1678,6 +1700,7 @@ fn fw_rule_eq(a: &FwRule, b: &FwRule) -> bool {
         && a.src == b.src
         && a.smask == b.smask
         && a.src_range == b.src_range
+        && a.sport == b.sport
         && a.iface == b.iface
         && a.oiface == b.oiface
         && a.state == b.state
@@ -2006,15 +2029,21 @@ const TRACER_SPORT: u16 = 0x8342;
 /// when the target itself answers ICMP 3/3). Each hop waits `per_ms`.
 pub fn net_trace(
     dst: [u8; 4],
+    first_hop: u8,
     max_hops: u8,
     per_ms: u64,
+    base_port: u16,
 ) -> Vec<(u8, Option<([u8; 4], u64)>, bool)> {
     let mut hops = Vec::new();
     let Some(mac) = next_hop(dst, 1500) else {
         return hops;
     };
-    for ttl in 1..=max_hops.min(30) {
-        let dport = 33434u16.wrapping_add(ttl as u16);
+    let first = first_hop.max(1).min(30);
+    for ttl in first..=max_hops.min(30).max(first) {
+        // `-p`: the UDP probe base port is real — dport = base + ttl,
+        // and the ICMP matcher keys on the quoted dport so a non-
+        // default base still matches.
+        let dport = base_port.wrapping_add(ttl as u16);
         let t0 = now_ms();
         send_udp_ttl(mac, dst, TRACER_SPORT, dport, b"cosmos-trace", ttl);
         let mut hit: Option<([u8; 4], bool)> = None;
@@ -2069,6 +2098,7 @@ const TRACER_EID: u16 = 0x7ACE;
 /// the target answers an echo reply.
 pub fn net_trace_icmp(
     dst: [u8; 4],
+    first_hop: u8,
     max_hops: u8,
     per_ms: u64,
 ) -> Vec<(u8, Option<([u8; 4], u64)>, bool)> {
@@ -2076,7 +2106,8 @@ pub fn net_trace_icmp(
     let Some(mac) = next_hop(dst, 1500) else {
         return hops;
     };
-    for ttl in 1..=max_hops.min(30) {
+    let first = first_hop.max(1).min(30);
+    for ttl in first..=max_hops.min(30).max(first) {
         let t0 = now_ms();
         send_icmp_echo_ttl(mac, dst, TRACER_EID, ttl as u16, ttl, b"cosmos-trace-icmp");
         let mut hit: Option<([u8; 4], bool)> = None;

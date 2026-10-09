@@ -8030,6 +8030,7 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut proto = 0u8;
     let mut src = String::new();
     let mut dport = 0u16;
+    let mut sport = 0u16;
     let mut dports = String::new();
     let mut src_range = String::new();
     let mut iif = "";
@@ -8062,8 +8063,17 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 src = String::from(args.get(i + 1).copied().unwrap_or(""));
                 i += 1;
             }
-            "--dport" | "--destination-port" | "--sport" => {
+            "--dport" | "--destination-port" => {
                 dport = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(0);
+                i += 1;
+            }
+            // `--sport <n>` — real source-port match (was incorrectly
+            // aliased to --dport before the kernel field existed).
+            "--sport" | "--source-port" => {
+                sport = args
                     .get(i + 1)
                     .and_then(|s| s.parse::<u16>().ok())
                     .unwrap_or(0);
@@ -8198,6 +8208,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     };
     if dport != 0 {
         line.push_str(&alloc::format!(" dport {}", dport));
+    }
+    if sport != 0 {
+        line.push_str(&alloc::format!(" sport {}", sport));
     }
     if !dports.is_empty() {
         line.push_str(&alloc::format!(" multiport {}", dports));
@@ -22909,9 +22922,13 @@ impl Term {
                 }
             },
             "traceroute" | "tracepath" => {
-                // traceroute [-m hops] host -- UDP probes with rising ttl;
-                // hops answer ICMP 11 (or the target's own 3/3)
+                // traceroute [-m hops] [-f first] [-p port] [-w secs]
+                // [-I|-U] host — UDP probes with rising ttl; hops answer
+                // ICMP 11 (or the target's own 3/3).
                 let mut maxh = 15u8;
+                let mut first = 1u8;
+                let mut basep = 0u16;
+                let mut wait_ms = 0u64;
                 let mut icmp = false;
                 let mut target: Option<&str> = None;
                 let mut i = 0usize;
@@ -22923,6 +22940,33 @@ impl Term {
                                 .and_then(|x| x.parse().ok())
                                 .unwrap_or(15)
                                 .min(30);
+                            i += 2;
+                        }
+                        "-f" | "--first-hop" => {
+                            first = args
+                                .get(i + 1)
+                                .and_then(|x| x.parse().ok())
+                                .unwrap_or(1)
+                                .min(30);
+                            i += 2;
+                        }
+                        "-p" | "--port" => {
+                            // -p: real UDP base port — probes use
+                            // base+ttl as dport (ICMP mode ignores it).
+                            basep = args
+                                .get(i + 1)
+                                .and_then(|x| x.parse().ok())
+                                .unwrap_or(0);
+                            i += 2;
+                        }
+                        "-w" | "--wait" => {
+                            // -w secs (fractional ok): per-hop wait.
+                            wait_ms = args
+                                .get(i + 1)
+                                .and_then(|x| x.parse::<f64>().ok())
+                                .map(|s| (s * 1000.0) as u64)
+                                .unwrap_or(0)
+                                .min(30_000);
                             i += 2;
                         }
                         "-I" | "--icmp" => {
@@ -22952,11 +22996,8 @@ impl Term {
                             s, ip[0], ip[1], ip[2], ip[3], maxh
                         ));
                         let mut ok = false;
-                        let hops = if icmp {
-                            ustd::net_trace_icmp(packed, maxh)
-                        } else {
-                            ustd::net_trace(packed, maxh)
-                        };
+                        let hops =
+                            ustd::net_trace_opts(packed, icmp, first, maxh, basep, wait_ms);
                         for (ttl, hop, reached) in hops {
                             match hop {
                                 Some((hip, ms)) => {
@@ -37633,8 +37674,12 @@ impl Term {
                     let h = ustd::hostname();
                     self.emit(h.split('.').next().unwrap_or(&h));
                 }
-                // -i/--ip-address: the host's own IPs (eth0 + lo)
-                Some(f) if *f == "-i" || *f == "--ip-address" => {
+                // -i/--ip-address / -I/--all-ip-addresses: the host's own
+                // IPs across the real interface set (eth0 + lo)
+                Some(f)
+                    if *f == "-i" || *f == "--ip-address" || *f == "-I"
+                        || *f == "--all-ip-addresses" =>
+                {
                     let ip = ustd::net_info()
                         .map(|(_, i)| {
                             alloc::format!(

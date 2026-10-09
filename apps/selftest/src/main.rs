@@ -5122,6 +5122,34 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = fw("X IFC\n");
         ok
     });
+    // `iptables --sport N` is a real match on the packet's source
+    // port: DNS replies (sport 53) die at ingress while the rule is
+    // up and resolution works again once it's flushed.
+    check("ipt-sport", {
+        let fw = |l: &str| ustd::write_all("/proc/net/iptables", l.as_bytes()).is_ok();
+        // The kernel DNS cache must be cold — a cached answer skips
+        // the wire entirely and nothing reaches the rule.
+        let _ = ustd::write_all("/proc/net/dns", b"F\n");
+        let blocked =
+            fw("A IN 0 sport 53 drop\n") && ustd::net_dns("example.com").is_none();
+        let _ = fw("F IN\n");
+        let _ = ustd::write_all("/proc/net/dns", b"F\n");
+        let restored = ustd::net_dns("example.com").is_some();
+        blocked && restored
+    });
+    // `traceroute -f N` starts the TTL walk at N — the first reported
+    // hop carries ttl N, none below.
+    check("trace-first-hop", {
+        let hops = ustd::net_trace_opts(0x0A00_0202, false, 3, 4, 0, 300);
+        !hops.is_empty() && hops.iter().all(|(t, _, _)| *t >= 3)
+    });
+    // `traceroute -p` is a real base port: the hop-1 gateway still
+    // answers ICMP 11 quoting dport base+1 — the probe matcher keys
+    // on the quoted port, so a non-default base proves the plumbing.
+    check("trace-base-port", {
+        let hops = ustd::net_trace_opts(0x0A00_0202, false, 1, 2, 40000, 400);
+        hops.first().map(|(_, h, _)| h.is_some()).unwrap_or(false)
+    });
 
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {
