@@ -685,6 +685,124 @@ pub fn net_iptables() -> String {
     out
 }
 
+/// Canonical `iptables-save` dump (`/proc/net/iptsave`): `*filter` …
+/// `COMMIT` — `iptables -S`/`iptables-save` read it, `iptables-restore`
+/// feeds the -A lines back through the ctl path, so the round-trip is
+/// the same grammar on both legs.
+pub fn net_iptsave() -> String {
+    let mut out = String::from("*filter\n");
+    let def = |out: &mut String, name: &str, pol: bool, ch: &Mutex<Vec<FwRule>>| {
+        let (p, b) = ch
+            .lock()
+            .iter()
+            .fold((0u64, 0u64), |(p, b), r| (p + r.hits, b + r.bytes));
+        out.push_str(&alloc::format!(
+            ":{} {} [{}:{}]\n",
+            name,
+            if pol { "DROP" } else { "ACCEPT" },
+            p,
+            b
+        ));
+    };
+    def(&mut out, "INPUT", *FW_POLICY.lock(), &FW);
+    def(&mut out, "OUTPUT", *FW_OUT_POLICY.lock(), &FW_OUT);
+    let names: Vec<String> = FW_USER.lock().keys().cloned().collect();
+    for n in &names {
+        out.push_str(&alloc::format!(":{} - [0:0]\n", n));
+    }
+    // `[pkts:bytes] -A CHAIN spec` — the real `-c` counter prefix.
+    for r in FW.lock().iter() {
+        out.push_str(&alloc::format!("[{}:{}] -A INPUT", r.hits, r.bytes));
+        fmt_fw_spec(&mut out, r);
+        out.push('\n');
+    }
+    for r in FW_OUT.lock().iter() {
+        out.push_str(&alloc::format!("[{}:{}] -A OUTPUT", r.hits, r.bytes));
+        fmt_fw_spec(&mut out, r);
+        out.push('\n');
+    }
+    for n in &names {
+        let v = FW_USER.lock().get(n).cloned().unwrap_or_default();
+        for r in v.iter() {
+            out.push_str(&alloc::format!("[{}:{}] -A {}", r.hits, r.bytes, n));
+            fmt_fw_spec(&mut out, r);
+            out.push('\n');
+        }
+    }
+    out.push_str("COMMIT\n");
+    out
+}
+
+/// One rule in `-A <chain> <spec>` restore syntax — the exact inverse
+/// of `fw_parse_spec` via the terminal's `ipt_rule_from_args` flags.
+fn fmt_fw_spec(out: &mut String, r: &FwRule) {
+    if r.proto != 0 {
+        out.push_str(&alloc::format!(
+            " -p {}",
+            match r.proto {
+                1 => String::from("icmp"),
+                6 => String::from("tcp"),
+                17 => String::from("udp"),
+                n => alloc::format!("{}", n),
+            }
+        ));
+    }
+    if r.src != [0; 4] {
+        let plen: u32 = r.smask.iter().map(|b| b.count_ones()).sum();
+        out.push_str(&alloc::format!(
+            " -s {}.{}.{}.{}/{}",
+            r.src[0], r.src[1], r.src[2], r.src[3], plen
+        ));
+    }
+    if let Some((lo, hi)) = r.src_range {
+        let (lo, hi) = (lo.to_be_bytes(), hi.to_be_bytes());
+        out.push_str(&alloc::format!(
+            " -m iprange --src-range {}.{}.{}.{}-{}.{}.{}.{}",
+            lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]
+        ));
+    }
+    if !r.dports.is_empty() {
+        let mut csv = String::new();
+        for (i, p) in r.dports.iter().enumerate() {
+            if i > 0 {
+                csv.push(',');
+            }
+            csv.push_str(&alloc::format!("{}", p));
+        }
+        out.push_str(&alloc::format!(" -m multiport --dports {}", csv));
+    } else if r.dport != 0 {
+        out.push_str(&alloc::format!(" --dport {}", r.dport));
+    }
+    if r.state != 0 {
+        out.push_str(&alloc::format!(
+            " -m state --state {}{}{}",
+            if r.state & 1 != 0 { "NEW" } else { "" },
+            if r.state == 3 { "," } else { "" },
+            if r.state & 2 != 0 { "ESTABLISHED" } else { "" }
+        ));
+    }
+    if r.limit_pps != 0 {
+        out.push_str(&alloc::format!(" -m limit --limit {}/s", r.limit_pps));
+        if r.limit_burst != 5 {
+            out.push_str(&alloc::format!(" --limit-burst {}", r.limit_burst));
+        }
+    }
+    out.push_str(&alloc::format!(
+        " -j {}",
+        if !r.jump.is_empty() {
+            r.jump.clone()
+        } else {
+            String::from(match r.target {
+                1 => "LOG",
+                2 => "REJECT",
+                3 => "ACCEPT",
+                4 => "RETURN",
+                _ => "DROP",
+            })
+        }
+    ));
+}
+
 fn fmt_fw_chain(
     out: &mut String,
     name: &str,
@@ -1147,6 +1265,40 @@ pub fn iptables_ctl(line: &str) -> bool {
                 true
             }
         },
+        // `Q <ch> <proto> <spec>` — check-rule-exists (`iptables -C`):
+        // same parse as spec-delete, returns whether a rule matches.
+        Some("Q") => {
+            let (ch, t) = fw_chain_tok(&mut f);
+            let Some(pr) = fw_proto_tok(t) else {
+                return false;
+            };
+            let Some(want) = fw_parse_spec(&mut f, pr) else {
+                return false;
+            };
+            fw_with_chain(&ch, |v| v.iter().any(|r| fw_rule_eq(r, &want)))
+                .unwrap_or(false)
+        }
+        // `C <ch> <pkts> <bytes>` — counter restore (`iptables-restore
+        // -c`): applies to the last rule of the named chain, which is
+        // the one the preceding `-A` line just appended.
+        Some("C") => {
+            let (ch, p) = fw_chain_tok(&mut f);
+            let (Some(p), Some(b)) = (
+                p.and_then(|s| s.parse::<u64>().ok()),
+                f.next().and_then(|s| s.parse::<u64>().ok()),
+            ) else {
+                return false;
+            };
+            fw_with_chain(&ch, |v| match v.last_mut() {
+                Some(r) => {
+                    r.hits = p;
+                    r.bytes = b;
+                    true
+                }
+                None => false,
+            })
+            .unwrap_or(false)
+        }
         // `E <old> <new>` — rename a user chain; jumps keep working
         // because netfilter refs the chain, not the name — so rewrite
         // every jump field equal to `old`.
