@@ -5185,6 +5185,36 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let delta = tx().saturating_sub(tx0);
         hops.first().map(|(_, h, _)| h.is_some()).unwrap_or(false) && delta >= 3
     });
+    check("ping-bcast", {
+        // `ping -b`: the broadcast echo must really leave the NIC — the
+        // TX counter bumps (no ARP lookup runs for 255.255.255.255).
+        let tx = || -> u64 {
+            ustd::read_all("/proc/net/dev")
+                .ok()
+                .and_then(|d| {
+                    String::from_utf8_lossy(&d)
+                        .lines()
+                        .find(|l| l.trim_start().starts_with("eth0:"))
+                        .and_then(|l| l.split(':').nth(1).map(String::from))
+                })
+                .and_then(|t| {
+                    t.split_whitespace().nth(9).and_then(|v| v.parse().ok())
+                })
+                .unwrap_or(0)
+        };
+        let tx0 = tx();
+        let _ = ustd::net_ping(0xFFFF_FFFF, 400);
+        tx().saturating_sub(tx0) >= 1
+    });
+    check("ipt-comment", {
+        // `-m comment --comment` rides on the rule — readable via -L.
+        let a = ustd::write_all("/proc/net/iptables", b"A IN 0 comment tagged_rule drop\n")
+            .is_ok();
+        let list = ustd::read_all("/proc/net/iptables").unwrap_or_default();
+        let has = String::from_utf8_lossy(&list).contains("tagged_rule");
+        let _ = ustd::write_all("/proc/net/iptables", b"F IN\n");
+        a && has
+    });
 
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {
