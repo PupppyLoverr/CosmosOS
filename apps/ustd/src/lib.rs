@@ -2622,13 +2622,27 @@ pub fn net_trace(
     ip: u32,
     max_hops: u8,
 ) -> alloc::vec::Vec<(u8, Option<([u8; 4], u64)>, bool)> {
+    net_trace_opts(ip, false, 1, max_hops, 0, 0)
+}
+/// Traceroute with real options: `icmp` = -I probes, `first_hop` = -f,
+/// `base_port` = -p (0 → 33434), `per_ms` = -w wait per hop (0 → 900).
+pub fn net_trace_opts(
+    ip: u32,
+    icmp: bool,
+    first_hop: u8,
+    max_hops: u8,
+    base_port: u16,
+    per_ms: u64,
+) -> alloc::vec::Vec<(u8, Option<([u8; 4], u64)>, bool)> {
     let mut buf = [0u8; 16 * 30];
-    let n = sc4(
+    let a5 = (base_port as u64) | ((first_hop as u64) << 16) | (per_ms << 24);
+    let n = sc5(
         shared::SYS_NET_TRACE,
         ip as u64,
-        max_hops as u64,
+        max_hops as u64 | ((icmp as u64) << 16),
         buf.as_mut_ptr() as u64,
         buf.len() as u64,
+        a5,
     );
     let mut out = alloc::vec::Vec::new();
     if n == u64::MAX {
@@ -2651,27 +2665,7 @@ pub fn net_trace_icmp(
     ip: u32,
     max_hops: u8,
 ) -> alloc::vec::Vec<(u8, Option<([u8; 4], u64)>, bool)> {
-    let mut buf = [0u8; 16 * 30];
-    let n = sc4(
-        shared::SYS_NET_TRACE,
-        ip as u64,
-        max_hops as u64 | (1 << 16),
-        buf.as_mut_ptr() as u64,
-        buf.len() as u64,
-    );
-    let mut out = alloc::vec::Vec::new();
-    if n == u64::MAX {
-        return out;
-    }
-    for e in buf[..(n as usize).min(buf.len())].chunks_exact(16) {
-        let ttl = e[0];
-        let got = e[1] & 1 != 0;
-        let reached = e[1] & 2 != 0;
-        let ip: [u8; 4] = e[4..8].try_into().unwrap_or([0; 4]);
-        let ms = u64::from_be_bytes(e[8..16].try_into().unwrap_or([0; 8]));
-        out.push((ttl, if got { Some((ip, ms)) } else { None }, reached));
-    }
-    out
+    net_trace_opts(ip, true, 1, max_hops, 0, 0)
 }
 
 /// fd-based TCP socket — poll/read/write/close all work on it.
