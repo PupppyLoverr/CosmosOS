@@ -491,14 +491,22 @@ static CT: Mutex<Vec<CtEnt>> = Mutex::new(Vec::new());
 /// Entries past their lifetime are real evictions — the flow forgets
 /// its state and the next packet is NEW again.
 fn ct_timeout(e: &CtEnt) -> u64 {
+    // net.netfilter.nf_conntrack_*_timeout sysctls — per-proto idle
+    // lifetimes in seconds, like the real conntrack knobs.
     match e.proto {
-        1 => 60_000,
-        17 => 120_000,
+        1 => crate::sysctl::ct_icmp_timeout() * 1000,
+        17 => {
+            if e.seen_reply {
+                crate::sysctl::ct_udp_stream_timeout() * 1000
+            } else {
+                crate::sysctl::ct_udp_timeout() * 1000
+            }
+        }
         6 => {
             if e.seen_reply {
-                300_000
+                crate::sysctl::ct_tcp_est_timeout() * 1000
             } else {
-                120_000
+                crate::sysctl::ct_tcp_syn_timeout() * 1000
             }
         }
         _ => 120_000,

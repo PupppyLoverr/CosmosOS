@@ -254,6 +254,11 @@ static NEIGH_STALE_MS: AtomicU64 = AtomicU64::new(60_000);
 static NEIGH_THRESH3: AtomicU64 = AtomicU64::new(1024);
 static NEIGH_RETRANS_MS: AtomicU64 = AtomicU64::new(1000);
 static NEIGH_MCAST_SOLICIT: AtomicU64 = AtomicU64::new(3);
+static CT_ICMP_TIMEOUT: AtomicU64 = AtomicU64::new(60);
+static CT_UDP_TIMEOUT: AtomicU64 = AtomicU64::new(120);
+static CT_UDP_STREAM_TIMEOUT: AtomicU64 = AtomicU64::new(120);
+static CT_TCP_SYN_TIMEOUT: AtomicU64 = AtomicU64::new(120);
+static CT_TCP_EST_TIMEOUT: AtomicU64 = AtomicU64::new(300);
 
 /// net.ipv4.tcp_syn_retries — SYN re-send cap during connect()
 /// (Linux default 6); the connect loop gives up ETIMEDOUT after
@@ -348,6 +353,31 @@ pub fn neigh_retrans_ms() -> u64 {
 /// a resolve sends before giving up on retransmits (Linux default 3).
 pub fn neigh_mcast_solicit() -> u64 {
     NEIGH_MCAST_SOLICIT.load(Ordering::Relaxed)
+}
+/// net.netfilter.nf_conntrack_icmp_timeout — idle seconds before an
+/// untracked ICMP flow is evicted (Linux default 30; ours shipped 60).
+pub fn ct_icmp_timeout() -> u64 {
+    CT_ICMP_TIMEOUT.load(Ordering::Relaxed)
+}
+/// net.netfilter.nf_conntrack_udp_timeout — idle seconds for an
+/// unanswered UDP flow.
+pub fn ct_udp_timeout() -> u64 {
+    CT_UDP_TIMEOUT.load(Ordering::Relaxed)
+}
+/// net.netfilter.nf_conntrack_udp_timeout_stream — idle seconds for a
+/// UDP flow that has seen a reply (Linux distinguishes the two).
+pub fn ct_udp_stream_timeout() -> u64 {
+    CT_UDP_STREAM_TIMEOUT.load(Ordering::Relaxed)
+}
+/// net.netfilter.nf_conntrack_tcp_timeout_syn_sent — idle seconds
+/// for a TCP flow that never saw a reply.
+pub fn ct_tcp_syn_timeout() -> u64 {
+    CT_TCP_SYN_TIMEOUT.load(Ordering::Relaxed)
+}
+/// net.netfilter.nf_conntrack_tcp_timeout_established — idle seconds
+/// for a replied TCP flow (Linux defaults to days; ours shipped 300).
+pub fn ct_tcp_est_timeout() -> u64 {
+    CT_TCP_EST_TIMEOUT.load(Ordering::Relaxed)
 }
 
 /// net.ipv4.conf.all.rp_filter — 0 off, 1 strict, 2 loose. Wire frames
@@ -479,6 +509,17 @@ pub fn get(name: &str) -> Option<u64> {
         "net/ipv4/neigh/default/gc_thresh3" => NEIGH_THRESH3.load(Ordering::Relaxed),
         "net/ipv4/neigh/default/retrans_time_ms" => NEIGH_RETRANS_MS.load(Ordering::Relaxed),
         "net/ipv4/neigh/default/mcast_solicit" => NEIGH_MCAST_SOLICIT.load(Ordering::Relaxed),
+        "net/netfilter/nf_conntrack_icmp_timeout" => CT_ICMP_TIMEOUT.load(Ordering::Relaxed),
+        "net/netfilter/nf_conntrack_udp_timeout" => CT_UDP_TIMEOUT.load(Ordering::Relaxed),
+        "net/netfilter/nf_conntrack_udp_timeout_stream" => {
+            CT_UDP_STREAM_TIMEOUT.load(Ordering::Relaxed)
+        }
+        "net/netfilter/nf_conntrack_tcp_timeout_syn_sent" => {
+            CT_TCP_SYN_TIMEOUT.load(Ordering::Relaxed)
+        }
+        "net/netfilter/nf_conntrack_tcp_timeout_established" => {
+            CT_TCP_EST_TIMEOUT.load(Ordering::Relaxed)
+        }
 
         _ => return None,
     })
@@ -627,6 +668,21 @@ pub fn set(name: &str, v: u64) -> bool {
         }
         "net/ipv4/neigh/default/mcast_solicit" if v <= 255 => {
             NEIGH_MCAST_SOLICIT.store(v, Ordering::Relaxed)
+        }
+        "net/netfilter/nf_conntrack_icmp_timeout" if v <= 86400 => {
+            CT_ICMP_TIMEOUT.store(v, Ordering::Relaxed)
+        }
+        "net/netfilter/nf_conntrack_udp_timeout" if v <= 86400 => {
+            CT_UDP_TIMEOUT.store(v, Ordering::Relaxed)
+        }
+        "net/netfilter/nf_conntrack_udp_timeout_stream" if v <= 86400 => {
+            CT_UDP_STREAM_TIMEOUT.store(v, Ordering::Relaxed)
+        }
+        "net/netfilter/nf_conntrack_tcp_timeout_syn_sent" if v <= 86400 => {
+            CT_TCP_SYN_TIMEOUT.store(v, Ordering::Relaxed)
+        }
+        "net/netfilter/nf_conntrack_tcp_timeout_established" if v <= 86400 => {
+            CT_TCP_EST_TIMEOUT.store(v, Ordering::Relaxed)
         }
 
         _ => return false,

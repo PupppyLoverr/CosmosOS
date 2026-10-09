@@ -2643,6 +2643,42 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok
     });
+    check("ct-timeouts", {
+        // net.netfilter.nf_conntrack_*_timeout: real per-proto idle
+        // lifetimes — a flow past its knob is evicted on the next
+        // sweep (the nf_conntrack read itself expires).
+        let nf = "/proc/sys/net/netfilter";
+        let w = |p: &str, v: &[u8]| ustd::write_all(p, v).is_ok();
+        let has = |needle: &str| {
+            ustd::read_all("/proc/net/nf_conntrack")
+                .map(|b| String::from_utf8_lossy(&b).contains(needle))
+                .unwrap_or(false)
+        };
+        let fd = ustd::socket(ustd::SOCK_DGRAM);
+        let mut ok = fd >= 0;
+        if ok {
+            let u = ustd::UdpFd(fd);
+            let du = alloc::format!("{}/nf_conntrack_udp_timeout", nf);
+            ok = ok && w("/proc/net/nf_conntrack", b"F") // empty table
+                && w(&du, b"1")
+                && u.sendto(b"x", [10, 0, 2, 2], 9) >= 0
+                && has("udp ");
+            ustd::sleep_ms(1300);
+            let expired = !has("udp ");
+            ok = ok && expired && w(&du, b"120");
+            // the reply stream arm: answered UDP lives on the
+            // udp_timeout_stream knob (round-trip it too)
+            let ds = alloc::format!("{}/nf_conntrack_udp_timeout_stream", nf);
+            ok = ok && w(&ds, b"90") && w(&ds, b"120");
+            let di = alloc::format!("{}/nf_conntrack_icmp_timeout", nf);
+            let dt = alloc::format!("{}/nf_conntrack_tcp_timeout_syn_sent", nf);
+            let de = alloc::format!("{}/nf_conntrack_tcp_timeout_established", nf);
+            ok = ok && w(&di, b"30") && w(&di, b"60")
+                && w(&dt, b"60") && w(&dt, b"120")
+                && w(&de, b"400") && w(&de, b"300");
+        }
+        ok
+    });
     check("domainname-sysctl", {
         // kernel.domainname: a real UTS-scoped string sysctl — round
         // trip through the proc file; empty restores the "(none)" value.

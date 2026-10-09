@@ -44,7 +44,7 @@ const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size", "file-max", "file-nr
 const NET_UNIX_FILES: &[&str] = &["max_dgram_qlen"];
 /// files under /proc/sys/net/core
 const NET_CORE_FILES: &[&str] = &["somaxconn"];
-const NET_NETFILTER_FILES: &[&str] = &["nf_conntrack_max"];
+const NET_NETFILTER_FILES: &[&str] = &["nf_conntrack_max", "nf_conntrack_icmp_timeout", "nf_conntrack_udp_timeout", "nf_conntrack_udp_timeout_stream", "nf_conntrack_tcp_timeout_syn_sent", "nf_conntrack_tcp_timeout_established"];
 /// files under /proc/sys/user
 const USER_SYS_FILES: &[&str] = &[
     "max_user_namespaces",
