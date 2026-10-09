@@ -311,12 +311,30 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         check("dev-null-eof", ustd::read_all("/dev/null")
             .map(|d| d.is_empty())
             .unwrap_or(false));
-        check("dev-zero", ustd::read_all("/dev/zero")
-            .map(|d| !d.is_empty() && d.iter().all(|b| *b == 0))
-            .unwrap_or(false));
+        check("dev-zero", {
+            match ustd::open("/dev/zero", ustd::O_RDONLY) {
+                Ok(fd) => {
+                    let mut b = [1u8; 8192];
+                    // infinite source: two full reads, never EOF
+                    let n = ustd::read(fd, &mut b).unwrap_or(0);
+                    let n2 = ustd::read(fd, &mut b).unwrap_or(0);
+                    ustd::close(fd);
+                    n == 8192 && n2 == 8192 && b.iter().all(|x| *x == 0)
+                }
+                Err(_) => false,
+            }
+        });
         check("dev-random-bits", {
-            let a = ustd::read_all("/dev/urandom").unwrap_or_default();
-            !a.is_empty() && a.iter().any(|b| *b != 0)
+            match ustd::open("/dev/urandom", ustd::O_RDONLY) {
+                Ok(fd) => {
+                    let mut b = [0u8; 128];
+                    let n = ustd::read(fd, &mut b).unwrap_or(0);
+                    let n2 = ustd::read(fd, &mut b).unwrap_or(0);
+                    ustd::close(fd);
+                    n == 128 && n2 == 128 && b.iter().any(|x| *x != 0)
+                }
+                Err(_) => false,
+            }
         });
         check("dev-full-enospc", {
             match ustd::open("/dev/full", ustd::O_RDWR) {

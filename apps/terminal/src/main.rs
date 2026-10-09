@@ -8029,6 +8029,115 @@ fn cpp_demangle(s: &str) -> Option<String> {
     Some(alloc::format!("{}({})", parts.join("::"), args))
 }
 
+/// Minimal on-disk FAT32 formatter: writes a BPB + FSInfo + backup
+/// sector + two FATs (media/EOC entries) + a zeroed data area into an
+/// existing-or-new image file. Layout matches the host `imgtool`
+/// (512B sectors, 1KiB clusters, reserved=32, fsinfo@1, bkboot@6).
+/// Returns (label, serial, sectors, spf32, cluster_count).
+fn fat32_mkfs(
+    path: &str,
+    label: &str,
+    kib: u64,
+) -> Result<(String, u32, u64, u64, u64), String> {
+    let secs = kib * 2;
+    if secs < 2048 {
+        return Err(String::from("image too small (min 1 MiB)"));
+    }
+    let spc: u8 = 2;
+    let mut spf: u64 = 1;
+    loop {
+        let clusters = secs.saturating_sub(32 + 2 * spf) / spc as u64;
+        let need = ((clusters + 2) * 4 + 511) / 512;
+        if need <= spf {
+            break;
+        }
+        spf = need;
+    }
+    let fat1 = 32u64;
+    let fat2 = fat1 + spf;
+    let mut bpb = [0u8; 512];
+    bpb[0] = 0xEB;
+    bpb[1] = 0x58;
+    bpb[2] = 0x90;
+    bpb[3..11].copy_from_slice(b"MSDOS5.0");
+    bpb[11..13].copy_from_slice(&512u16.to_le_bytes());
+    bpb[13] = spc;
+    bpb[14..16].copy_from_slice(&32u16.to_le_bytes());
+    bpb[16] = 2;
+    bpb[21] = 0xF8;
+    bpb[24..26].copy_from_slice(&63u16.to_le_bytes());
+    bpb[26..28].copy_from_slice(&255u16.to_le_bytes());
+    bpb[32..36].copy_from_slice(&(secs as u32).to_le_bytes());
+    bpb[36..40].copy_from_slice(&(spf as u32).to_le_bytes());
+    bpb[44..48].copy_from_slice(&2u32.to_le_bytes());
+    bpb[48..50].copy_from_slice(&1u16.to_le_bytes());
+    bpb[50..52].copy_from_slice(&6u16.to_le_bytes());
+    bpb[64] = 0x80;
+    bpb[66] = 0x29;
+    let serial = (ustd::rand_u64().unwrap_or(0x1234) as u32) | 0x1000_0000;
+    bpb[67..71].copy_from_slice(&serial.to_le_bytes());
+    let mut lab = [b' '; 11];
+    for (i, b) in label.bytes().take(11).enumerate() {
+        lab[i] = b.to_ascii_uppercase();
+    }
+    bpb[71..82].copy_from_slice(&lab);
+    bpb[82..90].copy_from_slice(b"FAT32   ");
+    bpb[510] = 0x55;
+    bpb[511] = 0xAA;
+    let mut fsi = [0u8; 512];
+    fsi[0..4].copy_from_slice(&0x4161_5252u32.to_le_bytes());
+    fsi[484..488].copy_from_slice(&0x6141_7272u32.to_le_bytes());
+    let clusters = (secs - 32 - 2 * spf) / spc as u64;
+    fsi[488..492].copy_from_slice(&((clusters - 1) as u32).to_le_bytes());
+    fsi[492..496].copy_from_slice(&3u32.to_le_bytes());
+    fsi[510] = 0x55;
+    fsi[511] = 0xAA;
+    // FAT[0]=media|EOC, FAT[1]=EOC, FAT[2]=EOC (root dir cluster)
+    let mut fat_head = [0u8; 12];
+    fat_head[0..4].copy_from_slice(&[0xF8, 0xFF, 0xFF, 0x0F]);
+    fat_head[4..12].fill(0xFF);
+    let fd = ustd::open(path, ustd::O_WRONLY | ustd::O_CREATE | ustd::O_TRUNC)
+        .map_err(|e| alloc::format!("open: err {}", e))?;
+    // Stream the whole image sequentially in <=64KiB chunks — the
+    // kernel FS path must never see a multi-MiB single write.
+    let wr = |fd: i64, data: &[u8]| -> Result<(), String> {
+        ustd::write(fd, data)
+            .map_err(|e| alloc::format!("write: err {}", e))?;
+        Ok(())
+    };
+    let zeros = alloc::vec![0u8; 64 * 1024];
+    let wr_zeros = |fd: i64, mut n: u64| -> Result<(), String> {
+        while n > 0 {
+            let c = (n as usize).min(zeros.len());
+            wr(fd, &zeros[..c])?;
+            n -= c as u64;
+        }
+        Ok(())
+    };
+    let r = (|| -> Result<(), String> {
+        // reserved region: BPB@0, FSInfo@1, backup BPB@6, rest zeros
+        let mut head = alloc::vec![0u8; 32 * 512];
+        head[0..512].copy_from_slice(&bpb);
+        head[512..1024].copy_from_slice(&fsi);
+        head[6 * 512..7 * 512].copy_from_slice(&bpb);
+        wr(fd, &head)?;
+        // FAT1 then FAT2: first 12 bytes carry the media+EOC entries
+        for _ in 0..2 {
+            let mut first = alloc::vec![0u8; 512];
+            first[..12].copy_from_slice(&fat_head);
+            wr(fd, &first)?;
+            wr_zeros(fd, (spf - 1) * 512)?;
+        }
+        // data area: zeroed clusters (cluster 2 = empty root dir)
+        wr_zeros(fd, secs * 512 - (fat2 + spf) * 512)?;
+        Ok(())
+    })();
+    ustd::close(fd);
+    r?;
+    Ok((String::from_utf8_lossy(&lab).trim_end().to_string(),
+        serial, secs, spf, clusters))
+}
+
 fn od_aname(b: u8) -> String {
     const NAMES: [&str; 33] = [
         "nul", "soh", "stx", "etx", "eot", "enq", "ack", "bel", " bs",
@@ -11957,6 +12066,7 @@ impl Term {
             "show", "tar", "md5sum", "uuencode", "uudecode", "grep", "find", "file",
             "sha1sum", "cksum", "comm", "zgrep", "zip", "unzip", "chmod", "touch",
             "basenc", "addr2line", "elfedit", "tcpdump", "msgfmt",
+            "mkfs", "mkfs.vfat", "blkid", "vol",
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look", "fmt",
         "pwck", "grpck", "pathchk", "nslookup", "b2sum",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
@@ -19273,6 +19383,236 @@ impl Term {
                     removed,
                     if removed == 1 { "" } else { "s" }
                 ));
+            }
+            "mkfs" | "mkfs.vfat" => {
+                // mkfs.vfat [-n LABEL] <img> <size-KiB> — writes a
+                // real FAT32 filesystem image (BPB/FSInfo/dual FATs).
+                let mut label = String::from("COSMOS");
+                let mut file: Option<&str> = None;
+                let mut kib: Option<u64> = None;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-n" => {
+                            if let Some(v) = args.get(i + 1) {
+                                label = String::from(*v);
+                                i += 1;
+                            }
+                        }
+                        "-C" | "-c" | "-v" | "-F" => {}
+                        a if !a.starts_with('-') => {
+                            if file.is_none() {
+                                file = Some(a);
+                            } else if let Ok(v) = a.parse() {
+                                kib = Some(v);
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let (Some(f), Some(k)) = (file, kib) else {
+                    self.fail("usage: mkfs.vfat [-n LABEL] <img> <size-KiB>");
+                    return;
+                };
+                match fat32_mkfs(f, &label, k) {
+                    Ok((lab, ser, secs, spf, clusters)) => {
+                        self.emit(&alloc::format!(
+                            "mkfs.vfat: {}KiB ({} sectors, 512B)",
+                            k, secs
+                        ));
+                        self.emit(&alloc::format!(
+                            "  FATs=2 spf={} reserved=32 clusters={} (1KiB)",
+                            spf, clusters
+                        ));
+                        self.emit(&alloc::format!(
+                            "  label={} serial={:08X}",
+                            lab, ser
+                        ));
+                    }
+                    Err(e) => self.fail(&alloc::format!("mkfs.vfat: {}", e)),
+                }
+            }
+            "perf" => {
+                // perf stat <cmd>... — real measurement: wall ms +
+                // self cpu-tick delta via proclist.
+                if args.first() != Some(&"stat") || args.len() < 2 {
+                    self.fail("usage: perf stat <cmd>...");
+                    return;
+                }
+                let self_pid = ustd::getpid();
+                let tick_of = |pid: u32| -> u64 {
+                    ustd::proclist(64)
+                        .into_iter()
+                        .find(|p| p.pid == pid)
+                        .map(|p| p.cpu_ticks)
+                        .unwrap_or(0)
+                };
+                let t0 = ustd::uptime_ms();
+                let c0 = tick_of(self_pid);
+                let lines = self.run_captured(&args[1..].join(" "));
+                let t1 = ustd::uptime_ms();
+                let c1 = tick_of(self_pid);
+                for l in lines {
+                    self.emit(&l);
+                }
+                self.emit("");
+                self.emit(" Performance counter stats:");
+                self.emit(&alloc::format!(
+                    "   {:>8} ms   task-clock (wall)",
+                    t1 - t0
+                ));
+                self.emit(&alloc::format!(
+                    "   {:>8}      cpu-ticks (self, 10ms)",
+                    c1.saturating_sub(c0)
+                ));
+            }
+            "iotop" => {
+                // iotop — real per-task io rates: two samples of
+                // /proc/<pid>/io 500ms apart, delta rchar/wchar.
+                let read_ios = |m: &mut Vec<(u32, String, u64, u64)>| {
+                    for p in ustd::proclist(64) {
+                        if p.is_user == 0 {
+                            continue;
+                        }
+                        let nm = core::str::from_utf8(&p.name)
+                            .unwrap_or("")
+                            .trim_matches(char::from(0))
+                            .to_string();
+                        let mut r = 0u64;
+                        let mut w = 0u64;
+                        if let Ok(d) = ustd::read_all(&alloc::format!(
+                            "/proc/{}/io",
+                            p.pid
+                        )) {
+                            let t =
+                                String::from_utf8_lossy(&d).into_owned();
+                            for l in t.lines() {
+                                if let Some(v) = l.strip_prefix("rchar: ") {
+                                    r = v.trim().parse().unwrap_or(0);
+                                } else if let Some(v) =
+                                    l.strip_prefix("wchar: ")
+                                {
+                                    w = v.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                        m.push((p.pid, nm, r, w));
+                    }
+                };
+                let mut a: Vec<(u32, String, u64, u64)> = Vec::new();
+                let mut b: Vec<(u32, String, u64, u64)> = Vec::new();
+                read_ios(&mut a);
+                ustd::sleep_ms(500);
+                read_ios(&mut b);
+                self.emit("  PID   READ-B/s  WRITE-B/s  COMMAND");
+                for (pid, nm, r2, w2) in &b {
+                    if let Some((_, _, r1, w1)) =
+                        a.iter().find(|(p, _, _, _)| p == pid)
+                    {
+                        let dr = r2.saturating_sub(*r1) * 2;
+                        let dw = w2.saturating_sub(*w1) * 2;
+                        if dr > 0 || dw > 0 {
+                            self.emit(&alloc::format!(
+                                "{:>5} {:>10} {:>10}  {}",
+                                pid, dr, dw, nm
+                            ));
+                        }
+                    }
+                }
+            }
+            "pidstat" => {
+                // pidstat [interval] — real cpu% per task: cpu_ticks
+                // deltas over a 1s (or Ns) sample.
+                let itv_ms: u64 = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1)
+                    * 1000;
+                let a = ustd::proclist(64);
+                let t0 = ustd::uptime_ms();
+                ustd::sleep_ms(itv_ms);
+                let b = ustd::proclist(64);
+                let dt = ustd::uptime_ms().saturating_sub(t0).max(1);
+                self.emit("  PID    %CPU  COMMAND");
+                for p in &b {
+                    if p.is_user == 0 {
+                        continue;
+                    }
+                    let d0 = a
+                        .iter()
+                        .find(|q| q.pid == p.pid)
+                        .map(|q| q.cpu_ticks)
+                        .unwrap_or(0);
+                    let ticks = p.cpu_ticks.saturating_sub(d0);
+                    let pct = ticks * 10 * 100 / dt;
+                    if ticks > 0 {
+                        let nm = core::str::from_utf8(&p.name)
+                            .unwrap_or("")
+                            .trim_matches(char::from(0));
+                        self.emit(&alloc::format!(
+                            "{:>5} {:>6}.{:02}  {}",
+                            p.pid,
+                            pct / 100,
+                            pct % 100,
+                            nm
+                        ));
+                    }
+                }
+            }
+            "lslogins" => {
+                // lslogins — real login table: /etc/passwd rows joined
+                // with live tasks (a matching running process marks
+                // the user as logged in).
+                let rows = db_rows("/etc/passwd");
+                let procs = ustd::proclist(64);
+                self.emit("UID  USER   GID  HOME   SHELL        STATUS");
+                for r in &rows {
+                    if r.len() < 7 {
+                        continue;
+                    }
+                    let live = procs.iter().any(|p| {
+                        p.is_user != 0
+                            && core::str::from_utf8(&p.name)
+                                .unwrap_or("")
+                                .trim_matches(char::from(0))
+                                .contains(r[0].as_str())
+                    });
+                    self.emit(&alloc::format!(
+                        "{:<4} {:<6} {:<4} {:<6} {:<12} {}",
+                        r[2], r[0], r[3], r[5], r[6],
+                        if live { "running" } else { "-" }
+                    ));
+                }
+            }
+            "blockdev" => {
+                // blockdev --report|--getro|--getsz — real geometry
+                // from statfs.
+                match args.first().copied() {
+                    Some("--report") | None => {
+                        let kib = ustd::statfs("/")
+                            .map(|(_, bs, tb, _)| bs * tb / 1024)
+                            .unwrap_or(0);
+                        self.emit(
+                            "RO    RA   SSZ   BSZ   StartSec   Size   Device",
+                        );
+                        self.emit(&alloc::format!(
+                            "rw   256   512  1024          0   {}K   /dev/vda",
+                            kib
+                        ));
+                    }
+                    Some("--getro") => self.emit("0"),
+                    Some("--getsz") => {
+                        let secs = ustd::statfs("/")
+                            .map(|(_, bs, tb, _)| bs * tb / 512)
+                            .unwrap_or(0);
+                        self.emit(&alloc::format!("{}", secs));
+                    }
+                    _ => self.fail(
+                        "usage: blockdev --report|--getro|--getsz",
+                    ),
+                }
             }
             "curl" => {
                 // curl — real HTTP/1.1 client on the raw TCP stack.
@@ -29329,8 +29669,13 @@ impl Term {
             }
             "vol" | "blkid" => {
                 // filesystem identity off /dev/vda's FAT BPB (real metadata)
-                let Ok(fd) = ustd::open("/dev/vda", ustd::O_RDONLY) else {
-                    self.fail("vol: no disk");
+                let dev = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .copied()
+                    .unwrap_or("/dev/vda");
+                let Ok(fd) = ustd::open(dev, ustd::O_RDONLY) else {
+                    self.fail(&alloc::format!("blkid: {}: err", dev));
                     return;
                 };
                 let mut sec = [0u8; 512];
@@ -29345,7 +29690,7 @@ impl Term {
                 let serial = u32::from_le_bytes(sec[67..71].try_into().unwrap());
                 let label = String::from_utf8_lossy(&sec[71..82]).trim().to_string();
                 let fstyp = String::from_utf8_lossy(&sec[82..90]).trim().to_string();
-                self.emit(&alloc::format!("/dev/vda: {} [{}] serial {:08x}", fstyp, label, serial));
+                self.emit(&alloc::format!("{}: {} [{}] serial {:08x}", dev, fstyp, label, serial));
                 self.emit(&alloc::format!(
                     "  oem={} bytes/sec={} sec/clus={} fats={} sec/track={} fatsz={}",
                     oem, bps, spc, nf, spt, fatsz
@@ -31802,7 +32147,39 @@ impl Term {
                     self.fail("usage: dd if=<in> of=<out> [bs=N] [count=M] [skip=N] [conv=...]");
                     return;
                 }
-                match ustd::read_all(fi) {
+                // infinite char sources can't use read_all (no EOF):
+                // loop bounded reads up to skip*bs+count*bs instead.
+                let infinite = matches!(
+                    fi,
+                    "/dev/zero" | "/dev/full" | "/dev/random" | "/dev/urandom"
+                );
+                let want = skip
+                    .saturating_mul(bs)
+                    .saturating_add(count.saturating_mul(bs))
+                    .min(128 * 1024 * 1024);
+                match if infinite {
+                    match ustd::open(fi, ustd::O_RDONLY) {
+                        Ok(fd) => {
+                            let mut d = Vec::new();
+                            let mut b2 =
+                                alloc::vec![0u8; bs.min(64 * 1024).max(1)];
+                            while d.len() < want {
+                                match ustd::read(fd, &mut b2) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        d.extend_from_slice(&b2[..n])
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            ustd::close(fd);
+                            Ok(d)
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    ustd::read_all(fi)
+                } {
                     Ok(d) => {
                         let s0 = (skip * bs).min(d.len());
                         let n = (count.saturating_mul(bs)).min(d.len() - s0);
@@ -34132,6 +34509,8 @@ impl Term {
         "elfedit", "setpriv", "runuser",
         "tcpdump", "pldd", "ldconfig", "msgfmt", "pwconv", "pwunconv",
         "grpconv", "grpunconv", "tmpwatch",
+        "mkfs", "mkfs.vfat", "perf", "iotop", "pidstat", "lslogins",
+        "blockdev",
         "fortune", "uuidgen", "mcookie", "logger", "whois", "fdisk", "vol", "blkid", "script",
         "nice", "renice", "pgrep", "pkill", "top", "dc", "vmstat", "free",
         "pcap", "ftp", "lsof", "fuser", "burn", "cron", "browse",

@@ -689,18 +689,17 @@ pub fn write(fd: i64, buf: &[u8]) -> Result<i64, i64> {
     const O_APPEND: u64 = shared::O_APPEND;
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
-    let mut data = fs.read_file(&path).map_err(err_to_i64)?;
-    let write_pos = if flags & O_APPEND != 0 { data.len() as u64 } else { pos };
-    let end = write_pos as usize + buf.len();
-    if end > data.len() {
-        data.resize(end, 0);
-    }
-    data[write_pos as usize..end].copy_from_slice(buf);
-    fs.write_file(&path, &data).map_err(err_to_i64)?;
+    let write_pos = if flags & O_APPEND != 0 {
+        fs.stat(&path).map(|s| s.size).unwrap_or(pos)
+    } else {
+        pos
+    };
+    fs.write_at(&path, write_pos, buf).map_err(err_to_i64)?;
     crate::notify::fire(&path, crate::notify::IN_MODIFY);
+    let end = write_pos + buf.len() as u64;
     task::with_current(|t| {
         if let Some(Some(f)) = t.fds.get_mut(fd as usize) {
-            f.pos = end as u64;
+            f.pos = end;
         }
     });
     task::io_charge(false, buf.len() as u64);
