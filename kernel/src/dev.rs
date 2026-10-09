@@ -116,27 +116,51 @@ pub fn read_at(path: &str, pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
 /// backing file on any real filesystem. /dev/loopctl is the control
 /// node — write "bind <n> <path>" or "clear <n>"; read for the table
 /// "<n> <size> <path>" per bound loop (newest to oldest sorted by n).
-static LOOPS: Mutex<BTreeMap<u32, String>> = Mutex::new(BTreeMap::new());
+/// (backing path, byte offset, size limit) — offset/limit shrink the
+/// loop's window into the file, matching `losetup -o/--sizelimit`.
+static LOOPS: Mutex<BTreeMap<u32, (String, u64, u64)>> =
+    Mutex::new(BTreeMap::new());
 
 fn loop_read(n: u32, pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
-    let file = LOOPS.lock().get(&n).cloned().ok_or(-2i64)?;
-    crate::vfs::read_range(&file, pos, buf)
+    let (file, off, lim) = LOOPS.lock().get(&n).cloned().ok_or(-2i64)?;
+    if lim != 0 {
+        if pos >= lim {
+            return Ok(0);
+        }
+        let take = buf.len().min((lim - pos) as usize);
+        return crate::vfs::read_range(&file, off + pos, &mut buf[..take]);
+    }
+    crate::vfs::read_range(&file, off + pos, buf)
 }
 
 fn loop_write_data(n: u32, pos: u64, buf: &[u8]) -> Result<usize, i64> {
-    let file = LOOPS.lock().get(&n).cloned().ok_or(-2i64)?;
-    let r = crate::vfs::write_range_path(&file, pos, buf)?;
+    let (file, off, lim) = LOOPS.lock().get(&n).cloned().ok_or(-2i64)?;
+    let take = if lim != 0 && pos + buf.len() as u64 > lim {
+        lim.saturating_sub(pos) as usize
+    } else {
+        buf.len()
+    };
+    if take == 0 {
+        return Ok(0);
+    }
+    let r = crate::vfs::write_range_path(&file, off + pos, &buf[..take])?;
     crate::notify::fire(&file, crate::notify::IN_MODIFY);
     Ok(r)
 }
 
 fn loopctl_read(pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
-    let rows: Vec<(u32, String)> =
-        LOOPS.lock().iter().map(|(n, f)| (*n, f.clone())).collect();
+    let rows: Vec<(u32, String, u64, u64)> = LOOPS
+        .lock()
+        .iter()
+        .map(|(n, (f, o, l))| (*n, f.clone(), *o, *l))
+        .collect();
     let mut s = String::new();
-    for (n, file) in rows {
+    for (n, file, off, lim) in rows {
         let sz = crate::vfs::stat_path(&file).map(|st| st.size).unwrap_or(0);
-        s.push_str(&alloc::format!("{} {} {}\n", n, sz, file));
+        s.push_str(&alloc::format!(
+            "{} {} {} {} {}\n",
+            n, sz, off, lim, file
+        ));
     }
     let b = s.as_bytes();
     if pos >= b.len() as u64 {
@@ -176,7 +200,30 @@ fn loopctl_write(buf: &[u8]) -> Result<usize, i64> {
                 if st.size == 0 {
                     return Err(-22);
                 }
-                LOOPS.lock().insert(n, String::from(file));
+                // optional trailing fields: "off <u64>" "size <u64>"
+                let mut off = 0u64;
+                let mut lim = 0u64;
+                while let Some(k) = it.next() {
+                    match k {
+                        "off" => {
+                            off = it
+                                .next()
+                                .and_then(|v| v.parse().ok())
+                                .ok_or(-22i64)?
+                        }
+                        "size" => {
+                            lim = it
+                                .next()
+                                .and_then(|v| v.parse().ok())
+                                .ok_or(-22i64)?
+                        }
+                        _ => return Err(-22),
+                    }
+                }
+                if off >= st.size || (lim != 0 && off + lim > st.size) {
+                    return Err(-22);
+                }
+                LOOPS.lock().insert(n, (String::from(file), off, lim));
             }
             Some("clear") => {
                 let n: u32 =

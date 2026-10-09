@@ -8271,6 +8271,258 @@ fn z85_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// ISO9660 level-1 file id: [A-Z0-9_.] 8.3 with a ";1" version for files.
+fn iso_name(name: &str, is_dir: bool) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| c.to_ascii_uppercase())
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let (stem, ext) = match clean.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && !e.is_empty() => {
+            (s.to_string(), e.to_string())
+        }
+        _ => (clean, String::new()),
+    };
+    let stem = &stem[..stem.len().min(8)];
+    let ext = &ext[..ext.len().min(3)];
+    if is_dir {
+        stem.to_string()
+    } else if ext.is_empty() {
+        alloc::format!("{};1", stem)
+    } else {
+        alloc::format!("{}.{};1", stem, ext)
+    }
+}
+
+/// Append one ISO9660 directory record (34+ bytes, even-aligned).
+fn iso_dirrec(
+    out: &mut Vec<u8>,
+    lba: u32,
+    size: u32,
+    is_dir: bool,
+    name: &[u8],
+    date7: &[u8; 7],
+) {
+    let nlen = name.len();
+    let mut len = 33 + nlen;
+    if len % 2 == 1 {
+        len += 1;
+    }
+    out.push(len as u8);
+    out.push(0); // ext attr record len
+    out.extend_from_slice(&lba.to_le_bytes());
+    out.extend_from_slice(&lba.to_be_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(date7);
+    out.push(if is_dir { 2 } else { 0 });
+    out.push(0); // unit size
+    out.push(0); // interleave gap
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.push(nlen as u8);
+    out.extend_from_slice(name);
+    if (33 + nlen) % 2 == 1 {
+        out.push(0);
+    }
+}
+
+/// Build a real ISO9660 image (primary volume descriptor + path tables +
+/// directory records + file extents). `files` are root-level entries;
+/// `dirs` are (isoname, child files) one level deep. Returns the image.
+fn mkisofs_build(
+    volid: &str,
+    files: &[(String, Vec<u8>)],
+    dirs: &[(String, Vec<(String, Vec<u8>)>)],
+    d7: &[u8; 7],
+    d17: &[u8; 17],
+) -> Vec<u8> {
+    // LBA map: 0-15 system, 16 PVD, 17 term, 18 Lpath, 19 Mpath,
+    // 20 root dir, 21..21+D dir sectors, then file extents.
+    let lba_root = 20u32;
+    let mut lba = lba_root + 1;
+    let mut dir_lbas: Vec<u32> = Vec::new();
+    for _ in dirs {
+        dir_lbas.push(lba);
+        lba += 1;
+    }
+    let mut assign = |v: &Vec<u8>, lba: &mut u32| -> (u32, u32) {
+        let l = *lba;
+        *lba += ((v.len() + 2047) / 2048).max(1) as u32;
+        (l, v.len() as u32)
+    };
+    let mut fl: Vec<(u32, u32)> = Vec::new();
+    for (_, d) in files {
+        fl.push(assign(d, &mut lba));
+    }
+    let mut dl: Vec<Vec<(u32, u32)>> = Vec::new();
+    for (_, ch) in dirs {
+        let mut row = Vec::new();
+        for (_, d) in ch {
+            row.push(assign(d, &mut lba));
+        }
+        dl.push(row);
+    }
+    let nsec = lba;
+
+    // path table (L form): root + each dir
+    let mut lpath: Vec<u8> = Vec::new();
+    lpath.push(1);
+    lpath.push(0);
+    lpath.extend_from_slice(&lba_root.to_le_bytes());
+    lpath.extend_from_slice(&1u16.to_le_bytes());
+    lpath.push(0);
+    lpath.push(0);
+    for (i, (name, _)) in dirs.iter().enumerate() {
+        let nb = name.as_bytes();
+        lpath.push(nb.len() as u8);
+        lpath.push(0);
+        lpath.extend_from_slice(&dir_lbas[i].to_le_bytes());
+        lpath.extend_from_slice(&1u16.to_le_bytes());
+        lpath.extend_from_slice(nb);
+        if nb.len() % 2 == 0 {
+            lpath.push(0);
+        }
+    }
+    // M form: same records, big-endian fields
+    let mut mpath: Vec<u8> = Vec::new();
+    mpath.push(1);
+    mpath.push(0);
+    mpath.extend_from_slice(&lba_root.to_be_bytes());
+    mpath.extend_from_slice(&1u16.to_be_bytes());
+    mpath.push(0);
+    mpath.push(0);
+    for (i, (name, _)) in dirs.iter().enumerate() {
+        let nb = name.as_bytes();
+        mpath.push(nb.len() as u8);
+        mpath.push(0);
+        mpath.extend_from_slice(&dir_lbas[i].to_be_bytes());
+        mpath.extend_from_slice(&1u16.to_be_bytes());
+        mpath.extend_from_slice(nb);
+        if nb.len() % 2 == 0 {
+            mpath.push(0);
+        }
+    }
+
+    // root dir sector: "." ".." then root children + subdir records
+    let mut root_dir: Vec<u8> = Vec::new();
+    iso_dirrec(&mut root_dir, lba_root, 2048, true, &[0], d7);
+    iso_dirrec(&mut root_dir, lba_root, 2048, true, &[1, 1], d7);
+    for (i, (name, _)) in files.iter().enumerate() {
+        iso_dirrec(
+            &mut root_dir,
+            fl[i].0,
+            fl[i].1,
+            false,
+            name.as_bytes(),
+            d7,
+        );
+    }
+    for (i, (name, _)) in dirs.iter().enumerate() {
+        iso_dirrec(
+            &mut root_dir,
+            dir_lbas[i],
+            2048,
+            true,
+            name.as_bytes(),
+            d7,
+        );
+    }
+    // each dir sector: "." self, ".." root, files
+    let mut dir_secs: Vec<Vec<u8>> = Vec::new();
+    for (i, (_, ch)) in dirs.iter().enumerate() {
+        let mut dsec: Vec<u8> = Vec::new();
+        iso_dirrec(&mut dsec, dir_lbas[i], 2048, true, &[0], d7);
+        iso_dirrec(&mut dsec, lba_root, 2048, true, &[1, 1], d7);
+        for (j, (name, _)) in ch.iter().enumerate() {
+            iso_dirrec(
+                &mut dsec,
+                dl[i][j].0,
+                dl[i][j].1,
+                false,
+                name.as_bytes(),
+                d7,
+            );
+        }
+        dir_secs.push(dsec);
+    }
+
+    let mut img = alloc::vec![0u8; (nsec as usize) * 2048];
+    // ---- primary volume descriptor @ sector 16
+    let pvd = &mut img[(16 * 2048)..(17 * 2048)];
+    pvd[0] = 1;
+    pvd[1..6].copy_from_slice(b"CD001");
+    pvd[6] = 1;
+    let pad = |s: &str, n: usize| -> Vec<u8> {
+        let mut b = s.as_bytes().to_vec();
+        b.resize(n, b' ');
+        b
+    };
+    pvd[8..40].copy_from_slice(&pad("COSMOS", 32));
+    pvd[40..72].copy_from_slice(&pad(volid, 32));
+    pvd[80..84].copy_from_slice(&nsec.to_le_bytes());
+    pvd[84..88].copy_from_slice(&nsec.to_be_bytes());
+    pvd[120..122].copy_from_slice(&1u16.to_le_bytes());
+    pvd[122..124].copy_from_slice(&1u16.to_be_bytes());
+    pvd[124..126].copy_from_slice(&1u16.to_le_bytes());
+    pvd[126..128].copy_from_slice(&1u16.to_be_bytes());
+    pvd[128..130].copy_from_slice(&2048u16.to_le_bytes());
+    pvd[130..132].copy_from_slice(&2048u16.to_be_bytes());
+    let pts = lpath.len() as u32;
+    pvd[132..136].copy_from_slice(&pts.to_le_bytes());
+    pvd[136..140].copy_from_slice(&pts.to_be_bytes());
+    pvd[140..144].copy_from_slice(&18u32.to_le_bytes());
+    pvd[148..152].copy_from_slice(&19u32.to_be_bytes());
+    // root dir record inline @156
+    let mut rr: Vec<u8> = Vec::new();
+    iso_dirrec(&mut rr, lba_root, 2048, true, &[0], d7);
+    pvd[156..156 + rr.len()].copy_from_slice(&rr);
+    pvd[190..318].copy_from_slice(&pad(volid, 128));
+    pvd[318..446].copy_from_slice(&pad("COSMOS", 128));
+    pvd[446..574].copy_from_slice(&pad("cosmos-terminal mkisofs", 128));
+    pvd[574..702].copy_from_slice(&pad("cosmos-terminal mkisofs", 128));
+    pvd[813..830].copy_from_slice(d17);
+    pvd[830..847].copy_from_slice(d17);
+    let zero17 = b"0000000000000000\0";
+    pvd[847..864].copy_from_slice(zero17);
+    pvd[864..881].copy_from_slice(d17);
+    pvd[881] = 1;
+    // ---- terminator @17
+    let t = &mut img[(17 * 2048)..(17 * 2048) + 7];
+    t[0] = 255;
+    t[1..6].copy_from_slice(b"CD001");
+    t[6] = 1;
+    // ---- path tables
+    img[(18 * 2048)..(18 * 2048) + lpath.len()].copy_from_slice(&lpath);
+    img[(19 * 2048)..(19 * 2048) + mpath.len()].copy_from_slice(&mpath);
+    // ---- dir sectors
+    img[(lba_root as usize * 2048)..(lba_root as usize * 2048 + root_dir.len())]
+        .copy_from_slice(&root_dir);
+    for (i, dsec) in dir_secs.iter().enumerate() {
+        let l = dir_lbas[i] as usize * 2048;
+        img[l..l + dsec.len()].copy_from_slice(dsec);
+    }
+    // ---- file extents
+    for (i, (_, d)) in files.iter().enumerate() {
+        let l = fl[i].0 as usize * 2048;
+        img[l..l + d.len()].copy_from_slice(d);
+    }
+    for (i, (_, ch)) in dirs.iter().enumerate() {
+        for (j, (_, d)) in ch.iter().enumerate() {
+            let l = dl[i][j].0 as usize * 2048;
+            img[l..l + d.len()].copy_from_slice(d);
+        }
+    }
+    img
+}
+
 /// Read exactly `buf.len()` bytes at absolute offset `off` — a userspace
 /// pread. Returns false on short/error reads (device EOF etc.).
 fn pread_all(fd: i64, off: u64, buf: &mut [u8]) -> bool {
@@ -12083,7 +12335,8 @@ impl Term {
             "sha1sum", "cksum", "comm", "zgrep", "zip", "unzip", "chmod", "touch",
             "basenc", "addr2line", "elfedit", "tcpdump", "msgfmt",
             "mkfs", "mkfs.vfat", "blkid", "vol", "fsck", "fsck.vfat",
-            "wipefs", "isosize", "losetup",
+            "wipefs", "isosize", "losetup", "fatlabel", "volname",
+            "badblocks", "mkisofs", "genisoimage", "xorrisofs",
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look", "fmt",
         "pwck", "grpck", "pathchk", "nslookup", "b2sum",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
@@ -30251,12 +30504,30 @@ impl Term {
                             self.emit("no loop devices bound");
                         } else {
                             for l in s.lines() {
+                                // "<n> <size> <off> <lim> <path>"
                                 let f: Vec<&str> =
-                                    l.splitn(3, ' ').collect();
-                                if f.len() == 3 {
+                                    l.splitn(5, ' ').collect();
+                                if f.len() == 5 {
+                                    let mut extra = String::new();
+                                    if f[2] != "0" {
+                                        extra.push_str(
+                                            &alloc::format!(
+                                                " offset {}",
+                                                f[2]
+                                            ),
+                                        );
+                                    }
+                                    if f[3] != "0" {
+                                        extra.push_str(
+                                            &alloc::format!(
+                                                " sizelimit {}",
+                                                f[3]
+                                            ),
+                                        );
+                                    }
                                     self.emit(&alloc::format!(
-                                        "/dev/loop{}: {} bytes, backing {}",
-                                        f[0], f[1], f[2]
+                                        "/dev/loop{}: {} bytes{}, backing {}",
+                                        f[0], f[1], extra, f[4]
                                     ));
                                 }
                             }
@@ -30279,8 +30550,12 @@ impl Term {
                         }
                     }
                     Some(&"-d") => match args.get(1) {
-                        Some(d) if d.starts_with("/dev/loop") => {
-                            let n = &d[9..];
+                        Some(d)
+                            if d.starts_with("/dev/loop")
+                                || d.starts_with("loop") =>
+                        {
+                            let n =
+                                d.trim_start_matches(|c: char| !c.is_ascii_digit());
                             match ustd::open("/dev/loopctl", ustd::O_WRONLY) {
                                 Ok(fd) => {
                                     let _ = ustd::write(
@@ -30305,17 +30580,45 @@ impl Term {
                     Some(d) => {
                         if !d.starts_with("/dev/loop") || args.get(1).is_none()
                         {
-                            self.fail("usage: losetup [-a] | -f | -d /dev/loopN | /dev/loopN <file>");
+                            self.fail("usage: losetup [-a] | -f | -d /dev/loopN | /dev/loopN <file> [-o off] [--sizelimit n]");
                         } else {
                             let n = &d[9..];
                             let file = String::from(args[1]);
+                            let mut off = 0u64;
+                            let mut lim = 0u64;
+                            let mut i = 2usize;
+                            let mut bad = false;
+                            while i < args.len() {
+                                match args[i] {
+                                    "-o" | "--offset" => {
+                                        off = args
+                                            .get(i + 1)
+                                            .and_then(|v| v.parse().ok())
+                                            .unwrap_or(0);
+                                        i += 1;
+                                    }
+                                    "--sizelimit" => {
+                                        lim = args
+                                            .get(i + 1)
+                                            .and_then(|v| v.parse().ok())
+                                            .unwrap_or(0);
+                                        i += 1;
+                                    }
+                                    _ => bad = true,
+                                }
+                                i += 1;
+                            }
+                            if bad {
+                                self.fail("losetup: unknown option");
+                                return;
+                            }
                             match ustd::open("/dev/loopctl", ustd::O_WRONLY) {
                                 Ok(fd) => {
                                     let w = ustd::write(
                                         fd,
                                         alloc::format!(
-                                            "bind {} {}\n",
-                                            n, file
+                                            "bind {} {} off {} size {}\n",
+                                            n, file, off, lim
                                         )
                                         .as_bytes(),
                                     );
@@ -30670,6 +30973,302 @@ impl Term {
                     for l in s.lines() {
                         self.emit(l);
                     }
+                }
+            }
+            "fatlabel" | "volname" => {
+                // fatlabel <img> [NEWLABEL]: read or patch the FAT BPB
+                // volume label + show the serial, real bytes at 71/67.
+                match args.first() {
+                    None => self.fail("usage: fatlabel <img> [label]"),
+                    Some(img) => {
+                        let wr = args.get(1).is_some();
+                        let fd = match ustd::open(
+                            img,
+                            if wr { ustd::O_RDWR } else { ustd::O_RDONLY },
+                        ) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                self.fail(&alloc::format!(
+                                    "fatlabel: {}: err {}",
+                                    img, e
+                                ));
+                                return;
+                            }
+                        };
+                        let mut bpb = [0u8; 512];
+                        if !pread_all(fd, 0, &mut bpb)
+                            || (bpb[510] != 0x55 && bpb[511] != 0xAA)
+                        {
+                            ustd::close(fd);
+                            self.fail(&alloc::format!(
+                                "fatlabel: {}: not a FAT image",
+                                img
+                            ));
+                            return;
+                        }
+                        let old = String::from_utf8_lossy(&bpb[71..82])
+                            .trim()
+                            .to_string();
+                        let serial = u32::from_le_bytes([
+                            bpb[67], bpb[68], bpb[69], bpb[70],
+                        ]);
+                        if let Some(nl) = args.get(1) {
+                            let mut b = String::from(*nl);
+                            b.make_ascii_uppercase();
+                            b.retain(|c| {
+                                c.is_ascii_alphanumeric() || " _$-~!#%&-{}()@'`^".contains(c)
+                            });
+                            if b.is_empty() || b.len() > 11 {
+                                ustd::close(fd);
+                                self.fail("fatlabel: bad label");
+                                return;
+                            }
+                            let mut lbl = [b' '; 11];
+                            lbl[..b.len()].copy_from_slice(b.as_bytes());
+                            if ustd::seek(fd, 71, 0).is_err()
+                                || ustd::write(fd, &lbl).is_err()
+                            {
+                                ustd::close(fd);
+                                self.fail("fatlabel: write failed");
+                                return;
+                            }
+                            self.emit(&alloc::format!(
+                                "{}: '{}' -> '{}'",
+                                img, old, b
+                            ));
+                        } else {
+                            self.emit(&alloc::format!(
+                                "{}: '{}' serial {:08x}",
+                                img, old, serial
+                            ));
+                        }
+                        ustd::close(fd);
+                    }
+                }
+            }
+            "badblocks" => {
+                // badblocks <img>: sequential read scan reporting any
+                // unreadable region — real sweep, not a stub.
+                let img = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .copied()
+                    .unwrap_or("/dev/vda");
+                let fd = match ustd::open(img, ustd::O_RDONLY) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        self.fail(&alloc::format!(
+                            "badblocks: {}: err {}",
+                            img, e
+                        ));
+                        return;
+                    }
+                };
+                let mut buf = alloc::vec![0u8; 64 * 1024];
+                let mut off = 0u64;
+                let mut bad: Vec<u64> = Vec::new();
+                loop {
+                    match pread_all(fd, off, &mut buf) {
+                        true => off += buf.len() as u64,
+                        false => {
+                            // tail may be a short EOF, not an error — probe
+                            // sector-wise to find real bad regions
+                            let mut sec = [0u8; 512];
+                            loop {
+                                if pread_all(fd, off, &mut sec) {
+                                    off += 512;
+                                } else {
+                                    if ustd::seek(fd, off, 0).is_ok() {
+                                        if let Ok(0) =
+                                            ustd::read(fd, &mut sec)
+                                        {
+                                            break; // clean EOF
+                                        }
+                                    }
+                                    bad.push(off / 512);
+                                    off += 512;
+                                    if off % (64 * 1024) != 0
+                                        && bad.len() <= 20
+                                    {
+                                        continue;
+                                    }
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                ustd::close(fd);
+                for b in &bad {
+                    self.emit(&alloc::format!("{}", b));
+                }
+                self.emit(&alloc::format!(
+                    "{}: {} bytes scanned, {} bad sector(s)",
+                    img, off, bad.len()
+                ));
+                if !bad.is_empty() {
+                    self.last_ok = false;
+                }
+            }
+            "mkisofs" | "genisoimage" | "xorrisofs" => {
+                // mkisofs -o <out.iso> [-V LABEL] <srcdir>: builds a real
+                // ISO9660 image (root files + one level of directories).
+                let mut out: Option<&str> = None;
+                let mut volid = String::from("COSMOS_VOL");
+                let mut src: Option<&str> = None;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-o" | "-output" => {
+                            out = args.get(i + 1).copied();
+                            i += 1;
+                        }
+                        "-V" | "-volid" => {
+                            if let Some(v) = args.get(i + 1) {
+                                volid = String::from(*v);
+                                i += 1;
+                            }
+                        }
+                        a if !a.starts_with('-') => {
+                            if src.is_none() {
+                                src = Some(a);
+                            } else {
+                                out = Some(a);
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let (out, src) = match (out, src) {
+                    (Some(o), Some(s)) => (o, s),
+                    _ => {
+                        self.fail("usage: mkisofs -o <out.iso> [-V LABEL] <srcdir>");
+                        return;
+                    }
+                };
+                let read_dir = |dir: &str| -> Vec<(String, bool, u64)> {
+                    ustd::readdir(dir)
+                        .map(|es| {
+                            es.iter()
+                                .map(|e| {
+                                    (
+                                        String::from_utf8_lossy(
+                                            &e.name[..e.name_len as usize],
+                                        )
+                                        .to_string(),
+                                        e.is_dir != 0,
+                                        e.size,
+                                    )
+                                })
+                                .filter(|(n, _, _)| n != "." && n != "..")
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+                let mut dirs: Vec<(String, Vec<(String, Vec<u8>)>)> =
+                    Vec::new();
+                let mut skipped = 0u32;
+                for (name, is_dir, sz) in read_dir(src) {
+                    if sz > 8 * 1024 * 1024 {
+                        skipped += 1;
+                        continue;
+                    }
+                    if is_dir {
+                        let sub = alloc::format!("{}/{}", src, name);
+                        let mut ch: Vec<(String, Vec<u8>)> = Vec::new();
+                        for (n2, d2, s2) in read_dir(&sub) {
+                            if d2 || s2 > 8 * 1024 * 1024 {
+                                skipped += 1;
+                                continue;
+                            }
+                            match ustd::read_all(&alloc::format!(
+                                "{}/{}",
+                                sub, n2
+                            )) {
+                                Ok(d) => ch.push((iso_name(&n2, false), d)),
+                                Err(_) => skipped += 1,
+                            }
+                        }
+                        dirs.push((iso_name(&name, true), ch));
+                    } else {
+                        match ustd::read_all(&alloc::format!(
+                            "{}/{}",
+                            src, name
+                        )) {
+                            Ok(d) => files.push((iso_name(&name, false), d)),
+                            Err(_) => skipped += 1,
+                        }
+                    }
+                }
+                // recording timestamps from the real RTC
+                let now = ustd::clock_gettime(0)
+                    .map(|(s, _)| s)
+                    .unwrap_or(0) as i64;
+                let days = now / 86400;
+                let secs = now % 86400;
+                let (y, mo, dd) = civil_from_days(days);
+                let d7: [u8; 7] = [
+                    (y.wrapping_sub(1900)) as u8,
+                    mo,
+                    dd,
+                    (secs / 3600) as u8,
+                    ((secs % 3600) / 60) as u8,
+                    (secs % 60) as u8,
+                    0,
+                ];
+                let mut d17 = [0u8; 17];
+                let ds = alloc::format!(
+                    "{:04}{:02}{:02}{:02}{:02}{:02}00",
+                    y, mo, dd,
+                    secs / 3600,
+                    (secs % 3600) / 60,
+                    secs % 60
+                );
+                d17[..16].copy_from_slice(ds.as_bytes());
+                let img = mkisofs_build(&volid, &files, &dirs, &d7, &d17);
+                match ustd::open(
+                    out,
+                    ustd::O_WRONLY | ustd::O_CREATE | ustd::O_TRUNC,
+                ) {
+                    Ok(fd) => {
+                        let mut off = 0usize;
+                        let mut werr = false;
+                        while off < img.len() {
+                            match ustd::write(fd, &img[off..]) {
+                                Ok(0) | Err(_) => {
+                                    werr = true;
+                                    break;
+                                }
+                                Ok(n) => off += n,
+                            }
+                        }
+                        ustd::close(fd);
+                        if werr {
+                            self.fail("mkisofs: write failed");
+                            return;
+                        }
+                        self.emit(&alloc::format!(
+                            "{}: {} sectors ({} bytes), {} files, {} dirs{}",
+                            out,
+                            img.len() / 2048,
+                            img.len(),
+                            files.len()
+                                + dirs.iter().map(|d| d.1.len()).sum::<usize>(),
+                            dirs.len(),
+                            if skipped > 0 {
+                                alloc::format!(", {} skipped", skipped)
+                            } else {
+                                String::new()
+                            }
+                        ));
+                    }
+                    Err(e) => self.fail(&alloc::format!(
+                        "mkisofs: {}: err {}",
+                        out, e
+                    )),
                 }
             }
             "halt" => ustd::poweroff(),
@@ -34986,7 +35585,8 @@ impl Term {
         "zdiff", "zcmp", "wall", "mesg",
         "lz4", "unlz4", "lz4cat", "scriptreplay", "run-parts", "chpasswd", "less",
         "losetup", "fsck", "fsck.vfat", "fsck.fat", "dosfsck", "wipefs",
-        "isosize", "sar", "swaps",
+        "isosize", "sar", "swaps", "fatlabel", "volname", "badblocks",
+        "mkisofs", "genisoimage", "xorrisofs",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
