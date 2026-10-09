@@ -3379,6 +3379,37 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             _ => false,
         }
     });
+    check("epoll-flags", {
+        // EPOLLET fires once per ready level, EPOLLONESHOT until MOD
+        // re-arms, EPOLLHUP surfaces on writer close, and the epoll fd
+        // itself is pollable while a live interest remains.
+        let mut ok = true;
+        let (rfd, wfd) = ustd::pipe().unwrap_or((-1, -1));
+        let ep = ustd::epoll_create();
+        ok = ok && rfd >= 0 && ep >= 0;
+        ok = ok && ustd::epoll_ctl(ep, ustd::EPOLL_CTL_ADD, rfd, ustd::EPOLLIN | ustd::EPOLLET) == 0;
+        let _ = ustd::write(wfd, b"a");
+        let mut evs = [(0u32, 0u32); 4];
+        ok = ok && ustd::epoll_wait(ep, &mut evs, 0) == 1; // first edge
+        ok = ok && ustd::epoll_wait(ep, &mut evs, 0) == 0; // same level: silent
+        let mut b = [0u8; 4];
+        let _ = ustd::read(rfd, &mut b); // drain -> level falls, re-arms ET
+        let _ = ustd::write(wfd, b"b");
+        ok = ok && ustd::epoll_wait(ep, &mut evs, 0) == 1; // new edge fires
+        ok = ok && ustd::epoll_ctl(ep, ustd::EPOLL_CTL_MOD, rfd, ustd::EPOLLIN | ustd::EPOLLONESHOT) == 0;
+        ok = ok && ustd::epoll_wait(ep, &mut evs, 0) == 1; // oneshot fires once
+        ok = ok && ustd::epoll_wait(ep, &mut evs, 0) == 0; // consumed
+        ok = ok && ustd::epoll_ctl(ep, ustd::EPOLL_CTL_MOD, rfd, ustd::EPOLLIN) == 0; // re-arm
+        ok = ok && ustd::epoll_wait(ep, &mut evs, 0) == 1;
+        ustd::close(wfd);
+        let mut hup = [(0u32, 0u32); 4];
+        ok = ok && ustd::epoll_wait(ep, &mut hup, 0) == 1 && hup[0].1 & 0x10 != 0; // EPOLLHUP
+        ok = ok && ustd::poll(&[ep as u32], &mut [1], 0) == 1; // live set -> readable
+        let _ = ustd::read(rfd, &mut b);
+        ustd::close(rfd);
+        ustd::close(ep);
+        ok
+    });
     check("epoll-timerfd", {
         // a timerfd interest fires once its armed timer expires
         let (tfd, ep) = (ustd::timerfd_create(), ustd::epoll_create());

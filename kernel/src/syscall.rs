@@ -3161,7 +3161,9 @@ pub fn fd_ready(path: &str, ev: u32) -> bool {
     } else if crate::pidfd::handles(path) {
         ev & 1 != 0 && crate::pidfd::ready(path, true)
     } else if crate::epoll::handles(path) {
-        false // epoll fds are wait targets, not readable/writable streams
+        // an epoll fd is readable while any interest would fire (poll and
+        // nested epoll both consult this)
+        ev & 1 != 0 && crate::epoll::ready(path)
     } else if crate::sockfd::handles(path) {
         (ev & 1 != 0 && crate::sockfd::ready(path, true))
             || (ev & 2 != 0 && crate::sockfd::ready(path, false))
@@ -3182,7 +3184,7 @@ pub fn fd_ready(path: &str, ev: u32) -> bool {
 /// Per-fd poll revents: bit0 read-ready, bit1 write-ready (masked by the
 /// caller's requested events like Linux), plus 0x8=POLLERR /
 /// 0x10=POLLHUP which report unconditionally.
-fn poll_revents(path: &str, req: u32) -> u32 {
+pub fn poll_revents(path: &str, req: u32) -> u32 {
     let mut raw = if crate::pipes::handles(path) {
         crate::pipes::poll_revents(path)
     } else if crate::sockfd::handles(path) {

@@ -17,10 +17,23 @@ pub const EPOLL_CTL_MOD: u64 = 3;
 
 pub const EPOLLIN: u32 = 0x1;
 pub const EPOLLOUT: u32 = 0x2;
+pub const EPOLLERR: u32 = 0x8;
+pub const EPOLLHUP: u32 = 0x10;
+pub const EPOLLET: u32 = 0x8000_0000;
+pub const EPOLLONESHOT: u32 = 0x4000_0000;
 
 struct Interest {
     path: String,
     events: u32,
+    /// EPOLLET: report only on a not-ready -> ready transition (edge).
+    /// Set once reported at this level; cleared when readiness falls.
+    seen_ready: bool,
+    /// object's readiness epoch at the last report (pipes::rise_gen; 0
+    /// for kinds without epochs) — detects a drain+refill that happened
+    /// entirely between two wait calls.
+    seen_gen: u64,
+    /// EPOLLONESHOT: reported once, silent until CTL_MOD re-arms.
+    disabled: bool,
 }
 
 struct Ep {
@@ -56,6 +69,7 @@ pub fn create(owner: u32) -> Result<String, i64> {
             owner,
             interests: BTreeMap::new(),
         },
+
     );
     Ok(alloc::format!("/epoll/{}", id))
 }
@@ -84,7 +98,13 @@ pub fn ctl(epfd_path: &str, op: u64, fdnum: u32, fd_path: &str, events: u32, uid
             }
             e.interests.insert(
                 fdnum,
-                Interest { path: String::from(fd_path), events },
+                Interest {
+                    path: String::from(fd_path),
+                    events,
+                    seen_ready: false,
+                    seen_gen: 0,
+                    disabled: false,
+                },
             );
             0
         }
@@ -99,6 +119,11 @@ pub fn ctl(epfd_path: &str, op: u64, fdnum: u32, fd_path: &str, events: u32, uid
             Some(i) => {
                 i.path = String::from(fd_path);
                 i.events = events;
+                // Linux: MOD re-arms a consumed ONESHOT and re-bases
+                // the ET edge.
+                i.disabled = false;
+                i.seen_ready = false;
+                i.seen_gen = 0;
                 0
             }
             None => -2,
@@ -107,29 +132,121 @@ pub fn ctl(epfd_path: &str, op: u64, fdnum: u32, fd_path: &str, events: u32, uid
     }
 }
 
+/// Probe one interest's revents: requested-masked IN/OUT plus
+/// unconditional ERR/HUP (same bit values as poll revents — poll_revents
+/// is the shared dispatcher, so EPOLLERR/EPOLLHUP surface for free).
+fn probe(path: &str, events: u32) -> u32 {
+    crate::syscall::poll_revents(path, events & (EPOLLIN | EPOLLOUT))
+}
+
+/// Would this interest report right now (read-only — for `fd_ready` so a
+/// poll()/nested epoll on THIS epoll fd works)?
+fn fires(i: &Interest, raw: u32, gen: u64) -> bool {
+    raw != 0
+        && !i.disabled
+        && !(i.events & EPOLLET != 0 && i.seen_ready && i.seen_gen == gen)
+}
+
+/// Snapshot interests, probe OUTSIDE the EPOLLS lock (member probes can
+/// recurse into this lock for nested epoll — never hold it while
+/// probing), then apply EPOLLET/EPOLLONESHOT bookkeeping under the lock.
+pub fn ready(path: &str) -> bool {
+    let Some(id) = id_of(path) else { return false };
+    let snap: Vec<Interest> = {
+        let g = EPOLLS.lock();
+        match g.get(&id) {
+            Some(e) => e
+                .interests
+                .values()
+                .map(|i| Interest {
+                    path: i.path.clone(),
+                    events: i.events,
+                    seen_ready: i.seen_ready,
+                    seen_gen: i.seen_gen,
+                    disabled: i.disabled,
+                })
+                .collect(),
+            None => return false,
+        }
+    };
+    snap.iter()
+        .any(|i| fires(i, probe(&i.path, i.events), epoch(&i.path)))
+}
+
 /// collect currently-ready interests as (fdnum, revents) pairs. The caller
 /// (sys_epoll_wait) writes them out or blocks and re-asks.
 pub fn collect(epfd_path: &str, max: usize) -> Vec<(u32, u32)> {
     let Some(id) = id_of(epfd_path) else { return Vec::new() };
-    let g = EPOLLS.lock();
-    let Some(e) = g.get(&id) else { return Vec::new() };
+    // phase 1: snapshot (fdnum, path, events, seen_ready, disabled)
+    let snap: Vec<(u32, Interest)> = {
+        let g = EPOLLS.lock();
+        match g.get(&id) {
+            Some(e) => e
+                .interests
+                .iter()
+                .map(|(fdn, i)| {
+                    (
+                        *fdn,
+                        Interest {
+                            path: i.path.clone(),
+                            events: i.events,
+                            seen_ready: i.seen_ready,
+                            seen_gen: i.seen_gen,
+                            disabled: i.disabled,
+                        },
+                    )
+                })
+                .collect(),
+            None => return Vec::new(),
+        }
+    };
+    // phase 2: probe each member path outside the lock
+    let raws: Vec<(u32, u32, u32)> = snap
+        .iter()
+        .map(|(fdn, i)| (*fdn, i.events, probe(&i.path, i.events)))
+        .collect();
+    let gens: alloc::collections::BTreeMap<u32, u64> = snap
+        .iter()
+        .map(|(fdn, i)| (*fdn, epoch(&i.path)))
+        .collect();
+    // phase 3: under the lock, gate on ET/ONESHOT state and mutate it.
+    let mut g = EPOLLS.lock();
+    let Some(e) = g.get_mut(&id) else { return Vec::new() };
     let mut out = Vec::new();
-    for (fdnum, i) in e.interests.iter() {
-        if out.len() >= max {
-            break;
+    for (fdn, _ev, raw) in raws {
+        let gen = gens.get(&fdn).copied().unwrap_or(0);
+        let Some(i) = e.interests.get_mut(&fdn) else { continue };
+        if raw == 0 {
+            // level fell: an ET interest re-arms for the next rise
+            i.seen_ready = false;
+            continue;
         }
-        let mut re = 0u32;
-        if i.events & EPOLLIN != 0 && crate::syscall::fd_ready(&i.path, 1) {
-            re |= EPOLLIN;
+        if !fires(i, raw, gen) {
+            continue;
         }
-        if i.events & EPOLLOUT != 0 && crate::syscall::fd_ready(&i.path, 2) {
-            re |= EPOLLOUT;
+        if i.events & EPOLLET != 0 {
+            i.seen_ready = true;
+            i.seen_gen = gen;
         }
-        if re != 0 {
-            out.push((*fdnum, re));
+        if i.events & EPOLLONESHOT != 0 {
+            i.disabled = true;
+        }
+        if out.len() < max {
+            out.push((fdn, raw));
         }
     }
     out
+}
+
+/// readiness-transition epoch per object kind — only pipes track edges
+/// for now; other kinds return 0 so ET degrades to the seen-once level
+/// model for them.
+fn epoch(path: &str) -> u64 {
+    if crate::pipes::handles(path) {
+        crate::pipes::rise_gen(path)
+    } else {
+        0
+    }
 }
 
 /// last close of the fd drops the interest set
