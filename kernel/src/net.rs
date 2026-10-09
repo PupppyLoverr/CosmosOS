@@ -1894,6 +1894,20 @@ pub fn net_snmp() -> String {
 static NFACCT: Mutex<alloc::collections::BTreeMap<String, (u64, u64)>> =
     Mutex::new(alloc::collections::BTreeMap::new());
 
+/// `/proc/net/mac` — the interface's real device MAC (read once from the
+/// virtio-net PCI config space at driver init).
+pub fn net_mac() -> String {
+    match NET.lock().clone() {
+        Some(n) => alloc::format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}
+",
+            n.mac[0], n.mac[1], n.mac[2], n.mac[3], n.mac[4], n.mac[5]
+        ),
+        None => String::from("00:00:00:00:00:00
+"),
+    }
+}
+
 /// `/proc/net/nfacct` — real nfacct-format dump:
 /// `{ pkts = N, bytes = M } = name;`
 pub fn net_nfacct() -> String {

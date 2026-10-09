@@ -1952,6 +1952,17 @@ fn inotify_mask_name(mask: u64) -> String {
     out
 }
 
+/// Parse a klog record's `[ secs.usecs ]` stamp -> (ms_since_boot, rest).
+fn klog_ts(l: &str) -> Option<(u64, &str)> {
+    let l = l.trim_start();
+    let i = l.find(']')?;
+    let inner = l.get(1..i)?.trim();
+    let (sec_s, us_s) = inner.split_once('.')?;
+    let sec = sec_s.trim().parse::<u64>().ok()?;
+    let us = us_s.parse::<u64>().ok()?;
+    Some((sec * 1000 + us / 1000, l.get(i + 1..)?.trim_start()))
+}
+
 fn epoch_to_dt(secs: u64) -> (u16, u8, u8, u8, u8, u8) {
     let mut d = secs / 86400;
     let rem = secs % 86400;
@@ -27558,16 +27569,73 @@ impl Term {
                 }
             }
             "dmesg" => {
-                // last 40 lines of the kernel log ring buffer;
-                // -c reads AND clears (prints), -C clears silently
+                // last 40 lines of the kernel log ring buffer — klog
+                // stamps every record `[ secs.usecs ]` like real dmesg.
+                // -T: wall-clock times (boot epoch = rtc - uptime);
+                // -d: delta since previous record; -t: strip the stamp;
+                // -w: follow via the watch machinery; -c/-C clear.
                 if args.iter().any(|a| *a == "-C") {
                     ustd::klog_clear();
                     return;
                 }
+                let want_t = args.iter().any(|a| *a == "-T" || *a == "--ctime");
+                let strip = args.iter().any(|a| *a == "-t" || *a == "--notime");
+                let delta = args.iter().any(|a| *a == "-d" || *a == "--delta");
+                if args.iter().any(|a| *a == "-w" || *a == "--follow") {
+                    self.watch = Some((String::from("dmesg -t"), 1000, 0));
+                    self.emit("watching every 1000ms -- Esc/Enter to stop");
+                    return;
+                }
+                // boot epoch estimate: wall-now minus uptime-now
+                let dt = ustd::datetime();
+                let base_ms = (cal_days(dt.year, dt.month, dt.day) * 86400
+                    + dt.hour as u64 * 3600
+                    + dt.minute as u64 * 60
+                    + dt.second as u64)
+                    .saturating_mul(1000)
+                    .saturating_sub(ustd::uptime_ms());
+                let ts = klog_ts;
                 let s = ustd::klog();
                 let ls: Vec<&str> = s.lines().collect();
+                let mut prev = 0u64;
                 for l in ls.iter().skip(ls.len().saturating_sub(40)) {
-                    self.emit(l);
+                    match ts(l) {
+                        Some((ms, rest)) => {
+                            if want_t {
+                                let e = (base_ms + ms) / 1000;
+                                let (y, mo, d, h, mi, se) = epoch_to_dt(e);
+                                const MON: [&str; 12] = [
+                                    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+                                ];
+                                const DOW: [&str; 7] = [
+                                    "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
+                                ];
+                                let dow = ((cal_days(y, mo, d) + 4) % 7) as usize;
+                                self.emit(&alloc::format!(
+                                    "{} {} {:2} {:02}:{:02}:{:02} {} {}",
+                                    DOW[dow], MON[(mo - 1) as usize], d, h, mi, se, y, rest
+                                ));
+                            } else if delta {
+                                self.emit(&alloc::format!(
+                                    "[<{:>4}.{:03}>] {}",
+                                    ms.saturating_sub(prev) / 1000,
+                                    ms.saturating_sub(prev) % 1000,
+                                    rest
+                                ));
+                            } else if strip {
+                                self.emit(rest);
+                            } else {
+                                self.emit(l);
+                            }
+                            prev = ms;
+                        }
+                        None => {
+                            if !delta {
+                                self.emit(l);
+                            }
+                        }
+                    }
                 }
                 if args.iter().any(|a| *a == "-c") {
                     ustd::klog_clear();
@@ -40627,7 +40695,42 @@ impl Term {
             }
             "ethtool" => {
                 // ethtool [dev]: link state + real driver/rx/tx counters.
-                // -i prints driver ident; -S prints the stat-name rows.
+                // -i prints driver ident; -S prints the stat-name rows;
+                // -P the real device MAC; -k the honest feature table.
+                if args.iter().any(|a| *a == "-P" || *a == "--show-permaddr") {
+                    match ustd::read_all("/proc/net/mac") {
+                        Ok(d) => {
+                            self.emit("Permanent address:");
+                            self.emit(&alloc::format!(
+                                "    {}",
+                                String::from_utf8_lossy(&d).trim()
+                            ));
+                        }
+                        Err(e) => self.fail(&alloc::format!("ethtool: err {}", e)),
+                    }
+                    return;
+                }
+                if args.iter().any(|a| *a == "-k" || *a == "--show-features") {
+                    // the driver's real offload set: virtio-net here does
+                    // software checksums, no SG/TSO/GRO — honest `off`.
+                    self.emit("Features for eth0:");
+                    for (n, v) in [
+                        ("rx-checksumming", "off"),
+                        ("tx-checksumming", "off"),
+                        ("scatter-gather", "off"),
+                        ("tcp-segmentation-offload", "off"),
+                        ("generic-segmentation-offload", "off"),
+                        ("generic-receive-offload", "off"),
+                        ("large-receive-offload", "off"),
+                        ("rx-vlan-offload", "off"),
+                        ("tx-vlan-offload", "off"),
+                        ("ntuple-filters", "off"),
+                        ("receive-hashing", "off"),
+                    ] {
+                        self.emit(&alloc::format!("{}: {} [fixed]", n, v));
+                    }
+                    return;
+                }
                 if args.iter().any(|a| *a == "-i" || *a == "--driver") {
                     self.emit("driver: virtio-net");
                     self.emit("version: 1.0");

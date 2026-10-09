@@ -17,6 +17,9 @@ struct Ring {
     /// Bytes appended since the last SYSLOG_ACTION_READ drain — the
     /// shared global read cursor (any reader consumes it, like klogctl).
     unread: usize,
+    /// True when the next byte starts a new record — klog stamps each
+    /// record's start with `[ secs.usecs ]` like real dmesg.
+    at_bol: bool,
 }
 
 static RING: Mutex<Ring> = Mutex::new(Ring {
@@ -24,9 +27,47 @@ static RING: Mutex<Ring> = Mutex::new(Ring {
     head: 0,
     len: 0,
     unread: 0,
+    at_bol: true,
 });
 
+/// Fixed-buffer writer for the record timestamp — klog runs before the
+/// heap and from panic paths, so the stamp is formatted into a stack
+/// array, never through the allocator.
+struct StampBuf {
+    buf: [u8; 24],
+    len: usize,
+}
+impl core::fmt::Write for StampBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &c in s.as_bytes() {
+            if self.len >= self.buf.len() {
+                return Err(core::fmt::Error);
+            }
+            self.buf[self.len] = c;
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
 fn push_locked(r: &mut Ring, b: u8) {
+    if r.at_bol && b != b'\n' {
+        r.at_bol = false;
+        let ms = crate::timer::uptime_ms();
+        let mut w = StampBuf { buf: [0; 24], len: 0 };
+        use core::fmt::Write;
+        let _ = write!(&mut w, "[{:>5}.{:06}] ", ms / 1000, ms % 1000 * 1000);
+        for i in 0..w.len {
+            push_inner(r, w.buf[i]);
+        }
+    }
+    if b == b'\n' {
+        r.at_bol = true;
+    }
+    push_inner(r, b);
+}
+
+fn push_inner(r: &mut Ring, b: u8) {
     r.unread = r.unread.saturating_add(1);
     if r.len == CAP {
         r.buf[r.head] = b;
