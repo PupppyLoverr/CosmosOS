@@ -31,7 +31,7 @@ const FILES: &[&str] = &[
 const NET_FILES: &[&str] = &[
     "tcp", "udp", "unix", "dev", "operstate", "owners", "route", "iptables",
     "snmp", "nf_conntrack", "arp", "fib_trie", "tc", "dns", "neigh", "mtu",
-    "tcpinfo",
+    "tcpinfo", "iptsave",
 ];
 
 /// files under /proc/sys/kernel
@@ -340,6 +340,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/net/neigh" => net::net_neigh(),
         "/proc/net/mtu" => net::net_mtu(),
         "/proc/net/tcpinfo" => net::net_tcpinfo(),
+        "/proc/net/iptsave" => net::net_iptsave(),
         "/proc/net/operstate" => alloc::format!(
             "{}\n",
             if net::is_up() { "up" } else { "down" }

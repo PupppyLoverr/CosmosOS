@@ -23607,6 +23607,13 @@ impl Term {
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0)
                     .saturating_mul(1000);
+                // `nc -p <port>` — real source-port bind for the outbound
+                // conn (was: ephemeral 40000+time%2000 always).
+                let src_port: Option<u16> = args
+                    .iter()
+                    .position(|a| *a == "-p")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|s| s.parse::<u16>().ok());
                 let pos: Vec<&str> = {
                     let mut skip = false;
                     args.iter()
@@ -23615,7 +23622,7 @@ impl Term {
                                 skip = false;
                                 return false;
                             }
-                            if **a == "-w" {
+                            if **a == "-w" || **a == "-p" {
                                 skip = true;
                                 return false;
                             }
@@ -23725,7 +23732,9 @@ impl Term {
                         pos.get(1).and_then(|s| s.parse::<u16>().ok()),
                     ) {
                         (Some(ip), Some(port)) => {
-                            let lport = 40000u16 + (ustd::uptime_ms() % 2000) as u16;
+                            let lport = src_port.unwrap_or(
+                                40000u16 + (ustd::uptime_ms() % 2000) as u16,
+                            );
                             match ustd::TcpSock::connect_timeout(lport, ip, port, w_ms) {
                                 Some(s) => {
                                     self.emit(&alloc::format!(
@@ -23737,7 +23746,7 @@ impl Term {
                                 None => self.fail(&alloc::format!("nc: connect to :{} failed", port)),
                             }
                         }
-                        _ => self.fail("usage: nc <host|a.b.c.d> <port>  |  nc -l [-k] <port>  |  nc -w N <host> <port>  (Esc closes)"),
+                        _ => self.fail("usage: nc <host|a.b.c.d> <port>  |  nc -p <lport> <host> <port>  |  nc -l [-k] <port>  |  nc -w N <host> <port>  (Esc closes)"),
                     }
                 }
             }
@@ -34642,52 +34651,72 @@ impl Term {
                 // -L/-n/-v | -F | -P INPUT ACCEPT|DROP | -D INPUT n |
                 // -A INPUT [-p proto] [-s ip[/plen]] [--dport n] -j DROP
                 let first = args.first().copied().unwrap_or("");
-                if first.is_empty()
-                    || matches!(first, "-L" | "--list" | "-S" | "--list-rules" | "-n" | "-v" | "-nv" | "-vn")
-                {
-                    match ustd::read_all("/proc/net/iptables") {
+                if first == "-S" || first == "--list-rules" {
+                    // Real -S: save-format rule listing for EVERY chain —
+                    // -P for builtins, -N for user chains, -A rules. The
+                    // previous -S re-dumped only INPUT rows from -L.
+                    match ustd::read_all("/proc/net/iptsave") {
                         Ok(b) => {
-                            if first == "-S" || first == "--list-rules" {
-                                let t = String::from_utf8_lossy(&b);
-                                // policy from the real header line
-                                // "Chain INPUT (policy <VERDICT>)"
-                                let pol = t
-                                    .lines()
-                                    .next()
-                                    .and_then(|h| {
-                                        h.strip_prefix("Chain INPUT (policy ")
-                                    })
-                                    .and_then(|r| r.strip_suffix(')'))
-                                    .unwrap_or("ACCEPT");
-                                self.emit(&alloc::format!("-P INPUT {}", pol));
-                                for l in t.lines().skip(2) {
-                                    let mut it = l.split_whitespace();
-                                    let _num = it.next();
-                                    let _pkts = it.next();
-                                    let tgt = it.next().unwrap_or("DROP");
-                                    let prot = it.next().unwrap_or("all");
-                                    let srcip = it.next().unwrap_or("0.0.0.0/0");
-                                    let _dst = it.next();
-                                    let mut ln = alloc::format!(
-                                        "-A INPUT -p {}",
-                                        if prot == "all" { "*" } else { prot }
-                                    );
-                                    if srcip != "0.0.0.0/0" && srcip != "anywhere" {
-                                        ln.push_str(&alloc::format!(" -s {}", srcip));
-                                    }
-                                    for w in it {
-                                        if let Some(dp) = w.strip_prefix("dpt:") {
-                                            ln.push_str(&alloc::format!(" --dport {}", dp));
-                                        }
-                                    }
-                                    ln.push_str(&alloc::format!(" -j {}", tgt));
-                                    self.emit(&ln);
+                            for l in String::from_utf8_lossy(&b).lines() {
+                                if l == "*filter" || l == "COMMIT" {
+                                    continue;
                                 }
-                            } else {
-                                self.emit_bin(&b);
+                                if let Some(rest) = l.strip_prefix(':') {
+                                    // :NAME POLICY|"-" [p:b] → -P NAME POL / -N NAME
+                                    let name = rest.split_whitespace().next().unwrap_or("");
+                                    let pol = rest.split_whitespace().nth(1).unwrap_or("");
+                                    if pol == "-" {
+                                        self.emit(&alloc::format!("-N {}", name));
+                                    } else if !pol.is_empty() {
+                                        self.emit(&alloc::format!("-P {} {}", name, pol));
+                                    }
+                                    continue;
+                                }
+                                let line = l
+                                    .strip_prefix('[')
+                                    .and_then(|x| x.split_once(']'))
+                                    .map(|(_, r)| r.trim_start())
+                                    .unwrap_or(l);
+                                if line.starts_with("-A ") {
+                                    self.emit(line);
+                                }
                             }
                         }
                         Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
+                    }
+                } else if first.is_empty()
+                    || matches!(first, "-L" | "--list" | "-n" | "-v" | "-nv" | "-vn")
+                {
+                    match ustd::read_all("/proc/net/iptables") {
+                        Ok(b) => self.emit_bin(&b),
+                        Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
+                    }
+                } else if first == "-C" || first == "--check" {
+                    // `iptables -C <chain> <spec>` — rule-exists check on
+                    // the live table (real exit status semantics).
+                    let rest: Vec<&str> = args
+                        .iter()
+                        .skip(1)
+                        .copied()
+                        .filter(|a| *a != "-C" && *a != "--check")
+                        .collect();
+                    let mut v: Vec<&str> = vec!["-D"];
+                    v.extend(rest.iter().copied());
+                    match ipt_rule_from_args(&v).map(|mut l| {
+                        l.replace_range(0..1, "Q");
+                        l
+                    }) {
+                        Some(line) => match ustd::write_all(
+                            "/proc/net/iptables",
+                            line.as_bytes(),
+                        ) {
+                            Ok(_) => self.emit("rule exists"),
+                            Err(e) => self.fail(&alloc::format!(
+                                "iptables: Bad rule (does a matching rule exist in that chain?) ({})",
+                                e
+                            )),
+                        },
+                        None => self.fail("usage: iptables -C <chain> -p <proto> --dport <n> -j <tgt>"),
                     }
                 } else if first == "-N" || first == "--new-chain" {
                     // user-defined chain — jumps resolve it by name
@@ -34843,75 +34872,36 @@ impl Term {
                 }
             }
             "iptables-save" => {
-                // emits *filter restore-format: :INPUT policy + -A lines + COMMIT
-                match ustd::read_all("/proc/net/iptables") {
+                // Canonical dump from the live table: *filter, :CHAIN
+                // defs (builtin policies + user chains), -A rules, COMMIT.
+                // -c keeps the real [pkts:bytes] prefixes; without it
+                // they're stripped like upstream iptables-save.
+                match ustd::read_all("/proc/net/iptsave") {
                     Ok(b) => {
+                        let with_cnt = args.iter().any(|a| *a == "-c");
                         self.emit("# Generated by iptables-save");
-                        self.emit("*filter");
-                        let t = String::from_utf8_lossy(&b);
-                        let mut chain = "INPUT";
-                        self.emit(":INPUT ACCEPT [0:0]");
-                        for l in t.lines().skip(2) {
-                            if l.is_empty() {
-                                continue;
-                            }
-                            if let Some(rest) = l.strip_prefix("Chain ") {
-                                chain = if rest.starts_with("OUTPUT") {
-                                    "OUTPUT"
-                                } else {
-                                    "INPUT"
-                                };
-                                if chain == "OUTPUT" {
-                                    self.emit(":OUTPUT ACCEPT [0:0]");
+                        for l in String::from_utf8_lossy(&b).lines() {
+                            if with_cnt {
+                                self.emit(l);
+                            } else if l.starts_with('[') {
+                                match l.split_once(']') {
+                                    Some((_, rest)) => self.emit(rest.trim_start()),
+                                    None => self.emit(l),
                                 }
-                                continue;
+                            } else {
+                                self.emit(l);
                             }
-                            if l.starts_with("num ") {
-                                continue;
-                            }
-                            let mut it = l.split_whitespace();
-                            let _num = it.next();
-                            let _pkts = it.next();
-                            let tgt = it.next().unwrap_or("DROP");
-                            let prot = it.next().unwrap_or("all");
-                            let srcip = it.next().unwrap_or("0.0.0.0/0");
-                            let _dst = it.next();
-                            let mut ln = alloc::format!(
-                                "-A {} -p {}",
-                                chain,
-                                if prot == "all" { "*" } else { prot }
-                            );
-                            if srcip != "0.0.0.0/0" && srcip != "anywhere" {
-                                ln.push_str(&alloc::format!(" -s {}", srcip));
-                            }
-                            for w in it {
-                                if let Some(dp) = w.strip_prefix("dpt:") {
-                                    ln.push_str(&alloc::format!(" --dport {}", dp));
-                                }
-                                if let Some(dp) = w.strip_prefix("dpts:") {
-                                    ln.push_str(&alloc::format!(
-                                        " -m multiport --dports {}",
-                                        dp
-                                    ));
-                                }
-                                if let Some(rg) = w.strip_prefix("src-range:") {
-                                    ln.push_str(&alloc::format!(
-                                        " -m iprange --src-range {}",
-                                        rg
-                                    ));
-                                }
-                            }
-                            ln.push_str(&alloc::format!(" -j {}", tgt));
-                            self.emit(&ln);
                         }
-                        self.emit("COMMIT");
                         self.emit("# Completed");
                     }
                     Err(e) => self.fail(&alloc::format!("iptables-save: {}", e)),
                 }
             }
             "iptables-restore" => {
-                // restores rules from a *filter file (stdin or path arg)
+                // Restore a *filter dump (stdin or path): buffered until
+                // COMMIT like upstream, then every line applied through
+                // the live ctl path — :CHAIN POLICY, :NAME - creates,
+                // [p:b] prefixes land as real rule counters.
                 let text = if let Some(inp) = self.pipe_in.take() {
                     inp
                 } else {
@@ -34929,50 +34919,155 @@ impl Term {
                         }
                     }
                 };
-                let mut n = 0u32;
-                let mut bad = 0u32;
+                // buffer until COMMIT — partial tables never apply
+                let mut ops: Vec<String> = Vec::new();
+                let mut committed = false;
+                let mut bad_table = false;
                 for l in text.lines() {
                     let l = l.trim();
-                    if l.is_empty()
-                        || l.starts_with('#')
-                        || l == "COMMIT"
-                        || l.starts_with('*')
-                    {
+                    if l.is_empty() || l.starts_with('#') {
                         continue;
                     }
-                    let toks: Vec<&str> = l.split_whitespace().collect();
-                    if toks
-                        .first()
-                        .map(|t| t.starts_with(':'))
-                        .unwrap_or(false)
-                    {
+                    if let Some(tb) = l.strip_prefix('*') {
+                        if tb != "filter" {
+                            bad_table = true;
+                        }
                         continue;
                     }
-                    if toks.first() == Some(&"-A") || toks.first() == Some(&"-I") {
-                        match ipt_rule_from_args(&toks[1..]) {
-                            Some(line) => {
-                                if ustd::write_all("/proc/net/iptables", line.as_bytes())
-                                    .is_ok()
-                                {
-                                    n += 1;
-                                } else {
-                                    bad += 1;
-                                }
-                            }
-                            None => bad += 1,
-                        }
-                    } else if toks.first() == Some(&"-F") {
-                        let _ = ustd::write_all("/proc/net/iptables", b"F\n");
-                    } else if toks.first() == Some(&"-P") {
-                        if let Some(v) = toks.iter().find(|a| **a == "DROP" || **a == "ACCEPT")
-                        {
-                            let line = alloc::format!("P {}\n", v);
-                            let _ = ustd::write_all("/proc/net/iptables", line.as_bytes());
-                        }
+                    if l == "COMMIT" {
+                        committed = true;
+                        break;
                     }
+                    ops.push(String::from(l));
                 }
-                self.emit(&alloc::format!("{} rule(s) restored{}", n,
-                    if bad > 0 { alloc::format!(", {} rejected", bad) } else { String::new() }));
+                if bad_table {
+                    self.fail("iptables-restore: only *filter table is supported");
+                } else if !committed {
+                    self.fail("iptables-restore: incomplete table, missing COMMIT");
+                } else {
+                    let mut n = 0u32;
+                    let mut bad = 0u32;
+                    for l in &ops {
+                        let l = l.trim();
+                        if let Some(rest) = l.strip_prefix(':') {
+                            // :NAME POLICY [..] or :NAME - [..] (user chain)
+                            let name = rest.split_whitespace().next().unwrap_or("");
+                            let pol = rest
+                                .split_whitespace()
+                                .nth(1)
+                                .unwrap_or("")
+                                .trim_matches(|c| c == '[' || c == ']');
+                            if name.is_empty() {
+                                continue;
+                            }
+                            let line = match pol {
+                                "-" => alloc::format!("N {}\n", name),
+                                "ACCEPT" | "DROP" => match name {
+                                    "INPUT" => alloc::format!("P {}\n", pol),
+                                    "OUTPUT" => alloc::format!("P OUT {}\n", pol),
+                                    _ => {
+                                        bad += 1;
+                                        continue;
+                                    }
+                                },
+                                _ => {
+                                    bad += 1;
+                                    continue;
+                                }
+                            };
+                            if ustd::write_all("/proc/net/iptables", line.as_bytes())
+                                .is_ok()
+                            {
+                                n += 1;
+                            }
+                        } else {
+                            // strip the `[pkts:bytes]` counter prefix —
+                            // re-applied after the rule lands via `C`
+                            let (cnt, body) = match l.strip_prefix('[') {
+                                Some(x) => match x.split_once(']') {
+                                    Some((c, rest)) => (Some(c), rest.trim_start()),
+                                    None => (None, l),
+                                },
+                                None => (None, l),
+                            };
+                            let toks: Vec<&str> =
+                                body.split_whitespace().collect();
+                            match toks.first() {
+                                Some(&"-F") => {
+                                    let line = match toks.get(1).copied() {
+                                        None => String::from("F\n"),
+                                        Some("OUTPUT") => String::from("F OUT\n"),
+                                        Some("INPUT") => String::from("F IN\n"),
+                                        Some(x) => {
+                                            alloc::format!("F {}\n", x)
+                                        }
+                                    };
+                                    let _ = ustd::write_all(
+                                        "/proc/net/iptables",
+                                        line.as_bytes(),
+                                    );
+                                }
+                                Some(&"-X") => {
+                                    let line = match toks.get(1).copied() {
+                                        Some(x) => alloc::format!("X {}\n", x),
+                                        None => String::from("X\n"),
+                                    };
+                                    let _ = ustd::write_all(
+                                        "/proc/net/iptables",
+                                        line.as_bytes(),
+                                    );
+                                }
+                                Some(&"-A") | Some(&"-I") | Some(&"-R")
+                                | Some(&"-D") => {
+                                    match ipt_rule_from_args(&toks) {
+                                        Some(line) => {
+                                            let ch = line
+                                                .split_whitespace()
+                                                .nth(1)
+                                                .unwrap_or("IN")
+                                                .to_string();
+                                            if ustd::write_all(
+                                                "/proc/net/iptables",
+                                                line.as_bytes(),
+                                            )
+                                            .is_ok()
+                                            {
+                                                n += 1;
+                                                if let Some(c) = cnt {
+                                                    if let Some((p, b)) =
+                                                        c.split_once(':')
+                                                    {
+                                                        let _ = ustd::write_all(
+                                                            "/proc/net/iptables",
+                                                            alloc::format!(
+                                                                "C {} {} {}\n",
+                                                                ch, p, b
+                                                            )
+                                                            .as_bytes(),
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                bad += 1;
+                                            }
+                                        }
+                                        None => bad += 1,
+                                    }
+                                }
+                                _ => bad += 1,
+                            }
+                        }
+                    }
+                    self.emit(&alloc::format!(
+                        "{} rule(s) restored{}",
+                        n,
+                        if bad > 0 {
+                            alloc::format!(", {} rejected", bad)
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
             }
             "sponge" => {
                 // soak up all piped input then write it out at once
