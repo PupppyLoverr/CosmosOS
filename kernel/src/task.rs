@@ -1455,11 +1455,16 @@ pub fn maybe_deliver(s: &mut Sched, idx: usize, ctx: *mut CpuContext) {
         && t.sig.sigstack_size >= 2048
         && t.sig.sigstack_flags & shared::SS_DISABLE == 0
         && !on_alt;
+    // The 168B footprint (160B ctx + 8B trampoline ret) must end strictly
+    // below the interrupted rsp: reserving only 168 lets base+160 land
+    // exactly on c.rsp when rsp ≡ 8 (mod 16), clobbering the caller's
+    // return address with the trampoline — resume then ret's back into
+    // sigreturn forever. Reserve 176 so base+168 <= c.rsp always.
     let base = if use_alt {
         let top = t.sig.sigstack_sp + t.sig.sigstack_size;
-        ((top.wrapping_sub(168)) & !0xF) + 8
+        ((top.wrapping_sub(176)) & !0xF) + 8
     } else {
-        ((c.rsp.wrapping_sub(168)) & !0xF) + 8
+        ((c.rsp.wrapping_sub(176)) & !0xF) + 8
     };
     let mut segv = false;
     for page in [(base - 8) & !0xFFF, (base + 167) & !0xFFF] {

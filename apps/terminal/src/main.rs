@@ -7748,7 +7748,7 @@ fn dns_read_name(pkt: &[u8], pos: usize, depth: usize) -> Option<(String, usize)
 
 /// Real dig: build a wire-format DNS query, send it through UdpSock,
 /// parse the answer section. Returns display lines.
-fn dig_query(name: &str, qtype: u16) -> Result<Vec<String>, String> {
+fn dig_query(name: &str, qtype: u16, use_tcp: bool) -> Result<Vec<String>, String> {
     let mut q = Vec::with_capacity(64);
     q.extend_from_slice(&0x1a2bu16.to_be_bytes()); // id
     q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
@@ -7759,12 +7759,43 @@ fn dig_query(name: &str, qtype: u16) -> Result<Vec<String>, String> {
     dns_name(&mut q, name);
     q.extend_from_slice(&qtype.to_be_bytes());
     q.extend_from_slice(&1u16.to_be_bytes());
-    let sock = ustd::UdpSock::open(15353).ok_or_else(|| String::from("dig: socket failed"))?;
-    sock.send_to([10, 0, 2, 3], 53, &q)
-        .ok_or_else(|| String::from("dig: send failed"))?;
-    let (_, _, p) = sock
-        .recv_from(3000)
-        .ok_or_else(|| String::from("dig: no answer (timeout)"))?;
+    // `+tcp`: the same wire message over TCP/53 with the RFC 1035
+    // two-byte length prefix — real stream transport, not UDP.
+    let p = if use_tcp {
+        let sock = ustd::TcpSock::connect_timeout(15354, [10, 0, 2, 3], 53, 3000)
+            .ok_or_else(|| String::from("dig: tcp connect failed"))?;
+        let mut m = Vec::with_capacity(q.len() + 2);
+        m.extend_from_slice(&(q.len() as u16).to_be_bytes());
+        m.extend_from_slice(&q);
+        sock.send(&m).ok_or_else(|| String::from("dig: send failed"))?;
+        // A DNS-over-TCP reply is <2B len><message>; read the stream
+        // until the announced bytes arrive (segments can split).
+        let mut buf: Vec<u8> = Vec::new();
+        let need = loop {
+            if buf.len() >= 2 {
+                let want = 2 + u16::from_be_bytes([buf[0], buf[1]]) as usize;
+                if buf.len() >= want {
+                    break want;
+                }
+            }
+            let chunk = sock
+                .recv(3000)
+                .ok_or_else(|| String::from("dig: no answer (timeout)"))?;
+            buf.extend_from_slice(&chunk);
+            if buf.len() > 66_000 {
+                return Err(String::from("dig: oversized reply"));
+            }
+        };
+        buf[2..need].to_vec()
+    } else {
+        let sock = ustd::UdpSock::open(15353).ok_or_else(|| String::from("dig: socket failed"))?;
+        sock.send_to([10, 0, 2, 3], 53, &q)
+            .ok_or_else(|| String::from("dig: send failed"))?;
+        let (_, _, p) = sock
+            .recv_from(3000)
+            .ok_or_else(|| String::from("dig: no answer (timeout)"))?;
+        p
+    };
     if p.len() < 12 {
         return Err(String::from("dig: short reply"));
     }
@@ -8038,6 +8069,7 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut oif = "";
     let mut state = String::new();
     let mut comment = String::new();
+    let mut ttl_spec = String::new();
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
     let mut jump = "DROP";
@@ -8101,6 +8133,21 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             "--comment" => {
                 comment = String::from(args.get(i + 1).copied().unwrap_or(""))
                     .replace(' ', "_");
+                i += 1;
+            }
+            // `-m ttl --ttl-{eq,lt,gt} N` — real TTL match at the hooks.
+            "--ttl-eq" | "--ttl-lt" | "--ttl-gt" => {
+                let op = match args[i] {
+                    "--ttl-eq" => "eq",
+                    "--ttl-lt" => "lt",
+                    _ => "gt",
+                };
+                ttl_spec = alloc::format!("{}:{}", op, args.get(i + 1).copied().unwrap_or("0"));
+                i += 1;
+            }
+            // `--ttl N` is the canonical form of --ttl-eq N.
+            "--ttl" => {
+                ttl_spec = alloc::format!("eq:{}", args.get(i + 1).copied().unwrap_or("0"));
                 i += 1;
             }
             "--dst-range" | "--destination-range" => {
@@ -8237,6 +8284,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !comment.is_empty() {
         line.push_str(&alloc::format!(" comment {}", comment));
+    }
+    if !ttl_spec.is_empty() {
+        line.push_str(&alloc::format!(" ttl {}", ttl_spec));
     }
     if !iif.is_empty() {
         line.push_str(&alloc::format!(" iif {}", iif));
@@ -19866,6 +19916,9 @@ impl Term {
                     i += 1;
                 }
                 let verbose = args.iter().any(|a| *a == "-v");
+                // -e: real tcpdump flag — print the link-level header
+                // (srcmac > dstmac, ethertype, frame length).
+                let show_eth = args.iter().any(|a| *a == "-e");
                 let Some(f) = file else {
                     self.fail("usage: tcpdump -r <file.pcap> [-c N]");
                     return;
@@ -19937,6 +19990,27 @@ impl Term {
                         continue;
                     }
                     let et = be16(fr, 12);
+                    // -e: prepend the real link-level fields like
+                    // tcpdump does — `src > dst, ethertype X (0x....),
+                    // length N:`
+                    let ts_s = if show_eth {
+                        let etn = match et {
+                            0x0800 => "IPv4",
+                            0x0806 => "ARP",
+                            _ => "Unknown",
+                        };
+                        alloc::format!(
+                            "{} {} > {}, ethertype {} (0x{:04x}), length {}: ",
+                            ts_s,
+                            macstr(fr, 6),
+                            macstr(fr, 0),
+                            etn,
+                            et,
+                            fr.len()
+                        )
+                    } else {
+                        ts_s
+                    };
                     match et {
                         0x0806 if fr.len() >= 42 => {
                             let op = be16(fr, 20);
@@ -20704,6 +20778,7 @@ impl Term {
                 let mut xhdrs: Vec<String> = Vec::new();
                 let mut wout: Option<String> = None;
                 let mut max_ms: u64 = 15_000;
+                let mut conn_ms: u64 = 0; // --connect-timeout (0 = default)
                 let mut follow = false;
                 let mut max_redirs = 50u32;
                 let mut i = 0usize;
@@ -20753,6 +20828,16 @@ impl Term {
                                 .saturating_mul(1000);
                             i += 1;
                         }
+                        // --connect-timeout SEC — real curl flag:
+                        // bounds the SYN handshake wait specifically.
+                        "--connect-timeout" => {
+                            conn_ms = args
+                                .get(i + 1)
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(0)
+                                .saturating_mul(1000);
+                            i += 1;
+                        }
                         _ if a.starts_with("-X") && a.len() > 2 => {
                             method = Some(a[2..].to_uppercase());
                         }
@@ -20761,6 +20846,12 @@ impl Term {
                         }
                         _ if a.starts_with("-H") && a.len() > 2 => {
                             xhdrs.push(String::from(&a[2..]));
+                        }
+                        _ if a.starts_with("--connect-timeout=") => {
+                            conn_ms = a[18..]
+                                .parse::<u64>()
+                                .unwrap_or(0)
+                                .saturating_mul(1000);
                         }
                         _ if a.starts_with("--max-time=") => {
                             max_ms = a[11..]
@@ -20856,8 +20947,9 @@ impl Term {
                         }
                     }
                     t0 = ustd::uptime_ms();
-                    let Some(sock) = (40000..40400)
-                        .find_map(|lp| ustd::TcpSock::connect(lp, ip, port))
+                    let Some(sock) = (40000..40400).find_map(|lp| {
+                        ustd::TcpSock::connect_timeout(lp, ip, port, conn_ms)
+                    })
                     else {
                         self.last_ok = false;
                         if !silent {
@@ -22888,6 +22980,7 @@ impl Term {
                 let mut flood = false;
                 let mut ts_stamp = false;
                 let mut ttl = 0u8;
+                let mut tos = 0u8;
                 let mut audible = false;
                 let mut size = 0u64;
                 let mut iface = 0u8;
@@ -22994,6 +23087,22 @@ impl Term {
                             ts_stamp = true;
                             i += 1;
                         }
+                        "-Q" => {
+                            // -Q N: real iputils flag — stamps the
+                            // IPv4 TOS/DSCP byte on the echo request
+                            // (accepts dec or 0x hex, like iputils).
+                            tos = args
+                                .get(i + 1)
+                                .map(|x| {
+                                    if let Some(h) = x.strip_prefix("0x") {
+                                        u8::from_str_radix(h, 16).unwrap_or(0)
+                                    } else {
+                                        x.parse::<u8>().unwrap_or(0)
+                                    }
+                                })
+                                .unwrap_or(0);
+                            i += 2;
+                        }
                         a => {
                             target = Some(a);
                             i += 1;
@@ -23028,7 +23137,7 @@ impl Term {
                                 self.fail("ping: connect: Invalid argument");
                                 break;
                             }
-                            match ustd::net_ping_if(packed, wto, ttl, size, iface) {
+                            match ustd::net_ping_qos(packed, wto, ttl, size, iface, tos) {
                                 Some(rtt) => {
                                     got += 1;
                                     if audible {
@@ -30759,7 +30868,10 @@ impl Term {
                     }
                 };
                 let short = args.iter().any(|a| *a == "+short");
-                match dig_query(name, qt) {
+                // `+tcp`: real dig option — the query goes over TCP/53
+                // (RFC 1035 2-byte length-prefixed stream).
+                let use_tcp = args.iter().any(|a| *a == "+tcp");
+                match dig_query(name, qt, use_tcp) {
                     Ok(lines) => {
                         for l in lines {
                             if short {
