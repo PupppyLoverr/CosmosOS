@@ -30,6 +30,7 @@ mod pipes;
 mod proc;
 mod serial;
 mod shm;
+mod acct;
 mod cgroup;
 mod syscall;
 mod task;

@@ -123,6 +123,9 @@ pub fn dispatch(ctx: &mut CpuContext) {
     // this syscall is a restarted ipc_recv, the freshly-pushed port message
     // is picked up by the try_recv below.
     crate::input::pump();
+    // process accounting: append records buffered by kill_at — runs
+    // here because kill_at can't take the FS lock under SCHED
+    crate::acct::flush();
     let nr = ctx.rax;
     let (a1, a2, a3, a4, a5) = (ctx.rdi, ctx.rsi, ctx.rdx, ctx.r8, ctx.r9);
     // PTRACE_SYSCALL entry-stop: a tracer armed sc_phase=1, so the tracee
@@ -988,6 +991,52 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_SCHED_YIELD => {
             ctx.rax = 0;
             task::yield_ctx(ctx);
+        }
+        shared::SYS_PERSONALITY => task::sys_personality(a1 as u32) as u64,
+        shared::SYS_ACCT => {
+            // (path | 0): arm or disarm process accounting
+            if a1 == 0 {
+                crate::acct::sys_acct(None) as u64
+            } else {
+                match copy_str(a1, a2) {
+                    Some(p) => {
+                        let cwd = task::with_current(|t| t.cwd.clone());
+                        let full = crate::vfs::normalize(&cwd, &p);
+                        crate::acct::sys_acct(Some(full)) as u64
+                    }
+                    None => ERR,
+                }
+            }
+        }
+        shared::SYS_SCHED_SETAFFINITY => {
+            // (pid, len, mask u64*) — Linux requires len >= 8
+            if a2 < 8 {
+                (-22i64) as u64
+            } else {
+                match copy_in(a3, 8) {
+                    Some(b) => task::sched_setaffinity(
+                        a1 as u32,
+                        u64::from_le_bytes(b[..8].try_into().unwrap()),
+                    ) as u64,
+                    None => ERR,
+                }
+            }
+        }
+        shared::SYS_SCHED_GETAFFINITY => {
+            if a2 < 8 {
+                (-22i64) as u64
+            } else {
+                match task::sched_getaffinity(a1 as u32) {
+                    Some(m) => {
+                        if copy_out(a3, &m.to_le_bytes()).is_some() {
+                            8
+                        } else {
+                            ERR
+                        }
+                    }
+                    None => (-3i64) as u64,
+                }
+            }
         }
         shared::SYS_CLOCK_NANOSLEEP => {
             // absolute deadline in ms; ticks run 10ms each. A past deadline

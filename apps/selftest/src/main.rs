@@ -3434,6 +3434,62 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::set_dumpable(1);
         ok
     });
+    check("posix-acct", {
+        // process accounting: SYS_ACCT arms a file and task exits
+        // append 64B records {comm,exit_code,uid,gid,ticks,wall}.
+        let mut ok = true;
+        // the accounting file must exist before arming (Linux: ENOENT)
+        match ustd::open("/tmp/acct-st", ustd::O_CREATE | ustd::O_WRONLY) {
+            Ok(fd) => {
+                let _ = ustd::close(fd);
+            }
+            _ => ok = false,
+        }
+        ok = ok && ustd::acct("/tmp/acct-st") == 0;
+        match ustd::fork() {
+            0 => ustd::exit(55),
+            c if c > 0 => {
+                let _ = ustd::waitpid(c as u32, 5000);
+                // the record flushes at our next syscall — force one
+                let _ = ustd::getpid();
+            }
+            _ => ok = false,
+        }
+        let _ = ustd::acct(""); // disarm
+        // the armed file must now hold a 64B record with our comm
+        // and exit code 55 at [16..20)
+        match ustd::read_all("/tmp/acct-st") {
+            Ok(b) if b.len() >= 64 => {
+                let code = u32::from_le_bytes(b[16..20].try_into().unwrap());
+                let named = b[..16]
+                    .iter()
+                    .any(|&c| c == b's')
+                    && String::from_utf8_lossy(&b[..16])
+                        .contains("selftest");
+                ok = ok && code == 55 && named;
+            }
+            _ => ok = false,
+        }
+        ok
+    });
+    check("persona-affinity", {
+        // personality round-trip + sched affinity (UP: mask must be {1}).
+        let mut ok = true;
+        let pid = ustd::getpid() as u32;
+        let old = ustd::personality(0xFFFF_FFFF);
+        ok = ok && old == 0;
+        ok = ok && ustd::personality(0x40000) == old; // ADDR_NO_RANDOMIZE
+        ok = ok && ustd::personality(0xFFFF_FFFF) == 0x40000;
+        let _ = ustd::personality(0);
+        // affinity: UP box — mask must be a nonzero subset of {cpu0}
+        ok = ok && ustd::sched_getaffinity(pid) == 1;
+        ok = ok && ustd::sched_setaffinity(pid, 0) == -22;
+        ok = ok && ustd::sched_setaffinity(pid, 2) == -22;
+        ok = ok && ustd::sched_setaffinity(pid, 1) == 0;
+        ok = ok && ustd::sched_getaffinity(pid) == 1;
+        ok = ok && ustd::sched_getaffinity(0xdead) == -3;
+        ok
+    });
     check("epoll-flags", {
         // EPOLLET fires once per ready level, EPOLLONESHOT until MOD
         // re-arms, EPOLLHUP surfaces on writer close, and the epoll fd
