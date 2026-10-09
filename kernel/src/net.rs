@@ -286,6 +286,7 @@ fn route_del(spec: &str) -> bool {
 struct FwRule {
     proto: u8,            // 0 = any; 1 icmp, 6 tcp, 17 udp
     dport: u16,           // 0 = any (tcp/udp destination port)
+    dports: Vec<u16>,     // `-m multiport --dports a,b,..` — empty = not used
     src: [u8; 4],         // [0;4] = anywhere
     smask: [u8; 4],
     state: u8,            // 0 = any; bit0 = NEW, bit1 = ESTABLISHED
@@ -427,6 +428,10 @@ fn fw_verdict(
             continue;
         }
         if r.dport != 0 && r.dport != dport {
+            continue;
+        }
+        // `-m multiport --dports`: real set match on the dest port
+        if !r.dports.is_empty() && !r.dports.contains(&dport) {
             continue;
         }
         if r.state != 0 && r.state & st == 0 {
@@ -573,6 +578,16 @@ fn fmt_fw_chain(
         } else {
             String::new()
         };
+        if !r.dports.is_empty() {
+            let mut csv = String::new();
+            for (i, p) in r.dports.iter().enumerate() {
+                if i > 0 {
+                    csv.push(',');
+                }
+                csv.push_str(&alloc::format!("{}", p));
+            }
+            extra.push_str(&alloc::format!(" multiport dpts:{}", csv));
+        }
         if r.state != 0 {
             extra.push_str(&alloc::format!(
                 "  state {}",
@@ -716,9 +731,10 @@ pub fn net_neigh() -> String {
     let mut s = String::new();
     for e in ARP_CACHE.lock().iter() {
         s.push_str(&alloc::format!(
-            "{}.{}.{}.{} dev eth0 lladdr {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} {}\n",
+            "{}.{}.{}.{} dev eth0 lladdr {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} used {} {}\n",
             e.ip[0], e.ip[1], e.ip[2], e.ip[3],
             e.mac[0], e.mac[1], e.mac[2], e.mac[3], e.mac[4], e.mac[5],
+            (now_ms() - e.learned_ms) / 1000,
             arp_state(e),
         ));
     }
@@ -887,7 +903,7 @@ pub fn iptables_ctl(line: &str) -> bool {
                 None => return false,
             };
             let mut r = FwRule {
-                proto, dport: 0, src: [0; 4], smask: [0; 4], state: 0,
+                proto, dport: 0, dports: Vec::new(), src: [0; 4], smask: [0; 4], state: 0,
                 limit_pps: 0, limit_burst: 5, lim_tokens: 5, lim_ms: 0,
                 target: 0, hits: 0, bytes: 0,
             };
@@ -897,6 +913,19 @@ pub fn iptables_ctl(line: &str) -> bool {
                     "dport" => {
                         r.dport = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                         if r.dport == 0 {
+                            ok = false;
+                        }
+                    }
+                    // `-m multiport --dports a,b,..` (15 max, like Linux)
+                    "multiport" => {
+                        r.dports = f
+                            .next()
+                            .unwrap_or("")
+                            .split(',')
+                            .filter_map(|s| s.parse::<u16>().ok())
+                            .take(15)
+                            .collect();
+                        if r.dports.is_empty() {
                             ok = false;
                         }
                     }
@@ -1552,6 +1581,12 @@ pub fn net_arping(dst: [u8; 4], per_ms: u64) -> Option<(u64, u64)> {
     None
 }
 
+/// Gratuitous ARP: a broadcast REPLY announcing our own ip/mac — the
+/// `arping -U` announce. Nobody asked; everyone updates their cache.
+pub fn send_arp_gratuitous() {
+    send_arp_reply([0xFF; 6], our_ip());
+}
+
 fn send_arp_reply(dst_mac: [u8; 6], dst_ip: [u8; 4]) {
     let mut p = Vec::with_capacity(28);
     p.extend_from_slice(&1u16.to_be_bytes());
@@ -1720,6 +1755,12 @@ pub fn arp_ctl(line: &str) -> bool {
         Some("del") => f.next().and_then(parse_ip).map(arp_del).unwrap_or(false),
         Some("flush") => {
             ARP_CACHE.lock().clear();
+            true
+        }
+        // "announce" — emit a gratuitous ARP reply for our own address
+        // (arping -U). Real broadcast frame on the wire.
+        Some("announce") => {
+            send_arp_gratuitous();
             true
         }
         _ => false,

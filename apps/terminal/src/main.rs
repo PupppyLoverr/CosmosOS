@@ -8030,6 +8030,7 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut proto = 0u8;
     let mut src = String::new();
     let mut dport = 0u16;
+    let mut dports = String::new();
     let mut state = String::new();
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
@@ -8059,6 +8060,11 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                     .get(i + 1)
                     .and_then(|s| s.parse::<u16>().ok())
                     .unwrap_or(0);
+                i += 1;
+            }
+            // `-m multiport --dports a,b,..` — a real multi-port match
+            "--dports" | "--destination-ports" => {
+                dports = String::from(args.get(i + 1).copied().unwrap_or(""));
                 i += 1;
             }
             "-j" | "--jump" => {
@@ -8136,6 +8142,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     };
     if dport != 0 {
         line.push_str(&alloc::format!(" dport {}", dport));
+    }
+    if !dports.is_empty() {
+        line.push_str(&alloc::format!(" multiport {}", dports));
     }
     if !src.is_empty() {
         line.push_str(&alloc::format!(" src {}", src));
@@ -34702,6 +34711,12 @@ impl Term {
                                 if let Some(dp) = w.strip_prefix("dpt:") {
                                     ln.push_str(&alloc::format!(" --dport {}", dp));
                                 }
+                                if let Some(dp) = w.strip_prefix("dpts:") {
+                                    ln.push_str(&alloc::format!(
+                                        " -m multiport --dports {}",
+                                        dp
+                                    ));
+                                }
                             }
                             ln.push_str(&alloc::format!(" -j {}", tgt));
                             self.emit(&ln);
@@ -35119,7 +35134,9 @@ impl Term {
             "arping" => {
                 // Real ARP who-has probes on the wire (SYS_ARPING) —
                 // arping [-c N] <ip>: 'Unicast reply from <ip> [mac]  N ms'.
+                // `arping -U` sends a gratuitous broadcast announce instead.
                 let mut cnt = 1u32;
+                let mut gratuit = false;
                 let mut target: Option<&str> = None;
                 let mut i = 0usize;
                 while i < args.len() {
@@ -35128,11 +35145,27 @@ impl Term {
                             cnt = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1).min(64);
                             i += 2;
                         }
+                        "-U" | "-A" => {
+                            gratuit = true;
+                            i += 1;
+                        }
                         a => {
                             target = Some(a);
                             i += 1;
                         }
                     }
+                }
+                if gratuit {
+                    if ustd::write_all("/proc/net/arp", b"announce").is_ok() {
+                        self.emit(&alloc::format!(
+                            "Sent gratuitous ARP for {}",
+                            target.unwrap_or("self")
+                        ));
+                        self.last_ok = true;
+                    } else {
+                        self.fail("arping: announce failed");
+                    }
+                    return;
                 }
                 let Some(ip) = target.and_then(|t| host_arg(t)) else {
                     self.fail("usage: arping [-c n] <ip>");
@@ -38550,6 +38583,22 @@ impl Term {
             "ip" => match args.first().copied() {
                 // `ip -s link` — per-iface RX/TX stats in iproute2 layout
                 Some("-s") | Some("--stats") => {
+                    // `ip -s neigh` — stats form keeps the real ` used N`
+                    // age column from /proc/net/neigh.
+                    if matches!(
+                        args.get(1).copied(),
+                        Some("n") | Some("neigh") | Some("neighbour")
+                    ) {
+                        match ustd::read_all("/proc/net/neigh") {
+                            Ok(d) => {
+                                for l in String::from_utf8_lossy(&d).lines() {
+                                    self.emit(l);
+                                }
+                            }
+                            Err(e) => self.fail(&alloc::format!("ip: {}", e)),
+                        }
+                        return;
+                    }
                     let devt = ustd::read_all("/proc/net/dev")
                         .map(|d| String::from_utf8_lossy(&d).into_owned())
                         .unwrap_or_default();
@@ -38725,13 +38774,24 @@ impl Term {
                             }
                         }
                         _ => {
-                            // ip neigh / ip neigh show — NUD states
+                            // ip neigh / ip neigh show — NUD states;
+                            // the proc line carries ` used N` which plain
+                            // `ip neigh` doesn't display (ip -s neigh does).
                             match ustd::read_all("/proc/net/neigh") {
                                 Ok(d) => {
                                     let t =
                                         String::from_utf8_lossy(&d).into_owned();
                                     for l in t.lines() {
-                                        self.emit(l);
+                                        match l.find(" used ") {
+                                            Some(i) => self.emit(&alloc::format!(
+                                                "{}{}",
+                                                &l[..i],
+                                                l.rsplit(' ').next()
+                                                    .map(|s| alloc::format!(" {}", s))
+                                                    .unwrap_or_default()
+                                            )),
+                                            None => self.emit(l),
+                                        }
                                     }
                                 }
                                 Err(e) => self.fail(&alloc::format!("ip: {}", e)),
