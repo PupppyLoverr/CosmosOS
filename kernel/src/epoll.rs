@@ -244,6 +244,10 @@ pub fn collect(epfd_path: &str, max: usize) -> Vec<(u32, u32)> {
 fn epoch(path: &str) -> u64 {
     if crate::pipes::handles(path) {
         crate::pipes::rise_gen(path)
+    } else if crate::sockfd::handles(path) {
+        crate::sockfd::rise_gen(path)
+    } else if crate::sockpair::handles(path) {
+        crate::sockpair::rise_gen(path)
     } else {
         0
     }

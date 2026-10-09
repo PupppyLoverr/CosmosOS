@@ -3656,6 +3656,7 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>, u64)> {
                     if k.ka_cnt > ka_max {
                         k.rst = true;
                         k.state = TcpState::Closed;
+                k.gen += 1;
                         k.closed_ms = now_ms();
                         continue;
                     }
@@ -3693,6 +3694,7 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>, u64)> {
                         if u.tries as u64 > crate::sysctl::tcp_retries2() {
                             k.rst = true;
                             k.state = TcpState::Closed;
+                k.gen += 1;
                             k.closed_ms = now;
                             continue;
                         }
@@ -5573,6 +5575,11 @@ pub fn dhcp_release() -> bool {
 const MAX_SOCK_Q: usize = 32;
 static SOCKS: Mutex<BTreeMap<u16, VecDeque<([u8; 4], u16, Vec<u8>)>>> =
     Mutex::new(BTreeMap::new());
+/// per-lport readiness epoch: bumped when a dgram lands on an empty
+/// queue — epoll ET keys off it (see pipes::rise_gen for the model).
+static UDP_EDGE: Mutex<BTreeMap<u16, u64>> = Mutex::new(BTreeMap::new());
+/// per-listener accept-queue edge epoch, same model.
+static ACCEPT_GEN: Mutex<BTreeMap<u16, u64>> = Mutex::new(BTreeMap::new());
 /// Port -> number of bound holders; >1 only via SO_REUSEADDR joins
 /// (udp_open_share). The port's queue dies when the count hits 0.
 static UDP_SHARES: Mutex<BTreeMap<u16, u32>> = Mutex::new(BTreeMap::new());
@@ -5692,6 +5699,16 @@ pub fn udp_bound(lport: u16) -> bool {
     SOCKS.lock().contains_key(&lport)
 }
 
+/// readiness epoch of a UDP port's rx queue (0 = never delivered).
+pub fn udp_edge_gen(lport: u16) -> u64 {
+    UDP_EDGE.lock().get(&lport).copied().unwrap_or(0)
+}
+
+/// readiness epoch of a TCP listener's accept queue.
+pub fn accept_gen(lport: u16) -> u64 {
+    ACCEPT_GEN.lock().get(&lport).copied().unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // Socket dispatch — every packet a wait loop pumps feeds the socket tables
 // (UDP dgram -> SOCKS queue, TCP seg -> TCP_SOCKS feed). Returns false for
@@ -5707,6 +5724,9 @@ fn dispatch(src_ip: [u8; 4], proto: u8, p: Vec<u8>) -> bool {
             match socks.get_mut(&dport) {
                 Some(q) => {
                     if q.len() < MAX_SOCK_Q {
+                        if q.is_empty() {
+                            *UDP_EDGE.lock().entry(dport).or_insert(0) += 1;
+                        }
                         q.push_back((src_ip, be16(&p[0..]), p[8..].to_vec()));
                     }
                     true
@@ -5821,6 +5841,9 @@ pub struct TcpSock {
     /// TIME_WAIT guard so its port can't be reused while wire segments
     /// for the dead 4-tuple may still be in flight.
     closed_ms: u64,
+    /// readiness-transition epoch: bumped on empty->non-empty rx pushes
+    /// and on Established/Closed transitions — epoll ET keys off it.
+    gen: u64,
 }
 
 /// A transmitted segment awaiting ACK — retransmitted by tcp_tick.
@@ -5891,6 +5914,7 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
             if s.flags & TCP_RST != 0 {
                 k.rst = true;
                 k.state = TcpState::Closed;
+                k.gen += 1;
                 k.closed_ms = now_ms();
             } else if s.flags & TCP_ACK != 0 && s.ack == k.snd_nxt {
                 // net.ipv4.tcp_abort_on_overflow (Linux default 0): a
@@ -5914,6 +5938,7 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
                 }
                 k.snd_una = s.ack;
                 k.state = TcpState::Open;
+                k.gen += 1;
                 if s.seq == k.rcv_nxt && !s.payload.is_empty() {
                     // net.ipv4.tcp_rmem[2]: a payload that would pass the
                     // byte cap is dropped — rcv_nxt stays put and the
@@ -5922,6 +5947,9 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
                     if buffered.saturating_add(s.payload.len()) as u64
                         <= crate::sysctl::tcp_rmem().2
                     {
+                        if k.q.is_empty() {
+                            k.gen += 1;
+                        }
                         k.q.push_back(s.payload.clone());
                         k.rcv_nxt += s.payload.len() as u32;
                         send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[], rx_win(k));
@@ -5935,12 +5963,16 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
                 let mut ag = ACCEPTED.lock();
                 let q = ag.entry(k.lport).or_default();
 if q.len() < cap {
+                    if q.is_empty() {
+                        *ACCEPT_GEN.lock().entry(k.lport).or_insert(0) += 1;
+                    }
                     q.push_back((k.cid, k.rip, k.rport));
                 } else {
                     drop(ag);
                     send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt,
                         k.rcv_nxt, TCP_RST, &[], 0);
                     k.state = TcpState::Closed;
+                k.gen += 1;
                 k.closed_ms = now_ms();
                     k.rst = true;
                 }
@@ -5951,12 +5983,14 @@ if q.len() < cap {
                 k.rcv_nxt = s.seq + 1;
                 k.snd_una = s.ack;
                 k.state = TcpState::Open;
+                k.gen += 1;
                 // handshake RTT: the estimator's first sample
                 tcp_rtt_sample(k, now_ms().saturating_sub(k.syn_ms));
                 send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[], rx_win(k));
             } else if s.flags & TCP_RST != 0 {
                 k.rst = true;
                 k.state = TcpState::Closed;
+                k.gen += 1;
                 k.closed_ms = now_ms();
             }
         }
@@ -5964,6 +5998,7 @@ if q.len() < cap {
             if s.flags & TCP_RST != 0 {
                 k.rst = true;
                 k.state = TcpState::Closed;
+                k.gen += 1;
                 k.closed_ms = now_ms();
                 return;
             }
@@ -5993,6 +6028,9 @@ if q.len() < cap {
                 if buffered.saturating_add(s.payload.len()) as u64
                     <= crate::sysctl::tcp_rmem().2
                 {
+                    if k.q.is_empty() {
+                        k.gen += 1;
+                    }
                     k.q.push_back(s.payload.clone());
                     k.rcv_nxt += s.payload.len() as u32;
                 }
@@ -6000,6 +6038,7 @@ if q.len() < cap {
             if s.flags & TCP_FIN != 0 {
                 k.rcv_nxt += 1;
                 k.state = TcpState::Closed;
+                k.gen += 1;
                 k.closed_ms = now_ms();
             }
             // ack whatever we consumed (dup acks are fine)
@@ -6029,6 +6068,7 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
             snd_nxt: isn + 1,
             snd_una: isn,
             rcv_nxt: 0,
+            gen: 0,
             state: TcpState::SynSent,
             q: VecDeque::new(),
             unacked: VecDeque::new(),
@@ -6150,6 +6190,7 @@ fn accept_syn(s: &TcpSeg, src_ip: [u8; 4]) {
             snd_nxt: isn + 1,
             snd_una: isn,
             rcv_nxt: s.seq + 1,
+            gen: 0,
             state: TcpState::SynRecv,
             q: VecDeque::new(),
             unacked: VecDeque::new(),
@@ -6329,6 +6370,7 @@ pub fn tcp_close_linger(lport: u16, linger: i64) {
                 send_rst = linger == 0;
             }
             k.state = TcpState::Closed;
+            k.gen += 1;
             k.closed_ms = now_ms();
         }
     }
@@ -6431,6 +6473,15 @@ pub fn tcp_was_rst(cid: u16) -> Option<bool> {
 }
 
 /// A completed inbound handshake is queued for accept on `lport`?
+/// readiness epoch of a TCP conn (u64::MAX = dead entry — always an edge).
+pub fn tcp_gen(cid: u16) -> u64 {
+    TCP_SOCKS
+        .lock()
+        .get(&cid)
+        .map(|k| k.gen)
+        .unwrap_or(u64::MAX)
+}
+
 pub fn tcp_accept_ready(lport: u16) -> bool {
     ACCEPTED
         .lock()

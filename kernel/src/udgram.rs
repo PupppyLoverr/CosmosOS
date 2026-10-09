@@ -14,6 +14,8 @@ const MAXPKT: usize = 16 * 1024; // max datagram payload
 
 struct Dbox {
     packets: VecDeque<(Vec<u8>, String)>, // (data, sender name)
+    /// readiness-transition epoch (empty->non-empty pushes) — epoll ET.
+    gen: u64,
 }
 
 static BOXES: Mutex<BTreeMap<String, Dbox>> = Mutex::new(BTreeMap::new());
@@ -28,6 +30,7 @@ pub fn register(name: &str) -> bool {
         String::from(name),
         Dbox {
             packets: VecDeque::new(),
+            gen: 0,
         },
     );
     true
@@ -56,12 +59,21 @@ pub fn send(dst: &str, src: &str, data: &[u8]) -> i64 {
     if b.packets.len() >= crate::sysctl::unix_max_dgram_qlen() as usize {
         return -11; // EAGAIN: past net.unix.max_dgram_qlen
     }
+    if b.packets.is_empty() {
+        b.gen += 1; // not-ready -> readable edge
+    }
     b.packets.push_back((Vec::from(data), String::from(src)));
     0
 }
 
 /// Pop one datagram for `name`: Ok((bytes copied, sender name)).
 /// A packet larger than `buf` is truncated, the rest dropped (POSIX).
+/// readiness-transition epoch for epoll ET (u64::MAX when the mailbox is
+/// gone — differs from any stored gen, so unregister is itself an edge).
+pub fn rise_gen(name: &str) -> u64 {
+    BOXES.lock().get(name).map(|b| b.gen).unwrap_or(u64::MAX)
+}
+
 /// Err(-11) empty queue, Err(-2) mailbox gone.
 pub fn recv(name: &str, buf: &mut [u8]) -> Result<(usize, String), i64> {
     let mut g = BOXES.lock();
