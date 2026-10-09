@@ -17,6 +17,25 @@ pub static TX_PKTS: AtomicU64 = AtomicU64::new(0);
 pub static TX_BYTES: AtomicU64 = AtomicU64::new(0);
 static IFACE_UP: AtomicU64 = AtomicU64::new(1);
 
+// /proc/net/snmp + netstat -s counters: pre/post-filter inbound, egress by
+// proto, and ICMP echo subcounts. All relaxed — observability only.
+pub static IP_IN_RECV: AtomicU64 = AtomicU64::new(0);
+pub static IP_IN_DELIV: AtomicU64 = AtomicU64::new(0);
+pub static IP_OUT_REQ: AtomicU64 = AtomicU64::new(0);
+pub static ICMP_IN: AtomicU64 = AtomicU64::new(0);
+pub static ICMP_OUT: AtomicU64 = AtomicU64::new(0);
+pub static TCP_IN: AtomicU64 = AtomicU64::new(0);
+pub static TCP_OUT: AtomicU64 = AtomicU64::new(0);
+pub static UDP_IN: AtomicU64 = AtomicU64::new(0);
+pub static UDP_OUT: AtomicU64 = AtomicU64::new(0);
+pub static ICMP_IN_ECHOREQ: AtomicU64 = AtomicU64::new(0);
+pub static ICMP_OUT_ECHOREQ: AtomicU64 = AtomicU64::new(0);
+pub static ICMP_IN_ECHOREP: AtomicU64 = AtomicU64::new(0);
+pub static ICMP_OUT_ECHOREP: AtomicU64 = AtomicU64::new(0);
+
+// net.ipv4 tunables (writable via /proc/sys/net/ipv4/*)
+static ICMP_IGNORE_ALL: AtomicU64 = AtomicU64::new(0);
+
 /// Administrative interface state (`ifconfig eth0 up/down`). When down the
 /// rx pump drops every frame and transmit requests fail — a real carrier
 /// flag, not cosmetic.
@@ -291,6 +310,82 @@ pub fn net_iptables() -> String {
     out
 }
 
+/// `/proc/net/snmp` — Linux-format IP/ICMP/TCP/UDP counters for `netstat -s`.
+/// InReceives counts everything arriving (incl. packets the INPUT filter then
+/// drops); InDelivers is what survived filtering.
+pub fn net_snmp() -> String {
+    alloc::format!(
+        "Ip: Forwarding DefaultTTL InReceives InDelivers OutRequests\n\
+         Ip: 2 64 {} {} {}\n\
+         Icmp: InMsgs OutMsgs InEchoReqs OutEchoReps InEchoReps OutEchoReqs\n\
+         Icmp: {} {} {} {} {} {}\n\
+         Tcp: InSegs OutSegs\n\
+         Tcp: {} {}\n\
+         Udp: InDatagrams OutDatagrams\n\
+         Udp: {} {}\n",
+        IP_IN_RECV.load(Ordering::Relaxed),
+        IP_IN_DELIV.load(Ordering::Relaxed),
+        IP_OUT_REQ.load(Ordering::Relaxed),
+        ICMP_IN.load(Ordering::Relaxed),
+        ICMP_OUT.load(Ordering::Relaxed),
+        ICMP_IN_ECHOREQ.load(Ordering::Relaxed),
+        ICMP_OUT_ECHOREP.load(Ordering::Relaxed),
+        ICMP_IN_ECHOREP.load(Ordering::Relaxed),
+        ICMP_OUT_ECHOREQ.load(Ordering::Relaxed),
+        TCP_IN.load(Ordering::Relaxed),
+        TCP_OUT.load(Ordering::Relaxed),
+        UDP_IN.load(Ordering::Relaxed),
+        UDP_OUT.load(Ordering::Relaxed),
+    )
+}
+
+/// `/proc/net/nf_conntrack` — live flow table: every TCP conn (state, addrs),
+/// every LISTEN port, every bound UDP socket.
+pub fn net_conntrack() -> String {
+    let mut out = String::new();
+    for k in TCP_SOCKS.lock().values() {
+        let st = match k.state {
+            TcpState::SynSent => "SYN_SENT",
+            TcpState::SynRecv => "SYN_RECV",
+            TcpState::Open => "ESTABLISHED",
+            TcpState::Closed => "CLOSE",
+        };
+        out.push_str(&alloc::format!(
+            "tcp      6 {} src={}.{}.{}.{} dst={}.{}.{}.{} sport={} dport={}\n",
+            st,
+            our_ip()[0], our_ip()[1], our_ip()[2], our_ip()[3],
+            k.rip[0], k.rip[1], k.rip[2], k.rip[3],
+            k.lport, k.rport,
+        ));
+    }
+    for p in LISTENERS.lock().iter() {
+        out.push_str(&alloc::format!(
+            "tcp      6 LISTEN src={}.{}.{}.{} dst=0.0.0.0 sport={} dport=0\n",
+            our_ip()[0], our_ip()[1], our_ip()[2], our_ip()[3], p,
+        ));
+    }
+    for p in SOCKS.lock().keys() {
+        out.push_str(&alloc::format!(
+            "udp      17 UNREPLIED src={}.{}.{}.{} dst=0.0.0.0 sport={} dport=0\n",
+            our_ip()[0], our_ip()[1], our_ip()[2], our_ip()[3], p,
+        ));
+    }
+    out
+}
+
+/// `/proc/sys/net/ipv4/icmp_echo_ignore_all` — 0/1 sysctl body.
+pub fn net_icmp_ignore_all() -> String {
+    alloc::format!(
+        "{}\n",
+        ICMP_IGNORE_ALL.load(Ordering::Relaxed)
+    )
+}
+
+/// sysctl write: `icmp_echo_ignore_all` — silences the echo responder.
+pub fn set_icmp_ignore_all(v: u64) {
+    ICMP_IGNORE_ALL.store(v, Ordering::Relaxed);
+}
+
 /// `/proc/net/iptables` write grammar (kernel side of the `iptables` cmd):
 ///   "F"                                  flush all rules
 ///   "D <n>"                              delete 1-based rule number
@@ -480,6 +575,26 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
         }
     }
     drop(lq);
+    // protocol counters: InReceives counts everything that arrived (incl.
+    // packets the INPUT filter is about to drop), InDelivers post-filter.
+    for (_, proto, p) in &out {
+        IP_IN_RECV.fetch_add(1, Ordering::Relaxed);
+        match *proto {
+            1 => {
+                ICMP_IN.fetch_add(1, Ordering::Relaxed);
+                if p.len() >= 1 {
+                    if p[0] == 8 {
+                        ICMP_IN_ECHOREQ.fetch_add(1, Ordering::Relaxed);
+                    } else if p[0] == 0 {
+                        ICMP_IN_ECHOREP.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            6 => { TCP_IN.fetch_add(1, Ordering::Relaxed); }
+            17 => { UDP_IN.fetch_add(1, Ordering::Relaxed); }
+            _ => {}
+        }
+    }
     // iptables INPUT: every inbound packet is evaluated once here at ingress —
     // wire, slirp-forwarded, and loopback alike — before dispatch, raw
     // consumers (ping/dhcp), or the ICMP echo responder can see it.
@@ -491,9 +606,12 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
         };
         !fw_dropped(*src_ip, *proto, dport)
     });
-    // ICMP: answer echo requests like a real host — wire or loopback
+    IP_IN_DELIV.fetch_add(out.len() as u64, Ordering::Relaxed);
+    // ICMP: answer echo requests like a real host — wire or loopback;
+    // net.ipv4.icmp_echo_ignore_all silences the responder.
+    let ignore_all = ICMP_IGNORE_ALL.load(Ordering::Relaxed) != 0;
     for (src_ip, proto, p) in &out {
-        if *proto == 1 && p.len() >= 8 && p[0] == 8 {
+        if *proto == 1 && p.len() >= 8 && p[0] == 8 && !ignore_all {
             icmp_echo_reply(*src_ip, p);
         }
     }
@@ -555,6 +673,7 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
 /// peer (mac from the ARP cache — absent = unreachable, drop) or straight
 /// back into lo when the requester is us.
 fn icmp_echo_reply(src_ip: [u8; 4], req: &[u8]) {
+    ICMP_OUT_ECHOREP.fetch_add(1, Ordering::Relaxed);
     let mut rep = Vec::with_capacity(req.len());
     rep.push(0); // echo reply
     rep.push(0);
@@ -739,6 +858,7 @@ fn send_arp_reply(dst_mac: [u8; 6], dst_ip: [u8; 4]) {
 }
 
 fn send_icmp_echo(dst_mac: [u8; 6], dst_ip: [u8; 4], id: u16, seq: u16, payload: &[u8]) {
+    ICMP_OUT_ECHOREQ.fetch_add(1, Ordering::Relaxed);
     let mut icmp = Vec::with_capacity(8 + payload.len());
     icmp.push(8); // echo request
     icmp.push(0);
@@ -910,6 +1030,13 @@ fn send_ip_src_ttl(
     ttl: u8,
     payload: &[u8],
 ) {
+    IP_OUT_REQ.fetch_add(1, Ordering::Relaxed);
+    match proto {
+        1 => ICMP_OUT.fetch_add(1, Ordering::Relaxed),
+        6 => TCP_OUT.fetch_add(1, Ordering::Relaxed),
+        17 => UDP_OUT.fetch_add(1, Ordering::Relaxed),
+        _ => 0,
+    };
     if is_loopback(dst_ip) {
         // lo: no ethernet, no ARP — the datagram re-enters rx as-is
         LOOPBACK_Q.lock().push_back((src_ip, proto, payload.to_vec()));

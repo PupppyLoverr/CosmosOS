@@ -25242,8 +25242,20 @@ impl Term {
                 }
             }
             "netstat" => {
-                // netstat [-l] [-t] [-u] [-p]: -p joins /proc/net/owners ->
-                // real owning pid+program name per socket row
+                // netstat [-l] [-t] [-u] [-p] [-s]: -p joins /proc/net/owners ->
+                // real owning pid+program name per socket row;
+                // -s prints the /proc/net/snmp counter sections.
+                if args.iter().any(|a| *a == "-s" || *a == "--statistics") {
+                    match ustd::read_all("/proc/net/snmp") {
+                        Ok(d) => {
+                            for l in String::from_utf8_lossy(&d).lines() {
+                                self.emit(l);
+                            }
+                        }
+                        Err(e) => self.fail(&alloc::format!("netstat: err {}", e)),
+                    }
+                    return;
+                }
                 let only_l = args.iter().any(|a| *a == "-l");
                 let tf = args.iter().any(|a| *a == "-t");
                 let uf = args.iter().any(|a| *a == "-u");
@@ -25297,6 +25309,26 @@ impl Term {
                         continue;
                     }
                     self.emit(l);
+                }
+            }
+            "conntrack" => {
+                // conntrack -L / --dump: live kernel flow table from
+                // /proc/net/nf_conntrack (real conn states + bound sockets).
+                let first = args.first().copied().unwrap_or("-L");
+                match first {
+                    "-L" | "--dump" | "-S" | "--stats" => {
+                        match ustd::read_all("/proc/net/nf_conntrack") {
+                            Ok(d) => {
+                                for l in String::from_utf8_lossy(&d).lines() {
+                                    self.emit(l);
+                                }
+                            }
+                            Err(e) => self.fail(&alloc::format!(
+                                "conntrack: err {}", e)),
+                        }
+                    }
+                    _ => self.fail(&alloc::format!(
+                        "conntrack: {}: unsupported op", first)),
                 }
             }
             "sync" => {
@@ -33924,7 +33956,17 @@ impl Term {
                         Ok(b) => {
                             if first == "-S" || first == "--list-rules" {
                                 let t = String::from_utf8_lossy(&b);
-                                self.emit("-P INPUT ACCEPT");
+                                // policy from the real header line
+                                // "Chain INPUT (policy <VERDICT>)"
+                                let pol = t
+                                    .lines()
+                                    .next()
+                                    .and_then(|h| {
+                                        h.strip_prefix("Chain INPUT (policy ")
+                                    })
+                                    .and_then(|r| r.strip_suffix(')'))
+                                    .unwrap_or("ACCEPT");
+                                self.emit(&alloc::format!("-P INPUT {}", pol));
                                 for l in t.lines().skip(2) {
                                     let mut it = l.split_whitespace();
                                     let _num = it.next();
@@ -34930,6 +34972,12 @@ impl Term {
                         "{}", mi.total_kb.saturating_sub(mi.used_kb))),
                     ("hw.ncpu", String::from("1")),
                 ];
+                // net.ipv4.* keys map to /proc/sys/net/ipv4/<name> procfiles
+                let sysfile = |key: &str| -> Option<String> {
+                    key.strip_prefix("net.ipv4.").map(|n| {
+                        alloc::format!("/proc/sys/net/ipv4/{}", n)
+                    })
+                };
                 let pos: Vec<&str> = args
                     .iter()
                     .filter(|a| !a.starts_with('-'))
@@ -34940,9 +34988,19 @@ impl Term {
                         for (k, v) in &kv {
                             self.emit(&alloc::format!("{} = {}", k, v));
                         }
+                        // live net.ipv4 keys from procfs
+                        if let Ok(d) = ustd::read_all(
+                            "/proc/sys/net/ipv4/icmp_echo_ignore_all",
+                        ) {
+                            self.emit(&alloc::format!(
+                                "net.ipv4.icmp_echo_ignore_all = {}",
+                                String::from_utf8_lossy(&d).trim()
+                            ));
+                        }
                     }
                     Some(k) if k.contains('=') => {
                         // sysctl -w kernel.hostname=X -> /proc/sys/kernel/hostname
+                        // sysctl -w net.ipv4.X=Y -> /proc/sys/net/ipv4/X
                         let mut it = k.splitn(2, '=');
                         let (key, val) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
                         match key {
@@ -34961,14 +35019,40 @@ impl Term {
                                         "sysctl: {} err {}", key, e)),
                                 }
                             }
-                            _ => self.fail(&alloc::format!(
-                                "sysctl: {}: unknown key", key)),
+                            _ => match sysfile(key) {
+                                Some(p) => match ustd::write_all(
+                                    &p, val.as_bytes(),
+                                ) {
+                                    Ok(()) => self.emit(&alloc::format!(
+                                        "{} = {}", key, val)),
+                                    Err(e) => self.fail(&alloc::format!(
+                                        "sysctl: {} err {}", key, e)),
+                                },
+                                None => self.fail(&alloc::format!(
+                                    "sysctl: {}: unknown key", key)),
+                            },
                         }
                     }
-                    Some(k) => match kv.iter().find(|(kk, _)| *kk == *k) {
-                        Some((kk, v)) => self.emit(&alloc::format!("{} = {}", kk, v)),
-                        None => self.fail(&alloc::format!("sysctl: {}: unknown key", k)),
-                    },
+                    Some(k) => {
+                        if let Some(p) = sysfile(k) {
+                            match ustd::read_all(&p) {
+                                Ok(d) => self.emit(&alloc::format!(
+                                    "{} = {}",
+                                    k,
+                                    String::from_utf8_lossy(&d).trim()
+                                )),
+                                Err(_) => self.fail(&alloc::format!(
+                                    "sysctl: {}: unknown key", k)),
+                            }
+                        } else {
+                            match kv.iter().find(|(kk, _)| *kk == *k) {
+                                Some((kk, v)) => self.emit(&alloc::format!(
+                                    "{} = {}", kk, v)),
+                                None => self.fail(&alloc::format!(
+                                    "sysctl: {}: unknown key", k)),
+                            }
+                        }
+                    }
                 }
             }
             "dos2unix" | "unix2dos" => {
@@ -39226,6 +39310,7 @@ impl Term {
         "spell", "ul", "skill", "snice", "sfdisk", "vi", "nano", "chvt",
         "rdmsr", "runlevel", "xgettext", "msgunfmt", "soelim",
         "iptables", "iptables-save", "iptables-restore", "shutdown",
+        "conntrack",
         "sponge", "oathtool", "pwgen", "xkcdpass", "pstack", "errno",
         "scrot", "fbset", "xterm", "uxterm", "xcalc", "taskmgr", "feh",
         "chafa", "xdg-open", "mimetype", "arping", "envdir", "lockfile",

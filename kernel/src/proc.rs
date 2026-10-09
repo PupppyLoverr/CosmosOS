@@ -30,10 +30,14 @@ const FILES: &[&str] = &[
 /// files under /proc/net
 const NET_FILES: &[&str] = &[
     "tcp", "udp", "unix", "dev", "operstate", "owners", "route", "iptables",
+    "snmp", "nf_conntrack",
 ];
 
 /// files under /proc/sys/kernel
 const SYS_FILES: &[&str] = &["hostname", "cow_pages"];
+
+/// files under /proc/sys/net/ipv4
+const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all"];
 
 pub fn handles(path: &str) -> bool {
     path == "/proc" || path.starts_with("/proc/")
@@ -71,6 +75,8 @@ pub fn is_dir(path: &str) -> bool {
         || path == "/proc/net"
         || path == "/proc/sys"
         || path == "/proc/sys/kernel"
+        || path == "/proc/sys/net"
+        || path == "/proc/sys/net/ipv4"
         || pid_of(path)
             .map(|p| task::pids().contains(&p) && path.matches('/').count() == 2)
             .unwrap_or(false)
@@ -109,6 +115,9 @@ pub fn exists(path: &str) -> bool {
     }
     if let Some(f) = path.strip_prefix("/proc/sys/kernel/") {
         return SYS_FILES.contains(&f);
+    }
+    if let Some(f) = path.strip_prefix("/proc/sys/net/ipv4/") {
+        return NET_SYS_FILES.contains(&f);
     }
     FILES.contains(&path.trim_start_matches("/proc/"))
 }
@@ -167,11 +176,32 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         return out;
     }
     if path == "/proc/sys" {
+        for name in ["kernel", "net"] {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            de.is_dir = 1;
+            out.push(de);
+        }
+        return out;
+    }
+    if path == "/proc/sys/net" {
         let mut de = shared::DirEntry::default();
-        de.name[..6].copy_from_slice(b"kernel");
-        de.name_len = 6;
+        de.name[..4].copy_from_slice(b"ipv4");
+        de.name_len = 4;
         de.is_dir = 1;
         out.push(de);
+        return out;
+    }
+    if path == "/proc/sys/net/ipv4" {
+        for name in NET_SYS_FILES {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            out.push(de);
+        }
         return out;
     }
     for name in FILES {
@@ -300,12 +330,15 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/net/dev" => net::net_dev(),
         "/proc/net/route" => net::net_route(),
         "/proc/net/iptables" => net::net_iptables(),
+        "/proc/net/snmp" => net::net_snmp(),
+        "/proc/net/nf_conntrack" => net::net_conntrack(),
         "/proc/net/operstate" => alloc::format!(
             "{}\n",
             if net::is_up() { "up" } else { "down" }
         ),
         "/proc/net/owners" => net::net_owners(),
         "/proc/sys/kernel/hostname" => alloc::format!("{}\n", crate::syscall::hostname()),
+        "/proc/sys/net/ipv4/icmp_echo_ignore_all" => net::net_icmp_ignore_all(),
         "/proc/swaps" => {
             // no swap devices in this kernel — header only, like an
             // enabled-but-empty swap table on Linux
@@ -536,6 +569,15 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
             ok &= net::iptables_ctl(line);
         }
         return ok.then_some(buf.len());
+    }
+    if path == "/proc/sys/net/ipv4/icmp_echo_ignore_all" {
+        let s = String::from(String::from_utf8_lossy(buf).trim());
+        match s.as_str() {
+            "0" => net::set_icmp_ignore_all(0),
+            "1" => net::set_icmp_ignore_all(1),
+            _ => return None,
+        }
+        return Some(buf.len());
     }
     if path != "/proc/sys/kernel/hostname" {
         return None;
