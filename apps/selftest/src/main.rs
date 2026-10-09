@@ -6079,6 +6079,35 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
     };
     check("ip-monitor", ok);
 
+    // --- chattr-i: real FS_IMMUTABLE_FL on FAT + tmpfs ---
+    // attr bit 0x80 marks a file immutable: writes, unlinks, renames and
+    // write-intent opens all fail EPERM until cleared.
+    let ok = {
+        let p = "/b193-immutable.txt";
+        let _ = ustd::remove(p);
+        let ok_c = ustd::write_all(p, b"locked").is_ok();
+        let ok_s = ustd::setattr(p, 0x80).is_ok();
+        let w_blk = ustd::write_all(p, b"nope").is_err();
+        let o_blk = ustd::open(p, shared::O_WRONLY).is_err();
+        let r_blk = ustd::remove(p).is_err();
+        let rn_blk = ustd::rename(p, "/b193-renamed.txt").is_err();
+        let ok_u = ustd::setattr(p, 0x20).is_ok();
+        let w_ok = ustd::write_all(p, b"free").is_ok();
+        let rd_ok = ustd::read_all(p)
+            .map(|d| d == b"free")
+            .unwrap_or(false);
+        let _ = ustd::remove(p);
+        let ok = ok_c && ok_s && w_blk && o_blk && r_blk && rn_blk && ok_u && w_ok && rd_ok;
+        if !ok {
+            println!(
+                "[dbg] chattr-i c={} s={} wb={} ob={} rb={} rn={} u={} w={} rd={}",
+                ok_c, ok_s, w_blk, o_blk, r_blk, rn_blk, ok_u, w_ok, rd_ok
+            );
+        }
+        ok
+    };
+    check("chattr-i", ok);
+
     check("ipt-rpfilter", {
         // `-m rpfilter`: while a route back to the gw exists the rule
         // matches and drops; with the subnet route gone there's no

@@ -537,7 +537,8 @@ impl<D: BlockDevice> Fat32<D> {
         }
         if let Some(a) = attr {
             // user-settable: 0x01 ro, 0x02 hidden, 0x04 sys + 0x40 symlink
-            raw[11] = (raw[11] & 0x38) | (a & 0x47);
+            // + 0x80 immutable (chattr +i; enforced in kernel vfs)
+            raw[11] = (raw[11] & 0x38) | (a & 0xC7);
         }
         self.write_dir_entry(e.slot_cluster, e.slot_offset, &raw)
     }
