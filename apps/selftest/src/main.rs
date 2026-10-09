@@ -5094,6 +5094,35 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         ustd::sc2(shared::SYS_DEBUG, 0xFFFF_8000_0000_0000, 16) == u64::MAX,
     );
 
+    // `ping -I <iface>` is a real source bind: lo sends the echo from
+    // 127.0.0.1 and the loopback path still answers it.
+    check(
+        "ping-iface-lo",
+        ustd::net_ping_if(0x7F00_0001, 2000, 0, 0, 2).is_some(),
+    );
+    // `ping -I eth0 <loopback>` is unroutable — the syscall refuses
+    // it rather than emitting an echo nobody could answer.
+    check(
+        "ping-iface-einval",
+        ustd::net_ping_if(0x7F00_0001, 2000, 0, 0, 1).is_none(),
+    );
+    // `-i <if>` is a real rule match now: the eth0-pinned DROP is
+    // skipped on lo traffic while the lo-pinned ACCEPT fires under a
+    // DROP policy — the reply only lands if iface matching works.
+    check("ipt-iface", {
+        let fw = |l: &str| ustd::write_all("/proc/net/iptables", l.as_bytes()).is_ok();
+        let ok = fw("N IFC\n")
+            && fw("A IFC 0 iif eth0 drop\n")
+            && fw("A IFC 0 iif lo accept\n")
+            && fw("A IN 0 IFC\n")
+            && fw("P DROP\n")
+            && ustd::net_ping(0x7F00_0001, 2000).is_some();
+        let _ = fw("P ACCEPT\n");
+        let _ = fw("F IN\n");
+        let _ = fw("X IFC\n");
+        ok
+    });
+
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {
         // 4 MiB through write_all (virtio-blk -> FAT32)

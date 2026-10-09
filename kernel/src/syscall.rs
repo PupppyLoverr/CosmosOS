@@ -966,7 +966,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 (a1 >> 8) as u8,
                 a1 as u8,
             ];
-            net::ping_ttl_sz(ip, a2.min(10_000), a3 as u8, if a4 == 0 { 36 } else { a4 as usize })
+            net::ping_ttl_if(ip, a2.min(10_000), a3 as u8, if a4 == 0 { 36 } else { a4 as usize }, a5 as u8)
                 .unwrap_or(ERR)
         }
         shared::SYS_NET_DNS => {
