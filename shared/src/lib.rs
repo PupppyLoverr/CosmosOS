@@ -307,6 +307,7 @@ pub const SYS_GETRESGID: u64 = 250;
 pub const SYS_CAPGET: u64 = 251;
 /// (pid, in u64[2]{eff,prm}) — self only; prm ⊆ bnd, eff ⊆ prm.
 pub const SYS_CAPSET: u64 = 252;      // (out u32[3]) -> 0 | err
+pub const SYS_RDMSR: u64 = 253;        // (msr u64) -> u64 | err -38 (whitelisted regs)
 /// MS_MOVE: move a mount point instead of creating one
 pub const MS_MOVE: u64 = 0x2000;
 /// CLONE_NEWUTS: unshare the UTS namespace (hostname)
@@ -590,6 +591,7 @@ pub const REQ_PING: u16 = 5;
 pub const REQ_LIST_WINS: u16 = 7;  // () -> RSP_WIN_LIST (WinInfo[])
 pub const REQ_FOCUS_WIN: u16 = 8;  // (window_id u32) raise + focus + unmin
 pub const REQ_MOVE_WIN: u16 = 9;   // (ReqMoveWin) reposition top-left
+pub const REQ_SWITCH_WS: u16 = 10; // (u32) switch active workspace
 // response kinds (winserver -> app)
 pub const RSP_WIN_CREATED: u16 = 100;
 pub const RSP_ERROR: u16 = 101;

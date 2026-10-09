@@ -2051,6 +2051,11 @@ pub fn syslog_n(action: u64) -> i64 {
     sc3(shared::SYS_SYSLOG, action, 0, 0) as i64
 }
 
+/// rdmsr — read a whitelisted model-specific register (SYS_RDMSR).
+pub fn rdmsr(msr: u32) -> i64 {
+    sc3(shared::SYS_RDMSR, msr as u64, 0, 0) as i64
+}
+
 /// timerfd_gettime(fd) -> (remaining_ms, interval_ms).
 pub fn timerfd_gettime(fd: u64) -> Option<(u64, u64)> {
     let mut b = [0u64; 2];

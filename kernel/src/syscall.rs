@@ -183,6 +183,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
             task::yield_ctx(ctx);
         }
         shared::SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
+        shared::SYS_RDMSR => sys_rdmsr(a1),
         shared::SYS_SLEEP_MS => sys_sleep(ctx, a1),
         shared::SYS_MMAP => sys_mmap(a1, a2, a3),
         shared::SYS_MMAP_FILE => sys_mmap_file(a1, a2, a3),
@@ -2187,6 +2188,26 @@ pub fn dispatch(ctx: &mut CpuContext) {
             task::yield_ctx(ctx);
         }
     }
+}
+
+/// rdmsr — read an architecturally safe model-specific register.
+/// Whitelist only: an unimplemented MSR #GPs inside the kernel, which
+/// would panic — out-of-set indexes get -ENOSYS instead.
+fn sys_rdmsr(msr: u64) -> u64 {
+    const OK: &[u32] = &[
+        0x10,          // IA32_TSC
+        0x1b,          // IA32_APIC_BASE
+        0x174, 0x175, 0x176, // SYSENTER CS/ESP/EIP
+        0x1a0,         // IA32_MISC_ENABLE
+        0x277,         // IA32_PAT
+        0xc000_0080,   // EFER
+        0xc000_0081, 0xc000_0082, 0xc000_0084, // STAR/LSTAR/SFMASK
+        0xc000_0100, 0xc000_0101, 0xc000_0102, // FS/GS/KernelGS base
+    ];
+    if !OK.contains(&(msr as u32)) {
+        return (-38i64) as u64;
+    }
+    unsafe { x86_64::registers::model_specific::Msr::new(msr as u32).read() }
 }
 
 fn sys_spawn(pptr: u64, plen: u64, aptr: u64, alen: u64) -> u64 {

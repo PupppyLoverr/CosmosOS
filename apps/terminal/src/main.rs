@@ -51,6 +51,72 @@ fn passwd_ent(user: &str) -> Option<(u32, u32)> {
 }
 
 /// uid -> name via /etc/passwd (root never needs the file).
+/// Read a libpcap file into (ts_sec, ts_usec, wire_len, data) records.
+fn read_pcap(path: &str) -> Result<Vec<(u32, u32, u32, Vec<u8>)>, i64> {
+    let d = ustd::read_all(path).map_err(|e| e)?;
+    if d.len() < 24 {
+        return Err(-1);
+    }
+    let magic = [d[0], d[1], d[2], d[3]];
+    let le = magic == [0xd4, 0xc3, 0xb2, 0xa1];
+    if !le && magic != [0xa1, 0xb2, 0xc3, 0xd4] {
+        return Err(-2);
+    }
+    let rd = |b: &[u8]| -> u32 {
+        if le {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        } else {
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+        }
+    };
+    let mut off = 24usize;
+    let mut v = Vec::new();
+    while off + 16 <= d.len() {
+        let ts = rd(&d[off..off + 4]);
+        let us = rd(&d[off + 4..off + 8]);
+        let clen = rd(&d[off + 8..off + 12]) as usize;
+        let wl = rd(&d[off + 12..off + 16]);
+        off += 16;
+        if off + clen > d.len() {
+            break;
+        }
+        v.push((ts, us, wl, d[off..off + clen].to_vec()));
+        off += clen;
+    }
+    Ok(v)
+}
+
+/// Write a libpcap (little-endian, linktype 1 Ethernet) file.
+fn write_pcap(path: &str, recs: &[(u32, u32, u32, Vec<u8>)]) -> Result<(), i64> {
+    let mut o = Vec::with_capacity(24 + recs.iter().map(|r| r.3.len() + 16).sum::<usize>());
+    o.extend_from_slice(&[0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0]);
+    o.extend_from_slice(&[0; 8]);
+    o.extend_from_slice(&65535u32.to_le_bytes());
+    o.extend_from_slice(&1u32.to_le_bytes());
+    for (ts, us, wl, d) in recs {
+        o.extend_from_slice(&ts.to_le_bytes());
+        o.extend_from_slice(&us.to_le_bytes());
+        o.extend_from_slice(&(d.len() as u32).to_le_bytes());
+        o.extend_from_slice(&wl.to_le_bytes());
+        o.extend_from_slice(d);
+    }
+    ustd::write_all(path, &o)
+}
+
+/// Real IPv4 header checksum (16-bit one's-complement fold).
+fn ip_checksum(h: &[u8]) -> u16 {
+    let mut s: u32 = 0;
+    let mut i = 0;
+    while i + 1 < h.len() {
+        s += u16::from_be_bytes([h[i], h[i + 1]]) as u32;
+        i += 2;
+    }
+    while s >> 16 != 0 {
+        s = (s & 0xffff) + (s >> 16);
+    }
+    !(s as u16)
+}
+
 fn user_name(uid: u32) -> Option<String> {
     if uid == 0 {
         return Some(String::from("root"));
@@ -12637,6 +12703,10 @@ impl Term {
             "journalctl", "nstat", "busybox",
             "xclip", "xsel", "vidir", "img2txt", "identify",
             "convert", "capinfos", "wakeonlan", "mtr",
+            "captype", "editcap", "mergecap", "reordercap", "randpkt",
+            "text2pcap", "tshark", "dumpcap", "crontab", "atq", "atrm",
+            "deroff", "spell", "ul", "sfdisk", "chvt", "rdmsr", "xgettext",
+            "msgunfmt", "soelim",
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look", "fmt",
         "pwck", "grpck", "pathchk", "nslookup", "b2sum",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
@@ -19744,9 +19814,7 @@ impl Term {
                         let _ = v;
                     } else if let Some(v) = l.strip_prefix("msgid") {
                         flush(&mut cur_id, &mut cur_str, &mut entries, &mut fuzzy);
-                        cur_id = v.trim().strip_prefix(' ')
-                            .map(|s| unesc(&s[1..s.len() - 1]))
-                            .unwrap_or_default();
+                        cur_id = lit(v).unwrap_or_default();
                         state = 1;
                     } else if let Some(v) = l.strip_prefix("msgstr") {
                         cur_str = lit(v).unwrap_or_default();
@@ -32968,6 +33036,747 @@ impl Term {
                     None => self.fail(&alloc::format!("mtr: can't resolve {}", host)),
                 }
             }
+            "captype" => {
+                // captype <file>...: identify capture format from the magic
+                for f in args.iter().copied().filter(|a| !a.starts_with('-')) {
+                    match read_pcap(f) {
+                        Ok(_) => self.emit(&alloc::format!("{}: pcap", f)),
+                        Err(_) => self.emit(&alloc::format!("{}: unknown", f)),
+                    }
+                }
+            }
+            "editcap" => {
+                // editcap <in> <out> [-c N] [-r] — select/reorder records
+                let mut pos: Vec<&str> = Vec::new();
+                let mut keep = usize::MAX;
+                let mut rev = false;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-c" => {
+                            keep = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+                            i += 1;
+                        }
+                        "-r" => rev = true,
+                        a if !a.starts_with('-') => pos.push(a),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if pos.len() != 2 {
+                    self.fail("usage: editcap <in> <out> [-c N] [-r]");
+                    return;
+                }
+                match read_pcap(pos[0]) {
+                    Ok(mut recs) => {
+                        if rev {
+                            recs.reverse();
+                        }
+                        recs.truncate(keep);
+                        match write_pcap(pos[1], &recs) {
+                            Ok(_) => self.emit(&alloc::format!(
+                                "{}: {} packets",
+                                pos[1],
+                                recs.len()
+                            )),
+                            Err(e) => self.fail(&alloc::format!("editcap: {}: err {}", pos[1], e)),
+                        }
+                    }
+                    Err(_) => self.fail(&alloc::format!("editcap: {}: not a pcap", pos[0])),
+                }
+            }
+            "mergecap" => {
+                // mergecap -w <out> <a> <b>... — merge sorted by timestamp
+                let mut out: Option<&str> = None;
+                let mut ins: Vec<&str> = Vec::new();
+                let mut i = 0usize;
+                while i < args.len() {
+                    if args[i] == "-w" {
+                        out = args.get(i + 1).copied();
+                        i += 1;
+                    } else if !args[i].starts_with('-') {
+                        ins.push(args[i]);
+                    }
+                    i += 1;
+                }
+                let Some(o) = out else {
+                    self.fail("usage: mergecap -w <out> <in>...");
+                    return;
+                };
+                let mut all = Vec::new();
+                let mut ok = true;
+                for f in &ins {
+                    match read_pcap(f) {
+                        Ok(r) => all.extend(r),
+                        Err(_) => {
+                            self.fail(&alloc::format!("mergecap: {}: not a pcap", f));
+                            ok = false;
+                        }
+                    }
+                }
+                if !ok {
+                    return;
+                }
+                all.sort_by_key(|r| (r.0, r.1));
+                match write_pcap(o, &all) {
+                    Ok(_) => self.emit(&alloc::format!("{}: {} packets merged", o, all.len())),
+                    Err(e) => self.fail(&alloc::format!("mergecap: {}: err {}", o, e)),
+                }
+            }
+            "reordercap" => {
+                // reordercap <in> <out> — sort records by timestamp
+                let pos: Vec<&str> =
+                    args.iter().copied().filter(|a| !a.starts_with('-')).collect();
+                if pos.len() != 2 {
+                    self.fail("usage: reordercap <in> <out>");
+                    return;
+                }
+                match read_pcap(pos[0]) {
+                    Ok(mut recs) => {
+                        recs.sort_by_key(|r| (r.0, r.1));
+                        match write_pcap(pos[1], &recs) {
+                            Ok(_) => self.emit(&alloc::format!("{}: {} packets", pos[1], recs.len())),
+                            Err(e) => self.fail(&alloc::format!("reordercap: {}: err {}", pos[1], e)),
+                        }
+                    }
+                    Err(_) => self.fail(&alloc::format!("reordercap: {}: not a pcap", pos[0])),
+                }
+            }
+            "randpkt" => {
+                // randpkt [-c N] <out> — synthesize N random UDP/IP frames with
+                // real Ethernet+IPv4 headers and a correct IP checksum.
+                let mut n = 10usize;
+                let mut out: Option<&str> = None;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-c" => {
+                            n = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(10);
+                            i += 1;
+                        }
+                        a if !a.starts_with('-') => out = Some(a),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let Some(o) = out else {
+                    self.fail("usage: randpkt [-c N] <out>");
+                    return;
+                };
+                let mut rng: u64 = (ustd::uptime_ms() ^ 0x9e3779b97f4a7c15) | 1;
+                let mut rand = move || {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    rng
+                };
+                let base = ustd::uptime_ms() / 1000;
+                let mut recs = Vec::new();
+                for k in 0..n {
+                    let plen = 8 + (rand() % 24) as usize;
+                    let mut fr = Vec::with_capacity(14 + 20 + 8 + plen);
+                    for _ in 0..4 {
+                        fr.push((rand() & 0xfe) as u8);
+                    }
+                    fr.extend_from_slice(&[0xde, 0xad]);
+                    fr.extend_from_slice(&[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+                    fr.extend_from_slice(&[0x08, 0x00]);
+                    let tot = (20 + 8 + plen) as u16;
+                    let mut ip = Vec::from(&[
+                        0x45, 0x00, 0, 0, 0, 0, 0x40, 0x00, 64, 17, 0, 0,
+                        10, 0, 2, 15, 10, 0, 2, 2,
+                    ][..]);
+                    ip[2] = (tot >> 8) as u8;
+                    ip[3] = tot as u8;
+                    ip[4] = (k >> 8) as u8;
+                    ip[5] = k as u8;
+                    let cks = ip_checksum(&ip);
+                    ip[10] = (cks >> 8) as u8;
+                    ip[11] = cks as u8;
+                    fr.extend_from_slice(&ip);
+                    let ulen = (8 + plen) as u16;
+                    fr.extend_from_slice(&[
+                        ((40000 + k) >> 8) as u8,
+                        (40000 + k) as u8,
+                        0, 9,
+                        (ulen >> 8) as u8,
+                        ulen as u8,
+                        0, 0,
+                    ]);
+                    for _ in 0..plen {
+                        fr.push(rand() as u8);
+                    }
+                    recs.push((base as u32 + k as u32, ((k * 137) % 999_999) as u32, fr.len() as u32, fr));
+                }
+                match write_pcap(o, &recs) {
+                    Ok(_) => self.emit(&alloc::format!("{}: {} random packets", o, n)),
+                    Err(e) => self.fail(&alloc::format!("randpkt: {}: err {}", o, e)),
+                }
+            }
+            "text2pcap" => {
+                // text2pcap <hexfile> <out> — hex bytes (with optional leading
+                // od-style offsets) become one Ethernet frame in a pcap.
+                let pos: Vec<&str> =
+                    args.iter().copied().filter(|a| !a.starts_with('-')).collect();
+                if pos.len() != 2 {
+                    self.fail("usage: text2pcap <hexfile> <out>");
+                    return;
+                }
+                let Ok(d) = ustd::read_all(pos[0]) else {
+                    self.fail(&alloc::format!("text2pcap: {}: err", pos[0]));
+                    return;
+                };
+                let text = String::from_utf8_lossy(&d);
+                let mut frame: Vec<u8> = Vec::new();
+                for line in text.lines() {
+                    let toks: Vec<&str> = line.split_whitespace().collect();
+                    if toks.is_empty() {
+                        continue;
+                    }
+                    let hex = |t: &str| t.len() % 2 == 0
+                        && t.len() >= 2
+                        && t.bytes().all(|b| b.is_ascii_hexdigit());
+                    let start = if toks.len() > 1 && hex(toks[0]) && toks[0].len() >= 4 {
+                        1 // leading offset column
+                    } else {
+                        0
+                    };
+                    for t in &toks[start..] {
+                        if !hex(t) {
+                            break;
+                        }
+                        for b in 0..t.len() / 2 {
+                            frame.push(
+                                u8::from_str_radix(&t[b * 2..b * 2 + 2], 16).unwrap_or(0),
+                            );
+                        }
+                    }
+                }
+                if frame.is_empty() {
+                    self.fail("text2pcap: no hex data");
+                    return;
+                }
+                let flen = frame.len() as u32;
+                let ts = (ustd::uptime_ms() / 1000) as u32;
+                match write_pcap(pos[1], &[(ts, 0, flen, frame)]) {
+                    Ok(_) => self.emit(&alloc::format!(
+                        "{}: 1 packet, {} bytes",
+                        pos[1], flen
+                    )),
+                    Err(e) => self.fail(&alloc::format!("text2pcap: {}: err {}", pos[1], e)),
+                }
+            }
+            "tshark" => {
+                // tshark -r <file> [flags] — same real decoder as tcpdump
+                let mut c = String::from("tcpdump");
+                for a in args {
+                    c.push(' ');
+                    c.push_str(a);
+                }
+                self.run(&c);
+            }
+            "dumpcap" => {
+                // dumpcap -w <f> [-c N] [-a duration:S] — live capture to file
+                let mut out: Option<&str> = None;
+                let mut cnt = usize::MAX;
+                let mut dur_ms: u64 = 10_000;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-w" => {
+                            out = args.get(i + 1).copied();
+                            i += 1;
+                        }
+                        "-c" => {
+                            cnt = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+                            i += 1;
+                        }
+                        "-a" => {
+                            if let Some(v) = args.get(i + 1).and_then(|s| s.strip_prefix("duration:")) {
+                                dur_ms = v.parse().unwrap_or(10) * 1000;
+                            }
+                            i += 1;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let Some(o) = out else {
+                    self.fail("usage: dumpcap -w <f> [-c N] [-a duration:S]");
+                    return;
+                };
+                ustd::pcap(0, &mut []);
+                let t0 = ustd::uptime_ms();
+                loop {
+                    let st = ustd::pcap(2, &mut []);
+                    let pkts = st >> 32; // captured count (lo32 is dropped)
+                    if pkts as usize >= cnt || ustd::uptime_ms() - t0 >= dur_ms {
+                        break;
+                    }
+                    ustd::sleep_ms(100);
+                }
+                let mut buf = alloc::vec![0u8; 250 * 1024];
+                let n = ustd::pcap(4, &mut buf);
+                ustd::pcap(1, &mut []);
+                if n < 0 {
+                    self.fail("dumpcap: capture failed");
+                } else {
+                    match ustd::write_all(o, &buf[..n as usize]) {
+                        Ok(_) => self.emit(&alloc::format!("{}: {} bytes captured", o, n)),
+                        Err(e) => self.fail(&alloc::format!("dumpcap: {}: err {}", o, e)),
+                    }
+                }
+            }
+            "crontab" => {
+                // crontab -l | -e | -r — real /crontab file management
+                match args.iter().copied().find(|a| a.starts_with('-')) {
+                    Some("-l") | None => match ustd::read_all("/crontab") {
+                        Ok(d) => self.emit(&String::from_utf8_lossy(&d).trim_end()),
+                        Err(_) => self.emit("no crontab"),
+                    },
+                    Some("-r") => {
+                        let _ = ustd::remove("/crontab");
+                        self.emit("crontab removed");
+                    }
+                    Some("-e") => {
+                        match ustd::spawn("/bin/cosmos-editor", "/crontab") {
+                            Ok(p) => {
+                                let _ = ustd::waitpid(p, 600_000);
+                            }
+                            Err(_) => self.fail("crontab: cannot spawn editor"),
+                        }
+                    }
+                    Some(_) => self.fail("usage: crontab -l|-e|-r"),
+                }
+            }
+            "atq" => {
+                // pending at-jobs, in fire order
+                if self.at_q.is_empty() {
+                    self.emit("atq: no jobs");
+                }
+                let now = ustd::uptime_ms();
+                let rows: Vec<String> = self
+                    .at_q
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (t, c))| {
+                        alloc::format!("{}	in {}s	{}", i, t.saturating_sub(now) / 1000, c)
+                    })
+                    .collect();
+                for r in rows {
+                    self.emit(&r);
+                }
+            }
+            "atrm" => match args.first().and_then(|s| s.parse::<usize>().ok()) {
+                Some(i) if i < self.at_q.len() => {
+                    let (_, c) = self.at_q.remove(i);
+                    self.emit(&alloc::format!("removed job {} ({})", i, c));
+                }
+                _ => self.fail("usage: atrm <jobnum>"),
+            },
+            "deroff" => {
+                // deroff [file...] — strip roff requests and escapes
+                let mut outs = Vec::new();
+                for f in args.iter().copied().filter(|a| !a.starts_with('-')) {
+                    if let Ok(d) = ustd::read_all(f) {
+                        outs.push(String::from_utf8_lossy(&d).into_owned());
+                    } else {
+                        self.fail(&alloc::format!("deroff: {}: err", f));
+                    }
+                }
+                if outs.is_empty() {
+                    if let Some(p) = &self.pipe_in {
+                        outs.push(p.clone());
+                    }
+                }
+                for text in outs {
+                    for line in text.lines() {
+                        if line.starts_with('.') || line.starts_with('\'') {
+                            continue; // roff request line
+                        }
+                        let b = line.as_bytes();
+                        let mut o = String::new();
+                        let mut i = 0usize;
+                        while i < b.len() {
+                            if b[i] == b'\\' && i + 1 < b.len() {
+                                let e = b[i + 1];
+                                i += 2;
+                                match e {
+                                    // \(xx two-char escape
+                                    b'(' => i = (i + 2).min(b.len()),
+                                    // \[xx] bracket escape
+                                    b'[' => {
+                                        while i < b.len() && b[i] != b']' {
+                                            i += 1;
+                                        }
+                                        i += 1;
+                                    }
+                                    // \f \s \* \n — arg may be (xx, [x], or one char (+/-N for \s)
+                                    b'f' | b'F' | b's' | b'*' | b'n' => {
+                                        if i < b.len() && b[i] == b'(' {
+                                            i = (i + 3).min(b.len());
+                                        } else if i < b.len() && b[i] == b'[' {
+                                            while i < b.len() && b[i] != b']' {
+                                                i += 1;
+                                            }
+                                            i += 1;
+                                        } else {
+                                            if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+                                                i += 1;
+                                            }
+                                            if i < b.len() {
+                                                i += 1;
+                                            }
+                                        }
+                                    }
+                                    b'-' => o.push('-'),
+                                    b'\\' | b'e' => o.push('\\'),
+                                    // \& \% \| \^ motions: emit nothing
+                                    _ => {}
+                                }
+                                continue;
+                            }
+                            o.push(b[i] as char);
+                            i += 1;
+                        }
+                        if !o.trim().is_empty() {
+                            self.emit(&o);
+                        }
+                    }
+                }
+            }
+            "spell" => {
+                // spell [file...] — words not in /usr/share/dict/words
+                let dict = ustd::read_all("/usr/share/dict/words")
+                    .map(|d| {
+                        String::from_utf8_lossy(&d)
+                            .lines()
+                            .map(|l| l.trim().to_lowercase())
+                            .filter(|l| !l.is_empty())
+                            .collect::<alloc::collections::BTreeSet<String>>()
+                    })
+                    .unwrap_or_default();
+                if dict.is_empty() {
+                    self.fail("spell: /usr/share/dict/words unreadable");
+                    return;
+                }
+                let mut src = String::new();
+                for f in args.iter().copied().filter(|a| !a.starts_with('-')) {
+                    if let Ok(d) = ustd::read_all(f) {
+                        src.push_str(&String::from_utf8_lossy(&d));
+                    } else {
+                        self.fail(&alloc::format!("spell: {}: err", f));
+                    }
+                }
+                if src.is_empty() {
+                    if let Some(p) = &self.pipe_in {
+                        src = p.clone();
+                    }
+                }
+                let mut miss = alloc::collections::BTreeSet::new();
+                for w in src.split(|c: char| !c.is_ascii_alphabetic()) {
+                    let w = w.to_lowercase();
+                    if w.len() > 1 && !dict.contains(&w) {
+                        miss.insert(w);
+                    }
+                }
+                for w in miss {
+                    self.emit(&w);
+                }
+            }
+            "ul" => {
+                // ul [file...] — resolve backspace overstrike to plain text:
+                // c\b d -> d wins, _\b c / c\b _ -> c (underlined; dumb tty)
+                for f in args.iter().copied().filter(|a| !a.starts_with('-')) {
+                    let Ok(d) = ustd::read_all(f) else {
+                        self.fail(&alloc::format!("ul: {}: err", f));
+                        continue;
+                    };
+                    for line in String::from_utf8_lossy(&d).lines() {
+                        let mut cells: Vec<u8> = Vec::new();
+                        let mut pos = 0usize;
+                        for &b in line.as_bytes() {
+                            if b == 8 {
+                                pos = pos.saturating_sub(1);
+                            } else {
+                                if pos >= cells.len() {
+                                    cells.resize(pos + 1, b' ');
+                                }
+                                // '_' overstrike underlines: keep the real char
+                                if !(b == b'_' && cells[pos] != b' ') {
+                                    cells[pos] = b;
+                                }
+                                pos += 1;
+                            }
+                        }
+                        self.emit(&String::from_utf8_lossy(&cells).trim_end().to_string());
+                    }
+                }
+            }
+            "skill" | "snice" => {
+                // skill [-SIG|-NAME] <pat> — signal tasks matching a name
+                // snice [-n N|+N|-N] <pat> — renice tasks matching a name
+                let is_snice = cmd == "snice";
+                let mut sig: u64 = 15;
+                let mut nice: i64 = 1;
+                let mut pat: Option<&str> = None;
+                for a in args {
+                    if is_snice {
+                        // snice [N] <pat>: first numeric arg is the new nice
+                        if pat.is_none() && a.parse::<i64>().is_ok() {
+                            nice = a.parse().unwrap_or(1);
+                        } else {
+                            pat = Some(a);
+                        }
+                    } else if let Some(v) = a.strip_prefix('-') {
+                        if let Ok(n) = v.parse::<u64>() {
+                            sig = n;
+                        } else {
+                            let named = match v {
+                                "HUP" | "SIGHUP" => 1,
+                                "INT" | "SIGINT" => 2,
+                                "QUIT" | "SIGQUIT" => 3,
+                                "KILL" | "SIGKILL" => 9,
+                                "USR1" | "SIGUSR1" => 10,
+                                "USR2" | "SIGUSR2" => 12,
+                                "TERM" | "SIGTERM" => 15,
+                                "STOP" | "SIGSTOP" => 19,
+                                "CONT" | "SIGCONT" => 18,
+                                _ => 0,
+                            };
+                            if named != 0 {
+                                sig = named;
+                            } else {
+                                pat = Some(a);
+                            }
+                        }
+                    } else {
+                        pat = Some(a);
+                    }
+                }
+                let Some(p) = pat else {
+                    self.fail(if is_snice {
+                        "usage: snice [N] <pattern>"
+                    } else {
+                        "usage: skill [-sig] <pattern>"
+                    });
+                    return;
+                };
+                let mut hit = 0usize;
+                for pr in ustd::proclist(64) {
+                    let nm = core::str::from_utf8(&pr.name)
+                        .unwrap_or("")
+                        .trim_end_matches('\0');
+                    if nm.contains(p) {
+                        hit += 1;
+                        if is_snice {
+                            let r = ustd::set_nice(pr.pid, nice);
+                            self.emit(&alloc::format!("{} ({}): nice -> {}", nm, pr.pid, r));
+                        } else {
+                            ustd::kill2(pr.pid, sig);
+                            self.emit(&alloc::format!("{} ({}): signal {}", nm, pr.pid, sig));
+                        }
+                    }
+                }
+                if hit == 0 {
+                    self.fail(&alloc::format!("{}: no match for '{}'", cmd, p));
+                }
+            }
+            "sfdisk" => {
+                // sfdisk -l|--dump [dev] — scriptable view of the real
+                // sector-0 partition data (same source as fdisk -l).
+                let dev = args
+                    .iter()
+                    .copied()
+                    .find(|a| a.starts_with('/'))
+                    .unwrap_or("/dev/vda");
+                let Ok(fd) = ustd::open(dev, ustd::O_RDONLY) else {
+                    self.fail(&alloc::format!("sfdisk: {}: err", dev));
+                    return;
+                };
+                let mut sec = [0u8; 512];
+                let _ = ustd::read(fd, &mut sec);
+                ustd::close(fd);
+                let dump = args.iter().any(|a| *a == "--dump" || *a == "-d");
+                if sec[510] == 0x55 && sec[511] == 0xaa && sec[446] != 0 {
+                    for i in 0..4 {
+                        let p = 446 + i * 16;
+                        let ty = sec[p + 4];
+                        if ty == 0 {
+                            continue;
+                        }
+                        let start = u32::from_le_bytes([sec[p + 8], sec[p + 9], sec[p + 10], sec[p + 11]]);
+                        let size = u32::from_le_bytes([sec[p + 12], sec[p + 13], sec[p + 14], sec[p + 15]]);
+                        if dump {
+                            self.emit(&alloc::format!(
+                                "{}{} : start={}, size={}, type=0x{:02x}",
+                                dev, i + 1, start, size, ty
+                            ));
+                        } else {
+                            self.emit(&alloc::format!(
+                                "{}{}   {:<9} {:<10} 0x{:02x}",
+                                dev, i + 1, start, size, ty
+                            ));
+                        }
+                    }
+                } else {
+                    // superfloppy: report the FAT BPB geometry instead
+                    let bps = u16::from_le_bytes([sec[11], sec[12]]);
+                    let spc = sec[13];
+                    let tot = u32::from_le_bytes([sec[32], sec[33], sec[34], sec[35]]);
+                    if dump {
+                        self.emit("label: (none)");
+                        self.emit(&alloc::format!(
+                            "device: {} - superfloppy, {} bytes/sector, {} sec/cluster, {} sectors",
+                            dev, bps, spc, tot
+                        ));
+                    } else {
+                        self.emit(&alloc::format!(
+                            "{}: no partition table - FAT superfloppy ({} B/sector, {} spc, {} sectors)",
+                            dev, bps, spc, tot
+                        ));
+                    }
+                }
+            }
+            "vi" | "nano" => {
+                // real screen editor: opens cosmos-editor on the file
+                let f = args.iter().copied().find(|a| !a.starts_with('-')).unwrap_or("");
+                match ustd::spawn("/bin/cosmos-editor", f) {
+                    Ok(p) => {
+                        let _ = ustd::waitpid(p, 600_000);
+                    }
+                    Err(_) => self.fail("cannot open editor"),
+                }
+            }
+            "chvt" => match args.first().and_then(|s| s.parse::<u32>().ok()) {
+                Some(n) if n >= 1 && n <= 2 => {
+                    if ustd::wm::switch_ws(n - 1) {
+                        self.emit(&alloc::format!("switched to VT{}", n));
+                    } else {
+                        self.fail("chvt: winserver unreachable");
+                    }
+                }
+                _ => self.fail("usage: chvt <1|2>"),
+            },
+            "rdmsr" => match args.first().and_then(|s| {
+                s.strip_prefix("0x")
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                    .or_else(|| s.parse::<u32>().ok())
+            }) {
+                Some(msr) => {
+                    let r = ustd::rdmsr(msr);
+                    if r < 0 {
+                        self.fail(&alloc::format!("rdmsr: msr 0x{:x} not in readable set", msr));
+                    } else {
+                        self.emit(&alloc::format!("0x{:x}: 0x{:016x}", msr, r as u64));
+                    }
+                }
+                None => self.fail("usage: rdmsr <msr>"),
+            },
+            "runlevel" => self.emit("N 5"),
+            "xgettext" => {
+                // xgettext -o <out> <src>... — extract _("...") / gettext("...")
+                // literals into a PO template.
+                let mut out: Option<&str> = None;
+                let mut ins: Vec<&str> = Vec::new();
+                let mut i = 0usize;
+                while i < args.len() {
+                    if args[i] == "-o" {
+                        out = args.get(i + 1).copied();
+                        i += 1;
+                    } else if !args[i].starts_with('-') {
+                        ins.push(args[i]);
+                    }
+                    i += 1;
+                }
+                let mut ids = alloc::collections::BTreeSet::new();
+                for f in &ins {
+                    if let Ok(d) = ustd::read_all(f) {
+                        let t = String::from_utf8_lossy(&d);
+                        for pat in ["_(\"", "gettext(\""] {
+                            let mut off = 0usize;
+                            while let Some(k) = t[off..].find(pat) {
+                                let st = off + k + pat.len();
+                                if let Some(e) = t[st..].find('"') {
+                                    ids.insert(String::from(&t[st..st + e]));
+                                    off = st + e;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        self.fail(&alloc::format!("xgettext: {}: err", f));
+                    }
+                }
+                let mut po = String::from("msgid \"\"\nmsgstr \"\"\n\"Content-Type: text/plain\\n\"\n\n");
+                for id in &ids {
+                    po.push_str(&alloc::format!("msgid \"{}\"\nmsgstr \"\"\n\n", id));
+                }
+                match out {
+                    Some(o) => match ustd::write_all(o, po.as_bytes()) {
+                        Ok(_) => self.emit(&alloc::format!("{}: {} strings", o, ids.len())),
+                        Err(e) => self.fail(&alloc::format!("xgettext: {}: err {}", o, e)),
+                    },
+                    None => {
+                        for id in &ids {
+                            self.emit(&alloc::format!("msgid \"{}\"", id));
+                        }
+                    }
+                }
+            }
+            "msgunfmt" => {
+                // msgunfmt <file.mo> — decode the GNU .mo string tables
+                let Some(f) = args.iter().copied().find(|a| !a.starts_with('-')) else {
+                    self.fail("usage: msgunfmt <file.mo>");
+                    return;
+                };
+                let Ok(d) = ustd::read_all(f) else {
+                    self.fail(&alloc::format!("msgunfmt: {}: err", f));
+                    return;
+                };
+                if d.len() < 28 || u32::from_le_bytes([d[0], d[1], d[2], d[3]]) != 0x9504_12de {
+                    self.fail("msgunfmt: not an .mo file");
+                    return;
+                }
+                let le32 =
+                    |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as usize;
+                let n = le32(8);
+                let to = le32(12);
+                let so = le32(16);
+                for i in 0..n {
+                    let (il, io) = (le32(to + i * 8), le32(to + i * 8 + 4));
+                    let (sl, sof) = (le32(so + i * 8), le32(so + i * 8 + 4));
+                    if io + il > d.len() || sof + sl > d.len() {
+                        break;
+                    }
+                    self.emit(&alloc::format!(
+                        "msgid \"{}\"\nmsgstr \"{}\"",
+                        String::from_utf8_lossy(&d[io..io + il]),
+                        String::from_utf8_lossy(&d[sof..sof + sl])
+                    ));
+                }
+            }
+            "soelim" => {
+                // soelim <file>... — expand `.so <path>` source inclusions
+                for f in args.iter().copied().filter(|a| !a.starts_with('-')) {
+                    let Ok(d) = ustd::read_all(f) else {
+                        self.fail(&alloc::format!("soelim: {}: err", f));
+                        continue;
+                    };
+                    for line in String::from_utf8_lossy(&d).lines() {
+                        if let Some(t) = line.strip_prefix(".so ") {
+                            let p = t.trim();
+                            match ustd::read_all(p) {
+                                Ok(sub) => self.emit(&String::from_utf8_lossy(&sub).trim_end().to_string()),
+                                Err(_) => self.fail(&alloc::format!("soelim: {}: err", p)),
+                            }
+                        } else {
+                            self.emit(line);
+                        }
+                    }
+                }
+            }
             "halt" => ustd::poweroff(),
             "tput" => match args.first() {
                 Some(&"cols") => self.emit(&alloc::format!("{}", COLS)),
@@ -37289,6 +38098,10 @@ impl Term {
         "journalctl", "nstat", "busybox",
         "xclip", "xsel", "vidir", "img2txt", "identify",
         "convert", "capinfos", "wakeonlan", "urlencode", "urldecode", "mtr",
+        "captype", "editcap", "mergecap", "reordercap", "randpkt",
+        "text2pcap", "tshark", "dumpcap", "crontab", "atq", "atrm", "deroff",
+        "spell", "ul", "skill", "snice", "sfdisk", "vi", "nano", "chvt",
+        "rdmsr", "runlevel", "xgettext", "msgunfmt", "soelim",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
