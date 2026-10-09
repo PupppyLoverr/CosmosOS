@@ -966,7 +966,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 (a1 >> 8) as u8,
                 a1 as u8,
             ];
-            net::ping(ip, a2.min(10_000)).unwrap_or(ERR)
+            net::ping_ttl(ip, a2.min(10_000), a3 as u8).unwrap_or(ERR)
         }
         shared::SYS_NET_DNS => {
             let Some(name) = copy_str(a1, a2.min(253)) else {

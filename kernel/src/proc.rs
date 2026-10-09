@@ -37,7 +37,7 @@ const NET_FILES: &[&str] = &[
 const SYS_FILES: &[&str] = &["hostname", "cow_pages"];
 
 /// files under /proc/sys/net/ipv4
-const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all"];
+const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "ip_default_ttl"];
 
 pub fn handles(path: &str) -> bool {
     path == "/proc" || path.starts_with("/proc/")
@@ -341,6 +341,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/net/owners" => net::net_owners(),
         "/proc/sys/kernel/hostname" => alloc::format!("{}\n", crate::syscall::hostname()),
         "/proc/sys/net/ipv4/icmp_echo_ignore_all" => net::net_icmp_ignore_all(),
+        "/proc/sys/net/ipv4/ip_default_ttl" => net::net_def_ttl(),
         "/proc/swaps" => {
             // no swap devices in this kernel — header only, like an
             // enabled-but-empty swap table on Linux
@@ -592,6 +593,15 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
             "1" => net::set_icmp_ignore_all(1),
             _ => return None,
         }
+        return Some(buf.len());
+    }
+    if path == "/proc/sys/net/ipv4/ip_default_ttl" {
+        let s = String::from(String::from_utf8_lossy(buf).trim());
+        let Ok(v) = s.parse::<u64>() else { return None };
+        if v == 0 || v > 255 {
+            return None;
+        }
+        net::set_def_ttl(v);
         return Some(buf.len());
     }
     if path != "/proc/sys/kernel/hostname" {
