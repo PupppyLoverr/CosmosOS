@@ -282,6 +282,11 @@ static FW: Mutex<Vec<FwRule>> = Mutex::new(Vec::new());
 /// INPUT chain policy: false = ACCEPT (default-allow), true = DROP.
 static FW_POLICY: Mutex<bool> = Mutex::new(false);
 
+/// OUTPUT chain: locally-generated datagrams are evaluated at egress
+/// (send_ip_src_ttl) before they leave — wire and loopback alike.
+static FW_OUT: Mutex<Vec<FwRule>> = Mutex::new(Vec::new());
+static FW_OUT_POLICY: Mutex<bool> = Mutex::new(false);
+
 /// Real conntrack: a per-flow table fed by every packet in BOTH
 /// directions (tx via `ct_observe_tx`, rx via `ct_update`). A flow is
 /// ESTABLISHED once packets have been seen both ways — the inbound SYN
@@ -384,14 +389,18 @@ fn ct_observe_tx(f: &[u8]) {
 /// byte counter shown by `iptables -L -v`. `st` is the packet's
 /// conntrack state bits from `ct_update` (1 NEW / 2 ESTABLISHED).
 fn fw_verdict(
+    chain: &Mutex<Vec<FwRule>>,
+    policy: &Mutex<bool>,
+    inbound: bool,
     src: [u8; 4],
+    dst: [u8; 4],
     proto: u8,
     _sport: u16,
     dport: u16,
     st: u8,
     plen: u64,
 ) -> u8 {
-    let mut fw = FW.lock();
+    let mut fw = chain.lock();
     for r in fw.iter_mut() {
         if r.proto != 0 && r.proto != proto {
             continue;
@@ -430,15 +439,17 @@ fn fw_verdict(
         if r.target == 1 {
             // -j LOG: audit the packet into the kernel log and fall
             // through to the next rule — the packet is NOT dropped.
+            let iface = if inbound { "eth0" } else { "" };
+            let oface = if inbound { "" } else { "eth0" };
             let pname = match proto { 1 => "icmp", 6 => "tcp", 17 => "udp", n => {
-                sprintln!("[fw] IN= OUT= SRC={}.{}.{}.{} DST={}.{}.{}.{} LEN={} PROTO={}",
-                    src[0], src[1], src[2], src[3],
-                    our_ip()[0], our_ip()[1], our_ip()[2], our_ip()[3], plen, n);
+                sprintln!("[fw] IN={} OUT={} SRC={}.{}.{}.{} DST={}.{}.{}.{} LEN={} PROTO={}",
+                    iface, oface, src[0], src[1], src[2], src[3],
+                    dst[0], dst[1], dst[2], dst[3], plen, n);
                 continue;
             }};
-            sprintln!("[fw] IN= OUT= SRC={}.{}.{}.{} DST={}.{}.{}.{} LEN={} PROTO={} DPT={}",
-                src[0], src[1], src[2], src[3],
-                our_ip()[0], our_ip()[1], our_ip()[2], our_ip()[3], plen, pname, dport);
+            sprintln!("[fw] IN={} OUT={} SRC={}.{}.{}.{} DST={}.{}.{}.{} LEN={} PROTO={} DPT={}",
+                iface, oface, src[0], src[1], src[2], src[3],
+                dst[0], dst[1], dst[2], dst[3], plen, pname, dport);
             continue;
         }
         if r.target == 3 {
@@ -446,16 +457,78 @@ fn fw_verdict(
         }
         return if r.target == 2 { 2 } else { 1 };
     }
-    if *FW_POLICY.lock() { 1 } else { 0 }
+    if *policy.lock() { 1 } else { 0 }
 }
 
-/// `/proc/net/iptables` — `iptables -L -n` listing (INPUT chain).
+/// OUTPUT -j REJECT: the refusal can't reach a remote — synthesize the
+/// exact reply the peer would have sent and queue it on the rx path so
+/// the local socket sees an instant refusal (RST for TCP, ICMP 3/3
+/// port-unreachable for everything else).
+fn out_reject(src_ip: [u8; 4], dst_ip: [u8; 4], proto: u8, payload: &[u8]) {
+    if proto == 6 {
+        if let Some(s) = parse_tcp(payload) {
+            let mut seg = Vec::with_capacity(20);
+            seg.extend_from_slice(&s.dport.to_be_bytes());
+            seg.extend_from_slice(&s.sport.to_be_bytes());
+            seg.extend_from_slice(&s.ack.to_be_bytes());
+            seg.extend_from_slice(&0u32.to_be_bytes());
+            seg.push(0x50); // data offset 5
+            seg.push(TCP_RST);
+            seg.extend_from_slice(&65535u16.to_be_bytes());
+            seg.extend_from_slice(&[0u8; 4]); // csum + urg
+            let src = if dst_ip[0] == 127 { LOOPBACK_IP } else { dst_ip };
+            let me = if is_loopback(src_ip) { LOOPBACK_IP } else { our_ip() };
+            let c = tcp_csum(src, me, &seg);
+            put16(&mut seg[16..], c);
+            LOOPBACK_Q.lock().push_back((src, 6, seg));
+        }
+    } else {
+        // ICMP 3/3 from the destination we "tried" to reach, quoting the
+        // offending datagram's header + first 8 payload bytes.
+        let mut icmp = Vec::with_capacity(8 + 20 + 8);
+        icmp.push(3);
+        icmp.push(3);
+        icmp.extend_from_slice(&[0u8; 2]);
+        icmp.extend_from_slice(&[0u8; 4]);
+        icmp.push(0x45);
+        icmp.push(0);
+        icmp.extend_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
+        icmp.extend_from_slice(&[0u8; 4]);
+        icmp.push(64);
+        icmp.push(proto);
+        icmp.extend_from_slice(&[0u8; 2]);
+        let me = if is_loopback(src_ip) { LOOPBACK_IP } else { our_ip() };
+        icmp.extend_from_slice(&me);
+        icmp.extend_from_slice(&dst_ip);
+        icmp.extend_from_slice(&payload[..payload.len().min(8)]);
+        let c = csum(&icmp);
+        put16(&mut icmp[2..], c);
+        let src = if dst_ip[0] == 127 { LOOPBACK_IP } else { dst_ip };
+        LOOPBACK_Q.lock().push_back((src, 1, icmp));
+    }
+}
+
+/// `/proc/net/iptables` — `iptables -L -n` listing (INPUT + OUTPUT chains).
 pub fn net_iptables() -> String {
-    let mut out = alloc::format!(
-        "Chain INPUT (policy {})\nnum  pkts bytes target  prot  source       destination\n",
-        if *FW_POLICY.lock() { "DROP" } else { "ACCEPT" }
-    );
-    for (i, r) in FW.lock().iter().enumerate() {
+    let mut out = String::new();
+    fmt_fw_chain(&mut out, "INPUT", &FW, &FW_POLICY);
+    out.push('\n');
+    fmt_fw_chain(&mut out, "OUTPUT", &FW_OUT, &FW_OUT_POLICY);
+    out
+}
+
+fn fmt_fw_chain(
+    out: &mut String,
+    name: &str,
+    chain: &Mutex<Vec<FwRule>>,
+    policy: &Mutex<bool>,
+) {
+    out.push_str(&alloc::format!(
+        "Chain {} (policy {})\nnum  pkts bytes target  prot  source       destination\n",
+        name,
+        if *policy.lock() { "DROP" } else { "ACCEPT" }
+    ));
+    for (i, r) in chain.lock().iter().enumerate() {
         let tgt = match r.target {
             1 => "LOG",
             2 => "REJECT",
@@ -506,7 +579,6 @@ pub fn net_iptables() -> String {
             extra
         ));
     }
-    out
 }
 
 /// `/proc/net/snmp` — Linux-format IP/ICMP/TCP/UDP counters for `netstat -s`.
@@ -694,41 +766,77 @@ pub fn set_icmp_ignore_all(v: u64) {
 /// Returns false on a parse miss.
 pub fn iptables_ctl(line: &str) -> bool {
     let mut f = line.split_whitespace();
+    // Chain word: ops take an optional `OUT` (or `IN`) chain token right
+    // after the op letter; absent means INPUT. Bare F/Z flush all chains.
     match f.next() {
-        Some("F") => {
-            FW.lock().clear();
-            true
-        }
+        Some("F") => match f.next() {
+            Some("OUT") => {
+                FW_OUT.lock().clear();
+                true
+            }
+            Some("IN") => {
+                FW.lock().clear();
+                true
+            }
+            _ => {
+                FW.lock().clear();
+                FW_OUT.lock().clear();
+                true
+            }
+        },
         Some("Z") => {
-            for r in FW.lock().iter_mut() {
+            let out = matches!(f.next(), Some("OUT"));
+            let ch = if out { &FW_OUT } else { &FW };
+            for r in ch.lock().iter_mut() {
                 r.hits = 0;
                 r.bytes = 0;
             }
             true
         }
         Some("D") => {
-            let n: usize = f.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let mut fw = FW.lock();
+            let mut t = f.next();
+            let out = t == Some("OUT");
+            if out {
+                t = f.next();
+            }
+            let n: usize = t.and_then(|s| s.parse().ok()).unwrap_or(0);
+            let ch = if out { &FW_OUT } else { &FW };
+            let mut fw = ch.lock();
             if n == 0 || n > fw.len() {
                 return false;
             }
             fw.remove(n - 1);
             true
         }
-        Some("P") => match f.next() {
-            Some("ACCEPT") => {
-                *FW_POLICY.lock() = false;
-                true
+        Some("P") => {
+            let mut t = f.next();
+            let out = t == Some("OUT");
+            if out {
+                t = f.next();
             }
-            Some("DROP") => {
-                *FW_POLICY.lock() = true;
-                true
+            let pol = if out { &FW_OUT_POLICY } else { &FW_POLICY };
+            match t {
+                Some("ACCEPT") => {
+                    *pol.lock() = false;
+                    true
+                }
+                Some("DROP") => {
+                    *pol.lock() = true;
+                    true
+                }
+                _ => false,
             }
-            _ => false,
-        },
+        }
         // `A` appends, `I <n>` inserts at 1-based position n — real
-        // iptables -I INPUT <n> ordering semantics.
+        // iptables -I INPUT <n> ordering semantics. `OUT` after the op
+        // targets the OUTPUT chain (evaluated on locally-generated tx).
         Some(op @ ("A" | "I")) => {
+            let out = if f.clone().next() == Some("OUT") {
+                f.next();
+                true
+            } else {
+                false
+            };
             let ins: Option<usize> = if op == "I" {
                 Some(f.next().and_then(|s| s.parse().ok()).unwrap_or(1).max(1))
             } else {
@@ -819,7 +927,8 @@ pub fn iptables_ctl(line: &str) -> bool {
                 }
             }
             if ok {
-                let mut fw = FW.lock();
+                let ch = if out { &FW_OUT } else { &FW };
+                let mut fw = ch.lock();
                 match ins {
                     Some(n) => {
                         let pos = (n - 1).min(fw.len());
@@ -971,7 +1080,7 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>)> {
         // so loopback flows pair with their tx counterparts.
         let dst = if is_loopback(*src_ip) { LOOPBACK_IP } else { our_ip() };
         let st = ct_update(*src_ip, dst, sport, dport, *proto);
-        let v = fw_verdict(*src_ip, *proto, sport, dport, st, p.len() as u64);
+        let v = fw_verdict(&FW, &FW_POLICY, true, *src_ip, dst, *proto, sport, dport, st, p.len() as u64);
         if v == 2 {
             // -j REJECT: a real refusal goes back — TCP_RST for TCP
             // (same wire shape as the unclaimed-port responder),
@@ -1647,6 +1756,17 @@ fn send_ip_src_ttl(
         17 => UDP_OUT.fetch_add(1, Ordering::Relaxed),
         _ => 0,
     };
+    // iptables OUTPUT: every locally-generated datagram is evaluated
+    // here at the egress funnel — wire, lo, and ARP-free sends alike.
+    let (osport, odport) = pkt_ports(proto, payload);
+    let v = fw_verdict(&FW_OUT, &FW_OUT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, payload.len() as u64);
+    if v == 2 {
+        out_reject(src_ip, dst_ip, proto, payload);
+        return;
+    }
+    if v == 1 {
+        return; // -j DROP: the datagram never leaves
+    }
     if is_loopback(dst_ip) {
         // lo: no ethernet, no ARP — the datagram re-enters rx as-is
         LOOPBACK_Q.lock().push_back((src_ip, proto, payload.to_vec()));

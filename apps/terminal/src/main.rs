@@ -8034,6 +8034,7 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
     let mut jump = "DROP";
+    let mut chain_out = false;
     let mut insert_at: Option<usize> = None;
     let mut i = 0usize;
     while i < args.len() {
@@ -8104,9 +8105,10 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 i += 1;
             }
             "-I" | "--insert" => {
-                // -I INPUT [rulenum]: INPUT is the next arg, then an
+                // -I <chain> [rulenum]: chain is the next arg, then an
                 // optional 1-based insert position (default 1).
-                i += 1; // consume "INPUT"
+                chain_out |= args.get(i + 1) == Some(&"OUTPUT");
+                i += 1; // consume the chain word
                 if let Some(n) = args.get(i + 1).and_then(|s| s.parse().ok()) {
                     insert_at = Some(n);
                     i += 1;
@@ -8115,6 +8117,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 }
             }
             "-A" | "-D" | "INPUT" | "OUTPUT" | "FORWARD" | "-i" | "-o" => {
+                if args[i] == "OUTPUT" {
+                    chain_out = true;
+                }
                 if args[i] == "-i" || args[i] == "-o" {
                     i += 1; // interface arg — single nic, ignored
                 }
@@ -8123,9 +8128,11 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
         }
         i += 1;
     }
-    let mut line = match insert_at {
-        Some(n) => alloc::format!("I {} {}", n, proto),
-        None => alloc::format!("A {}", proto),
+    let mut line = match (insert_at, chain_out) {
+        (Some(n), true) => alloc::format!("I OUT {} {}", n, proto),
+        (Some(n), false) => alloc::format!("I {} {}", n, proto),
+        (None, true) => alloc::format!("A OUT {}", proto),
+        (None, false) => alloc::format!("A {}", proto),
     };
     if dport != 0 {
         line.push_str(&alloc::format!(" dport {}", dport));
@@ -34449,16 +34456,26 @@ impl Term {
                         Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                     }
                 } else if first == "-F" || first == "--flush" {
-                    match ustd::write_all("/proc/net/iptables", b"F\n") {
+                    let ch = match args.iter().skip(1).next().copied() {
+                        Some("OUTPUT") => "F OUT\n",
+                        Some("INPUT") => "F IN\n",
+                        _ => "F\n",
+                    };
+                    match ustd::write_all("/proc/net/iptables", ch.as_bytes()) {
                         Ok(_) => self.emit("iptables: rules flushed"),
                         Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                     }
                 } else if first == "-Z" || first == "--zero" {
-                    match ustd::write_all("/proc/net/iptables", b"Z\n") {
+                    let ch = match args.iter().skip(1).next().copied() {
+                        Some("OUTPUT") => "Z OUT\n",
+                        _ => "Z\n",
+                    };
+                    match ustd::write_all("/proc/net/iptables", ch.as_bytes()) {
                         Ok(_) => self.emit("iptables: counters zeroed"),
                         Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                     }
                 } else if first == "-P" || first == "--policy" {
+                    let out = args.iter().any(|a| *a == "OUTPUT");
                     let verdict = args
                         .iter()
                         .copied()
@@ -34466,18 +34483,24 @@ impl Term {
                         .find(|a| *a == "DROP" || *a == "ACCEPT")
                         .unwrap_or("");
                     if !verdict.is_empty() {
-                        let line = alloc::format!("P {}\n", verdict);
+                        let line = if out {
+                            alloc::format!("P OUT {}\n", verdict)
+                        } else {
+                            alloc::format!("P {}\n", verdict)
+                        };
                         match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
                             Ok(_) => self.emit(&alloc::format!(
-                                "Chain INPUT (policy {})",
+                                "Chain {} (policy {})",
+                                if out { "OUTPUT" } else { "INPUT" },
                                 verdict
                             )),
                             Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                         }
                     } else {
-                        self.fail("usage: iptables -P INPUT ACCEPT|DROP");
+                        self.fail("usage: iptables -P INPUT|OUTPUT ACCEPT|DROP");
                     }
                 } else if first == "-D" || first == "--delete" {
+                    let out = args.iter().any(|a| *a == "OUTPUT");
                     let n = args
                         .iter()
                         .copied()
@@ -34485,21 +34508,30 @@ impl Term {
                         .find(|a| a.parse::<usize>().is_ok());
                     match n {
                         Some(n) => {
-                            let line = alloc::format!("D {}\n", n);
+                            let line = if out {
+                                alloc::format!("D OUT {}\n", n)
+                            } else {
+                                alloc::format!("D {}\n", n)
+                            };
                             match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
                                 Ok(_) => self.emit(&alloc::format!("rule {} deleted", n)),
                                 Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                             }
                         }
-                        None => self.fail("usage: iptables -D INPUT <rulenum>"),
+                        None => self.fail("usage: iptables -D INPUT|OUTPUT <rulenum>"),
                     }
                 } else if first == "-A" || first == "--append" || first == "-I" || first == "--insert" {
                     // pass args whole: -A/-I + chain + optional rulenum
                     // are part of the rule grammar
                     match ipt_rule_from_args(&args) {
                         Some(line) => {
+                            let ch = if line.split(' ').nth(1) == Some("OUT") {
+                                "OUTPUT"
+                            } else {
+                                "INPUT"
+                            };
                             match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
-                                Ok(_) => self.emit("rule added to INPUT"),
+                                Ok(_) => self.emit(&alloc::format!("rule added to {}", ch)),
                                 Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                             }
                         }
@@ -34507,7 +34539,7 @@ impl Term {
                     }
                 } else {
                     self.fail(
-                        "usage: iptables -L | -F | -P INPUT v | -D INPUT n | -A INPUT .. -j DROP",
+                        "usage: iptables -L | -F [chain] | -P <chain> v | -D <chain> n | -A|-I <chain> .. -j v",
                     );
                 }
             }
@@ -34518,8 +34550,26 @@ impl Term {
                         self.emit("# Generated by iptables-save");
                         self.emit("*filter");
                         let t = String::from_utf8_lossy(&b);
+                        let mut chain = "INPUT";
                         self.emit(":INPUT ACCEPT [0:0]");
                         for l in t.lines().skip(2) {
+                            if l.is_empty() {
+                                continue;
+                            }
+                            if let Some(rest) = l.strip_prefix("Chain ") {
+                                chain = if rest.starts_with("OUTPUT") {
+                                    "OUTPUT"
+                                } else {
+                                    "INPUT"
+                                };
+                                if chain == "OUTPUT" {
+                                    self.emit(":OUTPUT ACCEPT [0:0]");
+                                }
+                                continue;
+                            }
+                            if l.starts_with("num ") {
+                                continue;
+                            }
                             let mut it = l.split_whitespace();
                             let _num = it.next();
                             let _pkts = it.next();
@@ -34528,7 +34578,8 @@ impl Term {
                             let srcip = it.next().unwrap_or("0.0.0.0/0");
                             let _dst = it.next();
                             let mut ln = alloc::format!(
-                                "-A INPUT -p {}",
+                                "-A {} -p {}",
+                                chain,
                                 if prot == "all" { "*" } else { prot }
                             );
                             if srcip != "0.0.0.0/0" && srcip != "anywhere" {
@@ -34579,7 +34630,11 @@ impl Term {
                         continue;
                     }
                     let toks: Vec<&str> = l.split_whitespace().collect();
-                    if toks.first() == Some(&":INPUT") {
+                    if toks
+                        .first()
+                        .map(|t| t.starts_with(':'))
+                        .unwrap_or(false)
+                    {
                         continue;
                     }
                     if toks.first() == Some(&"-A") || toks.first() == Some(&"-I") {
