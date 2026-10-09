@@ -2636,13 +2636,26 @@ pub fn net_trace_opts(
     per_ms: u64,
     probes: u8,
 ) -> alloc::vec::Vec<(u8, Option<([u8; 4], u64)>, bool)> {
+    net_trace_proto(ip, icmp as u8, first_hop, max_hops, base_port, per_ms, probes)
+}
+/// Full-proto form: `proto` 0 = UDP (-U), 1 = ICMP echo (-I), 2 = TCP
+/// SYN (-T — `base_port` then is the probe dport, 0 → 80).
+pub fn net_trace_proto(
+    ip: u32,
+    proto: u8,
+    first_hop: u8,
+    max_hops: u8,
+    base_port: u16,
+    per_ms: u64,
+    probes: u8,
+) -> alloc::vec::Vec<(u8, Option<([u8; 4], u64)>, bool)> {
     let mut buf = [0u8; 16 * 30];
     let a5 = (base_port as u64) | ((first_hop as u64) << 16) | (per_ms << 24)
         | ((probes as u64) << 56);
     let n = sc5(
         shared::SYS_NET_TRACE,
         ip as u64,
-        max_hops as u64 | ((icmp as u64) << 16),
+        max_hops as u64 | ((proto as u64) << 16),
         buf.as_mut_ptr() as u64,
         buf.len() as u64,
         a5,
@@ -2662,13 +2675,21 @@ pub fn net_trace_opts(
     out
 }
 
-/// `traceroute -I`: same hop list, but probes are ICMP echo requests
-/// (kernel picks the ICMP path from a2 bit16).
+/// `traceroute -I`: same hop list, but probes are ICMP echo requests.
 pub fn net_trace_icmp(
     ip: u32,
     max_hops: u8,
 ) -> alloc::vec::Vec<(u8, Option<([u8; 4], u64)>, bool)> {
     net_trace_opts(ip, true, 1, max_hops, 0, 0, 1)
+}
+/// `traceroute -T`: TCP SYN probes to `dport` (0 → 80) — the target
+/// answers its own SYN-ACK/RST, hops answer time-exceeded.
+pub fn net_trace_tcp(
+    ip: u32,
+    max_hops: u8,
+    dport: u16,
+) -> alloc::vec::Vec<(u8, Option<([u8; 4], u64)>, bool)> {
+    net_trace_proto(ip, 2, 1, max_hops, dport, 0, 1)
 }
 
 /// fd-based TCP socket — poll/read/write/close all work on it.

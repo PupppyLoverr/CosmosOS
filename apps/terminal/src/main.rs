@@ -20698,6 +20698,7 @@ impl Term {
                 let mut head_only = false;
                 let mut include_hdr = false;
                 let mut silent = false;
+                let mut verbose = false;
                 let mut method: Option<String> = None;
                 let mut ddata: Option<String> = None;
                 let mut xhdrs: Vec<String> = Vec::new();
@@ -20712,6 +20713,7 @@ impl Term {
                         "-s" | "--silent" => silent = true,
                         "-i" | "--include" => include_hdr = true,
                         "-I" | "--head" => head_only = true,
+                        "-v" | "--verbose" => verbose = true,
                         "-L" | "--location" => follow = true,
                         "--max-redirs" => {
                             max_redirs = args
@@ -20813,6 +20815,12 @@ impl Term {
                         }
                         return;
                     };
+                    if verbose {
+                        self.emit(&alloc::format!(
+                            "*   Trying {}.{}.{}.{}:{}...",
+                            ip[0], ip[1], ip[2], ip[3], port
+                        ));
+                    }
                     // 303 → GET on the redirected request (real -L).
                     let m = method.clone().unwrap_or_else(|| {
                         String::from(if ddata.is_some() && redirects == 0 {
@@ -20857,6 +20865,20 @@ impl Term {
                         }
                         return;
                     };
+                    if verbose {
+                        // Real curl stderr trace: connect, then every
+                        // request/response header line > and <
+                        self.emit(&alloc::format!(
+                            "* Connected to {} ({}.{}.{}.{}) port {}",
+                            host, ip[0], ip[1], ip[2], ip[3], port
+                        ));
+                        for l in req.lines() {
+                            if !l.is_empty() {
+                                self.emit(&alloc::format!("> {}", l));
+                            }
+                        }
+                        self.emit(">");
+                    }
                     let rb = req.as_bytes();
                     let mut off = 0usize;
                     while off < rb.len() {
@@ -20887,6 +20909,15 @@ impl Term {
                         .position(|w| w == b"\r\n\r\n")
                         .map(|i| i + 4)
                         .unwrap_or(0);
+                    if verbose {
+                        let hh = String::from_utf8_lossy(&resp[..split]);
+                        for l in hh.lines() {
+                            if !l.is_empty() {
+                                self.emit(&alloc::format!("< {}", l));
+                            }
+                        }
+                        self.emit("<");
+                    }
                     let mut loc: Option<String> = None;
                     if follow
                         && matches!(code, 301 | 302 | 303 | 307 | 308)
@@ -22855,6 +22886,7 @@ impl Term {
                 let mut one_reply = false;
                 let mut bcast = false;
                 let mut flood = false;
+                let mut ts_stamp = false;
                 let mut ttl = 0u8;
                 let mut audible = false;
                 let mut size = 0u64;
@@ -22956,6 +22988,12 @@ impl Term {
                             flood = true;
                             i += 1;
                         }
+                        "-D" => {
+                            // -D: real iputils flag — prefix replies
+                            // with a unix-seconds timestamp.
+                            ts_stamp = true;
+                            i += 1;
+                        }
                         a => {
                             target = Some(a);
                             i += 1;
@@ -22997,9 +23035,22 @@ impl Term {
                                         ustd::beep(880, 40); // real beep per reply
                                     }
                                     if !quiet {
+                                        let ts = if ts_stamp {
+                                            // -D: [unix_s.mmm] prefix —
+                                            // REALTIME clock_gettime.
+                                            let (s, ns) = ustd::clock_gettime(0)
+                                                .unwrap_or((0, 0));
+                                            alloc::format!(
+                                                "[{}.{}] ",
+                                                s,
+                                                ns / 1_000_000
+                                            )
+                                        } else {
+                                            String::new()
+                                        };
                                         self.emit(&alloc::format!(
-                                            "reply from {}.{}.{}.{}: seq={} time={}ms",
-                                            a, b, c, d, n, rtt
+                                            "{}reply from {}.{}.{}.{}: seq={} time={}ms",
+                                            ts, a, b, c, d, n, rtt
                                         ));
                                     }
                                 }
@@ -23044,6 +23095,7 @@ impl Term {
                 let mut wait_ms = 0u64;
                 let mut probes = 1u8;
                 let mut icmp = false;
+                let mut tcp = false;
                 let mut target: Option<&str> = None;
                 let mut i = 0usize;
                 while i < args.len() {
@@ -23095,10 +23147,19 @@ impl Term {
                         }
                         "-I" | "--icmp" => {
                             icmp = true;
+                            tcp = false;
+                            i += 1;
+                        }
+                        // -T: real TCP SYN probes — the target answers
+                        // its own SYN-ACK/RST (dport = -p, default 80).
+                        "-T" | "--tcp" => {
+                            tcp = true;
+                            icmp = false;
                             i += 1;
                         }
                         "-U" | "--udp" => {
                             icmp = false;
+                            tcp = false;
                             i += 1;
                         }
                         a => {
@@ -23120,8 +23181,10 @@ impl Term {
                             s, ip[0], ip[1], ip[2], ip[3], maxh
                         ));
                         let mut ok = false;
-                        let hops = ustd::net_trace_opts(
-                            packed, icmp, first, maxh, basep, wait_ms, probes,
+                        let hops = ustd::net_trace_proto(
+                            packed,
+                            if tcp { 2 } else if icmp { 1 } else { 0 },
+                            first, maxh, basep, wait_ms, probes,
                         );
                         for (ttl, hop, reached) in hops {
                             match hop {
