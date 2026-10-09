@@ -4368,6 +4368,15 @@ pub fn set_rt(pid: u32, rt: bool) -> bool {
     }
 }
 
+/// (nice, rt, name, pdeathsig, cpu_ticks) for the POSIX getter syscalls.
+/// pid 0 = caller. None = no such live task.
+pub fn sched_fields(pid: u32) -> Option<(i8, bool, String, u8, u64)> {
+    let pid = if pid == 0 { current_id() } else { pid };
+    let g = SCHED.lock();
+    let t = g.as_ref()?.tasks.iter().find(|t| t.id == pid && t.state != State::Dead)?;
+    Some((t.nice, t.rt, t.name.clone(), t.pdeathsig, t.cpu_ticks))
+}
+
 /// Whether a task runs in the rt class (/proc/<pid>/status).
 pub fn pid_rt(pid: u32) -> Option<bool> {
     let g = SCHED.lock();

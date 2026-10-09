@@ -1021,6 +1021,58 @@ pub fn mprotect(addr: *mut u8, len: u64, prot: u64) -> bool {
     sc3(shared::SYS_MPROTECT, addr as u64, len, prot) == 0
 }
 
+/// getpriority/setpriority(PRIO_PROCESS=0, pid): real nice getters/setters.
+pub fn getpriority(pid: u32) -> i64 {
+    sc2(shared::SYS_GETPRIORITY, 0, pid as u64) as i64
+}
+pub fn setpriority(pid: u32, nice: i64) -> i64 {
+    sc3(shared::SYS_SETPRIORITY, 0, pid as u64, nice as u64) as i64
+}
+/// sched_getscheduler(pid) -> 0=OTHER|1=RT | err
+pub fn sched_getscheduler(pid: u32) -> i64 {
+    sc1(shared::SYS_SCHED_GETSCHEDULER, pid as u64) as i64
+}
+/// sched_getparam(pid) -> rt?99:0 | err
+pub fn sched_getparam(pid: u32) -> i64 {
+    let mut p: u64 = 0;
+    let r = sc2(shared::SYS_SCHED_GETPARAM, pid as u64, &mut p as *mut u64 as u64);
+    if r == 0 {
+        p as i64
+    } else {
+        r as i64
+    }
+}
+/// getcpu() -> (cpu, node) — UP box: (0, 0).
+pub fn getcpu() -> (u32, u32) {
+    let (mut c, mut n) = (0u32, 0u32);
+    let _ = sc2(
+        shared::SYS_GETCPU,
+        &mut c as *mut u32 as u64,
+        &mut n as *mut u32 as u64,
+    );
+    (c, n)
+}
+/// times() -> {utime,stime,cutime,cstime} PIT ticks (utime real).
+pub fn times() -> (u64, u64, u64, u64) {
+    let mut b = [0u64; 4];
+    let _ = sc1(shared::SYS_TIMES, b.as_mut_ptr() as u64);
+    (b[0], b[1], b[2], b[3])
+}
+/// prctl PR_GET_NAME -> NUL-trimmed task name.
+pub fn get_name() -> String {
+    let mut b = [0u8; 16];
+    let _ = sc2(shared::SYS_PRCTL, 16, b.as_mut_ptr() as u64);
+    String::from_utf8_lossy(&b)
+        .trim_matches('\0')
+        .into()
+}
+/// prctl PR_GET_PDEATHSIG -> signal number (0 = none).
+pub fn get_pdeathsig() -> u32 {
+    let mut v: u32 = 0;
+    let _ = sc2(shared::SYS_PRCTL, 2, &mut v as *mut u32 as u64);
+    v
+}
+
 /// chrt(pid, class): set scheduler class — SCHED_OTHER=0, SCHED_RT=1.
 pub fn chrt(pid: u32, class: u64) -> bool {
     sc2(shared::SYS_CHRT, pid as u64, class) == 0
