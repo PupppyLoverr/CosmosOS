@@ -1116,6 +1116,43 @@ pub fn set_dumpable(v: u64) -> i64 {
     sc5(shared::SYS_PRCTL, 4, v, 0, 0, 0) as i64
 }
 
+/// personality(p): 0xFFFFFFFF reads, else sets and returns the old value.
+pub fn personality(p: u32) -> i64 {
+    sc1(shared::SYS_PERSONALITY, p as u64) as i64
+}
+/// acct(path): arm process accounting to a file; "" disarms. CAP_SYS_ADMIN.
+pub fn acct(path: &str) -> i64 {
+    if path.is_empty() {
+        sc1(shared::SYS_ACCT, 0) as i64
+    } else {
+        sc2(shared::SYS_ACCT, path.as_ptr() as u64, path.len() as u64) as i64
+    }
+}
+/// sched_setaffinity(pid, mask) -> 0 | -22 | err
+pub fn sched_setaffinity(pid: u32, mask: u64) -> i64 {
+    sc3(
+        shared::SYS_SCHED_SETAFFINITY,
+        pid as u64,
+        8,
+        &mask as *const u64 as u64,
+    ) as i64
+}
+/// sched_getaffinity(pid) -> stored mask | -22 | -3
+pub fn sched_getaffinity(pid: u32) -> i64 {
+    let mut m: u64 = 0;
+    let r = sc3(
+        shared::SYS_SCHED_GETAFFINITY,
+        pid as u64,
+        8,
+        &mut m as *mut u64 as u64,
+    ) as i64;
+    if r >= 0 {
+        m as i64
+    } else {
+        r
+    }
+}
+
 /// chrt(pid, class): set scheduler class — SCHED_OTHER=0, SCHED_RT=1.
 pub fn chrt(pid: u32, class: u64) -> bool {
     sc2(shared::SYS_CHRT, pid as u64, class) == 0

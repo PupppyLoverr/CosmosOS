@@ -134,6 +134,8 @@ pub struct Task {
     pub rt: bool,            // SCHED_RT: runnable rt tasks preempt all non-rt tasks
     pub rt_prio: u8,         // static RT priority 1..99 (99 when set via chrt)
     pub dumpable: u8,        // PR_GET/SET_DUMPABLE: 0, 1 or 2 (SUID_DUMP)
+    pub personality: u32,    // SYS_PERSONALITY persona (ADDR_NO_RANDOMIZE bit)
+    pub affinity: u64,       // cpu affinity mask — UP box: only bit0 is legal
     pub vrun: u64,           // virtual runtime (scaled by nice) for fair scheduling
     pub trace: bool,         // syscall tracing on (strace -p)
     pub trbuf: Vec<u64>,     // packed trace records, 7 u64s each: nr,a1..a5,ret
@@ -353,6 +355,8 @@ pub fn init() {
         rt: false,
         rt_prio: 0,
         dumpable: 1,
+        personality: 0,
+        affinity: 1,
         vrun: 0,
         trace: false,
         trbuf: Vec::new(),
@@ -901,6 +905,8 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         rt: false,
         rt_prio: 0,
         dumpable: 1,
+        personality: 0,
+        affinity: 1,
         vrun: s.tasks[s.cur].vrun,
         trace: false,
         trbuf: Vec::new(),
@@ -1058,6 +1064,8 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         rt: false,
         rt_prio: 0,
         dumpable: 1,
+        personality: 0,
+        affinity: 1,
         vrun: s.tasks[s.cur].vrun,
         trace: false,
         trbuf: Vec::new(),
@@ -1222,11 +1230,13 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
     let ctns = if cur.child_tns != 0 { cur.child_tns } else { cur.time_ns };
     let borrowed = cur.borrowed.clone();
     let shm_ids = cur.shm.clone();
-    let (nice, rt, rtp, dmp, vrun, umask, exe, pfs, rnf, rnp, rstk, rcu, ras) = (
+    let (nice, rt, rtp, dmp, pers, aff, vrun, umask, exe, pfs, rnf, rnp, rstk, rcu, ras) = (
         cur.nice,
         cur.rt,
         cur.rt_prio,
         cur.dumpable,
+        cur.personality,
+        cur.affinity,
         cur.vrun,
         cur.umask,
         cur.exe.clone(),
@@ -1293,6 +1303,8 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         rt,
         rt_prio: rtp,
         dumpable: dmp,
+        personality: pers,
+        affinity: aff,
         vrun,
         trace: false,
         trbuf: Vec::new(),
@@ -1914,6 +1926,8 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         rt: false,
         rt_prio: 0,
         dumpable: 1,
+        personality: 0,
+        affinity: 1,
         vrun: cur.vrun,
         trace: false,
         trbuf: Vec::new(),
@@ -2193,7 +2207,9 @@ pub fn mm_reserve(pml4_phys: u64, pages: u64) -> u64 {
     }
     // kernel.randomize_va_space >= 2: an entropy-fed gap slides every
     // reservation's base like Linux mmap ASLR (0=off, 1=mild compat).
-    let gap = if crate::sysctl::randomize_va_space() >= 2 {
+    // personality(ADDR_NO_RANDOMIZE) disables it per-task.
+    let aslr_off = s.tasks[s.cur].personality & (shared::PER_ADDR_NO_RANDOMIZE as u32) != 0;
+    let gap = if crate::sysctl::randomize_va_space() >= 2 && !aslr_off {
         let mut b = [0u8; 8];
         if crate::virtio_rng::fill(&mut b) == 0 {
             0
@@ -3253,6 +3269,9 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
         }
         t.ctid_va = 0;
     }
+    // process accounting: one record per task exit (buffered — the FS
+    // lock is never taken under SCHED; acct::flush drains at dispatch)
+    crate::acct::on_exit(&t.name, code, t.cpu_ticks, t.uid, t.gid);
     // thread teardown: while mm peers still run on this pml4, unmap the
     // dead task's stack region — clone_user's slot scan can reuse it and
     // its frames go back to the allocator (free_frame is COW-refcounted,
@@ -4493,6 +4512,51 @@ pub fn sched_setparam(pid: u32, prio: u32) -> i64 {
         }
         None => -1000,
     }
+}
+
+/// sched_setaffinity(pid, mask): UP box — the only legal mask is a
+/// nonzero subset of {cpu0}: mask|!1 == 0 and mask != 0, else -22.
+/// Returns 0 | -22 | -1000 no such pid.
+pub fn sched_setaffinity(pid: u32, mask: u64) -> i64 {
+    if mask == 0 || mask & !1 != 0 {
+        return -22;
+    }
+    let pid = if pid == 0 { current_id() } else { pid };
+    let mut g = SCHED.lock();
+    let s = match g.as_mut() {
+        Some(s) => s,
+        None => return -1000,
+    };
+    match s.tasks.iter_mut().find(|t| t.id == pid && t.state != State::Dead) {
+        Some(t) => {
+            t.affinity = mask;
+            0
+        }
+        None => -1000,
+    }
+}
+
+/// sched_getaffinity(pid) -> the task's stored mask. None = no such pid.
+pub fn sched_getaffinity(pid: u32) -> Option<u64> {
+    let pid = if pid == 0 { current_id() } else { pid };
+    let g = SCHED.lock();
+    g.as_ref()?
+        .tasks
+        .iter()
+        .find(|t| t.id == pid && t.state != State::Dead)
+        .map(|t| t.affinity)
+}
+
+/// SYS_PERSONALITY: 0xFFFFFFFF reads; anything else stores and returns
+/// the old persona (Linux semantics: set returns the previous value).
+pub fn sys_personality(p: u32) -> i64 {
+    with_current(|t| {
+        let old = t.personality as i64;
+        if p != 0xFFFF_FFFF {
+            t.personality = p;
+        }
+        old
+    })
 }
 
 /// sched_get_priority_min/max for a policy. None = unknown policy.
