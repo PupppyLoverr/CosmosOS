@@ -654,6 +654,48 @@ impl<D: BlockDevice> Fat32<D> {
         self.write_file(path, &cur)
     }
 
+    /// Ranged write: `data` at byte offset `off`, creating the file if
+    /// missing and extending the cluster chain only as far as `end`.
+    /// Never materializes the whole file — one cluster buffer only.
+    pub fn write_at(&mut self, path: &str, off: u64, data: &[u8]) -> Result<()> {
+        let (parent_clus, name) = self.parent_of(path)?;
+        let (_, existing) = self.resolve(path)?;
+        let e = match existing {
+            Some(e) => {
+                if e.attr & ATTR_DIR != 0 {
+                    return Err(Error::NotDir);
+                }
+                e
+            }
+            None => self.create_entry(parent_clus, &name, 0x20)?,
+        };
+        let end = off + data.len() as u64;
+        let ch = self.ensure_capacity(e.first_cluster, end)?;
+        let first_clus = ch.first().copied().unwrap_or(0);
+        let cb = self.clus_bytes as u64;
+        let mut buf = vec![0u8; self.clus_bytes];
+        let mut written = 0usize;
+        let mut pos = off;
+        while written < data.len() {
+            let idx = (pos / cb) as usize;
+            let inner = (pos % cb) as usize;
+            let c = ch[idx];
+            let take = (data.len() - written).min(self.clus_bytes - inner);
+            if take == self.clus_bytes {
+                self.write_cluster(c, &data[written..written + take])?;
+            } else {
+                self.read_cluster(c, &mut buf)?;
+                buf[inner..inner + take]
+                    .copy_from_slice(&data[written..written + take]);
+                self.write_cluster(c, &buf)?;
+            }
+            written += take;
+            pos += take as u64;
+        }
+        let new_size = (e.size as u64).max(end) as u32;
+        self.update_entry(&e, first_clus, new_size)
+    }
+
     pub fn create_file(&mut self, path: &str) -> Result<()> {
         let (p, name) = self.parent_of(path)?;
         if let Ok(_) = self.resolve(path) {

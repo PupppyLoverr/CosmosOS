@@ -90,17 +90,17 @@ pub fn read_at(path: &str, pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
         }
         _ => {}
     }
-    let rem = (SNAPSHOT as u64).saturating_sub(pos) as usize;
-    let n = buf.len().min(rem);
     match &path[5..] {
         "null" => Ok(0),
+        // zero/full/random are infinite sources — they never EOF and
+        // ignore the read offset, matching Linux character devices.
         "zero" | "full" => {
-            buf[..n].iter_mut().for_each(|b| *b = 0);
-            Ok(n)
+            buf.iter_mut().for_each(|b| *b = 0);
+            Ok(buf.len())
         }
         "random" | "urandom" => {
-            crate::syscall::rand_fill(&mut buf[..n]);
-            Ok(n)
+            crate::syscall::rand_fill(buf);
+            Ok(buf.len())
         }
         "console" | "dsp" => Ok(0), // write-only sinks; reads EOF
         _ => Err(-2),
