@@ -3623,12 +3623,31 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>, u64)> {
         let probes: Vec<([u8; 6], [u8; 4], u16, u16, u32, u32, u16, u16)> = {
             let mut t = TCP_SOCKS.lock();
             let mut v = Vec::new();
+            let ka_time = crate::sysctl::tcp_keepalive_time() * 1000;
+            let ka_intvl = crate::sysctl::tcp_keepalive_intvl() * 1000;
+            let ka_max = crate::sysctl::tcp_keepalive_probes();
             for k in t.values_mut() {
-                if k.ka
-                    && k.state == TcpState::Open
-                    && now_ms().saturating_sub(k.ka_rx) > 15_000
-                {
-                    k.ka_rx = now_ms(); // one probe per idle window
+                if !k.ka || k.state != TcpState::Open {
+                    continue;
+                }
+                let idle = now_ms().saturating_sub(k.ka_rx);
+                // first probe after keepalive_time idle; then one every
+                // keepalive_intvl; unanswered past keepalive_probes the
+                // conn is dead — reads return ECONNRESET via k.rst.
+                let due = if k.ka_cnt == 0 {
+                    idle > ka_time
+                } else {
+                    idle > ka_intvl
+                };
+                if due {
+                    k.ka_rx = now_ms();
+                    k.ka_cnt += 1;
+                    if k.ka_cnt > ka_max {
+                        k.rst = true;
+                        k.state = TcpState::Closed;
+                        k.closed_ms = now_ms();
+                        continue;
+                    }
                     v.push((k.mac, k.rip, k.lport, k.rport,
                         k.snd_una.wrapping_sub(1), k.rcv_nxt, rx_win(k), k.cid));
                 }
@@ -5701,7 +5720,8 @@ pub struct TcpSock {
     rst: bool,            // peer sent RST (read path surfaces ECONNRESET)
     owner: u32,           // task id that opened/accepted it (0 = kernel side)
     wr_off: bool,         // shutdown(SHUT_WR): FIN sent, no more sends
-    ka: bool,             // SO_KEEPALIVE: probe the peer after 15s idle
+    ka: bool,             // SO_KEEPALIVE: probe the peer after keepalive_time idle
+    ka_cnt: u64,          // consecutive unanswered keepalive probes sent
     ka_rx: u64,           // last rx (or probe) timestamp — keepalive clock
     syn_ms: u64,          // outbound SYN tx time — first RTT sample
     srtt: u64,            // smoothed RTT estimate ms (0 = none yet)
@@ -5774,6 +5794,7 @@ static NEXT_CID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 
 fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
     k.ka_rx = now_ms(); // any segment from the peer resets the idle clock
+    k.ka_cnt = 0;
     match k.state {
         TcpState::SynRecv => {
             if s.flags & TCP_RST != 0 {
@@ -5911,6 +5932,7 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
             owner: crate::task::with_current(|t| t.id),
             wr_off: false,
             ka: false,
+            ka_cnt: 0,
             ka_rx: now_ms(),
             syn_ms: now_ms(),
             srtt: 0,
@@ -5921,10 +5943,18 @@ pub fn tcp_open(lport: u16, rip: [u8; 4], rport: u16, timeout_ms: u64) -> Result
     );
     let deadline = now_ms() + timeout_ms;
     let mut last_syn = 0u64;
+    // net.ipv4.tcp_syn_retries: give up ETIMEDOUT after this many
+    // unanswered SYN sends (Linux default 6, 1s spacing here).
+    let max_syn = crate::sysctl::tcp_syn_retries();
+    let mut syns = 0u64;
     let mut open = false;
     while now_ms() < deadline {
         if now_ms() - last_syn >= 1000 {
+            if syns > max_syn {
+                return Err(-110); // ETIMEDOUT
+            }
             send_tcp(mac, rip, lport, rport, isn, 0, TCP_SYN, &[], 65535);
+            syns += 1;
             last_syn = now_ms();
         }
         for (src_ip, proto, p, _pkt_meta) in pump_rx() {
@@ -6010,6 +6040,7 @@ fn accept_syn(s: &TcpSeg, src_ip: [u8; 4]) {
             owner: 0,
             wr_off: false,
             ka: false,
+            ka_cnt: 0,
             ka_rx: now_ms(),
             syn_ms: 0,
             srtt: 0,
@@ -6177,13 +6208,28 @@ pub fn tcp_close(lport: u16) {
     }
 }
 
-/// Sweep TIME_WAIT entries older than the linger window.
+/// Sweep TIME_WAIT entries older than net.ipv4.tcp_fin_timeout, and
+/// enforce net.ipv4.tcp_max_tw_buckets — over the cap the oldest
+/// TIME_WAIT is destroyed outright (Linux's bucket-overflow behavior).
 fn tcp_tw_sweep() {
-    const TW_MS: u64 = 2000;
+    let tw_ms = crate::sysctl::tcp_fin_timeout() * 1000;
+    let cap = crate::sysctl::tcp_max_tw_buckets() as usize;
     let now = now_ms();
-    TCP_SOCKS
-        .lock()
-        .retain(|_, k| !(k.state == TcpState::Closed && now.saturating_sub(k.closed_ms) >= TW_MS));
+    let mut t = TCP_SOCKS.lock();
+    t.retain(|_, k| !(k.state == TcpState::Closed && now.saturating_sub(k.closed_ms) >= tw_ms));
+    let tw: usize = t.values().filter(|k| k.state == TcpState::Closed).count();
+    if tw > cap {
+        // drop the oldest cap-overflow entries by closed_ms
+        let mut aged: Vec<(u16, u64)> = t
+            .iter()
+            .filter(|(_, k)| k.state == TcpState::Closed)
+            .map(|(p, k)| (*p, k.closed_ms))
+            .collect();
+        aged.sort_by_key(|(_, ms)| *ms);
+        for (port, _) in aged.into_iter().take(tw - cap) {
+            t.remove(&port);
+        }
+    }
 }
 
 // ---- socket-fd support (kernel/src/sockfd.rs rides these) ----

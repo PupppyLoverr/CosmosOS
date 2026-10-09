@@ -38523,6 +38523,12 @@ impl Term {
                     "/proc/sys/net/ipv4/ip_nonlocal_bind",
                     "/proc/sys/net/ipv4/conf/all/rp_filter",
                     "/proc/sys/net/ipv4/conf/all/log_martians",
+                    "/proc/sys/net/ipv4/tcp_syn_retries",
+                    "/proc/sys/net/ipv4/tcp_fin_timeout",
+                    "/proc/sys/net/ipv4/tcp_max_tw_buckets",
+                    "/proc/sys/net/ipv4/tcp_keepalive_time",
+                    "/proc/sys/net/ipv4/tcp_keepalive_intvl",
+                    "/proc/sys/net/ipv4/tcp_keepalive_probes",
                     "/proc/sys/net/netfilter/nf_conntrack_max",
                 ];
                 // `-N` prints names only, `-n`/`--values` values only —

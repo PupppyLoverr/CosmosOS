@@ -236,6 +236,42 @@ pub fn set_tcp_wmem(lo: u64, def: u64, max: u64) -> bool {
 static RP_FILTER: AtomicU64 = AtomicU64::new(0);
 static LOG_MARTIANS: AtomicU64 = AtomicU64::new(0);
 static IP_NONLOCAL_BIND: AtomicU64 = AtomicU64::new(0);
+static TCP_SYN_RETRIES: AtomicU64 = AtomicU64::new(6);
+static TCP_FIN_TIMEOUT: AtomicU64 = AtomicU64::new(2);
+static TCP_MAX_TW_BUCKETS: AtomicU64 = AtomicU64::new(4096);
+static KA_TIME: AtomicU64 = AtomicU64::new(15);
+static KA_INTVL: AtomicU64 = AtomicU64::new(1);
+static KA_PROBES: AtomicU64 = AtomicU64::new(9);
+
+/// net.ipv4.tcp_syn_retries — SYN re-send cap during connect()
+/// (Linux default 6); the connect loop gives up ETIMEDOUT after
+/// this many unanswered SYNs.
+pub fn tcp_syn_retries() -> u64 {
+    TCP_SYN_RETRIES.load(Ordering::Relaxed)
+}
+/// net.ipv4.tcp_fin_timeout — TIME_WAIT linger, seconds.
+pub fn tcp_fin_timeout() -> u64 {
+    TCP_FIN_TIMEOUT.load(Ordering::Relaxed)
+}
+/// net.ipv4.tcp_max_tw_buckets — cap on retained TIME_WAIT entries;
+/// the oldest is destroyed when the table would overflow (Linux's
+/// "time wait bucket table overflow" behavior).
+pub fn tcp_max_tw_buckets() -> u64 {
+    TCP_MAX_TW_BUCKETS.load(Ordering::Relaxed)
+}
+/// net.ipv4.tcp_keepalive_time — idle seconds before the first probe.
+pub fn tcp_keepalive_time() -> u64 {
+    KA_TIME.load(Ordering::Relaxed)
+}
+/// net.ipv4.tcp_keepalive_intvl — seconds between probes.
+pub fn tcp_keepalive_intvl() -> u64 {
+    KA_INTVL.load(Ordering::Relaxed)
+}
+/// net.ipv4.tcp_keepalive_probes — unanswered probes before the conn
+/// is declared dead (ECONNRESET on read).
+pub fn tcp_keepalive_probes() -> u64 {
+    KA_PROBES.load(Ordering::Relaxed)
+}
 
 /// net.ipv4.conf.all.rp_filter — 0 off, 1 strict, 2 loose. Wire frames
 /// whose source is martian (127/8, multicast-class, our own addr, or —
@@ -348,6 +384,12 @@ pub fn get(name: &str) -> Option<u64> {
         "net/ipv4/conf/all/rp_filter" => RP_FILTER.load(Ordering::Relaxed),
         "net/ipv4/conf/all/log_martians" => LOG_MARTIANS.load(Ordering::Relaxed),
         "net/ipv4/ip_nonlocal_bind" => IP_NONLOCAL_BIND.load(Ordering::Relaxed),
+        "net/ipv4/tcp_syn_retries" => TCP_SYN_RETRIES.load(Ordering::Relaxed),
+        "net/ipv4/tcp_fin_timeout" => TCP_FIN_TIMEOUT.load(Ordering::Relaxed),
+        "net/ipv4/tcp_max_tw_buckets" => TCP_MAX_TW_BUCKETS.load(Ordering::Relaxed),
+        "net/ipv4/tcp_keepalive_time" => KA_TIME.load(Ordering::Relaxed),
+        "net/ipv4/tcp_keepalive_intvl" => KA_INTVL.load(Ordering::Relaxed),
+        "net/ipv4/tcp_keepalive_probes" => KA_PROBES.load(Ordering::Relaxed),
 
         _ => return None,
     })
@@ -442,6 +484,24 @@ pub fn set(name: &str, v: u64) -> bool {
         }
         "net/ipv4/ip_nonlocal_bind" if v <= 1 => {
             IP_NONLOCAL_BIND.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/tcp_syn_retries" if v <= 127 => {
+            TCP_SYN_RETRIES.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/tcp_fin_timeout" if v <= 3600 => {
+            TCP_FIN_TIMEOUT.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/tcp_max_tw_buckets" if v <= (1 << 22) => {
+            TCP_MAX_TW_BUCKETS.store(v, Ordering::Relaxed)
+        }
+        "net/ipv4/tcp_keepalive_time" if v <= 32767 => {
+            KA_TIME.store(v.max(1), Ordering::Relaxed)
+        }
+        "net/ipv4/tcp_keepalive_intvl" if v <= 32767 => {
+            KA_INTVL.store(v.max(1), Ordering::Relaxed)
+        }
+        "net/ipv4/tcp_keepalive_probes" if v <= 127 => {
+            KA_PROBES.store(v, Ordering::Relaxed)
         }
 
         _ => return false,
