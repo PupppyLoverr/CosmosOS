@@ -34271,6 +34271,74 @@ impl Term {
                 }
             }
             // ---- batch 146: firewall + system utilities ----
+            "tc" => {
+                // Real traffic control: token-bucket shaping on the TX path.
+                // tc qdisc add dev eth0 root tbf rate <bps>[k|m] | tc qdisc del |
+                // tc [ -s ] qdisc [ show ]
+                let sub = args.first().copied().unwrap_or("qdisc");
+                let stats = args.iter().any(|a| *a == "-s");
+                let op = if sub == "-s" {
+                    args.get(1).copied().unwrap_or("qdisc")
+                } else {
+                    sub
+                };
+                match op {
+                    "qdisc" => {
+                        // find verb after 'qdisc'
+                        let qi = args.iter().position(|a| *a == "qdisc").unwrap_or(0);
+                        let verb = args.get(qi + 1).copied().unwrap_or("show");
+                        match verb {
+                            "add" => {
+                                // tc qdisc add dev eth0 root tbf rate R
+                                let rate = args
+                                    .iter()
+                                    .position(|a| *a == "rate")
+                                    .and_then(|i| args.get(i + 1))
+                                    .copied();
+                                let Some(rate) = rate else {
+                                    self.fail("usage: tc qdisc add dev eth0 root tbf rate <bps>[k|m]");
+                                    return;
+                                };
+                                let line = alloc::format!("add qdisc tbf rate {}\n", rate);
+                                match ustd::write_all("/proc/net/tc", line.as_bytes()) {
+                                    Ok(_) => self.emit(&alloc::format!(
+                                        "qdisc tbf added on eth0 (rate {})",
+                                        rate
+                                    )),
+                                    Err(e) => self.fail(&alloc::format!("tc: {}", e)),
+                                }
+                            }
+                            "del" | "delete" | "change" | "replace" => {
+                                if verb == "del" || verb == "delete" {
+                                    match ustd::write_all("/proc/net/tc", b"del\n") {
+                                        Ok(_) => self.emit("qdisc deleted from eth0"),
+                                        Err(e) => self.fail(&alloc::format!("tc: {}", e)),
+                                    }
+                                } else {
+                                    self.fail("tc: only 'add ... tbf rate' and 'del' are supported");
+                                }
+                            }
+                            _ => {
+                                // show / ls — dump /proc/net/tc (with -s it is
+                                // the same file; our table always carries stats)
+                                match ustd::read_all("/proc/net/tc") {
+                                    Ok(b) => {
+                                        let _ = stats;
+                                        for l in String::from_utf8_lossy(&b).lines() {
+                                            self.emit(l);
+                                        }
+                                    }
+                                    Err(e) => self.fail(&alloc::format!("tc: {}", e)),
+                                }
+                            }
+                        }
+                    }
+                    "help" | "-h" => self.emit(
+                        "usage: tc qdisc add dev eth0 root tbf rate <bps>[k|m]\n       tc qdisc del dev eth0 root\n       tc [-s] qdisc show",
+                    ),
+                    _ => self.fail(&alloc::format!("tc: {}: unsupported object", op)),
+                }
+            }
             "iptables" => {
                 // Real INPUT-chain firewall backed by /proc/net/iptables.
                 // -L/-n/-v | -F | -P INPUT ACCEPT|DROP | -D INPUT n |
@@ -39828,7 +39896,7 @@ impl Term {
         "spell", "ul", "skill", "snice", "sfdisk", "vi", "nano", "chvt",
         "rdmsr", "runlevel", "xgettext", "msgunfmt", "soelim",
         "iptables", "iptables-save", "iptables-restore", "shutdown",
-        "conntrack",
+        "conntrack", "tc",
         "sponge", "oathtool", "pwgen", "xkcdpass", "pstack", "errno",
         "scrot", "fbset", "xterm", "uxterm", "xcalc", "taskmgr", "feh",
         "chafa", "xdg-open", "mimetype", "arping", "envdir", "lockfile",
