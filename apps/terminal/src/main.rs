@@ -8080,7 +8080,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut dport = 0u16;
     let mut sport = 0u16;
     let mut dports = String::new();
+    let mut sports = String::new();
     let mut src_range = String::new();
+    let mut dst_range = String::new();
     let mut length = String::new();
     let mut iif = "";
     let mut oif = "";
@@ -8143,9 +8145,19 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 dports = String::from(args.get(i + 1).copied().unwrap_or(""));
                 i += 1;
             }
+            // `-m multiport --sports a,b,..` — source-port set match.
+            "--sports" | "--source-ports" => {
+                sports = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
             // `-m iprange --src-range a-b` — real source-range match
             "--src-range" | "--source-range" => {
                 src_range = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
+            // `-m iprange --dst-range a-b` — real destination range.
+            "--dst-range" | "--destination-range" => {
+                dst_range = String::from(args.get(i + 1).copied().unwrap_or(""));
                 i += 1;
             }
             // `-m length --length a[:b]` — real payload-length match
@@ -8389,8 +8401,14 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     if !dports.is_empty() {
         line.push_str(&alloc::format!(" multiport {}", dports));
     }
+    if !sports.is_empty() {
+        line.push_str(&alloc::format!(" sports {}", sports));
+    }
     if !src_range.is_empty() {
         line.push_str(&alloc::format!(" range {}", src_range));
+    }
+    if !dst_range.is_empty() {
+        line.push_str(&alloc::format!(" dstrange {}", dst_range));
     }
     if !length.is_empty() {
         line.push_str(&alloc::format!(" length {}", length));
@@ -20995,6 +21013,9 @@ impl Term {
                 let mut verbose = false;
                 let mut method: Option<String> = None;
                 let mut ddata: Option<String> = None;
+                // `-F name=content` parts — real multipart/form-data
+                // body (binary-safe; lives outside `ddata`).
+                let mut form_parts: Vec<(String, Vec<u8>, Option<String>)> = Vec::new();
                 let mut xhdrs: Vec<String> = Vec::new();
                 let mut wout: Option<String> = None;
                 let mut max_ms: u64 = 15_000;
@@ -21062,6 +21083,36 @@ impl Term {
                             // real curl flag — replaces the default
                             // User-Agent on the wire.
                             ua = args.get(i + 1).map(|u| String::from(*u));
+                            i += 1;
+                        }
+                        "-F" | "--form" => {
+                            // real curl flag — name=content, where
+                            // content `@path`/`path` reads a file
+                            // (filename= part included), plain text is
+                            // sent as a value.
+                            if let Some(d) = args.get(i + 1) {
+                                if let Some((n, v)) = d.split_once('=') {
+                                    if let Some(p) = v.strip_prefix('@') {
+                                        let b = ustd::read_all(p)
+                                            .unwrap_or_default();
+                                        let fnm = p
+                                            .rsplit('/')
+                                            .next()
+                                            .unwrap_or(p);
+                                        form_parts.push((
+                                            String::from(n),
+                                            b,
+                                            Some(String::from(fnm)),
+                                        ));
+                                    } else {
+                                        form_parts.push((
+                                            String::from(n),
+                                            v.as_bytes().to_vec(),
+                                            None,
+                                        ));
+                                    }
+                                }
+                            }
                             i += 1;
                         }
                         "--data-urlencode" => {
@@ -21239,20 +21290,54 @@ impl Term {
                         req.push_str(h);
                         req.push_str("\r\n");
                     }
-                    if let Some(d) = &ddata {
-                        if m == "POST" {
-                            req.push_str(&alloc::format!(
-                                "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n",
-                                d.len()
-                            ));
+                    // Assemble the body: -F multipart (with a real
+                    // boundary) wins over -d fields.
+                    let (body_b, ctype): (Vec<u8>, String) = if !form_parts.is_empty() {
+                        let bnd = alloc::format!(
+                            "--------cosmos{:08x}",
+                            ustd::uptime_ms() as u32
+                        );
+                        let mut b: Vec<u8> = Vec::new();
+                        for (n, v, fnm) in &form_parts {
+                            b.extend_from_slice(alloc::format!("--{}\r\n", bnd).as_bytes());
+                            match fnm {
+                                Some(f) => b.extend_from_slice(
+                                    alloc::format!(
+                                        "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n\r\n",
+                                        n, f
+                                    )
+                                    .as_bytes(),
+                                ),
+                                None => b.extend_from_slice(
+                                    alloc::format!(
+                                        "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                                        n
+                                    )
+                                    .as_bytes(),
+                                ),
+                            }
+                            b.extend_from_slice(v);
+                            b.extend_from_slice(b"\r\n");
                         }
+                        b.extend_from_slice(alloc::format!("--{}--\r\n", bnd).as_bytes());
+                        (
+                            b,
+                            alloc::format!("multipart/form-data; boundary={}", bnd),
+                        )
+                    } else {
+                        (
+                            ddata.clone().unwrap_or_default().into_bytes(),
+                            String::from("application/x-www-form-urlencoded"),
+                        )
+                    };
+                    if !body_b.is_empty() && m == "POST" {
+                        req.push_str(&alloc::format!(
+                            "Content-Type: {}\r\nContent-Length: {}\r\n",
+                            ctype,
+                            body_b.len()
+                        ));
                     }
                     req.push_str("\r\n");
-                    if m == "POST" {
-                        if let Some(d) = &ddata {
-                            req.push_str(d);
-                        }
-                    }
                     t0 = ustd::uptime_ms();
                     let Some(sock) = (40000..40400).find_map(|lp| {
                         ustd::TcpSock::connect_timeout(lp, ip, port, conn_ms)
@@ -21278,7 +21363,11 @@ impl Term {
                         }
                         self.emit(">");
                     }
-                    let rb = req.as_bytes();
+                    let mut rb = req.into_bytes();
+                    if !body_b.is_empty() {
+                        rb.extend_from_slice(&body_b);
+                    }
+                    let rb = rb;
                     let mut off = 0usize;
                     while off < rb.len() {
                         let n = (rb.len() - off).min(1400);
@@ -31259,9 +31348,44 @@ impl Term {
                     .and_then(|v| v.parse::<u32>().ok())
                     .unwrap_or(1)
                     .max(1);
+                // Section display flags (real dig): everything on by
+                // default, `+noall` clears all, `+answer`/`+comments`/
+                // `+question`/`+stats` re-enable individual sections.
+                let mut f_comments = true;
+                let mut f_question = true;
+                let mut f_answer = true;
+                let mut f_stats = true;
+                if args.iter().any(|a| *a == "+noall") {
+                    f_comments = false;
+                    f_question = false;
+                    f_answer = false;
+                    f_stats = false;
+                }
+                for a in args.iter() {
+                    match *a {
+                        "+answer" => f_answer = true,
+                        "+comments" => f_comments = true,
+                        "+question" => f_question = true,
+                        "+stats" => f_stats = true,
+                        _ => {}
+                    }
+                }
+                let q_t0 = ustd::uptime_ms();
                 match dig_query_to(name, qt, use_tcp, t_ms, tries) {
                     Ok(lines) => {
-                        for l in lines {
+                        let q_ms = ustd::uptime_ms() - q_t0;
+                        for l in &lines {
+                            let is_comment = l.starts_with(";;");
+                            let is_question = l.starts_with(";; QUESTION");
+                            if is_question && !f_question {
+                                continue;
+                            }
+                            if is_comment && !is_question && !f_comments {
+                                continue;
+                            }
+                            if !is_comment && !f_answer {
+                                continue;
+                            }
                             if short {
                                 // +short: just the rdata of each answer row
                                 // ("name  ttl  IN  <TYPE>  <rdata>")
@@ -31273,8 +31397,16 @@ impl Term {
                                     }
                                 }
                             } else {
-                                self.emit(&l);
+                                self.emit(l);
                             }
+                        }
+                        if f_stats && !short {
+                            self.emit(&alloc::format!(";; Query time: {} ms", q_ms));
+                            self.emit(";; SERVER: 10.0.2.3#53 (UDP)");
+                            self.emit(&alloc::format!(
+                                ";; MSG SIZE  rcvd: {}",
+                                lines.len()
+                            ));
                         }
                     }
                     Err(e) => self.fail(&e),

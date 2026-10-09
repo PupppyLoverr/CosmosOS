@@ -5467,6 +5467,32 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let p3 = ustd::net_ping(0x0A00_0202, 1500).is_some(); // flushed
         a && p1 && p2 && dump && p3
     });
+    check("ipt-dstrange", {
+        // `-m iprange --dst-range`: drop icmp replies whose
+        // destination (us) falls inside the range.
+        let a = ustd::write_all(
+            "/proc/net/iptables",
+            b"A IN icmp dstrange 10.0.2.14-10.0.2.16 drop\n",
+        )
+        .is_ok();
+        let dropped = ustd::net_ping(0x0A00_0202, 1200).is_none();
+        let _ = ustd::write_all("/proc/net/iptables", b"F\n");
+        let ok = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        a && dropped && ok
+    });
+    check("ipt-sports", {
+        // `-m multiport --sports`: drop UDP packets whose source port
+        // is 53 — the DNS reply is silently dropped, ping unaffected.
+        let _ = ustd::write_all("/proc/net/dns", b"F\n");
+        let a =
+            ustd::write_all("/proc/net/iptables", b"A IN udp sports 53 drop\n").is_ok();
+        let blocked = ustd::net_dns("example.com").is_none();
+        let _ = ustd::write_all("/proc/net/iptables", b"F\n");
+        let _ = ustd::write_all("/proc/net/dns", b"F\n");
+        let ok = ustd::net_dns("example.com").is_some()
+            && ustd::net_ping(0x0A00_0202, 1500).is_some();
+        a && blocked && ok
+    });
 
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {

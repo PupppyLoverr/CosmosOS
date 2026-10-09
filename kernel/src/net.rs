@@ -337,9 +337,11 @@ struct FwRule {
     proto: u8,            // 0 = any; 1 icmp, 6 tcp, 17 udp
     dport: u16,           // 0 = any (tcp/udp destination port)
     dports: Vec<u16>,     // `-m multiport --dports a,b,..` — empty = not used
+    sports: Vec<u16>,     // `-m multiport --sports a,b,..` — empty = not used
     src: [u8; 4],         // [0;4] = anywhere
     smask: [u8; 4],
     src_range: Option<(u32, u32)>, // `-m iprange --src-range a-b` (be u32 bounds)
+    dst_range: Option<(u32, u32)>, // `-m iprange --dst-range a-b` (be u32 bounds)
     sport: u16,           // `--sport` source-port match: 0 = any
     len_lo: u32,          // `-m length --length A[:B]` — payload-size match
     len_hi: u32,          // (len_hi == 0 => unlimited upper bound)
@@ -672,6 +674,11 @@ fn fw_eval(
         if !r.dports.is_empty() && !r.dports.contains(&dport) {
             continue;
         }
+        // `-m multiport --sports`: the same real set match on the
+        // packet's source port.
+        if !r.sports.is_empty() && !r.sports.contains(&sport) {
+            continue;
+        }
         if r.state != 0 && r.state & st == 0 {
             continue;
         }
@@ -686,6 +693,14 @@ fn fw_eval(
         if let Some((lo, hi)) = r.src_range {
             let s = u32::from_be_bytes(src);
             if s < lo || s > hi {
+                continue;
+            }
+        }
+        // `-m iprange --dst-range a-b`: range containment on the
+        // packet's destination address.
+        if let Some((lo, hi)) = r.dst_range {
+            let d = u32::from_be_bytes(dst);
+            if d < lo || d > hi {
                 continue;
             }
         }
@@ -962,6 +977,13 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
             lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]
         ));
     }
+    if let Some((lo, hi)) = r.dst_range {
+        let (lo, hi) = (lo.to_be_bytes(), hi.to_be_bytes());
+        out.push_str(&alloc::format!(
+            " -m iprange --dst-range {}.{}.{}.{}-{}.{}.{}.{}",
+            lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]
+        ));
+    }
     if !r.dports.is_empty() {
         let mut csv = String::new();
         for (i, p) in r.dports.iter().enumerate() {
@@ -973,6 +995,16 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
         out.push_str(&alloc::format!(" -m multiport --dports {}", csv));
     } else if r.dport != 0 {
         out.push_str(&alloc::format!(" --dport {}", r.dport));
+    }
+    if !r.sports.is_empty() {
+        let mut csv = String::new();
+        for (i, p) in r.sports.iter().enumerate() {
+            if i > 0 {
+                csv.push(',');
+            }
+            csv.push_str(&alloc::format!("{}", p));
+        }
+        out.push_str(&alloc::format!(" -m multiport --sports {}", csv));
     }
     if r.state != 0 {
         out.push_str(&alloc::format!(
@@ -1105,6 +1137,16 @@ fn fmt_fw_rule(out: &mut String, i: usize, r: &FwRule) {
         }
         extra.push_str(&alloc::format!(" multiport dpts:{}", csv));
     }
+    if !r.sports.is_empty() {
+        let mut csv = String::new();
+        for (i, p) in r.sports.iter().enumerate() {
+            if i > 0 {
+                csv.push(',');
+            }
+            csv.push_str(&alloc::format!("{}", p));
+        }
+        extra.push_str(&alloc::format!(" multiport spts:{}", csv));
+    }
     if let Some((lo, hi)) = r.src_range {
         let fmt = |v: u32| {
             let b = v.to_be_bytes();
@@ -1112,6 +1154,17 @@ fn fmt_fw_rule(out: &mut String, i: usize, r: &FwRule) {
         };
         extra.push_str(&alloc::format!(
             " iprange src-range:{}-{}",
+            fmt(lo),
+            fmt(hi)
+        ));
+    }
+    if let Some((lo, hi)) = r.dst_range {
+        let fmt = |v: u32| {
+            let b = v.to_be_bytes();
+            alloc::format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+        };
+        extra.push_str(&alloc::format!(
+            " iprange dst-range:{}-{}",
             fmt(lo),
             fmt(hi)
         ));
@@ -1424,7 +1477,7 @@ fn fw_name_ok(n: &str) -> bool {
         "icmp", "tcp", "udp", "all", "*", "dport", "multiport", "range", "src",
         "state", "limit", "lburst", "log", "reject", "accept", "return", "drop",
         "iif", "oif", "sport", "length", "comment", "ttl", "tos", "mac",
-        "dscp", "icmpt", "syn", "rset", "rchk", "rupd",
+        "dscp", "icmpt", "syn", "rset", "rchk", "rupd", "sports", "dstrange",
     ];
     !n.is_empty()
         && n.len() <= 28
@@ -1796,9 +1849,11 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         proto,
         dport: 0,
         dports: Vec::new(),
+        sports: Vec::new(),
         src: [0; 4],
         smask: [0; 4],
         src_range: None,
+        dst_range: None,
         sport: 0,
         len_lo: 0,
         len_hi: 0,
@@ -1888,6 +1943,38 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
                     .collect();
                 if r.dports.is_empty() {
                     ok = false;
+                }
+            }
+            // `-m multiport --sports a,b,..` — source-port set.
+            "sports" => {
+                r.sports = f
+                    .next()
+                    .unwrap_or("")
+                    .split(',')
+                    .filter_map(|s| s.parse::<u16>().ok())
+                    .take(15)
+                    .collect();
+                if r.sports.is_empty() {
+                    ok = false;
+                }
+            }
+            // `-m iprange --dst-range <a>-<b>` — destination range.
+            "dstrange" => {
+                let spec = f.next().unwrap_or("");
+                match spec.split_once('-') {
+                    Some((a, b)) => match (parse_ip(a), parse_ip(b)) {
+                        (Some(lo), Some(hi)) => {
+                            let (lo, hi) =
+                                (u32::from_be_bytes(lo), u32::from_be_bytes(hi));
+                            if lo <= hi {
+                                r.dst_range = Some((lo, hi));
+                            } else {
+                                ok = false;
+                            }
+                        }
+                        _ => ok = false,
+                    },
+                    None => ok = false,
                 }
             }
             "src" => {
@@ -2083,9 +2170,11 @@ fn fw_rule_eq(a: &FwRule, b: &FwRule) -> bool {
     a.proto == b.proto
         && a.dport == b.dport
         && a.dports == b.dports
+        && a.sports == b.sports
         && a.src == b.src
         && a.smask == b.smask
         && a.src_range == b.src_range
+        && a.dst_range == b.dst_range
         && a.sport == b.sport
         && a.len_lo == b.len_lo
         && a.len_hi == b.len_hi
