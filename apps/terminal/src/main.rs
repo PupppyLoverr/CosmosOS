@@ -9890,6 +9890,7 @@ struct TailFollow {
     ifd: i64,
     ents: Vec<TailEnt>,
     last: Option<usize>,
+    pid: u32, // --pid=PID: stop following when this process exits (0 = off)
 }
 
 /// Options for one grep pass (file or stdin).
@@ -10177,7 +10178,7 @@ impl Term {
     // `tail -F a b c…`: emit GNU-style `==> file <==` sections for the
     // current tails, then arm one TailFollow covering every file through a
     // single shared inotify fd (one watch per unique parent dir).
-    fn tail_follow_multi(&mut self, files: &[&str], n: usize, n_from: bool, big_f: bool) {
+    fn tail_follow_multi(&mut self, files: &[&str], n: usize, n_from: bool, big_f: bool, pid: u32) {
         let mut ents: Vec<TailEnt> = Vec::new();
         let mut first = true;
         for p in files {
@@ -10248,6 +10249,7 @@ impl Term {
             ifd,
             ents,
             last: None,
+            pid,
         });
         self.tailf_last = 0;
         self.emit("  (following -- Esc/Enter to stop)");
@@ -11848,8 +11850,16 @@ impl Term {
     }
 
     /// Recursive `tree` rendering (depth-capped).
-    fn tree_recur(&mut self, path: &str, prefix: String, depth: usize) {
-        if depth > 6 {
+    fn tree_recur(
+        &mut self,
+        path: &str,
+        prefix: String,
+        depth: usize,
+        show_all: bool,
+        dirs_only: bool,
+        maxd: usize,
+    ) {
+        if depth >= maxd {
             return;
         }
         let ents = match ustd::readdir(path) {
@@ -11859,8 +11869,18 @@ impl Term {
                 return;
             }
         };
-        let n = ents.len();
-        for (i, e) in ents.iter().enumerate() {
+        let vis: Vec<&shared::DirEntry> = ents
+            .iter()
+            .filter(|e| {
+                let name =
+                    core::str::from_utf8(&e.name[..e.name_len as usize])
+                        .unwrap_or("?");
+                let hidden = e.attr & 0x02 != 0 || name.starts_with('.');
+                (show_all || !hidden) && (!dirs_only || e.is_dir != 0)
+            })
+            .collect();
+        let n = vis.len();
+        for (i, e) in vis.iter().enumerate() {
             let name = core::str::from_utf8(&e.name[..e.name_len as usize]).unwrap_or("?");
             let last = i + 1 == n;
             self.emit(&alloc::format!("{}{} {}", prefix, if last { "`--" } else { "|--" }, name));
@@ -11871,7 +11891,7 @@ impl Term {
                     alloc::format!("{}/{}", path, name)
                 };
                 let next = alloc::format!("{}{}", prefix, if last { "    " } else { "|   " });
-                self.tree_recur(&child, next, depth + 1);
+                self.tree_recur(&child, next, depth + 1, show_all, dirs_only, maxd);
             }
         }
     }
@@ -13920,7 +13940,7 @@ impl Term {
                             'd' => dirself = true,
                             'h' => human = true,
                             'Q' => quote = true,
-                            'l' | '1' => {}
+                            '1' => {}
                             _ => {
                                 self.fail(&alloc::format!("ls: bad flag -{}", c));
                                 return;
@@ -15018,14 +15038,38 @@ impl Term {
                 self.last_ok = true;
             }
             "mkfifo" => {
-                // mkfifo <name...>: real named pipes — buffered kernel queues
-                // with blocking read/write at any canonical path (SYS_MKFIFO)
-                if args.is_empty() {
-                    self.fail("usage: mkfifo <name>...");
+                // mkfifo [-m MODE] <name...>: real named pipes — buffered
+                // kernel queues with blocking read/write at any canonical
+                // path (SYS_MKFIFO). -m/--mode takes an octal mode; FAT32
+                // maps "no write bits" to the readonly attribute (the only
+                // permission bit the fs carries).
+                let mut mode: Option<u32> = None;
+                let mut names: Vec<&str> = Vec::new();
+                let mut ai = 0usize;
+                while ai < args.len() {
+                    let a = args[ai];
+                    if a == "-m" || a == "--mode" {
+                        if let Some(v) = args.get(ai + 1) {
+                            mode = u32::from_str_radix(v, 8).ok();
+                            ai += 1;
+                        }
+                    } else if let Some(v) = a.strip_prefix("--mode=") {
+                        mode = u32::from_str_radix(v, 8).ok();
+                    } else if let Some(v) = a.strip_prefix("-m") {
+                        if !v.is_empty() {
+                            mode = u32::from_str_radix(v, 8).ok();
+                        }
+                    } else if !a.starts_with('-') {
+                        names.push(a);
+                    }
+                    ai += 1;
+                }
+                if names.is_empty() {
+                    self.fail("usage: mkfifo [-m MODE] <name>...");
                     return;
                 }
                 let cwd = ustd::getcwd();
-                for a in args.iter().copied() {
+                for a in names.iter().copied() {
                     let p = if a.starts_with('/') {
                         String::from(a)
                     } else {
@@ -15041,7 +15085,13 @@ impl Term {
                         continue;
                     }
                     match ustd::mkfifo(&p) {
-                        0 => {}
+                        0 => {
+                            if let Some(m) = mode {
+                                if m & 0o222 == 0 {
+                                    let _ = ustd::setattr(&p, 0x01);
+                                }
+                            }
+                        }
 
                         e => self.fail(&alloc::format!("mkfifo: {}: err {}", a, e)),
                     }
@@ -18352,8 +18402,110 @@ impl Term {
                 }
             }
             "cksum" => {
-                // cksum file: POSIX CRC (0x04C11DB7, reflected, len-augmented)
-                let f = args.first().copied().filter(|a| !a.starts_with('-')).unwrap_or("");
+                // cksum [-a ALG] [--untagged] file: POSIX CRC by default;
+                // -a/--algorithm selects sysv|bsd|md5|sha1|sha224|sha256|
+                // sha384|sha512|b2 (real digests, GNU 9.x). crc/sysv/bsd
+                // print `sum size file`; digest algs print `ALG (f) = hex`,
+                // or `hex  f` under --untagged.
+                let mut alg = "crc";
+                let mut untag = false;
+                let mut cfile: Option<&str> = None;
+                let mut ai = 0usize;
+                while ai < args.len() {
+                    let a = args[ai];
+                    if let Some(v) = a.strip_prefix("--algorithm=") {
+                        alg = v;
+                    } else if a == "--algorithm" {
+                        alg = args.get(ai + 1).copied().unwrap_or("crc");
+                        ai += 1;
+                    } else if a == "-a" {
+                        alg = args.get(ai + 1).copied().unwrap_or("crc");
+                        ai += 1;
+                    } else if let Some(v) = a.strip_prefix("-a") {
+                        if !v.is_empty() {
+                            alg = v;
+                        }
+                    } else if a == "--untagged" {
+                        untag = true;
+                    } else if !a.starts_with('-') && cfile.is_none() {
+                        cfile = Some(a);
+                    }
+                    ai += 1;
+                }
+                if !matches!(alg,
+                    "crc" | "sysv" | "bsd" | "md5" | "sha1" | "sha224"
+                        | "sha256" | "sha384" | "sha512" | "b2" | "blake2b")
+                {
+                    self.fail(&alloc::format!(
+                        "cksum: {}: unsupported algorithm",
+                        alg
+                    ));
+                    return;
+                }
+                if alg != "crc" {
+                    let f = cfile.unwrap_or("");
+                    let mut bad = false;
+                    let data = if f.is_empty() {
+                        self.pipe_in.clone().unwrap_or_default().into_bytes()
+                    } else {
+                        match ustd::read_all(f) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                self.fail(&alloc::format!(
+                                    "cksum: {}: err {}",
+                                    f, e
+                                ));
+                                bad = true;
+                                Vec::new()
+                            }
+                        }
+                    };
+                    if !bad {
+                        match alg {
+                            "sysv" | "bsd" => {
+                                // reuse the sum(1) cores: sysv folds a
+                                // byte sum in 512B blocks, bsd rotates right
+                                let (s, blk) = if alg == "sysv" {
+                                    (sum_sysv(&data), data.len().div_ceil(512))
+                                } else {
+                                    (sum_bsd(&data), data.len().div_ceil(1024))
+                                };
+                                self.emit(&alloc::format!("{} {} {}", s, blk, f));
+                            }
+                            _ => {
+                                let dg: Vec<u8> = match alg {
+                                    "md5" => ustd::md5(&data).to_vec(),
+                                    "sha1" => ustd::sha1(&data).to_vec(),
+                                    "sha224" => sha224(&data).to_vec(),
+                                    "sha256" => sha256(&data).to_vec(),
+                                    "sha384" => sha384(&data).to_vec(),
+                                    "sha512" => sha512(&data).to_vec(),
+                                    _ => b2s256(&data).to_vec(),
+                                };
+                                let nm = match alg {
+                                    "b2" | "blake2b" => "BLAKE2b",
+                                    _ => alg,
+                                };
+                                if untag {
+                                    self.emit(&alloc::format!(
+                                        "{}  {}",
+                                        hexs(&dg),
+                                        f
+                                    ));
+                                } else {
+                                    self.emit(&alloc::format!(
+                                        "{} ({}) = {}",
+                                        nm.to_uppercase(),
+                                        f,
+                                        hexs(&dg)
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                let f = cfile.unwrap_or("");
                 let mut bad = false;
                 let data = if f.is_empty() {
                     self.pipe_in.clone().unwrap_or_default().into_bytes()
@@ -22968,13 +23120,41 @@ impl Term {
                 }
             }
             "tree" => {
-                let root = match args.first() {
-                    Some(p) if *p != "." => String::from(*p),
+                // tree [-a] [-d] [-L N] [dir]: -a also lists hidden
+                // entries (FAT attr 0x02 / dot-names), -d lists
+                // directories only, -L caps descent depth (real GNU flags)
+                let mut show_all = false;
+                let mut dirs_only = false;
+                let mut maxd = 7usize;
+                let mut root: Option<&str> = None;
+                let mut ai = 0usize;
+                while ai < args.len() {
+                    let a = args[ai];
+                    if a == "-a" {
+                        show_all = true;
+                    } else if a == "-d" {
+                        dirs_only = true;
+                    } else if a == "-L" {
+                        if let Some(v) = args.get(ai + 1) {
+                            maxd = v.parse().unwrap_or(maxd);
+                            ai += 1;
+                        }
+                    } else if let Some(v) = a.strip_prefix("-L") {
+                        if !v.is_empty() {
+                            maxd = v.parse().unwrap_or(maxd);
+                        }
+                    } else if !a.starts_with('-') {
+                        root = Some(a);
+                    }
+                    ai += 1;
+                }
+                let root = match root {
+                    Some(p) if p != "." => String::from(p),
                     _ => ustd::getcwd(),
                 };
                 self.emit(&root);
                 let r = root.clone();
-                self.tree_recur(&r, "".into(), 0);
+                self.tree_recur(&r, "".into(), 0, show_all, dirs_only, maxd);
             }
             "sleep" => {
                 // real sleep semantics: seconds by default (fractional ok),
@@ -24790,6 +24970,39 @@ impl Term {
                             ));
                             return;
                         }
+                        // --output=a,b: GNU field selection — pick which
+                        // columns print, in the order given
+                        if let Some(ol) = args
+                            .iter()
+                            .find_map(|a| a.strip_prefix("--output="))
+                        {
+                            let mut hdrs: Vec<&str> = Vec::new();
+                            let mut vals: Vec<String> = Vec::new();
+                            for c in ol.split(',') {
+                                let (h, v): (&str, String) =
+                                    match c.trim().to_lowercase().as_str() {
+                                        "source" => ("Filesystem", String::from("/dev/vda")),
+                                        "fstype" => ("Type", String::from("vfat")),
+                                        "size" => ("Size", if human { human_size(total) } else { alloc::format!("{}", total / unit) }),
+                                        "used" => ("Used", if human { human_size(used) } else { alloc::format!("{}", used / unit) }),
+                                        "avail" => ("Avail", if human { human_size(free) } else { alloc::format!("{}", free / unit) }),
+                                        "pcent" => ("Use%", alloc::format!("{}%", pct)),
+                                        "target" => ("Mounted on", String::from("/")),
+                                        c => {
+                                            self.fail(&alloc::format!(
+                                                "df: '{}': unknown field",
+                                                c
+                                            ));
+                                            return;
+                                        }
+                                    };
+                                hdrs.push(h);
+                                vals.push(v);
+                            }
+                            self.emit(&hdrs.join(" "));
+                            self.emit(&vals.join(" "));
+                            return;
+                        }
                         if typ {
                             self.emit(&alloc::format!(
                                 "Filesystem     Type   {}      Used      Avail   Use%",
@@ -25577,7 +25790,7 @@ impl Term {
                     if *a == "-n" || *a == "-k" || *a == "-t" || *a == "-o" {
                         valpos.push(i + 1);
                     }
-                    if cmd != "sort" && *a == "-c" {
+                    if cmd != "sort" && (*a == "-c" || *a == "--pid") {
                         valpos.push(i + 1);
                     }
                 }
@@ -25618,6 +25831,18 @@ impl Term {
                 };
                 // multi-file tail -f/-F: GNU ==>-headers, one shared inotify fd
                 let follow = args.iter().any(|a| *a == "-f" || *a == "-F");
+                // --pid=PID | --pid PID: follow ends when the process exits
+                let follow_pid: u32 = args
+                    .iter()
+                    .find_map(|a| a.strip_prefix("--pid="))
+                    .and_then(|v| v.parse().ok())
+                    .or_else(|| {
+                        args.iter()
+                            .position(|a| *a == "--pid")
+                            .and_then(|i| args.get(i + 1))
+                            .and_then(|v| v.parse().ok())
+                    })
+                    .unwrap_or(0);
                 if cmd == "tail" && follow {
                     let files: Vec<&str> = args
                         .iter()
@@ -25631,6 +25856,7 @@ impl Term {
                             n,
                             n_from,
                             args.iter().any(|a| *a == "-F"),
+                            follow_pid,
                         );
                         return;
                     }
@@ -26061,6 +26287,7 @@ impl Term {
                                             wd,
                                         }],
                                         last: None,
+                                        pid: follow_pid,
                                     });
                                     self.tailf_last = 0;
                                     self.emit("  (following -- Esc/Enter to stop)");
@@ -26096,6 +26323,7 @@ impl Term {
                                         wd,
                                     }],
                                     last: None,
+                                    pid: follow_pid,
                                 });
                                 self.tailf_last = 0;
                                 self.emit(&alloc::format!(
@@ -43533,11 +43761,39 @@ impl Term {
         };
         let (fl, fw, fc, fm, fchars) =
             (has('l'), has('w'), has('c'), has('L'), has('m'));
-        let files: Vec<&str> = args
+        // --files0-from=F: NUL-separated name list from F ("-" = stdin);
+        // GNU rejects combining it with positional operands
+        let mut files: Vec<String> = args
             .iter()
             .filter(|a| !a.starts_with('-'))
-            .copied()
+            .map(|a| String::from(*a))
             .collect();
+        if let Some(f0f) =
+            args.iter().find_map(|a| a.strip_prefix("--files0-from="))
+        {
+            if !files.is_empty() {
+                self.fail(
+                    "wc: file operands cannot be combined with --files0-from",
+                );
+                return;
+            }
+            let raw = if f0f == "-" {
+                self.pipe_in.clone().unwrap_or_default().into_bytes()
+            } else {
+                match ustd::read_all(f0f) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.fail(&alloc::format!("wc: {}: err {}", f0f, e));
+                        return;
+                    }
+                }
+            };
+            for n in raw.split(|b| *b == 0) {
+                if !n.is_empty() {
+                    files.push(String::from_utf8_lossy(n).into_owned());
+                }
+            }
+        }
         // (lines, words, bytes, max line length, chars)
         let counts = |raw: &[u8], s: &str| -> (usize, usize, usize, usize, usize) {
             let (mut l, mut w) = (0usize, 0usize);
@@ -43599,10 +43855,43 @@ impl Term {
             self.fail("usage: wc [-lwc] <file..>");
             return;
         }
+        // --files0-from=F: NUL-separated name list from F ("-" = stdin);
+        // GNU rejects combining it with positional operands
+        let mut files: Vec<String> = args
+            .iter()
+            .filter(|a| !a.starts_with('-'))
+            .map(|a| String::from(*a))
+            .collect();
+        if let Some(f0f) =
+            args.iter().find_map(|a| a.strip_prefix("--files0-from="))
+        {
+            if !files.is_empty() {
+                self.fail(
+                    "wc: file operands cannot be combined with --files0-from",
+                );
+                return;
+            }
+            let raw = if f0f == "-" {
+                self.pipe_in.clone().unwrap_or_default().into_bytes()
+            } else {
+                match ustd::read_all(f0f) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.fail(&alloc::format!("wc: {}: err {}", f0f, e));
+                        return;
+                    }
+                }
+            };
+            for n in raw.split(|b| *b == 0) {
+                if !n.is_empty() {
+                    files.push(String::from_utf8_lossy(n).into_owned());
+                }
+            }
+        }
         let multi = files.len() > 1;
         let mut tot = (0usize, 0usize, 0usize, 0usize, 0usize);
         for f in &files {
-            match ustd::read_all(f) {
+            match ustd::read_all(f.as_str()) {
                 Ok(d) => {
                     let s = String::from_utf8_lossy(&d);
                     let c = counts(&d, &s);
@@ -43611,7 +43900,7 @@ impl Term {
                     tot.2 += c.2;
                     tot.3 = tot.3.max(c.3);
                     tot.4 += c.4;
-                    show(self, c, if multi { f } else { "" });
+                    show(self, c, if multi { f.as_str() } else { "" });
                 }
                 Err(e) => self.fail(&alloc::format!("wc: {}: err {}", f, e)),
             }
@@ -45220,6 +45509,25 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             if now - t.tailf_last >= 400 {
                 t.tailf_last = now;
                 let mut tf = tf;
+                // --pid=PID: GNU tail exits the follow when the named
+                // process is gone
+                if tf.pid != 0
+                    && !ustd::proclist(64).iter().any(|p| p.pid == tf.pid)
+                {
+                    for e in &tf.ents {
+                        if e.fd >= 0 {
+                            ustd::close(e.fd);
+                        }
+                    }
+                    if tf.ifd >= 0 {
+                        ustd::close(tf.ifd);
+                    }
+                    t.push_line(&alloc::format!(
+                        "tail: process {} has exited - stopped following",
+                        tf.pid
+                    ));
+                    t.tailf = None;
+                } else {
                 // -F: drain pending watch events; wd identifies the parent
                 // dir, the record's name the basename of the changed file
                 if tf.ifd >= 0 && ustd::poll(&[tf.ifd as u32], &[1], 0) > 0 {
@@ -45302,6 +45610,7 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
                     }
                 }
                 t.tailf = Some(tf);
+                }
                 t.dirty_all = true;
             }
         }
