@@ -45,6 +45,8 @@ mod signalfd;
 mod vfs;
 mod virtio;
 mod virtio_net;
+mod virtio_rng;
+mod sysctl;
 
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
@@ -97,6 +99,7 @@ fn main(boot_info: &'static mut BootInfo) -> ! {
 
     // devices
     virtio::init();
+    virtio_rng::init();
     net::init();
     vfs::init();
     input::init();

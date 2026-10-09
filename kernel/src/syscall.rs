@@ -4188,6 +4188,28 @@ fn sys_pidfd_getfd(pidfd: u64, tfd: u64, _flags: u64) -> u64 {
         return (-9i64) as u64;
     };
     let me = task::current_id();
+    // kernel.yama.ptrace_scope gates this just like PTRACE_ATTACH
+    let scope = crate::sysctl::yama_scope();
+    if scope == 3 || (scope >= 2 && !task::capable(task::CAP_SYS_PTRACE)) {
+        return (-1i64) as u64;
+    }
+    if scope == 1 && !task::capable(task::CAP_SYS_PTRACE) {
+        let mut w = task::with_pid_mut(pid, |t| t.parent as i64);
+        let mut is_desc = false;
+        for _ in 0..16 {
+            if w == me as i64 {
+                is_desc = true;
+                break;
+            }
+            if w <= 0 {
+                break;
+            }
+            w = task::with_pid_mut(w as u32, |p| p.parent as i64);
+        }
+        if !is_desc {
+            return (-1i64) as u64;
+        }
+    }
     let desc = task::fd_clone_from(pid, tfd as usize, me);
     let Some(desc) = desc else {
         return (-9i64) as u64;
@@ -4733,9 +4755,34 @@ fn sys_ptrace(op: u64, pid: u32, addr: u64, data: u64) -> u64 {
         }
         shared::PT_ATTACH => {
             // Linux: same-uid tracing is free; anything else needs
-            // CAP_SYS_PTRACE.
+            // CAP_SYS_PTRACE. kernel.yama.ptrace_scope adds a stricter
+            // gate on top: 1 = descendants only, 2 = CAP_SYS_PTRACE
+            // only, 3 = nobody may attach.
+            let scope = crate::sysctl::yama_scope();
             let (ru, _, eu, _) = task::creds();
             let privd = task::capable(task::CAP_SYS_PTRACE);
+            if scope == 3 || (scope >= 2 && !privd) {
+                return ERR;
+            }
+            if scope == 1 && !privd {
+                // walk the target's parent chain — each probe is its own
+                // SCHED lock acquisition (no nesting, that self-deadlocks)
+                let mut w = task::with_pid_mut(pid, |t| t.parent as i64);
+                let mut is_desc = false;
+                for _ in 0..16 {
+                    if w == me as i64 {
+                        is_desc = true;
+                        break;
+                    }
+                    if w <= 0 {
+                        break;
+                    }
+                    w = task::with_pid_mut(w as u32, |p| p.parent as i64);
+                }
+                if !is_desc {
+                    return ERR;
+                }
+            }
             let ok = task::with_pid_mut(pid, |t| {
                 if !privd && ru != t.uid && eu != t.uid && ru != t.suid && eu != t.suid {
                     return -1;
@@ -5492,6 +5539,15 @@ pub(crate) fn rand_fill(out: &mut [u8]) {
         let take = (out.len() - i).min(8);
         out[i..i + take].copy_from_slice(&b[..take]);
         i += take;
+    }
+    // when a hardware RNG is present (virtio-rng), fold its output over
+    // the software stream — real device entropy on every getrandom call
+    if crate::virtio_rng::ready() {
+        let mut hw = [0u8; 64];
+        let hwlen = crate::virtio_rng::fill(&mut hw);
+        for (i, ob) in out.iter_mut().enumerate() {
+            *ob ^= hw[i % 64.max(1).min(hwlen.max(1))].wrapping_add(i as u8);
+        }
     }
 }
 

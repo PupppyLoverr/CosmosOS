@@ -76,6 +76,9 @@ pub fn add_watch(fd_path: &str, path: &str, mask: u32) -> Result<u32, i64> {
         w.mask |= mask;
         return Ok(w.wd);
     }
+    if i.watches.len() as u64 >= crate::sysctl::inotify_max_watches() {
+        return Err(-28); // ENOSPC — real Linux inotify error
+    }
     let wd = i.next_wd;
     i.next_wd += 1;
     i.watches.push(Watch { wd, path: String::from(path), mask });

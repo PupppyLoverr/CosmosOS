@@ -25,9 +25,9 @@ use spin::Mutex;
 use x86_64::instructions::port::Port;
 
 const SNAPSHOT: usize = 4096;
-const NAMES: [&str; 21] = [
+const NAMES: [&str; 22] = [
     "null", "zero", "full", "random", "urandom", "rtc", "vda",
-    "fb0", "kmsg", "console", "mem", "nvram", "smbios", "dsp",
+    "fb0", "kmsg", "console", "mem", "nvram", "smbios", "dsp", "hwrng",
     "smbios-tables", "port", "loopctl", "loop0", "loop1", "loop2", "loop3",
 ];
 
@@ -100,6 +100,13 @@ pub fn read_at(path: &str, pos: u64, buf: &mut [u8]) -> Result<usize, i64> {
         "random" | "urandom" => {
             crate::syscall::rand_fill(buf);
             Ok(buf.len())
+        }
+        "hwrng" => {
+            // hardware entropy source (virtio-rng). ENODEV when absent.
+            match crate::virtio_rng::fill(buf) {
+                0 => Err(-19),
+                n => Ok(n),
+            }
         }
         "console" | "dsp" => Ok(0), // write-only sinks; reads EOF
         "loopctl" => loopctl_read(pos, buf),

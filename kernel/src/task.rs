@@ -831,8 +831,10 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
     }
     let mut g = SCHED.lock();
     let s = g.as_mut().unwrap();
-    let pid = s.next_pid;
-    s.next_pid += 1;
+    let pid = match alloc_pid(s) {
+        Some(p) => p,
+        None => return Err(11),
+    };
     let name = path.rsplit('/').next().unwrap_or(path);
     // children land in the parent's pidns_for_children (child_ns) when
     // set, else share the parent's namespace; a nonzero ns allocates a
@@ -948,12 +950,31 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
     Ok(pid)
 }
 
+/// kernel.pid_max-aware pid allocation: ids grow monotonically until
+/// they would exceed pid_max, then wrap-scan [1, pid_max] for a free
+/// slot. EAGAIN (None) when the table is also at kernel.threads-max.
+fn alloc_pid(s: &mut Sched) -> Option<u32> {
+    let live = s.tasks.iter().filter(|t| t.state != State::Dead).count() as u64;
+    if live >= crate::sysctl::threads_max() {
+        return None;
+    }
+    let cap = crate::sysctl::pid_max();
+    if s.next_pid as u64 <= cap {
+        let pid = s.next_pid;
+        s.next_pid += 1;
+        return Some(pid);
+    }
+    (1..=cap as u32).find(|c| !s.tasks.iter().any(|t| t.id == *c))
+}
+
 /// Spawn a kernel-space thread.
 pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
     let mut g = SCHED.lock();
     let s = g.as_mut().unwrap();
-    let pid = s.next_pid;
-    s.next_pid += 1;
+    let pid = match alloc_pid(s) {
+        Some(p) => p,
+        None => return 0,
+    };
     let mut kframes = Vec::new();
     let (kbase, ktop) = alloc_kstack(&mut kframes);
     // fabricated kernel iret frame: full CpuContext; ring-0 iretq consumes
@@ -1127,8 +1148,10 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         c.ss = gdt::USER_DS.0 as u64;
         c.rdi = arg;
     }
-    let pid = s.next_pid;
-    s.next_pid += 1;
+    let pid = match alloc_pid(s) {
+        Some(p) => p,
+        None => return None,
+    };
     // snapshot the parent's mm-facing state BEFORE mutating the list
     let cur = &mut s.tasks[s.cur];
     let parent = cur.id;
@@ -1696,10 +1719,12 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
     let cpml4 = create_user_pml4()?;
     let mut g = SCHED.lock();
     let s = g.as_mut().unwrap();
+    let pid = match alloc_pid(s) {
+        Some(p) => p,
+        None => return None,
+    };
     let cur = &mut s.tasks[s.cur];
     let pml4 = cur.pml4?;
-    let pid = s.next_pid;
-    s.next_pid += 1;
     let parent = cur.id;
 
     // share every present user page with the child — no copies
@@ -2823,7 +2848,9 @@ pub fn fd_clone_from(pid: u32, fd: usize, me: u32) -> Option<FileDesc> {
 /// adopt_fd owns the already-acquired reference.
 pub fn adopt_fd(desc: FileDesc) -> Option<usize> {
     with_current(|t| {
-        let limit = (t.rlim_nofile as usize).min(t.fds.len());
+        let limit = (t.rlim_nofile as usize)
+            .min(crate::sysctl::fs_nr_open() as usize)
+            .min(t.fds.len());
         let mut slot = None;
         for i in 0..limit {
             if t.fds[i].is_none() {

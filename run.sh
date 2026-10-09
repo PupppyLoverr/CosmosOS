@@ -42,6 +42,12 @@ NET_ARGS=(
     -device virtio-net-pci,netdev=n0,disable-modern=on
 )
 
+# hardware RNG for /dev/hwrng + getrandom (host /dev/urandom backend)
+RNG_ARGS=(
+    -object rng-random,filename=/dev/urandom,id=rng0
+    -device virtio-rng-pci,rng=rng0,disable-modern=on
+)
+
 exec qemu-system-x86_64 \
     -accel "$ACCEL" \
     -machine q35 \
@@ -53,6 +59,7 @@ exec qemu-system-x86_64 \
     -drive format=raw,file="$OS_IMG" \
     "${DATA_ARGS[@]}" \
     "${NET_ARGS[@]}" \
+    "${RNG_ARGS[@]}" \
     "${SER_ARGS[@]}" \
     "${DISP_ARGS[@]}" \
     $EXTRA
