@@ -8539,6 +8539,191 @@ fn pread_all(fd: i64, off: u64, buf: &mut [u8]) -> bool {
     true
 }
 
+/// Minimal read-only FAT32 volume descriptor for on-disk analysis tools
+/// (filefrag/freefrag). Pure pread-based — no kernel FS involvement.
+struct FatVol {
+    fd: i64,
+    bps: u64,
+    spc: u64,
+    fat_off: u64,
+    fat_sz: u64,   // bytes of one FAT
+    data_off: u64,
+    root_clus: u32,
+}
+
+fn fat_vol_open(img: &str) -> Option<FatVol> {
+    let fd = ustd::open(img, ustd::O_RDONLY).ok()?;
+    let mut b = [0u8; 512];
+    if !pread_all(fd, 0, &mut b) || b[510] != 0x55 || b[511] != 0xAA {
+        ustd::close(fd);
+        return None;
+    }
+    let bps = u16::from_le_bytes([b[11], b[12]]) as u64;
+    let spc = b[13] as u64;
+    if spc == 0 || bps == 0 {
+        ustd::close(fd);
+        return None;
+    }
+    let resv = u16::from_le_bytes([b[14], b[15]]) as u64;
+    let nfats = b[16] as u64;
+    let fz16 = u16::from_le_bytes([b[22], b[23]]) as u64;
+    let fz32 = u32::from_le_bytes([b[36], b[37], b[38], b[39]]) as u64;
+    let fatsz = if fz32 != 0 { fz32 } else { fz16 };
+    if fatsz == 0 || nfats == 0 {
+        ustd::close(fd);
+        return None;
+    }
+    let root_clus = u32::from_le_bytes([b[44], b[45], b[46], b[47]]);
+    Some(FatVol {
+        fd,
+        bps,
+        spc,
+        fat_off: resv * bps,
+        fat_sz: fatsz * bps,
+        data_off: (resv + nfats * fatsz) * bps,
+        root_clus,
+    })
+}
+
+impl FatVol {
+    fn clus_off(&self, c: u32) -> u64 {
+        self.data_off + (c as u64 - 2) * self.spc * self.bps
+    }
+    /// FAT[c] & 0x0FFFFFFF — next cluster in the chain (or EOC value).
+    fn next_clus(&self, c: u32) -> u32 {
+        let mut e = [0u8; 4];
+        if !pread_all(self.fd, self.fat_off + c as u64 * 4, &mut e) {
+            return 0x0FFF_FFFF;
+        }
+        u32::from_le_bytes(e) & 0x0FFF_FFFF
+    }
+    /// Whole cluster chain starting at `start` (capped to break loops).
+    fn chain(&self, start: u32) -> Vec<u32> {
+        let mut v = Vec::new();
+        let mut c = start;
+        let max = (self.fat_sz / 4).min(1 << 26) as u64;
+        while c >= 2 && (c as u64) < max && v.len() < 1 << 20 {
+            v.push(c);
+            let n = self.next_clus(c);
+            if n >= 0x0FFF_FFF8 {
+                break;
+            }
+            c = n;
+        }
+        v
+    }
+    /// Dump a directory's entries as (name, attr, first_cluster, size).
+    /// Reassembles LFN pieces — the returned name is the long filename
+    /// when one exists, else the decoded 8.3 short name.
+    fn dir_entries(&self, clus: u32) -> Vec<(String, u8, u32, u32)> {
+        let mut out = Vec::new();
+        let mut lfn: Vec<(u8, [u16; 13])> = Vec::new();
+        for c in self.chain(clus) {
+            let mut d = alloc::vec![0u8; (self.spc * self.bps) as usize];
+            if !pread_all(self.fd, self.clus_off(c), &mut d) {
+                continue;
+            }
+            for e in d.chunks_exact(32) {
+                if e[0] == 0 {
+                    return out;
+                }
+                if e[0] == 0xE5 {
+                    lfn.clear();
+                    continue;
+                }
+                if e[11] & 0x0F == 0x0F {
+                    // LFN piece: seq in e[0]&0x1f, 13 UTF-16 chars at
+                    // offsets 1 (5), 14 (6), 28 (2)
+                    let mut chars = [0u16; 13];
+                    let fields: [(usize, usize); 3] =
+                        [(1, 5), (14, 6), (28, 2)];
+                    let mut k = 0;
+                    for (off, len) in fields {
+                        for i in 0..len {
+                            chars[k] = u16::from_le_bytes([
+                                e[off + i * 2],
+                                e[off + i * 2 + 1],
+                            ]);
+                            k += 1;
+                        }
+                    }
+                    lfn.push((e[0] & 0x1F, chars));
+                    continue;
+                }
+                if e[11] & 0x08 != 0 {
+                    lfn.clear();
+                    continue; // volume label
+                }
+                // short entry — name = accumulated LFN or decoded 8.3
+                let name = if lfn.is_empty() {
+                    let mut s = [0u8; 11];
+                    s.copy_from_slice(&e[..11]);
+                    decode_83(&s)
+                } else {
+                    lfn.sort_by_key(|p| p.0);
+                    let mut s = String::new();
+                    for (_, ch) in &lfn {
+                        for &u in ch.iter() {
+                            if u == 0 || u == 0xFFFF {
+                                break;
+                            }
+                            s.push(char::from_u32(u as u32).unwrap_or('?'));
+                        }
+                    }
+                    s
+                };
+                lfn.clear();
+                let fc = (u16::from_le_bytes([e[20], e[21]]) as u32) << 16
+                    | u16::from_le_bytes([e[26], e[27]]) as u32;
+                out.push((name, e[11], fc, u32::from_le_bytes([
+                    e[28], e[29], e[30], e[31],
+                ])));
+            }
+        }
+        out
+    }
+    /// Resolve a /-separated path to (first_cluster, size, is_dir).
+    /// FAT names compare case-insensitively.
+    fn find(&self, path: &str) -> Option<(u32, u32, bool)> {
+        let mut clus = self.root_clus;
+        let comps: Vec<&str> =
+            path.split('/').filter(|s| !s.is_empty()).collect();
+        if comps.is_empty() {
+            return Some((clus, 0, true));
+        }
+        for (i, comp) in comps.iter().enumerate() {
+            let mut hit = None;
+            for (n, attr, fc, sz) in self.dir_entries(clus) {
+                if n.eq_ignore_ascii_case(comp) {
+                    hit = Some((fc, sz, attr & 0x10 != 0));
+                    break;
+                }
+            }
+            let (fc, sz, is_dir) = hit?;
+            if i + 1 == comps.len() {
+                return Some((fc, sz, is_dir));
+            }
+            if !is_dir {
+                return None;
+            }
+            clus = fc;
+        }
+        None
+    }
+}
+
+/// Decode a raw 8.3 dir name into a printable name ("BIG     BIN" ->
+/// "BIG.BIN"); strips trailing spaces and the stem/ext space gap.
+fn decode_83(n: &[u8; 11]) -> String {
+    let stem = String::from_utf8_lossy(&n[..8]).trim_end().to_string();
+    let ext = String::from_utf8_lossy(&n[8..]).trim_end().to_string();
+    if ext.is_empty() {
+        stem
+    } else {
+        alloc::format!("{}.{}", stem, ext)
+    }
+}
+
 fn fmt_fixed(millionths: u64) -> String {
     // millionths -> "i.frac" with trailing zeros trimmed
     let i = millionths / 1_000_000;
@@ -12337,6 +12522,7 @@ impl Term {
             "mkfs", "mkfs.vfat", "blkid", "vol", "fsck", "fsck.vfat",
             "wipefs", "isosize", "losetup", "fatlabel", "volname",
             "badblocks", "mkisofs", "genisoimage", "xorrisofs",
+            "filefrag", "freefrag",
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look", "fmt",
         "pwck", "grpck", "pathchk", "nslookup", "b2sum",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
@@ -31271,6 +31457,215 @@ impl Term {
                     )),
                 }
             }
+            "filefrag" => {
+                // filefrag [-v] <file>: real extent map — walks the FAT
+                // cluster chain of the file on the mounted data disk.
+                let verbose = args.iter().any(|a| *a == "-v");
+                let path = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .copied()
+                    .unwrap_or("");
+                if path.is_empty() {
+                    self.fail("usage: filefrag [-v] <file>");
+                    return;
+                }
+                let v = match fat_vol_open("/dev/vda") {
+                    Some(v) => v,
+                    None => {
+                        self.fail("filefrag: no FAT data disk");
+                        return;
+                    }
+                };
+                match v.find(path) {
+                    None => {
+                        ustd::close(v.fd);
+                        self.fail(&alloc::format!(
+                            "filefrag: {}: not found",
+                            path
+                        ));
+                        return;
+                    }
+                    Some((fc, sz, is_dir)) => {
+                        let ch = v.chain(fc);
+                        ustd::close(v.fd);
+                        if ch.is_empty() {
+                            self.emit(&alloc::format!(
+                                "{}: 0 extents found",
+                                path
+                            ));
+                            return;
+                        }
+                        // contiguous runs = extents
+                        let mut exts: Vec<(u32, u32)> = Vec::new();
+                        let mut s = ch[0];
+                        let mut prev = ch[0];
+                        for &c in &ch[1..] {
+                            if c != prev + 1 {
+                                exts.push((s, prev));
+                                s = c;
+                            }
+                            prev = c;
+                        }
+                        exts.push((s, prev));
+                        let kib = (v.spc * v.bps) as u64 / 1024;
+                        self.emit(&alloc::format!(
+                            "{}: {} bytes, {} clusters ({}KiB each), {} extent(s){}",
+                            path, sz, ch.len(), kib, exts.len(),
+                            if is_dir { " [dir]" } else { "" }
+                        ));
+                        if verbose {
+                            let mut logical = 0u32;
+                            for (ei, (a, b)) in exts.iter().enumerate() {
+                                self.emit(&alloc::format!(
+                                    "  {:>4}   {:>5}..{:<5}   {:>7}..{:<7}   {}",
+                                    ei,
+                                    logical,
+                                    logical + (b - a),
+                                    a,
+                                    b,
+                                    b - a + 1
+                                ));
+                                logical += b - a + 1;
+                            }
+                        }
+                    }
+                }
+            }
+            "freefrag" => {
+                // freefrag [img]: histogram of free-cluster runs — real FAT
+                // scan, e2freefrag-style power-of-2 buckets.
+                let img = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .copied()
+                    .unwrap_or("/dev/vda");
+                let v = match fat_vol_open(img) {
+                    Some(v) => v,
+                    None => {
+                        self.fail(&alloc::format!(
+                            "freefrag: {}: not a FAT image",
+                            img
+                        ));
+                        return;
+                    }
+                };
+                let kib = v.spc * v.bps / 1024;
+                // scan FAT in 256KiB chunks, count free runs
+                let mut hist: Vec<(u64, u64)> = Vec::new(); // (extent_kib, count)
+                let mut free_total = 0u64;
+                let mut run = 0u64;
+                let nentries = (v.fat_sz / 4) as u32;
+                let mut chunk = alloc::vec![0u8; 256 * 1024];
+                let mut idx = 0u32;
+                let mut flush_run = |run: u64, hist: &mut Vec<(u64, u64)>| {
+                    if run == 0 {
+                        return;
+                    }
+                    let kb = run * kib;
+                    // bucket: largest power-of-2 <= kb (min 1)
+                    let mut bucket = 1u64;
+                    while bucket * 2 <= kb {
+                        bucket *= 2;
+                    }
+                    if let Some(e) = hist.iter_mut().find(|e| e.0 == bucket) {
+                        e.1 += 1;
+                    } else {
+                        hist.push((bucket, 1));
+                    }
+                };
+                while idx < nentries {
+                    let want = ((nentries - idx) as u64 * 4)
+                        .min(chunk.len() as u64) as usize;
+                    if !pread_all(
+                        v.fd,
+                        v.fat_off + idx as u64 * 4,
+                        &mut chunk[..want],
+                    ) {
+                        break;
+                    }
+                    for e in chunk[..want].chunks_exact(4) {
+                        let val =
+                            u32::from_le_bytes([e[0], e[1], e[2], e[3]])
+                                & 0x0FFF_FFFF;
+                        if val == 0 && idx >= 2 {
+                            run += 1;
+                            free_total += 1;
+                        } else {
+                            flush_run(run, &mut hist);
+                            run = 0;
+                        }
+                        idx += 1;
+                    }
+                }
+                flush_run(run, &mut hist);
+                ustd::close(v.fd);
+                self.emit(&alloc::format!(
+                    "{}: {}KiB cluster, {} free clusters ({} KiB)",
+                    img, kib, free_total, free_total * kib
+                ));
+                hist.sort();
+                if hist.is_empty() {
+                    self.emit("no free extents");
+                } else {
+                    self.emit("   blocks   count");
+                    for (kb, n) in hist.iter().rev() {
+                        self.emit(&alloc::format!(
+                            "{:>8}K  {:>5}",
+                            kb, n
+                        ));
+                    }
+                }
+            }
+            "ifstat" => {
+                // ifstat [sec]: real interface rates — two /proc/net/dev
+                // samples `sec` apart (default 1s), per-iface rx/tx KiB/s.
+                let secs: u64 = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .and_then(|a| a.parse().ok())
+                    .unwrap_or(1)
+                    .max(1);
+                let parse = |s: &str| -> Vec<(String, u64, u64)> {
+                    s.lines()
+                        .filter(|l| l.contains(':'))
+                        .map(|l| {
+                            let (n, r) = l.split_once(':').unwrap();
+                            let f: Vec<&str> =
+                                r.split_whitespace().collect();
+                            (
+                                n.trim().to_string(),
+                                f.first().and_then(|x| x.parse().ok())
+                                    .unwrap_or(0),
+                                f.get(8).and_then(|x| x.parse().ok())
+                                    .unwrap_or(0),
+                            )
+                        })
+                        .collect()
+                };
+                let a = ustd::read_all("/proc/net/dev")
+                    .ok()
+                    .map(|b| String::from_utf8_lossy(&b).to_string())
+                    .unwrap_or_default();
+                let a = parse(&a);
+                ustd::sleep_ms(secs * 1000);
+                let b = ustd::read_all("/proc/net/dev")
+                    .ok()
+                    .map(|x| String::from_utf8_lossy(&x).to_string())
+                    .unwrap_or_default();
+                let b = parse(&b);
+                self.emit("       rx KiB/s      tx KiB/s");
+                for (n, r1, t1) in &a {
+                    if let Some((_, r2, t2)) = b.iter().find(|x| &x.0 == n) {
+                        self.emit(&alloc::format!(
+                            "{:<6}{:>10.1}  {:>10.1}",
+                            n,
+                            (r2 - r1) as f64 / ((secs * 1024) as f64),
+                            (t2 - t1) as f64 / ((secs * 1024) as f64)
+                        ));
+                    }
+                }
+            }
             "halt" => ustd::poweroff(),
             "tput" => match args.first() {
                 Some(&"cols") => self.emit(&alloc::format!("{}", COLS)),
@@ -35586,7 +35981,8 @@ impl Term {
         "lz4", "unlz4", "lz4cat", "scriptreplay", "run-parts", "chpasswd", "less",
         "losetup", "fsck", "fsck.vfat", "fsck.fat", "dosfsck", "wipefs",
         "isosize", "sar", "swaps", "fatlabel", "volname", "badblocks",
-        "mkisofs", "genisoimage", "xorrisofs",
+        "mkisofs", "genisoimage", "xorrisofs", "filefrag", "freefrag",
+        "ifstat", "mountpoint",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
