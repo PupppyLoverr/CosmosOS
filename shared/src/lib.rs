@@ -308,6 +308,7 @@ pub const SYS_CAPGET: u64 = 251;
 /// (pid, in u64[2]{eff,prm}) — self only; prm ⊆ bnd, eff ⊆ prm.
 pub const SYS_CAPSET: u64 = 252;      // (out u32[3]) -> 0 | err
 pub const SYS_RDMSR: u64 = 253;        // (msr u64) -> u64 | err -38 (whitelisted regs)
+pub const SYS_ARPING: u64 = 254;       // (ip u32 BE, timeout_ms) -> mac<<16|rtt | ERR
 /// MS_MOVE: move a mount point instead of creating one
 pub const MS_MOVE: u64 = 0x2000;
 /// CLONE_NEWUTS: unshare the UTS namespace (hostname)

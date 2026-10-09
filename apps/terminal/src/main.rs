@@ -8033,6 +8033,7 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut state = String::new();
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
+    let mut jump_log = false;
     let mut i = 0usize;
     while i < args.len() {
         match args[i] {
@@ -8060,8 +8061,10 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             }
             "-j" | "--jump" => {
                 let t = args.get(i + 1).copied().unwrap_or("DROP");
-                if t != "DROP" {
-                    return None; // only DROP targets are real
+                if t == "LOG" {
+                    jump_log = true;
+                } else if t != "DROP" {
+                    return None; // only DROP/LOG targets are real
                 }
                 i += 1;
             }
@@ -8124,6 +8127,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
         if limit_burst != 0 {
             line.push_str(&alloc::format!(" lburst {}", limit_burst));
         }
+    }
+    if jump_log {
+        line.push_str(" log");
     }
     line.push('\n');
     Some(line)
@@ -34923,23 +34929,48 @@ impl Term {
                     self.fail("usage: mimetype <file>...");
                 }
             }
-            "arping" => match args.iter().copied().find(|a| !a.starts_with('-')) {
-                Some(ip) => {
-                    // one probe to force a real ARP resolution, then read cache
-                    self.run(&alloc::format!("ping -c 1 {}", ip));
-                    let mut hit = false;
-                    for l in ustd::arp_stat().lines() {
-                        if l.contains(ip) && !l.starts_with("ip ") {
-                            self.emit(&alloc::format!("ARPING {} reply {}", ip, l.trim()));
-                            hit = true;
+            "arping" => {
+                // Real ARP who-has probes on the wire (SYS_ARPING) —
+                // arping [-c N] <ip>: 'Unicast reply from <ip> [mac]  N ms'.
+                let mut cnt = 1u32;
+                let mut target: Option<&str> = None;
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-c" => {
+                            cnt = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1).min(64);
+                            i += 2;
+                        }
+                        a => {
+                            target = Some(a);
+                            i += 1;
                         }
                     }
-                    if !hit {
-                        self.fail(&alloc::format!("arping: no reply from {}", ip));
+                }
+                let Some(ip) = target.and_then(|t| host_arg(t)) else {
+                    self.fail("usage: arping [-c n] <ip>");
+                    return;
+                };
+                let mut got = 0u32;
+                for _ in 0..cnt {
+                    match ustd::net_arping(ip, 1500) {
+                        Some((m, rtt)) => {
+                            got += 1;
+                            self.emit(&alloc::format!(
+                                "Unicast reply from {}.{}.{}.{} [{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}]  {}ms",
+                                ip[0], ip[1], ip[2], ip[3],
+                                m[0], m[1], m[2], m[3], m[4], m[5], rtt
+                            ));
+                        }
+                        None => self.emit(&alloc::format!(
+                            "Sent probe, no reply from {}.{}.{}.{}",
+                            ip[0], ip[1], ip[2], ip[3]
+                        )),
                     }
                 }
-                None => self.fail("usage: arping <ip>"),
-            },
+                self.emit(&alloc::format!("Sent {} probe(s).", cnt));
+                self.last_ok = got > 0;
+            }
             "envdir" => {
                 // envdir DIR cmd...: load env from files named by var in DIR
                 if args.len() >= 2 {
