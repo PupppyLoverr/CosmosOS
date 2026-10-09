@@ -5798,6 +5798,54 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         };
         row_ok("/proc/net/tcp") && row_ok("/proc/net/udp")
     });
+    check("ipt-owner", {
+        // `-m owner`: an OUTPUT uid rule matches the real sender's
+        // euid (selftest is uid 0 → `ouid 0` drops its own ping,
+        // `ouid 999` doesn't); INPUT owner rules are rejected.
+        let ipt = "/proc/net/iptables";
+        let gw = 0x0A00_0202u32;
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let warm = ustd::net_ping(gw, 1500).is_some();
+        let a1 = ustd::write_all(ipt, b"A OUTPUT 1 ouid 999 drop\n").is_ok();
+        let open = ustd::net_ping(gw, 1500).is_some();
+        let a2 = ustd::write_all(ipt, b"A OUTPUT 1 ouid 0 drop\n").is_ok();
+        let gated = ustd::net_ping(gw, 900).is_none();
+        let bad = ustd::write_all(ipt, b"A INPUT 1 ouid 0 drop\n").is_err();
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        warm && a1 && open && a2 && gated && bad
+    });
+    check("ipt-pkttype", {
+        // `-m pkttype`: inbound unicast is `host` — a broadcast rule
+        // can't match it, a host rule does; pkttype on OUTPUT fails.
+        let ipt = "/proc/net/iptables";
+        let gw = 0x0A00_0202u32;
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let a1 = ustd::write_all(ipt, b"A INPUT 1 pkttype broadcast drop\n").is_ok();
+        let open = ustd::net_ping(gw, 1500).is_some();
+        let _ = ustd::write_all(ipt, b"F\n");
+        let a2 = ustd::write_all(ipt, b"A INPUT 1 pkttype host drop\n").is_ok();
+        let gated = ustd::net_ping(gw, 900).is_none();
+        let bad = ustd::write_all(ipt, b"A OUTPUT 1 pkttype multicast drop\n").is_err();
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        a1 && open && a2 && gated && bad
+    });
+    check("ipt-hashlimit", {
+        // `-m hashlimit` — real per-src token bucket: 1pkt/s burst 1
+        // passes one ping, blocks the immediate re-ping, refills by
+        // the third a second later.
+        let ipt = "/proc/net/iptables";
+        let gw = 0x0A00_0202u32;
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let _ = ustd::net_ping(gw, 1500);
+        let a1 = ustd::write_all(ipt, b"A INPUT 1 hlimit 1 1 HL185 above drop\n").is_ok();
+        let p1 = ustd::net_ping(gw, 1500).is_some();
+        ustd::sleep_ms(30);
+        let p2 = ustd::net_ping(gw, 700).is_none();
+        ustd::sleep_ms(1200);
+        let p3 = ustd::net_ping(gw, 1500).is_some();
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        a1 && p1 && p2 && p3
+    });
 
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {
