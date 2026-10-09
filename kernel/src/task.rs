@@ -132,6 +132,8 @@ pub struct Task {
     pub argv: String,        // spawn arg string (for /proc/<pid>/cmdline)
     pub nice: i8,            // -20 (highest prio) ..= 19 (lowest); 0 = normal
     pub rt: bool,            // SCHED_RT: runnable rt tasks preempt all non-rt tasks
+    pub rt_prio: u8,         // static RT priority 1..99 (99 when set via chrt)
+    pub dumpable: u8,        // PR_GET/SET_DUMPABLE: 0, 1 or 2 (SUID_DUMP)
     pub vrun: u64,           // virtual runtime (scaled by nice) for fair scheduling
     pub trace: bool,         // syscall tracing on (strace -p)
     pub trbuf: Vec<u64>,     // packed trace records, 7 u64s each: nr,a1..a5,ret
@@ -349,6 +351,8 @@ pub fn init() {
         cpu_ticks: 0,
         nice: 0,
         rt: false,
+        rt_prio: 0,
+        dumpable: 1,
         vrun: 0,
         trace: false,
         trbuf: Vec::new(),
@@ -514,14 +518,19 @@ extern "C" fn sched_tick(saved: u64) -> u64 {
     // Re-picks when signal delivery killed the chosen task.
     loop {
         let n = s.tasks.len();
-        let mut best: Option<((u8, u64), usize)> = None;
+        let mut best: Option<((u8, u8, u64), usize)> = None;
         for off in 1..=n {
             let i = (s.cur + off) % n;
             let t = &s.tasks[i];
             // cgroup cpu.max: a group past quota is unschedulable
             // until its 1s window rolls
             if t.state == State::Running && !crate::cgroup::throttled(t.cgroup) {
-                let key = (if t.rt { 0u8 } else { 1u8 }, t.vrun);
+                // RT first, then descending static rt_prio, then lowest vrun
+                let key = (
+                    if t.rt { 0u8 } else { 1u8 },
+                    99u8.saturating_sub(t.rt_prio),
+                    t.vrun,
+                );
                 match best {
                     Some((k, _)) if key >= k => {}
                     _ => best = Some((key, i)),
@@ -600,12 +609,21 @@ pub fn yield_ctx(ctx: *mut CpuContext) -> ! {
     s.tasks[s.cur].saved_rsp = ctx as u64;
     'outer: loop {
         let n = s.tasks.len();
-        // runnable rt tasks first, then anyone runnable
+        // runnable rt tasks first (highest static rt_prio), then anyone
         for want_rt in [true, false] {
+            let mut best: Option<(u8, usize)> = None;
             for i in 1..=n {
                 let t = &s.tasks[(s.cur + i) % n];
                 if t.state == State::Running && t.rt == want_rt {
-                    s.cur = (s.cur + i) % n;
+                    let k = 99u8.saturating_sub(t.rt_prio);
+                    if best.map(|(bk, _)| k < bk).unwrap_or(true) {
+                        best = Some((k, (s.cur + i) % n));
+                    }
+                }
+            }
+            if let Some((_, bi)) = best {
+                {
+                    s.cur = bi;
                     activate(&s.tasks[s.cur]);
                     let rsp = s.tasks[s.cur].saved_rsp;
                     maybe_deliver(s, s.cur, rsp as *mut CpuContext);
@@ -881,6 +899,8 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         cpu_ticks: 0,
         nice: 0,
         rt: false,
+        rt_prio: 0,
+        dumpable: 1,
         vrun: s.tasks[s.cur].vrun,
         trace: false,
         trbuf: Vec::new(),
@@ -1036,6 +1056,8 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         cpu_ticks: 0,
         nice: 0,
         rt: false,
+        rt_prio: 0,
+        dumpable: 1,
         vrun: s.tasks[s.cur].vrun,
         trace: false,
         trbuf: Vec::new(),
@@ -1200,9 +1222,11 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
     let ctns = if cur.child_tns != 0 { cur.child_tns } else { cur.time_ns };
     let borrowed = cur.borrowed.clone();
     let shm_ids = cur.shm.clone();
-    let (nice, rt, vrun, umask, exe, pfs, rnf, rnp, rstk, rcu, ras) = (
+    let (nice, rt, rtp, dmp, vrun, umask, exe, pfs, rnf, rnp, rstk, rcu, ras) = (
         cur.nice,
         cur.rt,
+        cur.rt_prio,
+        cur.dumpable,
         cur.vrun,
         cur.umask,
         cur.exe.clone(),
@@ -1267,6 +1291,8 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         cpu_ticks: 0,
         nice,
         rt,
+        rt_prio: rtp,
+        dumpable: dmp,
         vrun,
         trace: false,
         trbuf: Vec::new(),
@@ -1886,6 +1912,8 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         cpu_ticks: 0,
         nice,
         rt: false,
+        rt_prio: 0,
+        dumpable: 1,
         vrun: cur.vrun,
         trace: false,
         trbuf: Vec::new(),
@@ -4064,10 +4092,23 @@ pub fn sys_getsid(pid: u32) -> i64 {
     with_pid_mut(target, |t| t.sid as i64)
 }
 
-/// prctl(op, arg): only PR_SET_PDEATHSIG(1) — the signal delivered to
-/// this task when its parent dies.
+/// prctl(op, arg): PR_SET_PDEATHSIG(1) — the signal delivered to this
+/// task when its parent dies; PR_GET_DUMPABLE(3)/PR_SET_DUMPABLE(4);
+/// PR_CAPBSET_DROP(24). GET_NAME/SET_NAME/GET_PDEATHSIG are handled at
+/// the dispatch layer since they copy_out.
 pub fn sys_prctl(op: u64, arg: u64) -> i64 {
     match op {
+        3 => with_current(|t| t.dumpable as i64),
+        4 => {
+            // 0, 1 or 2 (SUID_DUMP) — anything else EINVAL
+            if arg > 2 {
+                return -22;
+            }
+            with_current(|t| {
+                t.dumpable = arg as u8;
+                0
+            })
+        }
         1 => {
             if arg >= 32 {
                 return -22;
@@ -4362,20 +4403,109 @@ pub fn set_rt(pid: u32, rt: bool) -> bool {
     match g.as_mut().and_then(|s| s.tasks.iter_mut().find(|t| t.id == pid)) {
         Some(t) => {
             t.rt = rt;
+            t.rt_prio = if rt { 99 } else { 0 };
             true
         }
         None => false,
     }
 }
 
-/// (nice, rt, name, pdeathsig, cpu_ticks) for the POSIX getter syscalls.
-/// pid 0 = caller. None = no such live task.
-pub fn sched_fields(pid: u32) -> Option<(i8, bool, String, u8, u64)> {
+/// (nice, rt, rt_prio, name, pdeathsig, cpu_ticks, dumpable) for the POSIX
+/// getter syscalls. pid 0 = caller. None = no such live task.
+pub fn sched_fields(
+    pid: u32,
+) -> Option<(i8, bool, u8, String, u8, u64, u8)> {
     let pid = if pid == 0 { current_id() } else { pid };
     let g = SCHED.lock();
     let t = g.as_ref()?.tasks.iter().find(|t| t.id == pid && t.state != State::Dead)?;
-    Some((t.nice, t.rt, t.name.clone(), t.pdeathsig, t.cpu_ticks))
+    Some((
+        t.nice,
+        t.rt,
+        t.rt_prio,
+        t.name.clone(),
+        t.pdeathsig,
+        t.cpu_ticks,
+        t.dumpable,
+    ))
 }
+
+/// sched_setscheduler(pid, policy, prio): policy 0=OTHER needs prio 0;
+/// 1/2 (FIFO/RR, one RT class here) needs 1..99 and CAP_SYS_NICE.
+/// Returns 0 | -22 EINVAL | -1 EPERM | -1000 no such pid.
+pub fn sched_set(pid: u32, policy: u64, prio: u32) -> i64 {
+    let pid = if pid == 0 { current_id() } else { pid };
+    let (rt, rp) = match policy {
+        shared::SCHED_OTHER => {
+            if prio != 0 {
+                return -22;
+            }
+            (false, 0)
+        }
+        shared::SCHED_FIFO | shared::SCHED_RR => {
+            if !(1..=99).contains(&prio) {
+                return -22;
+            }
+            if !capable(CAP_SYS_NICE) {
+                return -1;
+            }
+            (true, prio.min(99) as u8)
+        }
+        _ => return -22,
+    };
+    let mut g = SCHED.lock();
+    let s = match g.as_mut() {
+        Some(s) => s,
+        None => return -1000,
+    };
+    match s.tasks.iter_mut().find(|t| t.id == pid && t.state != State::Dead) {
+        Some(t) => {
+            t.rt = rt;
+            t.rt_prio = rp;
+            0
+        }
+        None => -1000,
+    }
+}
+
+/// sched_setparam(pid, prio): rt tasks take 1..99 (CAP_SYS_NICE);
+/// normal tasks only accept 0. 0 | -22 | -1 | -1000.
+pub fn sched_setparam(pid: u32, prio: u32) -> i64 {
+    let pid = if pid == 0 { current_id() } else { pid };
+    let mut g = SCHED.lock();
+    let s = match g.as_mut() {
+        Some(s) => s,
+        None => return -1000,
+    };
+    match s.tasks.iter_mut().find(|t| t.id == pid && t.state != State::Dead) {
+        Some(t) => {
+            if t.rt {
+                if !(1..=99).contains(&prio) {
+                    return -22;
+                }
+                if !capable(CAP_SYS_NICE) {
+                    return -1;
+                }
+                t.rt_prio = prio.min(99) as u8;
+            } else if prio != 0 {
+                return -22;
+            }
+            0
+        }
+        None => -1000,
+    }
+}
+
+/// sched_get_priority_min/max for a policy. None = unknown policy.
+pub fn sched_prio_range(policy: u64) -> Option<(i64, i64)> {
+    match policy {
+        shared::SCHED_OTHER => Some((0, 0)),
+        shared::SCHED_FIFO | shared::SCHED_RR => Some((1, 99)),
+        _ => None,
+    }
+}
+
+/// set_rt now also stamps the default static priority 99/0 so chrt and
+/// sched_setscheduler stay consistent.
 
 /// Whether a task runs in the rt class (/proc/<pid>/status).
 pub fn pid_rt(pid: u32) -> Option<bool> {

@@ -3402,6 +3402,38 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         ok = ok && ustd::get_pdeathsig() == 0;
         ok
     });
+    check("sched-policy", {
+        // real scheduler-policy syscalls: sched_setscheduler/setparam,
+        // priority bounds, RR interval, sched_yield, prctl dumpable.
+        let mut ok = true;
+        let pid = ustd::getpid() as u32;
+        // bounds are real: OTHER 0..0, RT 1..99, bogus policy -22
+        ok = ok && ustd::sched_get_priority_min(0) == 0
+            && ustd::sched_get_priority_max(0) == 0
+            && ustd::sched_get_priority_min(1) == 1
+            && ustd::sched_get_priority_max(1) == 99
+            && ustd::sched_get_priority_min(9) == -22;
+        // sched_setscheduler: invalid prio rejected; OTHER+0 accepted;
+        // getscheduler reads back the class
+        ok = ok && ustd::sched_setscheduler(pid, 1, 0) == -22;
+        ok = ok && ustd::sched_setscheduler(pid, 0, 0) == 0;
+        ok = ok && ustd::sched_getscheduler(pid) == 0;
+        // setparam on OTHER rejects nonzero
+        ok = ok && ustd::sched_setparam(pid, 5) == -22;
+        ok = ok && ustd::sched_setparam(pid, 0) == 0;
+        // RR interval: real PIT quantum 10ms = 1e7 ns
+        ok = ok && ustd::sched_rr_get_interval(pid) == 10_000_000;
+        // bogus pid -> ESRCH (-3)
+        ok = ok && ustd::sched_rr_get_interval(0xdead) == -1;
+        ustd::sched_yield(); // reschedules and returns
+        // dumpable round-trip: default 1, set 0/2 read back, EINVAL on 3
+        ok = ok && ustd::get_dumpable() == 1;
+        ok = ok && ustd::set_dumpable(0) == 0 && ustd::get_dumpable() == 0;
+        ok = ok && ustd::set_dumpable(2) == 0 && ustd::get_dumpable() == 2;
+        ok = ok && ustd::set_dumpable(3) == -22;
+        let _ = ustd::set_dumpable(1);
+        ok
+    });
     check("epoll-flags", {
         // EPOLLET fires once per ready level, EPOLLONESHOT until MOD
         // re-arms, EPOLLHUP surfaces on writer close, and the epoll fd
