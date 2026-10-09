@@ -354,6 +354,9 @@ struct FwRule {
     dscp: u8,             // `-m dscp --dscp N` — 0xff = unused
     icmp_type: u8,        // `-m icmp --icmp-type N` — 0xff = unused
     tcp_syn: bool,        // `-m tcp --syn` — SYN-only segment match
+    recent_op: u8,        // `-m recent`: 0 = none, 1 = --set, 2 = --rcheck, 3 = --update
+    recent_name: String,  // list name (real default: "DEFAULT")
+    recent_secs: u64,     // --seconds N recency window (0 = any age)
     limit_pps: u16,       // 0 = unlimited; `-m limit --limit N/s` cap on rule hits
     comment: String,      // `-m comment --comment` — real per-rule annotation
     limit_burst: u16,     // bucket depth (real iptables default 5)
@@ -370,6 +373,13 @@ struct FwRule {
     hits: u64,
     bytes: u64,
 }
+
+/// `-m recent` source list — Linux ipt_recent semantics: --set always
+/// matches AND records (src → hits, last-seen-ms); --rcheck/--update
+/// match when the source was seen inside the --seconds window (0 =
+/// any age); --update also refreshes the stamp.
+static IPT_RECENT: Mutex<BTreeMap<(String, u32), (u64, u64)>> =
+    Mutex::new(BTreeMap::new());
 
 static FW: Mutex<Vec<FwRule>> = Mutex::new(Vec::new());
 
@@ -632,6 +642,32 @@ fn fw_eval(
         if r.tcp_syn && !syn {
             continue;
         }
+        // `-m recent` — real source-tracking list.
+        if r.recent_op != 0 {
+            let key = (r.recent_name.clone(), u32::from_be_bytes(src));
+            let mut t = IPT_RECENT.lock();
+            if r.recent_op == 1 {
+                let e = t.entry(key).or_insert((0, 0));
+                e.0 += 1;
+                e.1 = now_ms();
+            } else {
+                let hit = match t.get(&key) {
+                    Some((_, last)) => {
+                        r.recent_secs == 0
+                            || now_ms().saturating_sub(*last) <= r.recent_secs * 1000
+                    }
+                    None => false,
+                };
+                if !hit {
+                    continue;
+                }
+                if r.recent_op == 3 {
+                    if let Some(e) = t.get_mut(&key) {
+                        e.1 = now_ms();
+                    }
+                }
+            }
+        }
         // `-m multiport --dports`: real set match on the dest port
         if !r.dports.is_empty() && !r.dports.contains(&dport) {
             continue;
@@ -791,6 +827,46 @@ pub fn net_iptables() -> String {
     out
 }
 
+/// `/proc/net/ipt_recent` — the Linux ipt_recent dump: one line per
+/// (list, src) — `echo /` or `F` clears it, `echo -a.b.c.d` removes
+/// that source from every list.
+pub fn net_ipt_recent() -> String {
+    let t = IPT_RECENT.lock();
+    let now = now_ms();
+    let mut out = String::new();
+    for ((name, src), (hits, last)) in t.iter() {
+        out.push_str(&alloc::format!(
+            "src={}.{}.{}.{} list={} ttl=255 last_seen={}ms_ago hits={}\n",
+            src.to_be_bytes()[0],
+            src.to_be_bytes()[1],
+            src.to_be_bytes()[2],
+            src.to_be_bytes()[3],
+            name,
+            now.saturating_sub(*last),
+            hits
+        ));
+    }
+    out
+}
+
+/// `/proc/net/ipt_recent` writes: 'F' or '/' clears the table,
+/// '-a.b.c.d' deletes that source from every list.
+pub fn ipt_recent_ctl(line: &str) -> bool {
+    let line = line.trim();
+    if line == "F" || line == "/" {
+        IPT_RECENT.lock().clear();
+        return true;
+    }
+    if let Some(ip) = line.strip_prefix('-') {
+        if let Some(v) = parse_ip(ip.trim()) {
+            let src = u32::from_be_bytes(v);
+            IPT_RECENT.lock().retain(|(_, s), _| *s != src);
+            return true;
+        }
+    }
+    false
+}
+
 /// Canonical `iptables-save` dump (`/proc/net/iptsave`): `*filter` …
 /// `COMMIT` — `iptables -S`/`iptables-save` read it, `iptables-restore`
 /// feeds the -A lines back through the ctl path, so the round-trip is
@@ -936,6 +1012,17 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
     if r.tcp_syn {
         out.push_str(" -m tcp --syn");
     }
+    match r.recent_op {
+        1 => out.push_str(&alloc::format!(" -m recent --set --name {}", r.recent_name)),
+        2 | 3 => {
+            let op = if r.recent_op == 2 { "--rcheck" } else { "--update" };
+            out.push_str(&alloc::format!(" -m recent {} --name {}", op, r.recent_name));
+            if r.recent_secs > 0 {
+                out.push_str(&alloc::format!(" --seconds {}", r.recent_secs));
+            }
+        }
+        _ => {}
+    }
     if r.limit_pps != 0 {
         out.push_str(&alloc::format!(" -m limit --limit {}/s", r.limit_pps));
         if r.limit_burst != 5 {
@@ -1065,6 +1152,13 @@ fn fmt_fw_rule(out: &mut String, i: usize, r: &FwRule) {
     }
     if r.tcp_syn {
         extra.push_str("  tcp flags:0x17/0x02");
+    }
+    if r.recent_op != 0 {
+        extra.push_str(&alloc::format!(
+            "  recent: {} name: {} side: source",
+            if r.recent_op == 1 { "SET" } else { "CHECK" },
+            r.recent_name
+        ));
     }
     if r.len_hi != 0 {
         if r.len_lo == r.len_hi {
@@ -1330,7 +1424,7 @@ fn fw_name_ok(n: &str) -> bool {
         "icmp", "tcp", "udp", "all", "*", "dport", "multiport", "range", "src",
         "state", "limit", "lburst", "log", "reject", "accept", "return", "drop",
         "iif", "oif", "sport", "length", "comment", "ttl", "tos", "mac",
-        "dscp", "icmpt", "syn",
+        "dscp", "icmpt", "syn", "rset", "rchk", "rupd",
     ];
     !n.is_empty()
         && n.len() <= 28
@@ -1719,6 +1813,9 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         dscp: 0xff,
         icmp_type: 0xff,
         tcp_syn: false,
+        recent_op: 0,
+        recent_name: String::new(),
+        recent_secs: 0,
         limit_pps: 0,
         comment: String::new(),
         limit_burst: 5,
@@ -1951,6 +2048,22 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
             }
             // `-m tcp --syn` — bare flag token like the targets.
             "syn" => r.tcp_syn = true,
+            // `-m recent` — `rset <list>` always matches and records
+            // the source; `rchk|rupd <list> <secs>` gate on recency.
+            "rset" => {
+                r.recent_op = 1;
+                r.recent_name = String::from(f.next().unwrap_or("DEFAULT"));
+            }
+            "rchk" => {
+                r.recent_op = 2;
+                r.recent_name = String::from(f.next().unwrap_or("DEFAULT"));
+                r.recent_secs = f.next().unwrap_or("0").parse().unwrap_or(0);
+            }
+            "rupd" => {
+                r.recent_op = 3;
+                r.recent_name = String::from(f.next().unwrap_or("DEFAULT"));
+                r.recent_secs = f.next().unwrap_or("0").parse().unwrap_or(0);
+            }
             "log" => r.target = 1,    // "... log" marks -j LOG
             "reject" => r.target = 2, // -j REJECT: refusal goes back
             "accept" => r.target = 3, // -j ACCEPT: terminal allow
@@ -1984,6 +2097,9 @@ fn fw_rule_eq(a: &FwRule, b: &FwRule) -> bool {
         && a.dscp == b.dscp
         && a.icmp_type == b.icmp_type
         && a.tcp_syn == b.tcp_syn
+        && a.recent_op == b.recent_op
+        && a.recent_name == b.recent_name
+        && a.recent_secs == b.recent_secs
         && a.state == b.state
         && a.ttl_mode == b.ttl_mode
         && a.ttl_v == b.ttl_v

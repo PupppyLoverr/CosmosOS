@@ -5451,6 +5451,22 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         seen
     });
+    check("ipt-recent", {
+        // `-m recent`: --set records the source, --rcheck gates on
+        // recency. Ordered rchk-then-rset: the first reply records the
+        // gateway, the second is dropped inside the --seconds window.
+        let a = ustd::write_all("/proc/net/iptables", b"A IN icmp rchk SEEN 60 drop\n").is_ok()
+            && ustd::write_all("/proc/net/iptables", b"A IN icmp rset SEEN accept\n").is_ok();
+        let p1 = ustd::net_ping(0x0A00_0202, 1500).is_some(); // records gw
+        let p2 = ustd::net_ping(0x0A00_0202, 1200).is_none(); // rcheck drops
+        let dump = ustd::read_all("/proc/net/ipt_recent")
+            .map(|d| String::from_utf8_lossy(&d).contains("src=10.0.2.2"))
+            .unwrap_or(false);
+        let _ = ustd::write_all("/proc/net/iptables", b"F\n");
+        let _ = ustd::write_all("/proc/net/ipt_recent", b"F\n");
+        let p3 = ustd::net_ping(0x0A00_0202, 1500).is_some(); // flushed
+        a && p1 && p2 && dump && p3
+    });
 
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {
