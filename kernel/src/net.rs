@@ -6307,22 +6307,56 @@ pub fn tcp_recv(lport: u16, timeout_ms: u64) -> Option<Vec<u8>> {
 /// FIN + drop the socket (close is fire-and-forget — the peer's side is
 /// already Closed or will be once our FIN lands).
 pub fn tcp_close(lport: u16) {
+    tcp_close_linger(lport, -1);
+}
+
+/// Close a TCP conn honoring SO_LINGER (sockfd passes the socket's
+/// setting): linger<0 sends FIN (normal), linger==0 sends RST
+/// (abortive — the peer reads ECONNRESET, not EOF), linger>0 sends FIN
+/// then drains unacked bytes for up to `linger` seconds before giving
+/// up — the close syscall itself waits, like a blocking POSIX close.
+pub fn tcp_close_linger(lport: u16, linger: i64) {
     // TIME_WAIT: mark the conn Closed but keep the map entry — the port
     // stays allocated (~2s) so a fresh bind/connect can't reuse the
     // 4-tuple while the old conn's FIN/RST are still on the wire.
     let mut send_fin = None;
+    let mut send_rst = false;
     {
         let mut t = TCP_SOCKS.lock();
         if let Some(k) = t.get_mut(&lport) {
             if k.state != TcpState::Closed {
                 send_fin = Some((k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, rx_win(k)));
+                send_rst = linger == 0;
             }
             k.state = TcpState::Closed;
             k.closed_ms = now_ms();
         }
     }
     if let Some((mac, rip, lp, rp, sn, rn, w)) = send_fin {
-        send_tcp(mac, rip, lp, rp, sn, rn, TCP_FIN | TCP_ACK, &[], w);
+        if send_rst {
+            send_tcp(mac, rip, lp, rp, sn, rn, TCP_RST, &[], w);
+        } else {
+            send_tcp(mac, rip, lp, rp, sn, rn, TCP_FIN | TCP_ACK, &[], w);
+        }
+    }
+    if linger > 0 {
+        // Drain: wait for the peer to ACK our queued bytes+FIN, up to
+        // l_linger seconds.
+        let dl = now_ms() + (linger as u64) * 1000;
+        loop {
+            let _ = pump_rx();
+            let done = {
+                let t = TCP_SOCKS.lock();
+                match t.get(&lport) {
+                    Some(k) => k.unacked.is_empty(),
+                    None => true,
+                }
+            };
+            if done || now_ms() >= dl {
+                break;
+            }
+            unsafe { wait_irq() };
+        }
     }
 }
 

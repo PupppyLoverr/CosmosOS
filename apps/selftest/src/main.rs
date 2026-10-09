@@ -2522,6 +2522,46 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             && ustd::write_all("/proc/sys/net/ipv4/tcp_retries1", b"3").is_ok()
             && ustd::write_all("/proc/sys/net/ipv4/tcp_max_syn_backlog", b"128").is_ok()
     });
+    check("tcp-linger", {
+        // SO_LINGER: a default close still sends FIN (peer reads EOF
+        // after its buffered byte); l_linger=0 sends RST instead —
+        // the peer's read surfaces ECONNRESET (-104), not Ok(0).
+        let l = ustd::TcpFd::listen(19112);
+        let mut ok = l.is_ok();
+        if let Ok(l) = l {
+            // graceful reference: FIN -> buffered byte then Ok(0).
+            let c = ustd::TcpFd::connect([127, 0, 0, 1], 19112);
+            let a = l.accept();
+            ok = ok && c.is_ok() && a.is_ok();
+            if let (Ok(c), Ok((a, _, _))) = (c, a) {
+                let _ = c.write(b"x");
+                drop(c); // close() -> FIN
+                let mut b = [0u8; 8];
+                ok = ok && a.read(&mut b) == Ok(1) && a.read(&mut b) == Ok(0);
+            }
+            // abortive: SO_LINGER l_linger=0 -> RST -> ECONNRESET.
+            let c = ustd::TcpFd::connect([127, 0, 0, 1], 19112);
+            let a = l.accept();
+            ok = ok && c.is_ok() && a.is_ok();
+            if let (Ok(c), Ok((a, _, _))) = (c, a) {
+                let _ = c.write(b"x");
+                ok = ok && ustd::setsockopt(c.0, 1, 13, 0) == 0;
+                drop(c); // close() -> RST
+                let mut b = [0u8; 8];
+                let mut reset = false;
+                for _ in 0..60 {
+                    match a.read(&mut b) {
+                        Err(-104) => { reset = true; break; }
+                        Err(-11) => ustd::sleep_ms(25),
+                        Ok(_) => {} // drain the queued byte first
+                        Err(_) => break,
+                    }
+                }
+                ok = ok && reset;
+            }
+        }
+        ok
+    });
     check("icmp-rate-limit", {
         // net.ipv4.icmp_*: locally-generated ICMP errors pass two
         // gates — ratemask+ratelimit (per-type interval) and
