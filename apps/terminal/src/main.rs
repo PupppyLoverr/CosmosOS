@@ -8032,6 +8032,8 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut dport = 0u16;
     let mut dports = String::new();
     let mut src_range = String::new();
+    let mut iif = "";
+    let mut oif = "";
     let mut state = String::new();
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
@@ -8165,8 +8167,15 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             "INPUT" | "OUTPUT" | "FORWARD" => {
                 chain = args[i];
             }
-            "-i" | "-o" => {
-                i += 1; // interface arg — single nic, ignored
+            // `-i <if>`/`-o <if>` — real iface match (lo|eth0); the
+            // kernel also enforces -o-vs-INPUT / -i-vs-OUTPUT.
+            "-i" | "--in-interface" => {
+                iif = args.get(i + 1).copied().unwrap_or("");
+                i += 1;
+            }
+            "-o" | "--out-interface" => {
+                oif = args.get(i + 1).copied().unwrap_or("");
+                i += 1;
             }
             _ => {}
         }
@@ -8195,6 +8204,12 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !src_range.is_empty() {
         line.push_str(&alloc::format!(" range {}", src_range));
+    }
+    if !iif.is_empty() {
+        line.push_str(&alloc::format!(" iif {}", iif));
+    }
+    if !oif.is_empty() {
+        line.push_str(&alloc::format!(" oif {}", oif));
     }
     if !src.is_empty() {
         line.push_str(&alloc::format!(" src {}", src));
@@ -22748,6 +22763,7 @@ impl Term {
                 let mut ttl = 0u8;
                 let mut audible = false;
                 let mut size = 0u64;
+                let mut iface = 0u8;
                 let mut target: Option<&str> = None;
                 let mut i = 0usize;
                 while i < args.len() {
@@ -22798,6 +22814,23 @@ impl Term {
                                 .min(1450);
                             i += 2;
                         }
+                        "-I" => {
+                            // -I <iface>: bind the source address to the
+                            // interface — lo sends from 127.0.0.1, eth0
+                            // from our IP (real iputils semantics).
+                            iface = match args.get(i + 1).copied().unwrap_or("") {
+                                "lo" => 2,
+                                "eth0" => 1,
+                                other => {
+                                    self.fail(&alloc::format!(
+                                        "ping: unknown iface {}",
+                                        other
+                                    ));
+                                    return;
+                                }
+                            };
+                            i += 2;
+                        }
                         "-t" => {
                             // -t N: stamp the echo request's IPv4 TTL
                             ttl = args
@@ -22827,7 +22860,14 @@ impl Term {
                             | ((c as u32) << 8) | d as u32;
                         let mut got = 0u32;
                         for n in 0..cnt {
-                            match ustd::net_ping_size(packed, wto, ttl, size) {
+                            // `ping -I eth0 127.x`: loopback can't
+                            // leave the wire iface — real iputils
+                            // fails with EINVAL, not a timeout.
+                            if iface == 1 && ip[0] == 127 {
+                                self.fail("ping: connect: Invalid argument");
+                                break;
+                            }
+                            match ustd::net_ping_if(packed, wto, ttl, size, iface) {
                                 Some(rtt) => {
                                     got += 1;
                                     if audible {

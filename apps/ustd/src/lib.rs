@@ -605,12 +605,18 @@ pub fn net_ping_ttl(ip: u32, timeout_ms: u64, ttl: u8) -> Option<u64> {
 }
 /// Ping with explicit TTL and ICMP payload size (`ping -s`; 0 = default).
 pub fn net_ping_size(ip: u32, timeout_ms: u64, ttl: u8, size: u64) -> Option<u64> {
-    let r = sc4(
+    net_ping_if(ip, timeout_ms, ttl, size, 0)
+}
+/// Ping bound to an interface (`ping -I`): 0 = auto, 1 = eth0, 2 = lo.
+/// The iface picks the source address; routing still follows the dst.
+pub fn net_ping_if(ip: u32, timeout_ms: u64, ttl: u8, size: u64, iface: u8) -> Option<u64> {
+    let r = sc5(
         shared::SYS_NET_PING,
         ip as u64,
         timeout_ms,
         ttl as u64,
         size,
+        iface as u64,
     );
     if r == u64::MAX { None } else { Some(r) }
 }
