@@ -1593,19 +1593,28 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_READV => sys_iov(ctx, a1, a2, a3, true),
         shared::SYS_WRITEV => sys_iov(ctx, a1, a2, a3, false),
         shared::SYS_SOCKET => {
-            // (SOCK_STREAM|SOCK_DGRAM, domain=AF_INET|AF_UNIX) -> fd
-            if a1 != shared::SOCK_STREAM && a1 != shared::SOCK_DGRAM {
+            // (SOCK_STREAM|SOCK_DGRAM | SOCK_NONBLOCK|SOCK_CLOEXEC,
+            // domain=AF_INET|AF_UNIX) -> fd. The type is the low nibble —
+            // SOCK_* creation flags share the O_* bits and land on
+            // FileDesc.flags verbatim (SOCK_NONBLOCK==O_NONBLOCK).
+            let ty = a1 & 0xF;
+            if ty != shared::SOCK_STREAM && ty != shared::SOCK_DGRAM {
                 ctx.rax = ERR;
                 return;
             }
-            match crate::sockfd::create(a1 == shared::SOCK_STREAM, a2) {
+            let create_flags = a1 & (shared::SOCK_NONBLOCK | shared::SOCK_CLOEXEC);
+            match crate::sockfd::create(ty == shared::SOCK_STREAM, a2) {
                 Err(e) => {
                     ctx.rax = e as u64;
                     return;
                 }
                 Ok(path) => task::with_current(|t| {
                     let Some(s) = alloc_slot(t) else { return ERR; };
-                    t.fds[s] = Some(task::FileDesc { path, pos: 0, flags: shared::O_RDWR });
+                    t.fds[s] = Some(task::FileDesc {
+                        path,
+                        pos: 0,
+                        flags: shared::O_RDWR | create_flags,
+                    });
                     s as u64
                 }),
             }
@@ -1672,8 +1681,15 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
-        shared::SYS_ACCEPT => {
-            // (fd, peer_out[8]|0) -> conn fd; -11 reblocks unless O_NONBLOCK
+        shared::SYS_ACCEPT | shared::SYS_ACCEPT4 => {
+            // (fd, peer_out[8]|0[, SOCK_NONBLOCK|SOCK_CLOEXEC]) -> conn fd;
+            // -11 reblocks unless O_NONBLOCK. accept4's a3 carries the
+            // creation flags; SYS_ACCEPT passes none.
+            let conn_flags = if nr == shared::SYS_ACCEPT4 {
+                a3 & (shared::SOCK_NONBLOCK | shared::SOCK_CLOEXEC)
+            } else {
+                0
+            };
             let id = task::with_current(|t| match t.fds.get(a1 as usize) {
                 Some(Some(f)) => crate::sockfd::parse(&f.path),
                 _ => None,
@@ -1704,7 +1720,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                         t.fds[s] = Some(task::FileDesc {
                             path: cpath,
                             pos: 0,
-                            flags: shared::O_RDWR,
+                            flags: shared::O_RDWR | conn_flags,
                         });
                         s as u64
                     });

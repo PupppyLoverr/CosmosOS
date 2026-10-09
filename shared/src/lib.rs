@@ -126,6 +126,10 @@ pub const SYS_READV: u64 = 117;          // (fd,iov_ptr,iovcnt) -> n | ERR
 pub const SYS_WRITEV: u64 = 118;         // (fd,iov_ptr,iovcnt) -> n | ERR
 pub const SOCK_STREAM: u64 = 1;          // TCP socket
 pub const SOCK_DGRAM: u64 = 2;           // UDP socket
+// socket()/accept4() creation flags ride the fd flag values so they land
+// on FileDesc.flags unchanged — same convention as pipe2/eventfd2.
+pub const SOCK_NONBLOCK: u64 = O_NONBLOCK;
+pub const SOCK_CLOEXEC: u64 = O_CLOEXEC;
 pub const AF_UNIX: u64 = 1;              // unix-domain socket family
 pub const AF_INET: u64 = 2;              // ipv4 socket family
 pub const SYS_SOCKET: u64 = 119;         // (SOCK_*[, domain]) -> fd | ERR
@@ -310,6 +314,7 @@ pub const SYS_CAPSET: u64 = 252;      // (out u32[3]) -> 0 | err
 pub const SYS_RDMSR: u64 = 253;        // (msr u64) -> u64 | err -38 (whitelisted regs)
 pub const SYS_ARPING: u64 = 254;       // (ip u32 BE, timeout_ms) -> mac<<16|rtt | ERR
 pub const SYS_NET_DHCP_RELEASE: u64 = 255; // () -> 0 | ERR (no lease)
+pub const SYS_ACCEPT4: u64 = 256;         // (fd, peer_out[8]|0, flags) -> connfd | ERR
 /// MS_MOVE: move a mount point instead of creating one
 pub const MS_MOVE: u64 = 0x2000;
 /// CLONE_NEWUTS: unshare the UTS namespace (hostname)

@@ -2522,6 +2522,40 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             && ustd::write_all("/proc/sys/net/ipv4/tcp_retries1", b"3").is_ok()
             && ustd::write_all("/proc/sys/net/ipv4/tcp_max_syn_backlog", b"128").is_ok()
     });
+    check("socket-flags", {
+        // SOCK_NONBLOCK/SOCK_CLOEXEC OR'd into socket(): the descriptor
+        // is created with O_NONBLOCK (an unbound UDP read is EAGAIN,
+        // never a block) and FD_CLOEXEC set — no fcntl round-trip.
+        let mut ok = true;
+        let fd = ustd::socket(ustd::SOCK_DGRAM | ustd::SOCK_NONBLOCK | ustd::SOCK_CLOEXEC);
+        ok = ok && fd >= 0;
+        if ok {
+            ok = ok && ustd::fcntl(fd, ustd::F_GETFL, 0) & (ustd::O_NONBLOCK as i64) != 0
+                && ustd::fcntl(fd, ustd::F_GETFD, 0) == 1
+                && ustd::bind(fd, 19116) == 0;
+            let mut b = [0u8; 4];
+            // bound + no datagrams: O_NONBLOCK surfaces EAGAIN now.
+            ok = ok && ustd::read(fd, &mut b) == Err(-11);
+            ustd::close(fd);
+            // accept4: the accepted conn fd carries the flags atomically.
+            let l = ustd::TcpFd::listen(19114);
+            if let Ok(l) = l {
+                let c = ustd::TcpFd::connect([127, 0, 0, 1], 19114);
+                let a = ustd::accept4(l.0, ustd::SOCK_NONBLOCK | ustd::SOCK_CLOEXEC);
+                ok = ok && c.is_ok() && a.is_ok();
+                if let Ok((afd, _, _)) = a {
+                    ok = ok && ustd::fcntl(afd, ustd::F_GETFL, 0) & (ustd::O_NONBLOCK as i64) != 0
+                        && ustd::fcntl(afd, ustd::F_GETFD, 0) == 1;
+                    ustd::close(afd);
+                } else {
+                    ok = false;
+                }
+            } else {
+                ok = false;
+            }
+        }
+        ok
+    });
     check("tcp-linger", {
         // SO_LINGER: a default close still sends FIN (peer reads EOF
         // after its buffered byte); l_linger=0 sends RST instead —
