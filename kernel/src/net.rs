@@ -376,6 +376,13 @@ struct FwRule {
     connl_mask: u8,       // --connlimit-mask bits
     connb_lo: u64,        // `-m connbytes --connbytes LO[:HI]` (u64::MAX pair = unused)
     connb_hi: u64,
+    owner_uid: u32,       // `-m owner --uid-owner` (u32::MAX = unused; OUTPUT only)
+    owner_gid: u32,       // `-m owner --gid-owner`
+    pktype: u8,           // `-m pkttype`: 0 any, 1 host, 2 broadcast, 3 multicast
+    hlimit_pps: u64,      // `-m hashlimit --hashlimit N/s` per-src bucket (0 = off)
+    hlimit_burst: u32,
+    hlimit_name: String,
+    hlimit_above: bool,   // true = --hashlimit-above (match once over the rate)
     snat_to: Option<[u8; 4]>, // -j SNAT --to-source (nat POSTROUTING)
     limit_pps: u16,       // 0 = unlimited; `-m limit --limit N/s` cap on rule hits
     comment: String,      // `-m comment --comment` — real per-rule annotation
@@ -398,6 +405,9 @@ struct FwRule {
 /// matches AND records (src → hits, last-seen-ms); --rcheck/--update
 /// match when the source was seen inside the --seconds window (0 =
 /// any age); --update also refreshes the stamp.
+/// `-m hashlimit` buckets: (list-name, src-ip) -> (tokens, last_ms).
+static HLIMIT: Mutex<BTreeMap<(String, u32), (f64, u64)>> =
+    Mutex::new(BTreeMap::new());
 static IPT_RECENT: Mutex<BTreeMap<(String, u32), (u64, u64)>> =
     Mutex::new(BTreeMap::new());
 
@@ -594,10 +604,11 @@ fn fw_verdict(
     itype: u8,
     syn: bool,
     pl: &[u8],
+    owner: (u32, u32),
     nat: &mut Option<[u8; 4]>,
 ) -> u8 {
     let mut fw = chain.lock();
-    match fw_eval(&mut *fw, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, syn, pl, 0, nat) {
+    match fw_eval(&mut *fw, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, syn, pl, 0, owner, nat) {
         // 255 = walked off the end of the builtin chain: policy decides
         255 => {
             if *policy.lock() {
@@ -635,6 +646,7 @@ fn fw_eval(
     syn: bool,
     pl: &[u8],
     depth: u8,
+    owner: (u32, u32),
     nat: &mut Option<[u8; 4]>,
 ) -> u8 {
     for r in chain.iter_mut() {
@@ -826,6 +838,54 @@ fn fw_eval(
                 continue;
             }
         }
+        // `-m owner --uid-owner/--gid-owner` — real OUTPUT-only cred
+        // match against the local sender's euid/egid.
+        if r.owner_uid != u32::MAX && owner.0 != r.owner_uid {
+            continue;
+        }
+        if r.owner_gid != u32::MAX && owner.1 != r.owner_gid {
+            continue;
+        }
+        // `-m pkttype` — real L3 classification of the destination:
+        // broadcast = wire bcast or our subnet bcast, multicast = 224/4.
+        if r.pktype != 0 {
+            let bcast = dst == [255, 255, 255, 255]
+                || dst[0..3] == our_ip()[0..3] && dst[3] == 255;
+            let pt = if bcast {
+                2u8
+            } else if dst[0] >= 224 {
+                3
+            } else {
+                1
+            };
+            if pt != r.pktype {
+                continue;
+            }
+        }
+        // `-m hashlimit --hashlimit N/s [--hashlimit-burst B]
+        // --hashlimit-name L` — real per-source-IP token bucket.
+        if r.hlimit_pps != 0 {
+            let key = (r.hlimit_name.clone(), u32::from_be_bytes(src));
+            let burst = r.hlimit_burst.max(1) as f64;
+            let mut t = HLIMIT.lock();
+            let e = t.entry(key).or_insert((burst, now_ms()));
+            let dt = now_ms().saturating_sub(e.1) as f64;
+            e.0 = (e.0 + dt * r.hlimit_pps as f64 / 1000.0).min(burst);
+            e.1 = now_ms();
+            if r.hlimit_above {
+                // --hashlimit-above: matches only once the bucket is
+                // empty (the source exceeded the rate).
+                if e.0 >= 1.0 {
+                    e.0 -= 1.0;
+                    continue;
+                }
+            } else if e.0 < 1.0 {
+                // upto (default): matches while tokens remain.
+                continue;
+            } else {
+                e.0 -= 1.0;
+            }
+        }
         // `-m multiport --dports`: real set match on the dest port
         if !r.dports.is_empty() && !r.dports.contains(&dport) {
             continue;
@@ -888,7 +948,7 @@ fn fw_eval(
                 continue; // loop guard — treat as no-match
             }
             let mut snap = FW_USER.lock().get(&r.jump).cloned().unwrap_or_default();
-            let v = fw_eval(&mut snap, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, syn, pl, depth + 1, nat);
+            let v = fw_eval(&mut snap, inbound, src, dst, proto, sport, dport, st, iface, plen, ttl, tos, smac, itype, syn, pl, depth + 1, owner, nat);
             if let Some(u) = FW_USER.lock().get_mut(&r.jump) {
                 *u = snap;
             }
@@ -1399,6 +1459,25 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
         out.push_str(&alloc::format!(
             " -m connbytes --connbytes {}:{}",
             r.connb_lo, r.connb_hi
+        ));
+    }
+    if r.owner_uid != u32::MAX {
+        out.push_str(&alloc::format!(" -m owner --uid-owner {}", r.owner_uid));
+    }
+    if r.owner_gid != u32::MAX {
+        out.push_str(&alloc::format!(" -m owner --gid-owner {}", r.owner_gid));
+    }
+    if r.pktype != 0 {
+        out.push_str(&alloc::format!(
+            " -m pkttype --pkt-type {}",
+            match r.pktype { 2 => "broadcast", 3 => "multicast", _ => "host" }
+        ));
+    }
+    if r.hlimit_pps != 0 {
+        out.push_str(&alloc::format!(
+            " -m hashlimit --hashlimit{} {}/s --hashlimit-burst {} --hashlimit-name {}",
+            if r.hlimit_above { "-above" } else { "-upto" },
+            r.hlimit_pps, r.hlimit_burst, r.hlimit_name
         ));
     }
     if r.limit_pps != 0 {
@@ -2236,8 +2315,12 @@ fn fw_dir_ok(ch: &ChainSel, r: &FwRule) -> bool {
         return false;
     }
     match ch {
-        ChainSel::In => r.oiface == 0,
-        ChainSel::Out => r.iface == 0 && r.smac.is_none(),
+        // pkttype/owner matchers only classify on their real side
+        // (pkttype on arrival, owner on locally generated sends).
+        ChainSel::In => {
+            r.oiface == 0 && r.owner_uid == u32::MAX && r.owner_gid == u32::MAX
+        }
+        ChainSel::Out => r.iface == 0 && r.smac.is_none() && r.pktype == 0,
         ChainSel::User(_) => true,
     }
 }
@@ -2289,6 +2372,13 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         connl_mask: 32,
         connb_lo: u64::MAX,
         connb_hi: u64::MAX,
+        owner_uid: u32::MAX,
+        owner_gid: u32::MAX,
+        pktype: 0,
+        hlimit_pps: 0,
+        hlimit_burst: 0,
+        hlimit_name: String::new(),
+        hlimit_above: false,
         snat_to: None,
         limit_pps: 0,
         comment: String::new(),
@@ -2670,6 +2760,26 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
                 r.connl_n = f.next().unwrap_or("0").parse().unwrap_or(0);
                 r.connl_mask = f.next().unwrap_or("32").parse().unwrap_or(32);
             }
+            "ouid" => {
+                r.owner_uid = f.next().unwrap_or("").parse().unwrap_or(u32::MAX);
+            }
+            "ogid" => {
+                r.owner_gid = f.next().unwrap_or("").parse().unwrap_or(u32::MAX);
+            }
+            "pkttype" => {
+                r.pktype = match f.next().unwrap_or("") {
+                    "broadcast" => 2,
+                    "multicast" => 3,
+                    _ => 1,
+                };
+            }
+            "hlimit" => {
+                // `hlimit <pps> <burst> <name> [above]` — per-src bucket.
+                r.hlimit_pps = f.next().unwrap_or("0").parse().unwrap_or(0);
+                r.hlimit_burst = f.next().unwrap_or("5").parse().unwrap_or(5);
+                r.hlimit_name = String::from(f.next().unwrap_or("DEFAULT"));
+                r.hlimit_above = f.next().unwrap_or("") == "above";
+            }
             "connbytes" => {
                 // `N` or `LO:HI` — the flow's byte total must fall in
                 // the window (bare N = N:).
@@ -2901,7 +3011,7 @@ fn pump_rx() -> Vec<([u8; 4], u8, Vec<u8>, u64)> {
         let itype = if *proto == 1 && !p.is_empty() { p[0] } else { 0xff };
         let syn = *proto == 6 && p.len() >= 14 && p[13] & 0x17 == 0x02;
         let mut nat_none = None;
-        let v = fw_verdict(&FW, &FW_POLICY, true, *src_ip, dst, *proto, sport, dport, st, ifx, p.len() as u64, meta_ttl(*meta), meta_tos(*meta), meta_mac(*meta), itype, syn, p, &mut nat_none);
+        let v = fw_verdict(&FW, &FW_POLICY, true, *src_ip, dst, *proto, sport, dport, st, ifx, p.len() as u64, meta_ttl(*meta), meta_tos(*meta), meta_mac(*meta), itype, syn, p, (u32::MAX, u32::MAX), &mut nat_none);
         if v == 2 {
             // -j REJECT: a real refusal goes back — TCP_RST for TCP
             // (same wire shape as the unclaimed-port responder),
@@ -3783,7 +3893,11 @@ fn send_ip_src_qos(
     let itype = if proto == 1 && !payload.is_empty() { payload[0] } else { 0xff };
     let syn = proto == 6 && payload.len() >= 14 && payload[13] & 0x17 == 0x02;
     let mut nat_sel = None;
-    let v = fw_verdict(&FW_OUT, &FW_OUT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64, ttl, tos, [0; 6], itype, syn, payload, &mut nat_sel);
+    // `-m owner`: the real sender's creds for locally generated
+    // traffic — the syscall ctx the send rode in on (kernel-timer
+    // packets like keepalives get whatever task was current).
+    let snd = crate::task::with_current(|t| (t.euid, t.egid));
+    let v = fw_verdict(&FW_OUT, &FW_OUT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64, ttl, tos, [0; 6], itype, syn, payload, snd, &mut nat_sel);
     if v == 2 {
         out_reject(src_ip, dst_ip, proto, payload);
         return;
@@ -3798,7 +3912,7 @@ fn send_ip_src_qos(
     let mut src_ip = src_ip;
     {
         let mut nat_sel = None;
-        let _ = fw_verdict(&FW_NAT, &FW_NAT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64, ttl, tos, [0; 6], itype, syn, payload, &mut nat_sel);
+        let _ = fw_verdict(&FW_NAT, &FW_NAT_POLICY, false, src_ip, dst_ip, proto, osport, odport, 0, oifx, payload.len() as u64, ttl, tos, [0; 6], itype, syn, payload, snd, &mut nat_sel);
         if let Some(t) = nat_sel {
             let new_src = if t == [0; 4] { our_ip() } else { t };
             if new_src != src_ip {

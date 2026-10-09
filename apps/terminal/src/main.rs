@@ -8108,6 +8108,12 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut time_armed = false;
     let mut connl_n = String::new();
     let mut connb_spec = String::new();
+    let mut owner_u = String::new();
+    let mut owner_g = String::new();
+    let mut pktype = String::new();
+    let mut hlim = String::new();
+    let mut hlim_burst = String::new();
+    let mut hlim_name = String::new();
     let mut connl_mask = String::from("32");
     let mut snat_ip = String::new();
     let mut limit_pps = 0u64;
@@ -8330,6 +8336,38 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             }
             "--connlimit-mask" => {
                 connl_mask = String::from(args.get(i + 1).copied().unwrap_or("32"));
+                i += 1;
+            }
+            // `-m owner --uid-owner/--gid-owner` — OUTPUT-only local
+            // sender cred match.
+            "--uid-owner" => {
+                owner_u = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
+            "--gid-owner" => {
+                owner_g = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
+            // `-m pkttype --pkt-type` — broadcast/multicast/host dst.
+            "--pkt-type" => {
+                pktype = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
+            // `-m hashlimit` — real per-src token bucket.
+            "--hashlimit" | "--hashlimit-upto" | "--hashlimit-above" => {
+                hlim = alloc::format!(
+                    "{}{}",
+                    args.get(i + 1).copied().unwrap_or("0"),
+                    if args[i] == "--hashlimit-above" { " above" } else { "" }
+                );
+                i += 1;
+            }
+            "--hashlimit-burst" => {
+                hlim_burst = String::from(args.get(i + 1).copied().unwrap_or("5"));
+                i += 1;
+            }
+            "--hashlimit-name" => {
+                hlim_name = String::from(args.get(i + 1).copied().unwrap_or("DEFAULT"));
                 i += 1;
             }
             // `-m connbytes --connbytes N[:M]` — flow byte-total window.
@@ -8612,6 +8650,23 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !connb_spec.is_empty() {
         line.push_str(&alloc::format!(" connbytes {}", connb_spec));
+    }
+    if !owner_u.is_empty() {
+        line.push_str(&alloc::format!(" ouid {}", owner_u));
+    }
+    if !owner_g.is_empty() {
+        line.push_str(&alloc::format!(" ogid {}", owner_g));
+    }
+    if !pktype.is_empty() {
+        line.push_str(&alloc::format!(" pkttype {}", pktype));
+    }
+    if !hlim.is_empty() {
+        line.push_str(&alloc::format!(
+            " hlimit {} {} {}",
+            hlim.replace("/s", ""),
+            if hlim_burst.is_empty() { "5" } else { &hlim_burst },
+            if hlim_name.is_empty() { "DEFAULT" } else { &hlim_name }
+        ));
     }
     if limit_pps != 0 {
         line.push_str(&alloc::format!(" limit {}", limit_pps));
@@ -40875,7 +40930,10 @@ impl Term {
                         None => String::new(),
                     }
                 };
-                self.emit("Netid  Local Address:Port  Peer Address:Port");
+                let hdr_off = args.iter().any(|a| *a == "-H" || *a == "--no-header");
+                if !hdr_off {
+                    self.emit("Netid  Local Address:Port  Peer Address:Port");
+                }
                 if show_tcp {
                     if let Ok(d) = ustd::read_all("/proc/net/tcp") {
                         let t = String::from_utf8_lossy(&d);
