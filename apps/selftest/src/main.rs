@@ -5313,6 +5313,68 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         got
     });
+    check("ipt-tos", {
+        // `-m tos --tos`: OUTPUT rules see the stamped DS byte — a
+        // drop on 0x2e kills a -Q 0x2e ping; a tos-0 ping passes.
+        let a = ustd::write_all("/proc/net/iptables", b"A OUT 0 tos 0x2e drop\n").is_ok();
+        let dropped = ustd::net_ping_qos(0x7F00_0001, 350, 0, 0, 0, 0x2e).is_none();
+        let _ = ustd::write_all("/proc/net/iptables", b"F OUT\n");
+        let b = ustd::write_all("/proc/net/iptables", b"A OUT 0 tos 0x2e drop\n").is_ok();
+        let passed = ustd::net_ping_qos(0x7F00_0001, 600, 0, 0, 0, 0).is_some();
+        let _ = ustd::write_all("/proc/net/iptables", b"F OUT\n");
+        a && dropped && b && passed
+    });
+    check("ipt-mac", {
+        // `-m mac --mac-source`: real L2 sender off the wire frame.
+        // The gateway's echo replies arrive from slirp's MAC — dropping
+        // that address kills the ping; a wrong MAC never matches.
+        let a = ustd::write_all("/proc/net/iptables", b"A IN 0 mac 52:55:0a:00:02:02 drop\n").is_ok();
+        let dropped = ustd::net_ping(0x0A00_0202, 1500).is_none();
+        let _ = ustd::write_all("/proc/net/iptables", b"F IN\n");
+        let b = ustd::write_all("/proc/net/iptables", b"A IN 0 mac 11:22:33:44:55:66 drop\n").is_ok();
+        let passed = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        let _ = ustd::write_all("/proc/net/iptables", b"F IN\n");
+        a && dropped && b && passed
+    });
+    check("ping-pat", {
+        // `ping -p`: the caller's byte pattern fills the ICMP payload —
+        // the kernel pcap proves the 0xAA fill on the wire.
+        let _ = ustd::pcap(0, &mut []);
+        let _ = ustd::net_ping_pat(0x0A00_0202, 400, 0, 16, 0, 0, &[0xAA; 4]);
+        let _ = ustd::pcap(1, &mut []);
+        let mut cap = alloc::vec![0u8; 262_144];
+        let n = ustd::pcap(4, &mut cap);
+        let d: &[u8] = if n > 0 { &cap[..n as usize] } else { &[] };
+        let mut i = 24usize;
+        let mut seen = false;
+        while i + 16 <= d.len() {
+            let cl = u32::from_le_bytes([d[i + 8], d[i + 9], d[i + 10], d[i + 11]]) as usize;
+            i += 16;
+            if i + cl > d.len() {
+                break;
+            }
+            let fr = &d[i..i + cl];
+            i += cl;
+            // eth/IPv4 ICMP echo request whose payload starts 0xAA *4
+            if fr.len() >= 14 + 20 + 8 + 4
+                && fr[12] == 0x08
+                && fr[13] == 0x00
+                && fr[14] >> 4 == 4
+                && fr[23] == 1
+            {
+                let ihl = (fr[14] & 0xf) as usize * 4;
+                if fr.len() >= 14 + ihl + 8 + 4 && fr[14 + ihl] == 8 {
+                    let p = 14 + ihl + 8;
+                    if fr[p] == 0xaa && fr[p + 1] == 0xaa
+                        && fr[p + 2] == 0xaa && fr[p + 3] == 0xaa
+                    {
+                        seen = true;
+                    }
+                }
+            }
+        }
+        seen
+    });
 
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {
