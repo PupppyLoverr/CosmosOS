@@ -12635,6 +12635,8 @@ impl Term {
             "filefrag", "freefrag", "isols", "isocat", "fatls", "fatget",
             "openssl", "lsscsi", "ioping", "pidwait", "fincore",
             "journalctl", "nstat", "busybox",
+            "xclip", "xsel", "vidir", "img2txt", "identify",
+            "convert", "capinfos", "wakeonlan", "mtr",
             "csplit", "lsattr", "chattr", "unlink", "install", "fdupes", "rename", "nl", "look", "fmt",
         "pwck", "grpck", "pathchk", "nslookup", "b2sum",
             "locate", "cpio", "rsync", "xxd", "tsort", "updatedb",
@@ -32443,6 +32445,529 @@ impl Term {
                     Err(e) => self.fail(&alloc::format!("nstat: err {}", e)),
                 }
             }
+            "xclip" | "xsel" => {
+                // real kernel clipboard: -i loads stdin/file, -o prints it
+                let ins = args.iter().any(|a| *a == "-i");
+                let out = args.iter().any(|a| *a == "-o") || (!ins);
+                if ins {
+                    let data: Vec<u8> = if let Some(pos) =
+                        args.iter().position(|a| !a.starts_with('-'))
+                    {
+                        match ustd::read_all(args[pos]) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                self.fail(&alloc::format!(
+                                    "{}: {}: err {}",
+                                    cmd, args[pos], e
+                                ));
+                                return;
+                            }
+                        }
+                    } else {
+                        self.pipe_in.clone().unwrap_or_default().into_bytes()
+                    };
+                    ustd::clip_set(&data);
+                }
+                if out {
+                    let d = ustd::clip_get();
+                    if !d.is_empty() {
+                        self.emit(&String::from_utf8_lossy(&d));
+                    }
+                }
+            }
+            "vidir" => {
+                // vidir <dir>: editor-based batch rename — edit the listing,
+                // save+close, lines renumbered 1:1 back onto real names
+                let dir = args.first().copied().unwrap_or(".");
+                match ustd::readdir(dir) {
+                    Ok(ents) => {
+                        let mut names: Vec<String> = ents
+                            .iter()
+                            .map(|e| {
+                                String::from_utf8_lossy(
+                                    &e.name[..e.name_len as usize],
+                                )
+                                .into_owned()
+                            })
+                            .filter(|n| n != "." && n != "..")
+                            .collect();
+                        names.sort();
+                        let tmp = "/tmp/vidir-list";
+                        let body = names.join("\n");
+                        if ustd::write_all(tmp, body.as_bytes()).is_err() {
+                            self.fail("vidir: cannot write tmp file");
+                            return;
+                        }
+                        match ustd::spawn("/bin/cosmos-editor", tmp) {
+                            Ok(pid) => {
+                                self.emit("edit names, save (Ctrl-S) and close the window");
+                                let _ = ustd::waitpid(pid as u32, 300_000);
+                            }
+                            Err(_) => {
+                                self.fail("vidir: editor spawn failed");
+                                return;
+                            }
+                        }
+                        let new: Vec<String> = match ustd::read_all(tmp) {
+                            Ok(d) => String::from_utf8_lossy(&d)
+                                .lines()
+                                .map(|l| String::from(l.trim()))
+                                .collect(),
+                            Err(_) => names.clone(),
+                        };
+                        let mut done = 0usize;
+                        for (i, old) in names.iter().enumerate() {
+                            let Some(nw) = new.get(i) else { break };
+                            if nw.is_empty() || nw == old || nw.contains('/') {
+                                continue;
+                            }
+                            let a = alloc::format!("{}/{}", dir.trim_end_matches('/'), old);
+                            let b = alloc::format!("{}/{}", dir.trim_end_matches('/'), nw);
+                            if ustd::rename(&a, &b).is_ok() {
+                                self.emit(&alloc::format!("{} -> {}", old, nw));
+                                done += 1;
+                            }
+                        }
+                        self.emit(&alloc::format!("{} renamed", done));
+                    }
+                    Err(e) => self.fail(&alloc::format!("vidir: {}: err {}", dir, e)),
+                }
+            }
+            "img2txt" => {
+                // img2txt [-w cols] <img>: grayscale ASCII art
+                let mut w = 72usize;
+                let mut file = "";
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-w" => {
+                            i += 1;
+                            w = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(72);
+                        }
+                        a => file = a,
+                    }
+                    i += 1;
+                }
+                if file.is_empty() {
+                    self.fail("usage: img2txt [-w cols] <img>");
+                    return;
+                }
+                match ustd::read_all(file) {
+                    Ok(d) => match ustd::img::decode(&d) {
+                        Some(img) => {
+                            let w = w.min(160).max(8);
+                            // chars are ~2x taller than wide — halve the y scale
+                            let h = (img.h * w / img.w.max(1) / 2).max(1);
+                            let px = ustd::img::scale(&img, w, h);
+                            const RAMP: &[u8] = b" .:-=+*#%@";
+                            for y in 0..h {
+                                let mut line = String::new();
+                                for x in 0..w {
+                                    let c = px[y * w + x];
+                                    let r = (c >> 16) as u64;
+                                    let g = ((c >> 8) & 0xff) as u64;
+                                    let b = (c & 0xff) as u64;
+                                    let lum = (r * 299 + g * 587 + b * 114) / 1000;
+                                    let ix = (lum * (RAMP.len() - 1) as u64 / 255)
+                                        as usize;
+                                    line.push(RAMP[ix] as char);
+                                }
+                                self.emit(&line);
+                            }
+                        }
+                        None => self.fail("img2txt: unsupported image"),
+                    },
+                    Err(e) => self.fail(&alloc::format!("img2txt: {}: err {}", file, e)),
+                }
+            }
+            "identify" => {
+                // identify <img>...: format + dims from real headers
+                for f in args.iter().copied().filter(|a| !a.starts_with('-')) {
+                    match ustd::read_all(f) {
+                        Ok(d) => {
+                            let info = if d.len() > 24 && &d[..8] == b"\x89PNG\r\n\x1a\n" {
+                                let w = u32::from_be_bytes([d[16], d[17], d[18], d[19]]);
+                                let h = u32::from_be_bytes([d[20], d[21], d[22], d[23]]);
+                                alloc::format!("PNG {}x{}", w, h)
+                            } else if d.len() > 10
+                                && &d[..3] == b"GIF"
+                                && d[3] == b'8'
+                            {
+                                let w = u16::from_le_bytes([d[6], d[7]]);
+                                let h = u16::from_le_bytes([d[8], d[9]]);
+                                alloc::format!("GIF {}x{}", w, h)
+                            } else {
+                                match ustd::img::decode(&d) {
+                                    Some(img) => {
+                                        let fmt = if d[0] == b'P' && d[1] == b'6' {
+                                            "PPM"
+                                        } else if d[0] == b'P' && d[1] == b'3' {
+                                            "PPM-ascii"
+                                        } else if d[0] == b'B' && d[1] == b'M' {
+                                            "BMP"
+                                        } else {
+                                            "QOI"
+                                        };
+                                        alloc::format!("{} {}x{}", fmt, img.w, img.h)
+                                    }
+                                    None => alloc::format!("unknown ({:?})", &d[..4.min(d.len())]),
+                                }
+                            };
+                            self.emit(&alloc::format!("{}: {}", f, info));
+                        }
+                        Err(e) => self.fail(&alloc::format!(
+                            "identify: {}: err {}",
+                            f, e
+                        )),
+                    }
+                }
+            }
+            "convert" | "magick" => {
+                // convert <in> <out.{ppm,bmp,png}> — real transcode
+                let pos: Vec<&str> =
+                    args.iter().copied().filter(|a| !a.starts_with('-')).collect();
+                if pos.len() != 2 {
+                    self.fail("usage: convert <in> <out.ppm|out.bmp|out.png>");
+                    return;
+                }
+                match ustd::read_all(pos[0]) {
+                    Ok(d) => match ustd::img::decode(&d) {
+                        Some(img) => {
+                            let out: Option<Vec<u8>> = if pos[1].ends_with(".ppm") {
+                                let mut v = alloc::format!(
+                                    "P6\n{} {}\n255\n",
+                                    img.w, img.h
+                                )
+                                .into_bytes();
+                                for c in &img.px {
+                                    v.extend_from_slice(&[
+                                        (c >> 16) as u8,
+                                        (c >> 8) as u8,
+                                        *c as u8,
+                                    ]);
+                                }
+                                Some(v)
+                            } else if pos[1].ends_with(".bmp") {
+                                // 24bpp bottom-up BMP
+                                let row = (img.w * 3 + 3) & !3;
+                                let isz = row * img.h;
+                                let mut v = Vec::with_capacity(54 + isz);
+                                v.extend_from_slice(b"BM");
+                                v.extend_from_slice(&(54 + isz as u32).to_le_bytes());
+                                v.extend_from_slice(&[0; 4]);
+                                v.extend_from_slice(&54u32.to_le_bytes());
+                                v.extend_from_slice(&40u32.to_le_bytes());
+                                v.extend_from_slice(&(img.w as u32).to_le_bytes());
+                                v.extend_from_slice(&(img.h as u32).to_le_bytes());
+                                v.extend_from_slice(&1u16.to_le_bytes());
+                                v.extend_from_slice(&24u16.to_le_bytes());
+                                v.extend_from_slice(&[0; 4]);
+                                v.extend_from_slice(&(isz as u32).to_le_bytes());
+                                v.extend_from_slice(&[0; 16]);
+                                for y in (0..img.h).rev() {
+                                    for x in 0..img.w {
+                                        let c = img.px[y * img.w + x];
+                                        v.extend_from_slice(&[
+                                            c as u8,
+                                            (c >> 8) as u8,
+                                            (c >> 16) as u8,
+                                        ]);
+                                    }
+                                    v.resize(v.len() + (row - img.w * 3), 0);
+                                }
+                                Some(v)
+                            } else if pos[1].ends_with(".png") {
+                                // PNG: IHDR + IDAT(zlib: 0x78 0x01 + deflate + adler32) + IEND
+                                let mut raw = Vec::with_capacity(img.h * (img.w * 3 + 1));
+                                for y in 0..img.h {
+                                    raw.push(0u8);
+                                    for x in 0..img.w {
+                                        let c = img.px[y * img.w + x];
+                                        raw.extend_from_slice(&[
+                                            (c >> 16) as u8,
+                                            (c >> 8) as u8,
+                                            c as u8,
+                                        ]);
+                                    }
+                                }
+                                let def = ustd::deflate::deflate(&raw);
+                                let (mut s1, mut s2) = (1u32, 0u32);
+                                for b in &raw {
+                                    s1 = (s1 + *b as u32) % 65521;
+                                    s2 = (s2 + s1) % 65521;
+                                }
+                                let mut zl = vec![0x78u8, 0x01];
+                                zl.extend_from_slice(&def);
+                                zl.extend_from_slice(&((s2 << 16 | s1).to_be_bytes()));
+                                let chunk = |ty: &[u8; 4], body: &[u8]| -> Vec<u8> {
+                                    let mut c = Vec::with_capacity(body.len() + 12);
+                                    c.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                                    c.extend_from_slice(ty);
+                                    c.extend_from_slice(body);
+                                    let mut cc = Vec::from(&ty[..]);
+                                    cc.extend_from_slice(body);
+                                    c.extend_from_slice(&crc32(&cc).to_be_bytes());
+                                    c
+                                };
+                                let mut png = Vec::from(&b"\x89PNG\r\n\x1a\n"[..]);
+                                let mut ihdr = Vec::new();
+                                ihdr.extend_from_slice(&(img.w as u32).to_be_bytes());
+                                ihdr.extend_from_slice(&(img.h as u32).to_be_bytes());
+                                ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+                                png.extend_from_slice(&chunk(b"IHDR", &ihdr));
+                                png.extend_from_slice(&chunk(b"IDAT", &zl));
+                                png.extend_from_slice(&chunk(b"IEND", &[]));
+                                Some(png)
+                            } else {
+                                self.fail("convert: unknown out format (want .ppm/.bmp/.png)");
+                                None
+                            };
+                            if let Some(b) = out {
+                                match ustd::write_all(pos[1], &b) {
+                                    Ok(_) => self.emit(&alloc::format!(
+                                        "{} -> {} ({} bytes)",
+                                        pos[0], pos[1], b.len()
+                                    )),
+                                    Err(e) => self.fail(&alloc::format!(
+                                        "convert: {}: err {}",
+                                        pos[1], e
+                                    )),
+                                }
+                            }
+                        }
+                        None => self.fail("convert: cannot decode input"),
+                    },
+                    Err(e) => self.fail(&alloc::format!(
+                        "convert: {}: err {}",
+                        pos[0], e
+                    )),
+                }
+            }
+            "capinfos" => {
+                // capinfos <pcap>: real pcap header + record walk
+                let Some(f) = args.iter().find(|a| !a.starts_with('-')) else {
+                    self.fail("usage: capinfos <file.pcap>");
+                    return;
+                };
+                match ustd::read_all(f) {
+                    Ok(d) => {
+                        if d.len() < 24 {
+                            self.fail("capinfos: too short");
+                            return;
+                        }
+                        // real magic check: a1b2c3d4 or d4c3b2a1 (+ ns variants)
+                        let magic = [d[0], d[1], d[2], d[3]];
+                        let le = magic == [0xd4, 0xc3, 0xb2, 0xa1]
+                            || magic == [0x4d, 0x3c, 0xb2, 0xa1];
+                        let be = magic == [0xa1, 0xb2, 0xc3, 0xd4]
+                            || magic == [0xa1, 0xb2, 0x3c, 0x4d];
+                        if !le && !be {
+                            self.fail("capinfos: not a pcap file");
+                            return;
+                        }
+                        let r32 = |o: usize| -> u32 {
+                            if le {
+                                u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+                            } else {
+                                u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+                            }
+                        };
+                        let r16 = |o: usize| -> u16 {
+                            if le {
+                                u16::from_le_bytes([d[o], d[o + 1]])
+                            } else {
+                                u16::from_be_bytes([d[o], d[o + 1]])
+                            }
+                        };
+                        let snaplen = r32(16);
+                        let link = r32(20);
+                        let mut i = 24usize;
+                        let (mut pkts, mut first, mut last) = (0u64, u64::MAX, 0u64);
+                        while i + 16 <= d.len() {
+                            let ts = r32(i) as u64;
+                            let incl = r32(i + 8) as usize;
+                            pkts += 1;
+                            first = first.min(ts);
+                            last = last.max(ts);
+                            i += 16 + incl;
+                        }
+                        self.emit(&alloc::format!(
+                            "{}: {} packets, snaplen {}, linktype {}, {}s span",
+                            f,
+                            pkts,
+                            snaplen,
+                            link,
+                            last.saturating_sub(first)
+                        ));
+                    }
+                    Err(e) => self.fail(&alloc::format!("capinfos: {}: err {}", f, e)),
+                }
+            }
+            "wakeonlan" => {
+                // wakeonlan [-p port] <aa:bb:cc:dd:ee:ff>: real magic packet
+                let mut port = 9u16;
+                let mut mac_s = "";
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-p" => {
+                            i += 1;
+                            port = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(9);
+                        }
+                        a => mac_s = a,
+                    }
+                    i += 1;
+                }
+                let mut mac = [0u8; 6];
+                let mut ok = false;
+                {
+                    let parts: Vec<&str> = mac_s.split(':').collect();
+                    if parts.len() == 6 {
+                        ok = true;
+                        for (j, p) in parts.iter().enumerate() {
+                            match u8::from_str_radix(p, 16) {
+                                Ok(v) => mac[j] = v,
+                                Err(_) => ok = false,
+                            }
+                        }
+                    }
+                }
+                if !ok {
+                    self.fail("usage: wakeonlan [-p port] <aa:bb:cc:dd:ee:ff>");
+                    return;
+                }
+                let mut pkt = vec![0xffu8; 6];
+                for _ in 0..16 {
+                    pkt.extend_from_slice(&mac);
+                }
+                match ustd::UdpSock::open(49987) {
+                    Some(s) => match s.send_to([255, 255, 255, 255], port, &pkt) {
+                        Some(()) => self.emit(&alloc::format!(
+                            "magic packet (102B) sent to 255.255.255.255:{} for {}",
+                            port, mac_s
+                        )),
+                        None => self.fail("wakeonlan: send failed"),
+                    },
+                    None => self.fail("wakeonlan: socket failed"),
+                }
+            }
+            "urlencode" | "urldecode" => {
+                // %-codec for stdin or the first arg
+                let src = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .copied()
+                    .collect::<Vec<&str>>()
+                    .join(" ");
+                let src = if src.is_empty() {
+                    self.pipe_in.clone().unwrap_or_default()
+                } else {
+                    src
+                };
+                if cmd == "urlencode" {
+                    let mut o = String::new();
+                    for b in src.bytes() {
+                        if b.is_ascii_alphanumeric()
+                            || matches!(b, b'-' | b'.' | b'_' | b'~')
+                        {
+                            o.push(b as char);
+                        } else {
+                            o.push_str(&alloc::format!("%{:02X}", b));
+                        }
+                    }
+                    self.emit(&o);
+                } else {
+                    let mut o = Vec::new();
+                    let b = src.as_bytes();
+                    let mut i = 0usize;
+                    while i < b.len() {
+                        if b[i] == b'%' && i + 2 < b.len() {
+                            if let Ok(v) = u8::from_str_radix(
+                                core::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""),
+                                16,
+                            ) {
+                                o.push(v);
+                                i += 3;
+                                continue;
+                            }
+                        }
+                        o.push(if b[i] == b'+' { b' ' } else { b[i] });
+                        i += 1;
+                    }
+                    self.emit(&String::from_utf8_lossy(&o));
+                }
+            }
+            "mtr" => {
+                // mtr -r [N] <host>: traceroute hops + N pings per hop
+                let mut reps = 3u64;
+                let mut host = "";
+                let mut i = 0usize;
+                while i < args.len() {
+                    match args[i] {
+                        "-r" | "--report" => {}
+                        "-c" => {
+                            i += 1;
+                            reps = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(3);
+                        }
+                        "-n" | "--no-dns" => {}
+                        a => host = a,
+                    }
+                    i += 1;
+                }
+                if host.is_empty() {
+                    self.fail("usage: mtr -r [-c N] <host>");
+                    return;
+                }
+                match host_arg(host) {
+                    Some(ip) => {
+                        let packed = u32::from_be_bytes(ip);
+                        self.emit(&alloc::format!(
+                            "HOST: {} ({}.{}.{}.{})",
+                            host, ip[0], ip[1], ip[2], ip[3]
+                        ));
+                        self.emit("  Hop  Address           Loss%   Avg ms");
+                        for (ttl, hop, reached) in ustd::net_trace(packed, 15) {
+                            match hop {
+                                Some((hip, _)) => {
+                                    let (mut loss, mut tot) = (0u64, 0u64);
+                                    for _ in 0..reps {
+                                        match ustd::net_ping(
+                                            u32::from_be_bytes(hip),
+                                            800,
+                                        ) {
+                                            Some(ms) => tot += ms,
+                                            None => loss += 1,
+                                        }
+                                    }
+                                    let avg = if reps > loss {
+                                        tot / (reps - loss)
+                                    } else {
+                                        0
+                                    };
+                                    self.emit(&alloc::format!(
+                                        "  {:>3}  {:<16}  {:>3.0}%   {:>3}ms",
+                                        ttl,
+                                        alloc::format!(
+                                            "{}.{}.{}.{}",
+                                            hip[0], hip[1], hip[2], hip[3]
+                                        ),
+                                        loss * 100 / reps,
+                                        avg
+                                    ));
+                                }
+                                None => self.emit(&alloc::format!(
+                                    "  {:>3}  ???              100%",
+                                    ttl
+                                )),
+                            }
+                            if reached {
+                                break;
+                            }
+                        }
+                    }
+                    None => self.fail(&alloc::format!("mtr: can't resolve {}", host)),
+                }
+            }
             "halt" => ustd::poweroff(),
             "tput" => match args.first() {
                 Some(&"cols") => self.emit(&alloc::format!("{}", COLS)),
@@ -36762,6 +37287,8 @@ impl Term {
         "ifstat", "mountpoint", "isols", "isocat", "fatls", "fatget",
         "openssl", "lsscsi", "ioping", "pidwait", "fincore",
         "journalctl", "nstat", "busybox",
+        "xclip", "xsel", "vidir", "img2txt", "identify",
+        "convert", "capinfos", "wakeonlan", "urlencode", "urldecode", "mtr",
     ];
 
     const HELP_LINES: &'static [&'static str] = &[
