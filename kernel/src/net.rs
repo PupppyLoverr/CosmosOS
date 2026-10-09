@@ -5713,7 +5713,12 @@ fn tcp_rtt_sample(k: &mut TcpSock, sample: u64) {
 /// backpressure; peers stop sending when our app doesn't read.
 fn rx_win(k: &TcpSock) -> u16 {
     let buffered: usize = k.q.iter().map(|c| c.len()).sum();
-    32768u32.saturating_sub(buffered as u32).min(65535) as u16
+    // net.ipv4.tcp_rmem[2] is the real byte budget for queued rx data —
+    // the advertised window shrinks to 0 as it fills.
+    crate::sysctl::tcp_rmem()
+        .2
+        .saturating_sub(buffered as u64)
+        .min(65535) as u16
 }
 
 static TCP_SOCKS: Mutex<BTreeMap<u16, TcpSock>> = Mutex::new(BTreeMap::new());
@@ -5743,9 +5748,17 @@ fn tcp_feed(k: &mut TcpSock, s: &TcpSeg) {
                 k.snd_una = s.ack;
                 k.state = TcpState::Open;
                 if s.seq == k.rcv_nxt && !s.payload.is_empty() {
-                    k.q.push_back(s.payload.clone());
-                    k.rcv_nxt += s.payload.len() as u32;
-                    send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[], rx_win(k));
+                    // net.ipv4.tcp_rmem[2]: a payload that would pass the
+                    // byte cap is dropped — rcv_nxt stays put and the
+                    // sender retransmits (real overflow behavior).
+                    let buffered: usize = k.q.iter().map(|c| c.len()).sum();
+                    if buffered.saturating_add(s.payload.len()) as u64
+                        <= crate::sysctl::tcp_rmem().2
+                    {
+                        k.q.push_back(s.payload.clone());
+                        k.rcv_nxt += s.payload.len() as u32;
+                        send_tcp(k.mac, k.rip, k.lport, k.rport, k.snd_nxt, k.rcv_nxt, TCP_ACK, &[], rx_win(k));
+                    }
                 }
                 // accept queue: bounded by min(listen backlog,
                 // net.core.somaxconn) — a full queue refuses the
@@ -5814,8 +5827,13 @@ if q.len() < cap {
                 }
             }
             if s.seq == k.rcv_nxt && !s.payload.is_empty() {
-                k.q.push_back(s.payload.clone());
-                k.rcv_nxt += s.payload.len() as u32;
+                let buffered: usize = k.q.iter().map(|c| c.len()).sum();
+                if buffered.saturating_add(s.payload.len()) as u64
+                    <= crate::sysctl::tcp_rmem().2
+                {
+                    k.q.push_back(s.payload.clone());
+                    k.rcv_nxt += s.payload.len() as u32;
+                }
             }
             if s.flags & TCP_FIN != 0 {
                 k.rcv_nxt += 1;

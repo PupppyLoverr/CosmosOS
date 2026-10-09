@@ -44,6 +44,9 @@ static TIME_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static TCP_WMEM_LO: AtomicU64 = AtomicU64::new(4096);
 static TCP_WMEM_DEF: AtomicU64 = AtomicU64::new(16384);
 static TCP_WMEM_MAX: AtomicU64 = AtomicU64::new(4194304);
+static TCP_RMEM_LO: AtomicU64 = AtomicU64::new(4096);
+static TCP_RMEM_DEF: AtomicU64 = AtomicU64::new(131072);
+static TCP_RMEM_MAX: AtomicU64 = AtomicU64::new(6291456);
 static NF_CT_MAX: AtomicU64 = AtomicU64::new(65536);
 static ICMP_ECHO_IGNORE_BCAST: AtomicU64 = AtomicU64::new(1);
 static IP_FORWARD: AtomicU64 = AtomicU64::new(0);
@@ -228,6 +231,26 @@ pub fn set_tcp_wmem(lo: u64, def: u64, max: u64) -> bool {
     TCP_WMEM_LO.store(lo, Ordering::Relaxed);
     TCP_WMEM_DEF.store(def, Ordering::Relaxed);
     TCP_WMEM_MAX.store(max, Ordering::Relaxed);
+    true
+}
+/// net.ipv4.tcp_rmem: [2] is the real byte ceiling backing rx_win —
+/// the advertised receive window = rmem_max - queued bytes, and tcp_feed
+/// drops data past the cap (real overflow behavior).
+pub fn tcp_rmem() -> (u64, u64, u64) {
+    (
+        TCP_RMEM_LO.load(Ordering::Relaxed),
+        TCP_RMEM_DEF.load(Ordering::Relaxed),
+        TCP_RMEM_MAX.load(Ordering::Relaxed),
+    )
+}
+/// Write a tcp_rmem triple (1-3 values). Rejects non-ordered triples.
+pub fn set_tcp_rmem(lo: u64, def: u64, max: u64) -> bool {
+    if !(lo <= def && def <= max && max <= (1 << 26)) {
+        return false;
+    }
+    TCP_RMEM_LO.store(lo, Ordering::Relaxed);
+    TCP_RMEM_DEF.store(def, Ordering::Relaxed);
+    TCP_RMEM_MAX.store(max, Ordering::Relaxed);
     true
 }
 /// net.netfilter.nf_conntrack_max — real cap on the conntrack table.

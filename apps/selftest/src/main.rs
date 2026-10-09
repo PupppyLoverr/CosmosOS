@@ -2361,6 +2361,23 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         }
         ok && ustd::write_all("/proc/sys/net/ipv4/tcp_wmem", b"4096 16384 4194304").is_ok()
     });
+    check("tcp-rmem", {
+        // net.ipv4.tcp_rmem[2]: the real byte budget behind the
+        // advertised receive window — the knob round-trips through the
+        // proc file and a non-ordered triple is rejected like Linux.
+        ustd::write_all("/proc/sys/net/ipv4/tcp_rmem", b"2048 4096 8192").is_ok()
+            && ustd::read_all("/proc/sys/net/ipv4/tcp_rmem")
+                .map(|d| {
+                    let s = String::from_utf8_lossy(&d);
+                    s.split_whitespace()
+                        .filter_map(|t| t.parse::<u64>().ok())
+                        .collect::<alloc::vec::Vec<_>>()
+                        == alloc::vec![2048u64, 4096, 8192]
+                })
+                .unwrap_or(false)
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_rmem", b"99999 1 1").is_err()
+            && ustd::write_all("/proc/sys/net/ipv4/tcp_rmem", b"4096 131072 6291456").is_ok()
+    });
     check("domainname-sysctl", {
         // kernel.domainname: a real UTS-scoped string sysctl — round
         // trip through the proc file; empty restores the "(none)" value.
