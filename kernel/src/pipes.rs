@@ -33,6 +33,11 @@ pub struct Pipe {
     pub attr: u8,
     /// euid at create — fs.protected_fifos compares openers against it
     pub uid: u32,
+    /// readiness-transition epoch: bumped on empty->non-empty writes and
+    /// on 0<->non0 reader/writer transitions — epoll ET edges key off it
+    /// (a drain+refill between polls is a real edge Linux hooks via wait
+    /// queues; a monotonically-advanced epoch detects the same thing).
+    pub rise_gen: u64,
 }
 
 static PIPES: Mutex<BTreeMap<String, Pipe>> = Mutex::new(BTreeMap::new());
@@ -62,6 +67,13 @@ pub fn create_anon() -> Result<String, i64> {
     let path = alloc::format!("/pipes/.anon{}", n);
     create(&path)?;
     Ok(path)
+}
+
+/// readiness-transition epoch for epoll ET (0 when the pipe is gone —
+/// never equal to a live pipe's gen, which starts at 1 after its first
+/// transition... it starts at 0 too but a dead pipe answers Eof anyway).
+pub fn rise_gen(path: &str) -> u64 {
+    PIPES.lock().get(path).map(|p| p.rise_gen).unwrap_or(0)
 }
 
 /// poll(2) readiness: read is ready when data is queued OR all writers are
@@ -124,7 +136,7 @@ pub fn create(path: &str) -> Result<(), i64> {
     }
     g.insert(
         String::from(path),
-        Pipe { buf: VecDeque::new(), writers: 0, readers: 0, readers_seen: false, mtime: crate::vfs::now_unix(), attr: 0, uid: crate::task::cred().0 },
+        Pipe { buf: VecDeque::new(), writers: 0, readers: 0, readers_seen: false, mtime: crate::vfs::now_unix(), attr: 0, uid: crate::task::cred().0, rise_gen: 0 },
     );
     Ok(())
 }
@@ -176,9 +188,15 @@ pub fn open_role(path: &str, writer: bool) {
     if let Some(p) = PIPES.lock().get_mut(path) {
         if writer {
             p.writers += 1;
+            if p.writers == 1 {
+                p.rise_gen += 1; // first writer: EOF -> blocked transition
+            }
         } else {
             p.readers += 1;
             p.readers_seen = true;
+            if p.readers == 1 {
+                p.rise_gen += 1; // first reader: EPIPE -> writable
+            }
         }
     }
 }
@@ -190,8 +208,14 @@ pub fn close_role(path: &str, writer: bool) {
         Some(p) => {
             if writer && p.writers > 0 {
                 p.writers -= 1;
+                if p.writers == 0 {
+                    p.rise_gen += 1; // EOF edge
+                }
             } else if !writer && p.readers > 0 {
                 p.readers -= 1;
+                if p.readers == 0 {
+                    p.rise_gen += 1; // EPIPE edge for writers
+                }
             }
             // only anonymous pipe() objects self-destruct on last close; a
             // mkfifo'd name is a persistent fs object until unlinked
@@ -245,7 +269,11 @@ pub fn try_write(path: &str, data: &[u8]) -> Result<i64, i64> {
         return Err(-11);
     }
     let n = space.min(data.len());
+    let was_empty = p.buf.is_empty();
     p.buf.extend(&data[..n]);
+    if was_empty {
+        p.rise_gen += 1; // not-ready -> readable edge
+    }
     p.mtime = crate::vfs::now_unix();
     Ok(n as i64)
 }
@@ -267,7 +295,11 @@ pub fn tee(from: &str, to: &str, len: usize) -> Result<u64, i64> {
     let Some(dst) = g.get_mut(to) else { return Err(-22) };
     let space = pipe_cap().saturating_sub(dst.buf.len());
     let n = take.len().min(space);
+    let was_empty = dst.buf.is_empty();
     dst.buf.extend(&take[..n]);
+    if was_empty {
+        dst.rise_gen += 1;
+    }
     dst.mtime = crate::vfs::now_unix();
     Ok(n as u64)
 }

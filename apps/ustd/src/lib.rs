@@ -1777,6 +1777,10 @@ pub const EPOLL_CTL_DEL: u64 = 2;
 pub const EPOLL_CTL_MOD: u64 = 3;
 pub const EPOLLIN: u64 = 0x1;
 pub const EPOLLOUT: u64 = 0x2;
+pub const EPOLLERR: u64 = 0x8;
+pub const EPOLLHUP: u64 = 0x10;
+pub const EPOLLET: u64 = 0x8000_0000;
+pub const EPOLLONESHOT: u64 = 0x4000_0000;
 
 /// epoll_create: an fd owning a kernel interest set.
 pub fn epoll_create() -> i64 {
