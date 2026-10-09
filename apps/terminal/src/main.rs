@@ -8036,7 +8036,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
     let mut jump = "DROP";
-    let mut chain_out = false;
+    // chain operand: INPUT by default; -A/-I/-R/-D consume the next
+    // word (INPUT/OUTPUT or a user chain), bare chain names work too.
+    let mut chain = "INPUT";
     let mut insert_at: Option<usize> = None;
     let mut replace_at: Option<usize> = None;
     let mut del_spec = false;
@@ -8079,11 +8081,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 return None; // dst-range match isn't a real gate here
             }
             "-j" | "--jump" => {
-                let t = args.get(i + 1).copied().unwrap_or("DROP");
-                jump = match t {
-                    "DROP" | "ACCEPT" | "REJECT" | "LOG" => t,
-                    _ => return None, // only real targets
-                };
+                // builtins DROP/ACCEPT/REJECT/LOG/RETURN or a user-chain
+                // name — the kernel rejects an unregistered one.
+                jump = args.get(i + 1).copied().unwrap_or("DROP");
                 i += 1;
             }
             "-m" | "--match" => {
@@ -8125,7 +8125,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 // -I <chain> [rulenum] / -R <chain> <rulenum>: chain is
                 // the next arg, then a 1-based position (insert defaults
                 // to 1, replace requires the number).
-                chain_out |= args.get(i + 1) == Some(&"OUTPUT");
+                if let Some(c) = args.get(i + 1).copied() {
+                    chain = c;
+                }
                 i += 1; // consume the chain word
                 if let Some(n) = args.get(i + 1).and_then(|s| s.parse().ok()) {
                     if args[i - 1].starts_with("-R") || args[i - 1] == "--replace" {
@@ -8144,33 +8146,45 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 // -D <chain> <spec>: spec-delete mode — the kernel drops
                 // the first rule matching every parsed field.
                 del_spec = true;
+                if let Some(c) = args.get(i + 1).copied() {
+                    if !c.starts_with('-') {
+                        chain = c;
+                        i += 1;
+                    }
+                }
             }
-            "-A" | "INPUT" | "OUTPUT" | "FORWARD" | "-i" | "-o" => {
-                if args[i] == "OUTPUT" {
-                    chain_out = true;
+            "-A" | "--append" => {
+                // -A <chain>: the next word is the chain operand
+                if let Some(c) = args.get(i + 1).copied() {
+                    if !c.starts_with('-') {
+                        chain = c;
+                        i += 1;
+                    }
                 }
-                if args[i] == "-i" || args[i] == "-o" {
-                    i += 1; // interface arg — single nic, ignored
-                }
+            }
+            "INPUT" | "OUTPUT" | "FORWARD" => {
+                chain = args[i];
+            }
+            "-i" | "-o" => {
+                i += 1; // interface arg — single nic, ignored
             }
             _ => {}
         }
         i += 1;
     }
+    // chain token on the wire: INPUT→IN, OUTPUT→OUT, user names raw.
+    let ct = match chain {
+        "INPUT" | "IN" => "IN",
+        "OUTPUT" | "OUT" => "OUT",
+        c => c,
+    };
     let mut line = if del_spec {
-        if chain_out {
-            alloc::format!("D OUT {}", proto)
-        } else {
-            alloc::format!("D {}", proto)
-        }
+        alloc::format!("D {} {}", ct, proto)
     } else {
-        match (insert_at, replace_at, chain_out) {
-            (Some(n), _, true) => alloc::format!("I OUT {} {}", n, proto),
-            (Some(n), _, false) => alloc::format!("I {} {}", n, proto),
-            (_, Some(n), true) => alloc::format!("R OUT {} {}", n, proto),
-            (_, Some(n), false) => alloc::format!("R {} {}", n, proto),
-            (_, _, true) => alloc::format!("A OUT {}", proto),
-            _ => alloc::format!("A {}", proto),
+        match (insert_at, replace_at) {
+            (Some(n), _) => alloc::format!("I {} {} {}", ct, n, proto),
+            (_, Some(n)) => alloc::format!("R {} {} {}", ct, n, proto),
+            _ => alloc::format!("A {} {}", ct, proto),
         }
     };
     if dport != 0 {
@@ -8195,10 +8209,12 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
         }
     }
     match jump {
+        "DROP" => {}
         "LOG" => line.push_str(" log"),
         "REJECT" => line.push_str(" reject"),
         "ACCEPT" => line.push_str(" accept"),
-        _ => {}
+        "RETURN" => line.push_str(" return"),
+        n => line.push_str(&alloc::format!(" {}", n)), // user chain jump
     }
     line.push('\n');
     Some(line)
@@ -34673,34 +34689,81 @@ impl Term {
                         }
                         Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                     }
+                } else if first == "-N" || first == "--new-chain" {
+                    // user-defined chain — jumps resolve it by name
+                    match args.get(1) {
+                        Some(n) => match ustd::write_all(
+                            "/proc/net/iptables",
+                            alloc::format!("N {}\n", n).as_bytes(),
+                        ) {
+                            Ok(_) => self.emit(&alloc::format!("chain {} created", n)),
+                            Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
+                        },
+                        None => self.fail("usage: iptables -N <chain>"),
+                    }
+                } else if first == "-X" || first == "--delete-chain" {
+                    // delete an empty chain nothing references; bare -X
+                    // removes every chain that qualifies
+                    let line = match args.get(1) {
+                        Some(n) => alloc::format!("X {}\n", n),
+                        None => String::from("X\n"),
+                    };
+                    match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
+                        Ok(_) => self.emit("chain deleted"),
+                        Err(e) => self.fail(&alloc::format!(
+                            "iptables: chain is in use or not empty ({})",
+                            e
+                        )),
+                    }
+                } else if first == "-E" || first == "--rename-chain" {
+                    match (args.get(1), args.get(2)) {
+                        (Some(o), Some(n)) => match ustd::write_all(
+                            "/proc/net/iptables",
+                            alloc::format!("E {} {}\n", o, n).as_bytes(),
+                        ) {
+                            Ok(_) => self.emit(&alloc::format!(
+                                "chain {} renamed to {}",
+                                o, n
+                            )),
+                            Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
+                        },
+                        _ => self.fail("usage: iptables -E <old> <new>"),
+                    }
                 } else if first == "-F" || first == "--flush" {
-                    let ch = match args.iter().skip(1).next().copied() {
-                        Some("OUTPUT") => "F OUT\n",
-                        Some("INPUT") => "F IN\n",
-                        _ => "F\n",
+                    // -F [chain]: builtins map to IN/OUT, user names raw
+                    let ch = match args.get(1).copied() {
+                        None => String::from("F\n"),
+                        Some("OUTPUT") => String::from("F OUT\n"),
+                        Some("INPUT") => String::from("F IN\n"),
+                        Some(n) => alloc::format!("F {}\n", n),
                     };
                     match ustd::write_all("/proc/net/iptables", ch.as_bytes()) {
                         Ok(_) => self.emit("iptables: rules flushed"),
                         Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                     }
                 } else if first == "-Z" || first == "--zero" {
-                    let ch = match args.iter().skip(1).next().copied() {
-                        Some("OUTPUT") => "Z OUT\n",
-                        _ => "Z\n",
+                    let ch = match args.get(1).copied() {
+                        None => String::from("Z\n"),
+                        Some("OUTPUT") => String::from("Z OUT\n"),
+                        Some("INPUT") => String::from("Z IN\n"),
+                        Some(n) => alloc::format!("Z {}\n", n),
                     };
                     match ustd::write_all("/proc/net/iptables", ch.as_bytes()) {
                         Ok(_) => self.emit("iptables: counters zeroed"),
                         Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                     }
                 } else if first == "-P" || first == "--policy" {
-                    let out = args.iter().any(|a| *a == "OUTPUT");
+                    let ch = args.get(1).copied().unwrap_or("");
+                    let out = ch == "OUTPUT";
                     let verdict = args
                         .iter()
                         .copied()
                         .skip(1)
                         .find(|a| *a == "DROP" || *a == "ACCEPT")
                         .unwrap_or("");
-                    if !verdict.is_empty() {
+                    if ch != "INPUT" && ch != "OUTPUT" {
+                        self.fail("iptables: policy can only be set on a built-in chain");
+                    } else if !verdict.is_empty() {
                         let line = if out {
                             alloc::format!("P OUT {}\n", verdict)
                         } else {
@@ -34721,21 +34784,20 @@ impl Term {
                     // -D <chain> <rulenum> deletes by position; -D <chain>
                     // <rule-spec> deletes the first rule matching every
                     // field — real iptables spec-delete semantics.
-                    let out = args.iter().any(|a| *a == "OUTPUT");
-                    let chain_pos = args
-                        .iter()
-                        .position(|a| *a == "INPUT" || *a == "OUTPUT")
-                        .unwrap_or(0);
+                    // The chain operand is the first non-flag arg: IN/OUT
+                    // tokens or a user chain name.
+                    let (ct, cpos) = match args.get(1).copied() {
+                        Some("INPUT") | Some("IN") => ("IN", 1usize),
+                        Some("OUTPUT") | Some("OUT") => ("OUT", 1usize),
+                        Some(c) if !c.starts_with('-') => (c, 1usize),
+                        _ => ("IN", 0usize),
+                    };
                     let n = args
-                        .get(chain_pos + 1)
+                        .get(cpos + 1)
                         .and_then(|s| s.parse::<usize>().ok());
                     match n {
                         Some(n) => {
-                            let line = if out {
-                                alloc::format!("D OUT {}\n", n)
-                            } else {
-                                alloc::format!("D {}\n", n)
-                            };
+                            let line = alloc::format!("D {} {}\n", ct, n);
                             match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
                                 Ok(_) => self.emit(&alloc::format!("rule {} deleted", n)),
                                 Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
@@ -34761,21 +34823,22 @@ impl Term {
                     // are part of the rule grammar
                     match ipt_rule_from_args(&args) {
                         Some(line) => {
-                            let ch = if line.split(' ').nth(1) == Some("OUT") {
-                                "OUTPUT"
-                            } else {
-                                "INPUT"
+                            let ch = match line.split(' ').nth(1) {
+                                Some("IN") => "INPUT",
+                                Some("OUT") => "OUTPUT",
+                                Some(n) => n,
+                                None => "INPUT",
                             };
                             match ustd::write_all("/proc/net/iptables", line.as_bytes()) {
                                 Ok(_) => self.emit(&alloc::format!("rule added to {}", ch)),
                                 Err(e) => self.fail(&alloc::format!("iptables: {}", e)),
                             }
                         }
-                        None => self.fail("iptables: only -j DROP|REJECT|LOG|ACCEPT targets are supported"),
+                        None => self.fail("iptables: only -j DROP|REJECT|LOG|ACCEPT|RETURN|<chain> targets are supported"),
                     }
                 } else {
                     self.fail(
-                        "usage: iptables -L | -F [chain] | -P <chain> v | -D <chain> n | -A|-I <chain> .. -j v",
+                        "usage: iptables -L | -N|-X|-E <chain> | -F [chain] | -P <chain> v | -D <chain> n | -A|-I|-R <chain> .. -j v",
                     );
                 }
             }
@@ -39041,6 +39104,24 @@ impl Term {
                 }
                 let show_tcp = only_tcp || !only_udp;
                 let show_udp = only_udp || !only_tcp;
+                // -i/--info: internal tcp state per conn — rtt/rto/
+                // retransmits from the kernel estimator (tcpinfo dump).
+                let want_i = args.iter().any(|a| *a == "-i" || *a == "--info");
+                let mut tinfo: alloc::collections::BTreeMap<u64, Vec<String>> =
+                    Default::default();
+                if want_i {
+                    if let Ok(d) = ustd::read_all("/proc/net/tcpinfo") {
+                        for l in String::from_utf8_lossy(&d).lines().skip(1) {
+                            let f: Vec<String> =
+                                l.split_whitespace().map(String::from).collect();
+                            if f.len() >= 9 {
+                                if let Ok(lp) = f[0].parse::<u64>() {
+                                    tinfo.insert(lp, f);
+                                }
+                            }
+                        }
+                    }
+                }
                 let mut owners: alloc::collections::BTreeMap<u64, u32> =
                     Default::default();
                 if want_p {
@@ -39108,6 +39189,22 @@ impl Term {
                             self.emit(&alloc::format!(
                                 "tcp  {}{}", l.trim(), owner_field(l)
                             ));
+                            // -i: the estimator's real numbers under the
+                            // conn — rto/rtt/var + retransmit + queue
+                            // depths, like the kernel's own tcp_info.
+                            if want_i {
+                                let lp = l
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .and_then(|a| a.rsplit(':').next())
+                                    .and_then(|h| u64::from_str_radix(h, 16).ok());
+                                if let Some(f) = lp.and_then(|p| tinfo.get(&p)) {
+                                    self.emit(&alloc::format!(
+                                        "      rto:{} rtt:{}/{} retrans:0/{} unacked:{} rcvq:{}",
+                                        f[5], f[3], f[4], f[6], f[7], f[8]
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
