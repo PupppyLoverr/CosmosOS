@@ -36,13 +36,20 @@ const NET_FILES: &[&str] = &[
 ];
 
 /// files under /proc/sys/kernel
-const SYS_FILES: &[&str] = &["hostname", "shmmax", "shmall", "shmmni", "ngroups_max", "sysrq", "dmesg_restrict", "randomize_va_space", "cow_pages", "pid_max", "threads-max"];
+const SYS_FILES: &[&str] = &["hostname", "shmmax", "shmall", "shmmni", "ngroups_max", "sysrq", "dmesg_restrict", "randomize_va_space", "kptr_restrict", "cow_pages", "pid_max", "threads-max"];
 
 /// files under /proc/sys/fs (fs/inotify/max_user_watches lives one deeper)
-const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size", "file-max", "file-nr"];
+const FS_SYS_FILES: &[&str] = &["nr_open", "pipe-max-size", "file-max", "file-nr", "protected_symlinks"];
 
 /// files under /proc/sys/net/ipv4
-const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward"];
+const NET_SYS_FILES: &[&str] = &["icmp_echo_ignore_all", "ip_default_ttl", "ip_unprivileged_port_start", "icmp_echo_ignore_broadcasts", "ip_forward", "ip_local_port_range"];
+
+/// kernel.kptr_restrict: %pK-style addresses in /proc output —
+/// 0 = show, 1 = hide unless CAP_SYSLOG, 2 = hide for everyone.
+fn kptr_hide() -> bool {
+    let v = crate::sysctl::kptr_restrict();
+    v == 2 || (v == 1 && !crate::task::capable(crate::task::CAP_SYSLOG))
+}
 
 pub fn handles(path: &str) -> bool {
     path == "/proc" || path.starts_with("/proc/")
@@ -142,7 +149,9 @@ pub fn exists(path: &str) -> bool {
         return FS_SYS_FILES.contains(&f);
     }
     if let Some(f) = path.strip_prefix("/proc/sys/vm/") {
-        return f == "max_map_count";
+        return f == "max_map_count"
+            || f == "overcommit_memory"
+            || f == "overcommit_ratio";
     }
     if let Some(f) = path.strip_prefix("/proc/sys/kernel/") {
         if let Some(n) = f.strip_prefix("yama/") {
@@ -241,13 +250,16 @@ pub fn entries(path: &str) -> Vec<shared::DirEntry> {
         return out;
     }
     if path == "/proc/sys/vm" {
-        let mut de = shared::DirEntry::default();
-        de.name[..13].copy_from_slice(b"max_map_count");
-        de.name_len = 13;
-        de.size = read_file("/proc/sys/vm/max_map_count")
-            .map(|d| d.len() as u64)
-            .unwrap_or(0);
-        out.push(de);
+        for name in ["max_map_count", "overcommit_memory", "overcommit_ratio"] {
+            let mut de = shared::DirEntry::default();
+            let nb = name.as_bytes();
+            de.name[..nb.len()].copy_from_slice(nb);
+            de.name_len = nb.len() as u8;
+            de.size = read_file(&alloc::format!("/proc/sys/vm/{}", name))
+                .map(|d| d.len() as u64)
+                .unwrap_or(0);
+            out.push(de);
+        }
         return out;
     }
     if path == "/proc/sys/fs/inotify" {
@@ -499,6 +511,10 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         }
         "/proc/sys/net/ipv4/ip_forward" => {
             alloc::format!("{}\n", crate::sysctl::ip_forward())
+        }
+        "/proc/sys/net/ipv4/ip_local_port_range" => {
+            let (lo, hi) = crate::sysctl::local_port_range();
+            alloc::format!("{}\t{}\n", lo, hi)
         }
         "/proc/sys/net/ipv4/ip_default_ttl" => net::net_def_ttl(),
         "/proc/swaps" => {
@@ -873,6 +889,19 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
         return crate::sysctl::set("net/ipv4/ip_unprivileged_port_start", v)
             .then_some(buf.len());
     }
+    if path == "/proc/sys/net/ipv4/ip_local_port_range" {
+        let s = String::from(String::from_utf8_lossy(buf));
+        let parts: Vec<u64> = s
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| t.parse::<u64>().ok())
+            .collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        return crate::sysctl::set_local_port_range(parts[0], parts[1])
+            .then_some(buf.len());
+    }
     if let Some(rel) = path.strip_prefix("/proc/sys/net/ipv4/") {
         if rel == "icmp_echo_ignore_broadcasts" || rel == "ip_forward" {
             let s = String::from(String::from_utf8_lossy(buf).trim());
@@ -1015,13 +1044,13 @@ fn pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
         "fds" => task::fd_list(pid).unwrap_or_default(),
         "fdinfo" => task::fd_info(pid).unwrap_or_default(),
         "cwd" => alloc::format!("{}\n", task::pid_cwd(pid).unwrap_or_default()),
-        "maps" => task::pid_maps(pid).unwrap_or_default(),
+        "maps" => task::pid_maps(pid, kptr_hide()).unwrap_or_default(),
         "io" => {
             let (r, w) = task::pid_io(pid).unwrap_or((0, 0));
             alloc::format!("rchar: {}\nwchar: {}\nsyscr: {}\nsyscw: {}\nread_bytes: 0\nwrite_bytes: 0\n", r, w, r, w)
         }
         "statm" => task::pid_statm(pid).unwrap_or_default(),
-        "smaps" => task::pid_smaps(pid).unwrap_or_default(),
+        "smaps" => task::pid_smaps(pid, kptr_hide()).unwrap_or_default(),
         "wchan" => task::pid_wchan(pid).unwrap_or_default(),
         "children" => alloc::format!(
             "{}\n",

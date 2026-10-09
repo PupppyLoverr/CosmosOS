@@ -22,6 +22,12 @@ static INOTIFY_MAX_QUEUED: AtomicU64 = AtomicU64::new(16384);
 static EPOLL_MAX_WATCHES: AtomicU64 = AtomicU64::new(131072);
 static UNPRIV_PORT_START: AtomicU64 = AtomicU64::new(1024);
 static NGROUPS_MAX: AtomicU64 = AtomicU64::new(65536);
+static OVERCOMMIT_MEMORY: AtomicU64 = AtomicU64::new(0);
+static OVERCOMMIT_RATIO: AtomicU64 = AtomicU64::new(50);
+static KPTR_RESTRICT: AtomicU64 = AtomicU64::new(0);
+static PROTECTED_SYMLINKS: AtomicU64 = AtomicU64::new(1);
+static LOCAL_PORT_LO: AtomicU64 = AtomicU64::new(49152);
+static LOCAL_PORT_HI: AtomicU64 = AtomicU64::new(65535);
 static ICMP_ECHO_IGNORE_BCAST: AtomicU64 = AtomicU64::new(1);
 static IP_FORWARD: AtomicU64 = AtomicU64::new(0);
 static KERNEL_SYSRQ: AtomicU64 = AtomicU64::new(1);
@@ -100,6 +106,32 @@ pub fn dmesg_restrict() -> u64 {
 pub fn randomize_va_space() -> u64 {
     RANDOMIZE_VA.load(Ordering::Relaxed)
 }
+pub fn vm_overcommit_memory() -> u64 {
+    OVERCOMMIT_MEMORY.load(Ordering::Relaxed)
+}
+pub fn vm_overcommit_ratio() -> u64 {
+    OVERCOMMIT_RATIO.load(Ordering::Relaxed)
+}
+pub fn kptr_restrict() -> u64 {
+    KPTR_RESTRICT.load(Ordering::Relaxed)
+}
+pub fn protected_symlinks() -> u64 {
+    PROTECTED_SYMLINKS.load(Ordering::Relaxed)
+}
+pub fn local_port_range() -> (u64, u64) {
+    (
+        LOCAL_PORT_LO.load(Ordering::Relaxed),
+        LOCAL_PORT_HI.load(Ordering::Relaxed),
+    )
+}
+pub fn set_local_port_range(lo: u64, hi: u64) -> bool {
+    if lo == 0 || hi == 0 || lo > hi || hi > 65535 {
+        return false;
+    }
+    LOCAL_PORT_LO.store(lo, Ordering::Relaxed);
+    LOCAL_PORT_HI.store(hi, Ordering::Relaxed);
+    true
+}
 
 /// sysctl name under /proc/sys → current value, or None when unknown.
 /// Names are given relative, e.g. "kernel/pid_max", "fs/nr_open".
@@ -134,6 +166,11 @@ pub fn get(name: &str) -> Option<u64> {
         "kernel/sysrq" => KERNEL_SYSRQ.load(Ordering::Relaxed),
         "kernel/dmesg_restrict" => DMESG_RESTRICT.load(Ordering::Relaxed),
         "kernel/randomize_va_space" => RANDOMIZE_VA.load(Ordering::Relaxed),
+        "vm/overcommit_memory" => OVERCOMMIT_MEMORY.load(Ordering::Relaxed),
+        "vm/overcommit_ratio" => OVERCOMMIT_RATIO.load(Ordering::Relaxed),
+        "kernel/kptr_restrict" => KPTR_RESTRICT.load(Ordering::Relaxed),
+        "fs/protected_symlinks" => PROTECTED_SYMLINKS.load(Ordering::Relaxed),
+
         _ => return None,
     })
 }
@@ -177,6 +214,11 @@ pub fn set(name: &str, v: u64) -> bool {
         "kernel/sysrq" if v <= 1 << 16 => KERNEL_SYSRQ.store(v, Ordering::Relaxed),
         "kernel/dmesg_restrict" if v <= 1 => DMESG_RESTRICT.store(v, Ordering::Relaxed),
         "kernel/randomize_va_space" if v <= 2 => RANDOMIZE_VA.store(v, Ordering::Relaxed),
+        "vm/overcommit_memory" if v <= 2 => OVERCOMMIT_MEMORY.store(v, Ordering::Relaxed),
+        "vm/overcommit_ratio" if v <= 100 => OVERCOMMIT_RATIO.store(v, Ordering::Relaxed),
+        "kernel/kptr_restrict" if v <= 2 => KPTR_RESTRICT.store(v, Ordering::Relaxed),
+        "fs/protected_symlinks" if v <= 1 => PROTECTED_SYMLINKS.store(v, Ordering::Relaxed),
+
         _ => return false,
     }
     true

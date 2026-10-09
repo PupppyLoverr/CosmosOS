@@ -300,6 +300,9 @@ fn resolve_links(
         // tmpfs-covered dir (e.g. /tmp) resolves here too, and its
         // target may point back at FAT
         if crate::tmpfs::handles(full) {
+            if crate::tmpfs::link_follow_denied(full) {
+                return Err(-1); // EPERM — fs.protected_symlinks
+            }
             match crate::tmpfs::readlink(full) {
                 Some(tgt) => {
                     let base = match full.rfind('/') {

@@ -551,6 +551,37 @@ pub fn truncate(path: &str, len: u64) -> Result<(), i64> {
     Ok(())
 }
 
+/// fs.protected_symlinks: a link in a sticky, world-writable dir may
+/// only be followed by its owner, the dir's owner, or CAP_FOWNER.
+/// readlink(2) stays ungated — this is for the follow path only.
+pub fn link_follow_denied(path: &str) -> bool {
+    if crate::sysctl::protected_symlinks() == 0 {
+        return false;
+    }
+    let (eu, _eg) = crate::task::cred();
+    if eu == 0 || crate::task::capable_ns_dac(crate::task::CAP_FOWNER) {
+        return false;
+    }
+    let ng = NODES.lock();
+    let Some(n) = ng.get(path) else {
+        return false;
+    };
+    if n.is_dir || n.attr & 0x40 == 0 {
+        return false;
+    }
+    let parent = match path.rfind('/') {
+        Some(0) => "/",
+        Some(i) => &path[..i],
+        None => return false,
+    };
+    let Some(dir) = ng.get(parent) else {
+        return false;
+    };
+    dir.is_dir && dir.mode & 0o1000 != 0 && dir.mode & 0o002 != 0
+        && eu != n.uid
+        && eu != dir.uid
+}
+
 /// Raw symlink target — mirrors the FAT32 "LNK>" convention: a node
 /// with attr bit 0x40 whose body starts with "LNK>" names its target.
 /// None when the node isn't a link (also what dangling means).
