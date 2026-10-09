@@ -25278,6 +25278,42 @@ impl Term {
                     self.route_show(true);
                     return;
                 }
+                if args.iter().any(|a| *a == "-i" || *a == "--interfaces") {
+                    // netstat -i: kernel interface table from /proc/net/dev
+                    self.emit("Kernel Interface table");
+                    self.emit(
+                        "Iface   MTU Met   RX-OK RX-ERR RX-DRP RX-OVR    TX-OK TX-ERR TX-DRP TX-OVR Flg",
+                    );
+                    if let Ok(d) = ustd::read_all("/proc/net/dev") {
+                        for l in String::from_utf8_lossy(&d).lines() {
+                            let Some((dev, rest)) = l.split_once(':') else {
+                                continue;
+                            };
+                            let dev = dev.trim();
+                            if dev != "eth0" && dev != "lo" {
+                                continue;
+                            }
+                            let f: Vec<u64> = rest
+                                .split_whitespace()
+                                .filter_map(|n| n.parse().ok())
+                                .collect();
+                            if f.len() < 16 {
+                                continue;
+                            }
+                            let (mtu, flg) = if dev == "lo" {
+                                (65536, "LRU")
+                            } else {
+                                (1500, "BMRU")
+                            };
+                            self.emit(&alloc::format!(
+                                "{:<7} {:<4} {:<4} {:<5} {:<6} {:<6} {:<6} {:<6} {:<6} {:<6} {:<5} {}",
+                                dev, mtu, 0, f[1], f[2], f[3], f[4],
+                                f[9], f[10], f[11], f[12], flg
+                            ));
+                        }
+                    }
+                    return;
+                }
                 let only_l = args.iter().any(|a| *a == "-l");
                 let tf = args.iter().any(|a| *a == "-t");
                 let uf = args.iter().any(|a| *a == "-u");
@@ -25427,20 +25463,61 @@ impl Term {
                 match args.first().copied() {
                     Some("add") | Some("del") => {
                         let op = args.first().copied().unwrap_or("");
-                        let net = args.get(1) == Some(&"-net");
-                        let spec = if net { args.get(2).copied() } else { args.get(1).copied() };
+                        // -net/-host take the next arg as the dest spec; a
+                        // bare spec works like -host (host route /32).
+                        let kind = args.get(1).copied().unwrap_or("");
+                        let flag_spec = matches!(kind, "-net" | "-host");
+                        let spec = if flag_spec {
+                            args.get(2).copied()
+                        } else {
+                            args.get(1).copied()
+                        };
                         let Some(spec) = spec else {
-                            self.fail("usage: route {add,del} [-net] <dest>[/<plen>] [gw <gw>]");
+                            self.fail("usage: route {add,del} [-net|-host] <dest>[/<plen>] [netmask <m>] [gw <gw>]");
                             return;
                         };
-                        let (dest, plen) = if spec == "default" {
-                            ("0.0.0.0", "0")
+                        // `netmask a.b.c.d` supplies a dotted mask like GNU
+                        // route; a /plen suffix still wins if both given.
+                        let nm = args
+                            .iter()
+                            .position(|a| *a == "netmask")
+                            .and_then(|i| args.get(i + 1))
+                            .and_then(|m| {
+                                let o: Vec<u32> = m
+                                    .split('.')
+                                    .filter_map(|x| x.parse::<u8>().ok().map(|b| b as u32))
+                                    .collect();
+                                if o.len() == 4 {
+                                    Some((o[0] << 24 | o[1] << 16 | o[2] << 8 | o[3])
+                                        .count_ones()
+                                        .to_string())
+                                } else {
+                                    None
+                                }
+                            });
+                        let (dest, plen_s);
+                        if spec == "default" {
+                            dest = "0.0.0.0";
+                            plen_s = String::from("0");
                         } else {
                             match spec.split_once('/') {
-                                Some((d, p)) => (d, p),
-                                None => (spec, "32"),
+                                Some((d, p)) => {
+                                    dest = d;
+                                    plen_s = String::from(p);
+                                }
+                                None => {
+                                    dest = spec;
+                                    plen_s = nm.clone().unwrap_or_else(|| {
+                                        if kind == "-net" {
+                                            String::from("24")
+                                        } else {
+                                            String::from("32")
+                                        }
+                                    });
+                                }
                             }
-                        };
+                        }
+                        let plen = plen_s.as_str();
                         let gw = args
                             .iter()
                             .position(|a| *a == "gw")
@@ -29918,11 +29995,17 @@ impl Term {
             }
             "dig" => {
                 // dig <name> [A|MX|NS|TXT|CNAME|AAAA|ANY] — raw DNS over UDP/53
-                let Some(name) = args.first() else {
-                    self.fail("usage: dig <name> [type]");
+                // `+short` (and other +opts) aren't positional args
+                let pargs: Vec<&str> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('+'))
+                    .copied()
+                    .collect();
+                let Some(name) = pargs.first() else {
+                    self.fail("usage: dig <name> [type] [+short]");
                     return;
                 };
-                let qt = match args.get(1).map(|s| s.to_uppercase()).as_deref() {
+                let qt = match pargs.get(1).map(|s| s.to_uppercase()).as_deref() {
                     None | Some("A") => 1u16,
                     Some("NS") => 2,
                     Some("CNAME") => 5,
@@ -29937,10 +30020,23 @@ impl Term {
                         return;
                     }
                 };
+                let short = args.iter().any(|a| *a == "+short");
                 match dig_query(name, qt) {
                     Ok(lines) => {
                         for l in lines {
-                            self.emit(&l);
+                            if short {
+                                // +short: just the rdata of each answer row
+                                // ("name  ttl  IN  <TYPE>  <rdata>")
+                                if let Some(rest) = l.split_once("  IN  ") {
+                                    if let Some(rd) =
+                                        rest.1.splitn(2, ' ').nth(1)
+                                    {
+                                        self.emit(rd);
+                                    }
+                                }
+                            } else {
+                                self.emit(&l);
+                            }
                         }
                     }
                     Err(e) => self.fail(&e),
@@ -30768,7 +30864,42 @@ impl Term {
             },
             "ifconfig" => {
                 // ifconfig [eth0 [up|down]] — 'up'/'down' flip the real link
-                // state through /proc/net/operstate (drops rx, fails tx)
+                // state through /proc/net/operstate (drops rx, fails tx).
+                // -s prints net-tools' short iface-stats table.
+                if args.iter().any(|a| *a == "-s") {
+                    self.emit(
+                        "Iface      MTU    RX-OK  RX-ERR  RX-DRP  RX-OVR    TX-OK  TX-ERR  TX-DRP  TX-OVR Flg",
+                    );
+                    if let Ok(d) = ustd::read_all("/proc/net/dev") {
+                        for l in String::from_utf8_lossy(&d).lines() {
+                            let Some((dev, rest)) = l.split_once(':') else {
+                                continue;
+                            };
+                            let dev = dev.trim();
+                            if dev != "eth0" && dev != "lo" {
+                                continue;
+                            }
+                            let f: Vec<u64> = rest
+                                .split_whitespace()
+                                .filter_map(|n| n.parse().ok())
+                                .collect();
+                            if f.len() < 16 {
+                                continue;
+                            }
+                            let (mtu, flg) = if dev == "lo" {
+                                (65536, "LRU")
+                            } else {
+                                (1500, "BMRU")
+                            };
+                            self.emit(&alloc::format!(
+                                "{:<10} {:<5} {:<6} {:<7} {:<7} {:<7} {:<6} {:<7} {:<7} {:<6} {}",
+                                dev, mtu, f[1], f[2], f[3], f[4],
+                                f[9], f[10], f[11], f[12], flg
+                            ));
+                        }
+                    }
+                    return;
+                }
                 let pos: Vec<&str> =
                     args.iter().filter(|a| !a.starts_with('-')).copied().collect();
                 if pos.len() >= 2 && (pos[1] == "up" || pos[1] == "down") {
@@ -37941,6 +38072,67 @@ impl Term {
                 self.emit(&alloc::format!("\tTX: {} packets {} bytes", txp, txb));
             }
             "ip" => match args.first().copied() {
+                // `ip -s link` — per-iface RX/TX stats in iproute2 layout
+                Some("-s") | Some("--stats") => {
+                    let devt = ustd::read_all("/proc/net/dev")
+                        .map(|d| String::from_utf8_lossy(&d).into_owned())
+                        .unwrap_or_default();
+                    let up = ustd::read_all("/proc/net/operstate")
+                        .map(|d| String::from_utf8_lossy(&d).trim().to_string())
+                        .unwrap_or_else(|_| String::from("down"));
+                    for (dev, mtu, flag) in [("eth0", 1500u32, "BROADCAST,MULTICAST,UP,LOWER_UP"), ("lo", 65536u32, "LOOPBACK,UP,LOWER_UP")] {
+                        let mut f = [0u64; 16];
+                        for l in devt.lines() {
+                            if l.trim_start().starts_with(&alloc::format!("{}:", dev)) {
+                                let rest = l.split(':').nth(1).unwrap_or("");
+                                for (i, n) in rest.split_whitespace().enumerate() {
+                                    if i < 16 {
+                                        f[i] = n.parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                        let st = if dev == "lo" || up == "up" { "UP" } else { "DOWN" };
+                        let (mac, ip) = ustd::net_info()
+                            .map(|(m, i)| (Some(m), Some(i)))
+                            .unwrap_or((None, None));
+                        self.emit(&alloc::format!(
+                            "{}: {}: <{}> mtu {} state {} mode DEFAULT",
+                            if dev == "eth0" { "2" } else { "1" }, dev, flag, mtu, st
+                        ));
+                        if dev == "eth0" {
+                            if let Some(m) = mac {
+                                self.emit(&alloc::format!(
+                                    "    link/ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} brd ff:ff:ff:ff:ff:ff",
+                                    m[0], m[1], m[2], m[3], m[4], m[5]
+                                ));
+                            }
+                        } else {
+                            self.emit("    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00");
+                        }
+                        self.emit("    RX: bytes  packets  errors  dropped  mcast");
+                        self.emit(&alloc::format!(
+                            "    {:<10} {:<8} {:<7} {:<8} {}",
+                            f[0], f[1], f[2], f[3], f[7]
+                        ));
+                        self.emit("    TX: bytes  packets  errors  dropped  carrier");
+                        self.emit(&alloc::format!(
+                            "    {:<10} {:<8} {:<7} {:<8} {}",
+                            f[8], f[9], f[10], f[11], f[13]
+                        ));
+                        if dev == "eth0" {
+                            if let Some(i) = ip {
+                                self.emit(&alloc::format!(
+                                    "    inet {}.{}.{}.{}/24 brd {}.{}.{}.255 scope global eth0",
+                                    i[0], i[1], i[2], i[3], i[0], i[1], i[2]
+                                ));
+                            }
+                        } else {
+                            self.emit("    inet 127.0.0.1/8 scope host lo");
+                        }
+                    }
+                    return;
+                }
                 Some("a") | Some("addr") | Some("address") => {
                     self.run(&String::from("ifconfig"));
                 }

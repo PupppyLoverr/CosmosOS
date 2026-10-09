@@ -389,6 +389,61 @@ pub fn net_arp() -> String {
     s
 }
 
+/// `/proc/net/fib_trie` — the main routing table as a Linux-format
+/// prefix tree: one `+-- <net>` grouping per distinct route, with the
+/// leaf prefixes and their route attributes nested under it. Local
+/// routes (127/8, our own /32, broadcasts) show under `Local:`.
+pub fn net_fib_trie() -> String {
+    let mut g = ROUTES.lock();
+    let r = g.get_or_insert_with(default_routes);
+    let dot = |ip: [u8; 4]| alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    let plen = |m: [u8; 4]| {
+        (u32::from_be_bytes(m)).count_ones()
+    };
+    // the kernel's fixed local delivery rules, like Linux's Local table
+    let mut out = String::from("Local:\n");
+    out.push_str(" +-- 127.0.0.0/8\n");
+    out.push_str("    |-- 127.0.0.0\n       /8 host LOCAL\n");
+    out.push_str("    |-- 127.255.255.255\n       /32 host LOCAL\n");
+    let ip = our_ip();
+    out.push_str(&alloc::format!(
+        " +-- {}.{}.{}.{}/32\n    |-- {}.{}.{}.{}\n       /32 host LOCAL\n",
+        ip[0], ip[1], ip[2], ip[3], ip[0], ip[1], ip[2], ip[3]
+    ));
+    // each ROUTES entry becomes its own leaf chain (flat table = flat trie)
+    out.push_str("Main:\n");
+    for rt in r.iter() {
+        let p = plen(rt.mask);
+        let base = dot(rt.dest);
+        let gw = dot(rt.gw);
+        let via = if rt.gw == [0; 4] {
+            alloc::format!("link dev {}", rt.dev)
+        } else {
+            alloc::format!("via {} dev {}", gw, rt.dev)
+        };
+        let scope = if rt.gw == [0; 4] { "link" } else { "universe" };
+        out.push_str(&alloc::format!(" +-- {}/{}\n", base, p));
+        out.push_str(&alloc::format!(
+            "    |-- {}\n       /{} {} UNICAST {}\n",
+            base, p, scope, via
+        ));
+        if rt.gw == [0; 4] && rt.dev == "eth0" {
+            // connected nets get a subnet broadcast, like Linux's LOCAL
+            let b = dot([
+                rt.dest[0] | !rt.mask[0],
+                rt.dest[1] | !rt.mask[1],
+                rt.dest[2] | !rt.mask[2],
+                rt.dest[3] | !rt.mask[3],
+            ]);
+            out.push_str(&alloc::format!(
+                "    |-- {}\n       /32 host LOCAL dev {}\n",
+                b, rt.dev
+            ));
+        }
+    }
+    out
+}
+
 /// `/proc/sys/net/ipv4/icmp_echo_ignore_all` — 0/1 sysctl body.
 pub fn net_icmp_ignore_all() -> String {
     alloc::format!(
