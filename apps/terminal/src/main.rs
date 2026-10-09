@@ -10152,11 +10152,25 @@ impl Term {
     fn emit_no_nl(&mut self, s: &str) {
         let mut cleaned = String::new();
         let s = self.bell(s, &mut cleaned);
-        if let Some(c) = self.capture.as_mut() {
+        if self.out_err {
+            if self.err_file.is_some() {
+                self.err_buf.push(String::from(s));
+            } else {
+                match self.lines.last_mut() {
+                    Some(last) => last.push_str(s),
+                    None => self.push_line(s),
+                }
+            }
+        } else if let Some(c) = self.capture.as_mut() {
             match c.last_mut() {
                 Some(last) => last.push_str(s),
                 None => c.push(String::from(s)),
             }
+        } else if let Some(p) = self.exec_out.clone() {
+            // `exec >f` / the su output sink: raw append, no newline
+            let mut prev = ustd::read_all(&p).unwrap_or_default();
+            prev.extend_from_slice(s.as_bytes());
+            let _ = ustd::write_all(&p, &prev);
         } else {
             match self.lines.last_mut() {
                 Some(last) => last.push_str(s),
@@ -22928,16 +22942,30 @@ impl Term {
                 } else {
                     String::from("id")
                 };
+                // The child's pane writes are COW — emit output never
+                // reaches the parent's scrollback. Route it through a real
+                // /tmp sink (emit's exec_out/exec_err arms append to files)
+                // that the parent drains after waitpid.
+                let sink = alloc::format!("/tmp/.su-out-{}", ustd::getpid());
+                let _ = ustd::remove(&sink);
                 match ustd::fork() {
                     0 => {
                         if ustd::setgid(gid) != 0 || ustd::setuid(uid) != 0 {
                             ustd::exit(126);
                         }
+                        self.exec_out = Some(sink.clone());
+                        self.exec_err = Some(sink.clone());
                         self.run(&cmdline);
-                        ustd::exit(0);
+                        ustd::exit(if self.last_ok { 0 } else { 1 });
                     }
                     p if p > 0 => {
                         let c = ustd::waitpid(p as u32, 120_000).unwrap_or(-1);
+                        if let Ok(blob) = ustd::read_all(&sink) {
+                            let _ = ustd::remove(&sink);
+                            if !blob.is_empty() {
+                                self.emit_bin(&blob);
+                            }
+                        }
                         if c != 0 {
                             self.fail(&alloc::format!("su: child exited {}", c));
                         }
