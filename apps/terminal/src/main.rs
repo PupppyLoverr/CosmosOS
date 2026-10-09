@@ -19264,18 +19264,124 @@ impl Term {
                 self.emit("      Architecture: x86-64");
             }
             "resolvectl" => {
-                // resolvectl status | query NAME — real resolver state
-                // + real DNS lookups through the kernel resolver.
+                // resolvectl status|statistics|flush-caches|dns|query
+                // — real resolver state: nameserver from resolv.conf,
+                // cache stats from /proc/net/dns, real DNS lookups.
+                let ns = {
+                    let b = ustd::read_all("/etc/resolv.conf")
+                        .unwrap_or_default();
+                    let t = String::from_utf8_lossy(&b);
+                    t.lines()
+                        .filter_map(|l| {
+                            let mut f = l.split_whitespace();
+                            if f.next() == Some("nameserver") {
+                                f.next()
+                            } else {
+                                None
+                            }
+                        })
+                        .next()
+                        .unwrap_or("10.0.2.3")
+                        .to_string()
+                };
                 match args.first() {
                     Some(&"status") => {
                         self.emit("Global");
                         self.emit("         Protocols: DNS");
-                        self.emit("          DNS Servers: 10.0.2.3");
+                        self.emit(&alloc::format!(
+                            "          DNS Servers: {}",
+                            ns
+                        ));
                         self.emit("");
                         self.emit("Link 2 (eth0)");
-                        self.emit("    Current DNS Server: 10.0.2.3");
-                        self.emit("            DNS Servers: 10.0.2.3");
+                        self.emit(&alloc::format!(
+                            "    Current DNS Server: {}",
+                            ns
+                        ));
+                        self.emit(&alloc::format!(
+                            "            DNS Servers: {}",
+                            ns
+                        ));
                         self.emit("         Default Route: yes");
+                    }
+                    Some(&"statistics") => {
+                        let d = ustd::read_all("/proc/net/dns")
+                            .unwrap_or_default();
+                        let t = String::from_utf8_lossy(&d);
+                        let (mut h, mut m, mut n) = (0u64, 0u64, 0u64);
+                        for l in t.lines() {
+                            let mut f = l.split_whitespace();
+                            let key = f.next();
+                            let v =
+                                f.next().and_then(|s| s.parse().ok());
+                            match (key, v) {
+                                (Some("hits"), Some(x)) => h = x,
+                                (Some("misses"), Some(x)) => m = x,
+                                (Some("entries"), Some(x)) => n = x,
+                                _ => {}
+                            }
+                        }
+                        self.emit("DNS Cache");
+                        self.emit(&alloc::format!(
+                            "  Cache hits:   {}",
+                            h
+                        ));
+                        self.emit(&alloc::format!(
+                            "  Cache misses: {}",
+                            m
+                        ));
+                        self.emit(&alloc::format!(
+                            "  Live entries: {}",
+                            n
+                        ));
+                    }
+                    Some(&"flush-caches") | Some(&"flush") => {
+                        match ustd::write_all("/proc/net/dns", b"F\n") {
+                            Ok(_) => self.emit("DNS cache flushed"),
+                            Err(e) => self.fail(&alloc::format!(
+                                "resolvectl: {}",
+                                e
+                            )),
+                        }
+                    }
+                    Some(&"dns") => {
+                        // resolvectl dns [link] <server> — real write
+                        // to /etc/resolv.conf; the kernel resolver
+                        // reads it on every uncached query.
+                        let srv = args
+                            .iter()
+                            .copied()
+                            .skip(1)
+                            .find(|a| {
+                                a.split('.').all(|o| {
+                                    !o.is_empty()
+                                        && o.bytes().all(|b| {
+                                            b.is_ascii_digit()
+                                        })
+                                }) && a.contains('.')
+                            });
+                        match srv {
+                            Some(ip) => {
+                                let line =
+                                    alloc::format!("nameserver {}\n", ip);
+                                match ustd::write_all(
+                                    "/etc/resolv.conf",
+                                    line.as_bytes(),
+                                ) {
+                                    Ok(_) => self.emit(&alloc::format!(
+                                        "DNS server set to {}",
+                                        ip
+                                    )),
+                                    Err(e) => self.fail(&alloc::format!(
+                                        "resolvectl: {}",
+                                        e
+                                    )),
+                                }
+                            }
+                            None => self.fail(
+                                "usage: resolvectl dns [link] <server-ip>",
+                            ),
+                        }
                     }
                     Some(&"query") => {
                         let Some(n) = args.get(1) else {
@@ -19303,7 +19409,7 @@ impl Term {
                             )),
                         }
                     }
-                    _ => self.fail("usage: resolvectl status|query <name>"),
+                    _ => self.fail("usage: resolvectl status|statistics|flush-caches|dns <ip>|query <name>"),
                 }
             }
             "networkctl" => {

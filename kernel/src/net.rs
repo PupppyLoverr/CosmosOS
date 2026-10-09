@@ -1829,8 +1829,74 @@ fn dns_skip_name(m: &[u8], mut i: usize) -> Option<usize> {
     }
 }
 
-/// `resolve <hostname>`: real DNS A-record query to the slirp resolver
-/// (10.0.2.3:53) over real UDP. Returns the first A record.
+/// Real DNS cache: wire answers are stored with the TTL the server
+/// sent — a hit answers without leaving the guest. 64-entry cap,
+/// oldest-expiry eviction, lazily pruned on lookup.
+struct DnsEnt {
+    name: String,
+    ip: [u8; 4],
+    expiry_ms: u64,
+}
+static DNS_CACHE: Mutex<Vec<DnsEnt>> = Mutex::new(Vec::new());
+static DNS_HITS: AtomicU64 = AtomicU64::new(0);
+static DNS_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// The resolver's upstream: `nameserver <ip>` from /etc/resolv.conf,
+/// falling back to the slirp resolver.
+pub fn dns_server() -> [u8; 4] {
+    if let Ok(b) = crate::vfs::read_all("/etc/resolv.conf") {
+        if let Ok(t) = core::str::from_utf8(&b) {
+            for l in t.lines() {
+                let l = l.split('#').next().unwrap_or("");
+                let mut f = l.split_whitespace();
+                if f.next() == Some("nameserver") {
+                    if let Some(ip) = f.next().and_then(parse_ip) {
+                        return ip;
+                    }
+                }
+            }
+        }
+    }
+    [10, 0, 2, 3]
+}
+
+/// `/proc/net/dns` — cache statistics + live entries with TTL left.
+pub fn net_dns_stats() -> String {
+    let mut c = DNS_CACHE.lock();
+    let now = now_ms();
+    c.retain(|e| e.expiry_ms > now);
+    let mut out = alloc::format!(
+        "hits {}\nmisses {}\nentries {}\n",
+        DNS_HITS.load(Ordering::Relaxed),
+        DNS_MISSES.load(Ordering::Relaxed),
+        c.len()
+    );
+    for e in c.iter() {
+        out.push_str(&alloc::format!(
+            "{} {}.{}.{}.{} ttl={}\n",
+            e.name,
+            e.ip[0], e.ip[1], e.ip[2], e.ip[3],
+            (e.expiry_ms - now) / 1000
+        ));
+    }
+    out
+}
+
+/// `/proc/net/dns` write ops: `F` flushes the cache (resolvectl
+/// flush-caches).
+pub fn dns_ctl(op: &str) -> bool {
+    match op.trim() {
+        "F" => {
+            DNS_CACHE.lock().clear();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `resolve <hostname>`: real DNS A-record query over real UDP.
+/// nsswitch: /etc/hosts first, then the cache, then the wire.
+/// Returns the first A record.
 pub fn dns_query(name: &str, timeout_ms: u64) -> Option<[u8; 4]> {
     // nsswitch order: /etc/hosts file first, then wire DNS — same as a
     // real resolver. Lines: `a.b.c.d name [alias...]` (+ `#` comments).
@@ -1862,7 +1928,24 @@ pub fn dns_query(name: &str, timeout_ms: u64) -> Option<[u8; 4]> {
             }
         }
     }
-    const DNS: [u8; 4] = [10, 0, 2, 3];
+    // Cache check: the name is normalized lowercase; a live entry
+    // answers without touching the wire. Stale entries are pruned
+    // here so the table can't fill with dead names.
+    let lc = name.to_lowercase();
+    {
+        let now = now_ms();
+        let mut c = DNS_CACHE.lock();
+        c.retain(|e| e.expiry_ms > now);
+        if let Some(e) = c.iter().find(|e| e.name == lc) {
+            DNS_HITS.fetch_add(1, Ordering::Relaxed);
+            sprintln!("[net] dns '{}' -> {}.{}.{}.{} (cached, ttl={}s)",
+                name, e.ip[0], e.ip[1], e.ip[2], e.ip[3],
+                (e.expiry_ms - now) / 1000);
+            return Some(e.ip);
+        }
+    }
+    DNS_MISSES.fetch_add(1, Ordering::Relaxed);
+    let dns = dns_server();
     const SPORT: u16 = 43210;
     let txid = 0xC05Au16;
     // build query: hdr + qname labels + qtype A + qclass IN
@@ -1884,8 +1967,9 @@ pub fn dns_query(name: &str, timeout_ms: u64) -> Option<[u8; 4]> {
 
     // ride the socket abstraction: bind, sendto, recvfrom
     udp_open(SPORT).ok()?;
-    udp_send(SPORT, DNS, 53, &q).ok()?;
-    sprintln!("[net] dns query '{}' -> 10.0.2.3:53", name);
+    udp_send(SPORT, dns, 53, &q).ok()?;
+    sprintln!("[net] dns query '{}' -> {}.{}.{}.{}:53",
+        name, dns[0], dns[1], dns[2], dns[3]);
 
     let t0 = now_ms();
     let out = loop {
@@ -1921,7 +2005,7 @@ pub fn dns_query(name: &str, timeout_ms: u64) -> Option<[u8; 4]> {
         if bad {
             break None;
         }
-        let mut found: Option<[u8; 4]> = None;
+        let mut found: Option<([u8; 4], u32)> = None;
         for _ in 0..ancount {
             match dns_skip_name(m, i) {
                 Some(ni) => i = ni,
@@ -1935,9 +2019,10 @@ pub fn dns_query(name: &str, timeout_ms: u64) -> Option<[u8; 4]> {
                 break;
             }
             let rtype = be16(&m[i..]);
+            let ttl = u32::from_be_bytes(m[i + 4..i + 8].try_into().unwrap());
             let rdlen = be16(&m[i + 8..]) as usize;
             if rtype == 1 && rdlen == 4 && m.len() >= i + 10 + 4 {
-                found = Some(m[i + 10..i + 14].try_into().unwrap());
+                found = Some((m[i + 10..i + 14].try_into().unwrap(), ttl));
                 break;
             }
             i += 10 + rdlen;
@@ -1945,11 +2030,27 @@ pub fn dns_query(name: &str, timeout_ms: u64) -> Option<[u8; 4]> {
         if bad {
             break None;
         }
-        if let Some(ip) = found {
+        if let Some((ip, ttl)) = found {
             sprintln!(
-                "[net] dns '{}' -> {}.{}.{}.{}",
-                name, ip[0], ip[1], ip[2], ip[3]
+                "[net] dns '{}' -> {}.{}.{}.{} (ttl={}s)",
+                name, ip[0], ip[1], ip[2], ip[3], ttl
             );
+            // TTL 0 means "do not cache" — honor it exactly.
+            if ttl > 0 {
+                let mut c = DNS_CACHE.lock();
+                c.retain(|e| e.name != lc);
+                if c.len() >= 64 {
+                    let (idx, _) = c.iter().enumerate()
+                        .min_by_key(|(_, e)| e.expiry_ms)
+                        .unwrap_or((0, &DnsEnt { name: String::new(), ip: [0; 4], expiry_ms: 0 }));
+                    c.remove(idx);
+                }
+                c.push(DnsEnt {
+                    name: lc.clone(),
+                    ip,
+                    expiry_ms: now_ms() + ttl as u64 * 1000,
+                });
+            }
             break Some(ip);
         }
         if now_ms() - t0 >= timeout_ms {

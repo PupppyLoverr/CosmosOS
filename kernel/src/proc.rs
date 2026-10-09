@@ -30,7 +30,7 @@ const FILES: &[&str] = &[
 /// files under /proc/net
 const NET_FILES: &[&str] = &[
     "tcp", "udp", "unix", "dev", "operstate", "owners", "route", "iptables",
-    "snmp", "nf_conntrack", "arp", "fib_trie", "tc",
+    "snmp", "nf_conntrack", "arp", "fib_trie", "tc", "dns",
 ];
 
 /// files under /proc/sys/kernel
@@ -335,6 +335,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/net/arp" => net::net_arp(),
         "/proc/net/fib_trie" => net::net_fib_trie(),
         "/proc/net/tc" => net::tc_show(),
+        "/proc/net/dns" => net::net_dns_stats(),
         "/proc/net/operstate" => alloc::format!(
             "{}\n",
             if net::is_up() { "up" } else { "down" }
@@ -611,6 +612,19 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
                 continue;
             }
             ok &= net::tc_ctl(line);
+        }
+        return ok.then_some(buf.len());
+    }
+    if path == "/proc/net/dns" {
+        // 'F' flushes the cache (resolvectl flush-caches).
+        let text = String::from(String::from_utf8_lossy(buf));
+        let mut ok = true;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            ok &= net::dns_ctl(line);
         }
         return ok.then_some(buf.len());
     }
