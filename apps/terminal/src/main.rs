@@ -8031,6 +8031,8 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut src = String::new();
     let mut dport = 0u16;
     let mut state = String::new();
+    let mut limit_pps = 0u64;
+    let mut limit_burst = 0u16;
     let mut i = 0usize;
     while i < args.len() {
         match args[i] {
@@ -8064,8 +8066,34 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 i += 1;
             }
             "-m" | "--match" => {
-                // `-m state|conntrack` — the state list rides along via
-                // --state/--ctstate below
+                // `-m state|conntrack|limit` — module-specific options
+                // ride along via --state/--ctstate/--limit below
+                i += 1;
+            }
+            "--limit" => {
+                // `N/s|/sec|/second|/m|/minute|/h|/hour|/d|/day` → pps
+                let spec = args.get(i + 1).copied().unwrap_or("");
+                let (num, unit) = match spec.find('/') {
+                    Some(s) => (&spec[..s], &spec[s + 1..]),
+                    None => (spec, "s"),
+                };
+                let base: u64 = num.parse().unwrap_or(0);
+                let per = match unit {
+                    "s" | "sec" | "second" => 1,
+                    "m" | "min" | "minute" => 60,
+                    "h" | "hour" => 3600,
+                    "d" | "day" => 86400,
+                    _ => 1,
+                };
+                limit_pps = (base / per).max(1).min(255);
+                i += 1;
+            }
+            "--limit-burst" => {
+                limit_burst = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(5)
+                    .max(1);
                 i += 1;
             }
             "--state" | "--states" | "--ctstate" => {
@@ -8090,6 +8118,12 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !state.is_empty() {
         line.push_str(&alloc::format!(" state {}", state));
+    }
+    if limit_pps != 0 {
+        line.push_str(&alloc::format!(" limit {}", limit_pps));
+        if limit_burst != 0 {
+            line.push_str(&alloc::format!(" lburst {}", limit_burst));
+        }
     }
     line.push('\n');
     Some(line)
