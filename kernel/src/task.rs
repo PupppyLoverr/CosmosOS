@@ -2116,20 +2116,40 @@ pub fn for_mm_peers(pml4_phys: u64, f: impl Fn(&mut Task)) {
 /// advanced past base + guard. Two threads of one mm can never hand
 /// out the same anonymous range. Returns the reserved base VA.
 pub fn mm_reserve(pml4_phys: u64, pages: u64) -> u64 {
+    // CommitLimit = totalram * vm.overcommit_ratio% under
+    // vm.overcommit_memory=2 (strict accounting, like Linux).
+    let commit_limit = if crate::sysctl::vm_overcommit_memory() == 2 {
+        mem::FRAME_ALLOC
+            .lock()
+            .as_ref()
+            .map(|a| a.total_bytes())
+            .unwrap_or(0)
+            * crate::sysctl::vm_overcommit_ratio()
+            / 100
+    } else {
+        u64::MAX
+    };
     let mut g = SCHED.lock();
     let Some(s) = g.as_mut() else {
         return 0;
     };
     let mut base = 0u64;
+    let mut committed = 0u64;
     for t in s.tasks.iter() {
-        if t.state != State::Dead
-            && t.pml4.map(|p| p.start_address().as_u64()) == Some(pml4_phys)
-            && t.mmap_next > base
-        {
-            base = t.mmap_next;
+        if t.state != State::Dead {
+            committed =
+                committed.saturating_add(t.mmap_next.saturating_sub(USER_MMAP_BASE));
+            if t.pml4.map(|p| p.start_address().as_u64()) == Some(pml4_phys)
+                && t.mmap_next > base
+            {
+                base = t.mmap_next;
+            }
         }
     }
     if base == 0 {
+        return 0;
+    }
+    if committed.saturating_add(pages.saturating_mul(0x1000)) > commit_limit {
         return 0;
     }
     // kernel.randomize_va_space >= 2: an entropy-fed gap slides every
@@ -4074,16 +4094,17 @@ pub fn record_map(pid: u32, start: u64, end: u64, perm: u8, name: &str) {
 }
 
 /// `/proc/<pid>/maps` — Linux-format lines: `start-end rwxp 00000000 00:00 0 name`.
-pub fn pid_maps(pid: u32) -> Option<String> {
+pub fn pid_maps(pid: u32, hide_ptrs: bool) -> Option<String> {
     let g = SCHED.lock();
     let s = g.as_ref()?;
     let t = s.tasks.iter().find(|t| t.id == pid)?;
     let mut out = String::new();
     for m in &t.maps {
+        let (lo, hi) = if hide_ptrs { (0, 0) } else { (m.start, m.end) };
         out.push_str(&alloc::format!(
             "{:08x}-{:08x} {}{}{}p 00000000 00:00 0          {}\n",
-            m.start,
-            m.end,
+            lo,
+            hi,
             if m.perm & 1 != 0 { 'r' } else { '-' },
             if m.perm & 2 != 0 { 'w' } else { '-' },
             if m.perm & 4 != 0 { 'x' } else { '-' },
@@ -4309,17 +4330,18 @@ pub fn children_of(pid: u32) -> Vec<u32> {
 }
 
 /// `/proc/<pid>/smaps` — maps plus real per-region sizes.
-pub fn pid_smaps(pid: u32) -> Option<String> {
+pub fn pid_smaps(pid: u32, hide_ptrs: bool) -> Option<String> {
     let g = SCHED.lock();
     let s = g.as_ref()?;
     let t = s.tasks.iter().find(|t| t.id == pid)?;
     let mut out = String::new();
     for m in &t.maps {
         let kb = (m.end - m.start) / 1024;
+        let (lo, hi) = if hide_ptrs { (0, 0) } else { (m.start, m.end) };
         out.push_str(&alloc::format!(
             "{:08x}-{:08x} {}{}{}p 00000000 00:00 0          {}\nSize:                {} kB\nRss:                 {} kB\nPss:                 {} kB\n",
-            m.start,
-            m.end,
+            lo,
+            hi,
             if m.perm & 1 != 0 { 'r' } else { '-' },
             if m.perm & 2 != 0 { 'w' } else { '-' },
             if m.perm & 4 != 0 { 'x' } else { '-' },

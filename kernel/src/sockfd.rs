@@ -88,8 +88,10 @@ fn fields(id: u64) -> Option<Sock> {
 
 /// Next ephemeral local port not claimed by this registry or the net stack.
 fn ephemeral(m: &BTreeMap<u64, Sock>) -> u16 {
-    for i in 0..16384u32 {
-        let p = 49152 + i as u16;
+    // net.ipv4.ip_local_port_range — real sysctl bounds, not a constant.
+    let (lo, hi) = crate::sysctl::local_port_range();
+    for p in lo..=hi {
+        let p = p as u16;
         if !m.values().any(|s| s.bound && s.lport == p) && crate::net::lport_free(p) {
             return p;
         }
