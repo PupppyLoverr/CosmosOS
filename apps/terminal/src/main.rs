@@ -8097,6 +8097,7 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut recent_op = "";
     let mut recent_name = String::from("DEFAULT");
     let mut recent_secs = String::new();
+    let mut recent_hits = String::new();
     let mut str_spec = String::new();   // hex needle for `-m string`
     let mut u32_spec = String::new();
     let mut stat_every = String::new();
@@ -8217,6 +8218,11 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             "--set" => recent_op = "rset",
             "--rcheck" => recent_op = "rchk",
             "--update" => recent_op = "rupd",
+            "--remove" => recent_op = "rrem",
+            "--hitcount" => {
+                recent_hits = String::from(args.get(i + 1).copied().unwrap_or("0"));
+                i += 1;
+            }
             "--name" => {
                 recent_name = String::from(args.get(i + 1).copied().unwrap_or("DEFAULT"));
                 i += 1;
@@ -8560,6 +8566,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 recent_name,
                 if recent_secs.is_empty() { "0" } else { &recent_secs }
             ));
+        }
+        if !recent_hits.is_empty() && recent_hits != "0" {
+            line.push_str(&alloc::format!(" rhitc {}", recent_hits));
         }
     }
     if !str_spec.is_empty() {
@@ -25844,7 +25853,8 @@ impl Term {
                             }
                             return;
                         }
-                        let mut any = false;
+                        let tag = args.iter().any(|a| *a == "--tag");
+                    let mut any = false;
                         for a in args.iter() {
                             match ustd::read_all(a) {
                                 Ok(d) => {
@@ -25854,7 +25864,13 @@ impl Term {
                                     for b in dg {
                                         hx.push_str(&alloc::format!("{:02x}", b));
                                     }
-                                    self.emit(&alloc::format!("{}  {}", hx, a));
+                                    // --tag: BSD-style `SHA256 (f) = hx`
+                                    if tag {
+                                        self.emit(&alloc::format!(
+                                            "SHA256 ({}) = {}", a, hx));
+                                    } else {
+                                        self.emit(&alloc::format!("{}  {}", hx, a));
+                                    }
                                 }
                                 Err(e) => self.fail(&alloc::format!("sha256sum: {}: err {}", a, e)),
                             }
@@ -40783,6 +40799,16 @@ impl Term {
                 // -m/--memory: real ss flag — per-socket queue memory,
                 // from the real tx_queue/rx_queue columns.
                 let want_m = args.iter().any(|a| *a == "-m" || *a == "--memory");
+                // -e/--extended: Linux-style `ino:` suffix — the real
+                // socket registry key carried in the proc row tail.
+                let want_e = args.iter().any(|a| *a == "-e" || *a == "--extended");
+                let ino_field = |l: &str| -> String {
+                    if !want_e {
+                        return String::new();
+                    }
+                    let ino = l.split_whitespace().last().unwrap_or("0");
+                    alloc::format!("  ino:{}", ino)
+                };
                 let mut tinfo: alloc::collections::BTreeMap<u64, Vec<String>> =
                     Default::default();
                 if want_i {
@@ -40875,7 +40901,11 @@ impl Term {
                                 String::new()
                             };
                             self.emit(&alloc::format!(
-                                "tcp  {}{}{}", l.trim(), mem, owner_field(l)
+                                "tcp  {}{}{}{}",
+                                l.trim(),
+                                mem,
+                                owner_field(l),
+                                ino_field(l)
                             ));
                             // -i: the estimator's real numbers under the
                             // conn — rto/rtt/var + retransmit + queue
@@ -40904,7 +40934,10 @@ impl Term {
                                 continue;
                             }
                             self.emit(&alloc::format!(
-                                "udp  {}{}", l.trim(), owner_field(l)
+                                "udp  {}{}{}",
+                                l.trim(),
+                                owner_field(l),
+                                ino_field(l)
                             ));
                         }
                     }

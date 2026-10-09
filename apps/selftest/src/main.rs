@@ -5680,6 +5680,61 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
             && !inp.contains("9999")
             && bad
     });
+    check("ipt-recent-rm", {
+        // `-m recent --remove` + `--hitcount` — real list ops on
+        // inbound ICMP: --set records, hitcount gates, remove deletes.
+        let ipt = "/proc/net/iptables";
+        let rec = "/proc/net/ipt_recent";
+        let gw = 0x0A00_0202u32; // 10.0.2.2 echo replies
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let _ = ustd::write_all(rec, b"F\n");
+        let a1 = ustd::write_all(ipt, b"A INPUT 1 rset RL183 accept\n").is_ok();
+        let mut n = 0u32;
+        for _ in 0..4 {
+            if ustd::net_ping(gw, 2000).is_some() {
+                n += 1;
+            }
+        }
+        let seeded = ustd::read_all(rec)
+            .map(|d| String::from_utf8_lossy(&d).contains("list=RL183"))
+            .unwrap_or(false);
+        // --rcheck --hitcount 2: with >=2 recorded hits the next
+        // inbound reply matches -> dropped -> ping fails.
+        let _ = ustd::write_all(ipt, b"F\n");
+        let a2 = ustd::write_all(ipt, b"A INPUT 1 rchk RL183 0 rhitc 2 drop\n").is_ok();
+        let blocked = n >= 2 && ustd::net_ping(gw, 2000).is_none();
+        // --remove: next inbound reply deletes the entry.
+        let _ = ustd::write_all(ipt, b"F\n");
+        let _ = ustd::write_all(ipt, b"A INPUT 1 rrem RL183 0 drop\n");
+        let _ = ustd::net_ping(gw, 2000);
+        let gone = ustd::read_all(rec)
+            .map(|d| !String::from_utf8_lossy(&d).contains("list=RL183"))
+            .unwrap_or(false);
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let _ = ustd::write_all(rec, b"F\n");
+        a1 && a2 && n >= 2 && seeded && blocked && gone
+    });
+    check("proc-net-ino", {
+        // Linux uid+ino tail on /proc/net/{tcp,udp}: every row ends
+        // `0 <registry-key>` — parse the tail as a real number.
+        let row_ok = |p: &str| -> bool {
+            ustd::read_all(p)
+                .map(|d| {
+                    String::from_utf8_lossy(&d)
+                        .lines()
+                        .skip(1)
+                        .filter(|l| !l.trim().is_empty())
+                        .all(|l| {
+                            l.split_whitespace()
+                                .last()
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .is_some()
+                        })
+                })
+                .unwrap_or(true)
+        };
+        row_ok("/proc/net/tcp") && row_ok("/proc/net/udp")
+    });
 
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {
