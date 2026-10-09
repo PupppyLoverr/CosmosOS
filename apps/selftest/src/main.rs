@@ -5657,6 +5657,30 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         a && nated && f && ok
     });
 
+    // Selective single-chain dump: /proc/net/iptables/<chain> returns
+    // exactly that chain's rules — the wire behind `iptables -L <name>`.
+    check("ipt-list-chain", {
+        let _ = ustd::write_all("/proc/net/iptables", b"F\n/\n");
+        let _ = ustd::write_all("/proc/net/iptables", b"N TST182\n");
+        let _ = ustd::write_all("/proc/net/iptables", b"A TST182 udp dport 9999 drop\n");
+        let _ = ustd::write_all("/proc/net/iptables", b"A INPUT udp dport 11111 drop\n");
+        let ch = ustd::read_all("/proc/net/iptables/TST182")
+            .map(|d| String::from_utf8_lossy(&d).to_string())
+            .unwrap_or_default();
+        let inp = ustd::read_all("/proc/net/iptables/INPUT")
+            .map(|d| String::from_utf8_lossy(&d).to_string())
+            .unwrap_or_default();
+        let bad = ustd::read_all("/proc/net/iptables/NOPE182").is_err();
+        // INPUT rule had a fake port — scrub it so nothing else trips.
+        let _ = ustd::write_all("/proc/net/iptables", b"F\n/\n");
+        ch.contains("TST182")
+            && ch.contains("9999")
+            && !ch.contains("INPUT")
+            && inp.contains("INPUT")
+            && !inp.contains("9999")
+            && bad
+    });
+
     // --- performance baseline: real durations (tick = 10ms resolution) ---
     {
         // 4 MiB through write_all (virtio-blk -> FAT32)

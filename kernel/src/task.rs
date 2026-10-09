@@ -1470,6 +1470,9 @@ pub fn maybe_deliver(s: &mut Sched, idx: usize, ctx: *mut CpuContext) {
     for page in [(base - 8) & !0xFFF, (base + 167) & !0xFFF] {
         match crate::elf::translate_user(pml4, page) {
             None => {
+                // sys_sigaltstack pre-faults registered alt stacks and
+                // stack pages grow via the same task-scoped path — an
+                // unmapped frame target here is a genuine bad stack.
                 if !(page >= t.stack_min && page < t.stack_max && stack_grow(t, page)) {
                     segv = true;
                     break;

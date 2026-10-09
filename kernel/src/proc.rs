@@ -113,6 +113,10 @@ pub fn exists(path: &str) -> bool {
         return false;
     }
     if let Some(f) = path.strip_prefix("/proc/net/") {
+        // /proc/net/iptables/<chain> — the selective -L dump
+        if let Some(c) = f.strip_prefix("iptables/") {
+            return net::net_iptables_chain_exists(c);
+        }
         return NET_FILES.contains(&f);
     }
     if let Some(f) = path.strip_prefix("/proc/sys/kernel/") {
@@ -332,6 +336,13 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/net/dev" => net::net_dev(),
         "/proc/net/route" => net::net_route(),
         "/proc/net/iptables" => net::net_iptables(),
+        // `/proc/net/iptables/<chain>` — selective single-chain dump
+        p if p.starts_with("/proc/net/iptables/") => {
+            match net::net_iptables_chain(&p[19..]) {
+                Some(t) => t,
+                None => return None,
+            }
+        }
         "/proc/net/nat" => net::net_nat(),
         "/proc/net/natsave" => net::net_natsave(),
         "/proc/net/snmp" => net::net_snmp(),

@@ -961,6 +961,38 @@ pub fn net_iptables() -> String {
     out
 }
 
+/// `/proc/net/iptables/<chain>` — one chain's `-L` dump (builtin or
+/// user); `iptables -L <chain>` reads this. None for unknown names.
+pub fn net_iptables_chain(name: &str) -> Option<String> {
+    let mut out = String::new();
+    match fw_chain_sel(name) {
+        Some(ChainSel::In) => fmt_fw_chain(&mut out, "INPUT", &FW, &FW_POLICY),
+        Some(ChainSel::Out) => {
+            fmt_fw_chain(&mut out, "OUTPUT", &FW_OUT, &FW_OUT_POLICY)
+        }
+        Some(ChainSel::User(_)) => {
+            if !FW_USER.lock().contains_key(name) {
+                return None;
+            }
+            out.push_str(&alloc::format!(
+                "Chain {} ({} references)\nnum  pkts bytes target  prot  source       destination\n",
+                name, fw_refs(name)
+            ));
+            let v = FW_USER.lock().get(name).cloned().unwrap_or_default();
+            for (i, r) in v.iter().enumerate() {
+                fmt_fw_rule(&mut out, i, r);
+            }
+        }
+        None => return None,
+    }
+    Some(out)
+}
+
+/// Chain-name existence for the /proc/net/iptables/<chain> exists() gate.
+pub fn net_iptables_chain_exists(name: &str) -> bool {
+    fw_chain_sel(name).is_some()
+}
+
 /// `/proc/net/natsave` — iptables-save format for the nat table;
 /// `iptables -t nat -S` reads this. POSTROUTING is the only chain.
 pub fn net_natsave() -> String {
