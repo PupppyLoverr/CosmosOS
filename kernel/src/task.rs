@@ -3567,6 +3567,11 @@ pub fn eff_cred() -> (u32, u32) {
     with_current(|t| (t.euid, t.egid))
 }
 
+/// Session id of the current task (keyring/objects scope to it).
+pub fn cur_sid() -> u32 {
+    with_current(|t| t.sid)
+}
+
 /// Group-membership check for DAC: effective gid OR the supplementary list.
 pub fn in_group(gid: u32) -> bool {
     with_current(|t| t.fsgid == gid || t.groups.contains(&gid))

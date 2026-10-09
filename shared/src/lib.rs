@@ -812,3 +812,16 @@ pub const SYS_SETREUID: u64 = 285;            // (ruid,euid; MAX=keep) -> 0|EPER
 pub const SYS_SETREGID: u64 = 286;            // (rgid,egid; MAX=keep) -> 0|EPERM
 pub const SEEK_DATA: u64 = 3;                 // lseek whence — dense files: off<size? off : ENXIO
 pub const SEEK_HOLE: u64 = 4;                 // lseek whence — dense files: off<size? size : ENXIO
+
+// Batch 228 — tmpfs extended attributes + kernel keyring.
+pub const SYS_SETXATTR: u64 = 287;
+pub const SYS_GETXATTR: u64 = 288;
+pub const SYS_LISTXATTR: u64 = 289;
+pub const SYS_REMOVEXATTR: u64 = 290;
+pub const SYS_ADD_KEY: u64 = 291;
+pub const SYS_REQUEST_KEY: u64 = 292;
+pub const SYS_KEYCTL: u64 = 293;
+pub const KEYCTL_READ: u64 = 1;
+pub const KEYCTL_REVOKE: u64 = 3;
+pub const KEYCTL_UNLINK: u64 = 5;
+pub const KEYCTL_SEARCH: u64 = 10;

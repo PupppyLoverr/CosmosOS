@@ -1216,6 +1216,113 @@ pub fn dispatch(ctx: &mut CpuContext) {
             let s = if a2 != u32::MAX as u64 { a2 } else { u32::MAX as u64 };
             sys_setresid(a1, a2, s, true)
         }
+        shared::SYS_SETXATTR => {
+            // (path_ptr,path_len, name_ptr,name_len, val_len... ) -> 0|err
+            // args: a1=path ptr, a2=path len; a3=name ptr; a4=name len;
+            // a5=val ptr — val len travels via ctx.r10 slot below.
+            let Some(p) = copy_str(a1, a2) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let cwd = task::with_current(|t| t.cwd.clone());
+            let full = crate::vfs::normalize(&cwd, &p);
+            if !crate::tmpfs::handles(&full) {
+                (-95i64) as u64 // ENOTSUP: FAT has no xattr store
+            } else {
+                let name = copy_str(a3, a4).unwrap_or_default();
+                let val = copy_in(a5, ctx.r10.min(4096)).unwrap_or_default();
+                crate::tmpfs::xattr_set(&full, &name, &val) as u64
+            }
+        }
+        shared::SYS_GETXATTR | shared::SYS_LISTXATTR => {
+            // a1/a2 path, a3/a4 name (getxattr), a5 = out ptr,
+            // ctx.r10 = out cap -> needed len | negative
+            let Some(p) = copy_str(a1, a2) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let cwd = task::with_current(|t| t.cwd.clone());
+            let full = crate::vfs::normalize(&cwd, &p);
+            if !crate::tmpfs::handles(&full) {
+                (-95i64) as u64
+            } else {
+                let res = if nr == shared::SYS_GETXATTR {
+                    let name = copy_str(a3, a4).unwrap_or_default();
+                    crate::tmpfs::xattr_get(&full, &name)
+                } else {
+                    crate::tmpfs::xattr_list(&full)
+                };
+                match res {
+                    Err(e) => e as u64,
+                    Ok(v) => {
+                        if a5 == 0 {
+                            v.len() as u64 // size query: NULL buf
+                        } else if (ctx.r10 as usize) < v.len() {
+                            (-34i64) as u64 // ERANGE
+                        } else if copy_out(a5, &v).is_some() {
+                            v.len() as u64
+                        } else {
+                            ERR
+                        }
+                    }
+                }
+            }
+        }
+        shared::SYS_REMOVEXATTR => {
+            let Some(p) = copy_str(a1, a2) else {
+                ctx.rax = ERR;
+                return;
+            };
+            let cwd = task::with_current(|t| t.cwd.clone());
+            let full = crate::vfs::normalize(&cwd, &p);
+            if !crate::tmpfs::handles(&full) {
+                (-95i64) as u64
+            } else {
+                let name = copy_str(a3, a4).unwrap_or_default();
+                crate::tmpfs::xattr_remove(&full, &name) as u64
+            }
+        }
+        shared::SYS_ADD_KEY => {
+            // a1/a2 type, a3/a4 desc, a5 payload ptr, ctx.r10 payload len
+            let typ = copy_str(a1, a2).unwrap_or_default();
+            let desc = copy_str(a3, a4).unwrap_or_default();
+            if ctx.r10 > 4096 {
+                (-34i64) as u64
+            } else {
+                let payload = copy_in(a5, ctx.r10).unwrap_or_default();
+                crate::keys::add(&typ, &desc, &payload) as u64
+            }
+        }
+        shared::SYS_REQUEST_KEY => {
+            let desc = copy_str(a1, a2).unwrap_or_default();
+            crate::keys::request(&desc) as u64
+        }
+        shared::SYS_KEYCTL => {
+            // a1=cmd; READ: a2=serial a3=buf a4=len; SEARCH: a2=desc a3=len
+            match a1 {
+                shared::KEYCTL_READ => match crate::keys::read(a2 as u32) {
+                    Err(e) => e as u64,
+                    Ok(v) => {
+                        if a3 == 0 {
+                            v.len() as u64
+                        } else if (a4 as usize) < v.len() {
+                            (-34i64) as u64
+                        } else if copy_out(a3, &v).is_some() {
+                            v.len() as u64
+                        } else {
+                            ERR
+                        }
+                    }
+                },
+                shared::KEYCTL_REVOKE => crate::keys::revoke(a2 as u32) as u64,
+                shared::KEYCTL_UNLINK => crate::keys::unlink(a2 as u32) as u64,
+                shared::KEYCTL_SEARCH => {
+                    let desc = copy_str(a2, a3).unwrap_or_default();
+                    crate::keys::search(&desc) as u64
+                }
+                _ => (-22i64) as u64,
+            }
+        }
         shared::SYS_CLOCK_NANOSLEEP => {
             // absolute deadline in ms; ticks run 10ms each. A past deadline
             // returns immediately (POSIX TIMER_ABSTIME).
