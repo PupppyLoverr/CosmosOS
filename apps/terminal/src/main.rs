@@ -8097,6 +8097,10 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut recent_op = "";
     let mut recent_name = String::from("DEFAULT");
     let mut recent_secs = String::new();
+    let mut str_spec = String::new();   // hex needle for `-m string`
+    let mut u32_spec = String::new();
+    let mut stat_every = String::new();
+    let mut tflags: Option<(String, String)> = None;
     let mut limit_pps = 0u64;
     let mut limit_burst = 0u16;
     let mut jump = "DROP";
@@ -8213,6 +8217,68 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             "--seconds" => {
                 recent_secs = String::from(args.get(i + 1).copied().unwrap_or("0"));
                 i += 1;
+            }
+            // `-m string --string <txt>` / `--hex-string <hex>` — the
+            // needle rides the wire hex-encoded so spaces never split.
+            "--string" => {
+                let t = args.get(i + 1).copied().unwrap_or("");
+                str_spec = t
+                    .bytes()
+                    .map(|b| alloc::format!("{:02x}", b))
+                    .collect();
+                i += 1;
+            }
+            "--hex-string" => {
+                let t = args.get(i + 1).copied().unwrap_or("");
+                str_spec = String::from(t.trim_start_matches('|').trim_end_matches('|'));
+                i += 1;
+            }
+            // `-m u32 --u32 "<off>[&<mask>]=<val>"` — passed through;
+            // the kernel applies the real word read.
+            "--u32" => {
+                u32_spec = String::from(args.get(i + 1).copied().unwrap_or(""));
+                i += 1;
+            }
+            // `-m statistic --mode nth --every N` — every Nth match.
+            "--mode" => {
+                if args.get(i + 1).copied() != Some("nth") {
+                    return None; // only --mode nth is real here
+                }
+                i += 1;
+            }
+            "--every" => {
+                stat_every = String::from(args.get(i + 1).copied().unwrap_or("0"));
+                i += 1;
+            }
+            // `-m tcp --tcp-flags <mask> <comp>` — flag-name csv (or
+            // 0x hex) for both words.
+            "--tcp-flags" => {
+                let names = |t: &str| -> String {
+                    if let Some(h) = t.strip_prefix("0x") {
+                        let v = u8::from_str_radix(h, 16).unwrap_or(0);
+                        let mut n = String::new();
+                        for (b, s) in [
+                            (0x80u8, "CWR"), (0x40, "ECE"), (0x20, "URG"),
+                            (0x10, "ACK"), (0x08, "PSH"), (0x04, "RST"),
+                            (0x02, "SYN"), (0x01, "FIN"),
+                        ] {
+                            if v & b != 0 {
+                                if !n.is_empty() { n.push(','); }
+                                n.push_str(s);
+                            }
+                        }
+                        if n.is_empty() { String::from("NONE") } else { n }
+                    } else {
+                        t.to_uppercase()
+                    }
+                };
+                let m = names(args.get(i + 1).copied().unwrap_or(""));
+                let c = names(args.get(i + 2).copied().unwrap_or(""));
+                if m.is_empty() {
+                    return None;
+                }
+                tflags = Some((m, c));
+                i += 2;
             }
             // `-m icmp --icmp-type <name|n>` — real ICMP-type match;
             // names map to their real type codes.
@@ -8445,6 +8511,18 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
                 if recent_secs.is_empty() { "0" } else { &recent_secs }
             ));
         }
+    }
+    if !str_spec.is_empty() {
+        line.push_str(&alloc::format!(" string {}", str_spec));
+    }
+    if !u32_spec.is_empty() {
+        line.push_str(&alloc::format!(" u32 {}", u32_spec));
+    }
+    if !stat_every.is_empty() {
+        line.push_str(&alloc::format!(" statnth {}", stat_every));
+    }
+    if let Some((m, c)) = &tflags {
+        line.push_str(&alloc::format!(" tflags {} {}", m, c));
     }
     if !iif.is_empty() {
         line.push_str(&alloc::format!(" iif {}", iif));
