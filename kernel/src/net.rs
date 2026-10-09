@@ -385,6 +385,8 @@ struct FwRule {
     hlimit_above: bool,   // true = --hashlimit-above (match once over the rate)
     msocket: bool,        // `-m socket` — packet belongs to a local socket
     ctdir: u8,            // `-m conntrack --ctdir` (1 ORIGINAL / 2 REPLY)
+    cpu: u8,              // `-m cpu --cpu N` (0xff = unset; only cpu 0 exists)
+    nfacct: String,       // `-m nfacct --nfacct-name` — named acct object
     atype_dst: u8,        // `-m addrtype --dst-type` (0 any,1 UNICAST,2 LOCAL,3 BROADCAST,4 MULTICAST)
     atype_src: u8,        // `--src-type` same map
     rpfilter: bool,       // `-m rpfilter` — a real route back to src exists
@@ -915,6 +917,12 @@ fn fw_eval(
         // exists locally (real transparent-proxy test): TCP checks
         // the established table + listeners on the local port, UDP
         // the bound-owner map.
+        // `-m cpu`: single-processor box — every packet is classified
+        // on cpu 0, so only `--cpu 0` can ever match (real xt_cpu on
+        // UP behaves the same way).
+        if r.cpu != u8::MAX && r.cpu != 0 {
+            continue;
+        }
         if r.ctdir != 0 && ct_dir(src, dst, sport, dport, proto) != r.ctdir {
             continue;
         }
@@ -1015,6 +1023,14 @@ fn fw_eval(
         }
         r.hits += 1;
         r.bytes += plen;
+        if !r.nfacct.is_empty() {
+            // `-m nfacct` is an accounting matcher: a fully-matched
+            // packet charges the named object's packet+byte totals.
+            let mut t = NFACCT.lock();
+            let e = t.entry(r.nfacct.clone()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += plen;
+        }
         if !r.jump.is_empty() {
             // -j <chain>: evaluate the user chain on a snapshot (the
             // FW_USER map can't be re-locked while we hold entries),
@@ -1587,6 +1603,12 @@ fn fmt_fw_spec(out: &mut String, r: &FwRule) {
             if r.ctdir == 2 { "REPLY" } else { "ORIGINAL" }
         ));
     }
+    if r.cpu != u8::MAX {
+        out.push_str(&alloc::format!(" -m cpu --cpu {}", r.cpu));
+    }
+    if !r.nfacct.is_empty() {
+        out.push_str(&alloc::format!(" -m nfacct --nfacct-name {}", r.nfacct));
+    }
     if r.limit_pps != 0 {
         out.push_str(&alloc::format!(" -m limit --limit {}/s", r.limit_pps));
         if r.limit_burst != 5 {
@@ -1847,6 +1869,55 @@ pub fn net_snmp() -> String {
     )
 }
 
+/// `-m nfacct` accounting objects: named packet/byte counters a rule
+/// charges when it fully matches (`nfacct add` pre-creates them, like
+/// the real userspace object that must exist before the rule does).
+static NFACCT: Mutex<alloc::collections::BTreeMap<String, (u64, u64)>> =
+    Mutex::new(alloc::collections::BTreeMap::new());
+
+/// `/proc/net/nfacct` — real nfacct-format dump:
+/// `{ pkts = N, bytes = M } = name;`
+pub fn net_nfacct() -> String {
+    let mut s = String::new();
+    for (n, (p, b)) in NFACCT.lock().iter() {
+        s.push_str(&alloc::format!("{{ pkts = {}, bytes = {} }} = {};
+", p, b, n));
+    }
+    s
+}
+
+/// `/proc/net/nfacct` control grammar (the `nfacct` tool's ops):
+///   "A <name>"  add a zeroed object (EEXIST if it exists)
+///   "R <name>"  reset one object's counters
+///   "F"         flush every object
+pub fn net_nfacct_ctl(t: &str) -> bool {
+    let mut f = t.split_whitespace();
+    match f.next() {
+        Some("A") => {
+            let n = String::from(f.next().unwrap_or(""));
+            if n.is_empty() {
+                return false;
+            }
+            NFACCT.lock().insert(n, (0, 0)).is_none()
+        }
+        Some("R") => {
+            let n = f.next().unwrap_or("");
+            match NFACCT.lock().get_mut(n) {
+                Some(e) => {
+                    *e = (0, 0);
+                    true
+                }
+                None => false,
+            }
+        }
+        Some("F") => {
+            NFACCT.lock().clear();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// `/proc/net/nf_conntrack` — the REAL conntrack flow table (CT),
 /// Linux two-tuple format: orig direction then reply direction,
 /// `[UNREPLIED]` when the flow never saw a return packet. Entries are
@@ -2058,7 +2129,8 @@ fn fw_name_ok(n: &str) -> bool {
         "iif", "oif", "sport", "length", "comment", "ttl", "tos", "mac",
         "dscp", "icmpt", "syn", "rset", "rchk", "rupd", "rrem", "rhitc", "sports", "dstrange",
         "string", "u32", "statnth", "tflags", "quota", "time", "connl", "ctstate", "connbytes", "ouid", "ogid",
-        "pkttype", "hlimit", "msocket", "addrtype", "rpfilter", "ctdir",
+        "pkttype", "hlimit", "msocket", "addrtype", "rpfilter", "ctdir", "cpu",
+        "nfacct",
         "snat", "masq",
     ];
     !n.is_empty()
@@ -2489,6 +2561,8 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
         hlimit_above: false,
         msocket: false,
         ctdir: 0,
+        cpu: u8::MAX,
+        nfacct: String::new(),
         atype_dst: 0,
         atype_src: 0,
         rpfilter: false,
@@ -2894,6 +2968,12 @@ fn fw_parse_spec<'a, I: Iterator<Item = &'a str>>(f: &mut I, proto: u8) -> Optio
                     "REPLY" => 2,
                     _ => 1,
                 };
+            }
+            "cpu" => {
+                r.cpu = f.next().unwrap_or("0").parse().unwrap_or(0);
+            }
+            "nfacct" => {
+                r.nfacct = String::from(f.next().unwrap_or(""));
             }
             "addrtype" => {
                 // `addrtype <src|dst> <UNICAST|LOCAL|BROADCAST|MULTICAST>`

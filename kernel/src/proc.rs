@@ -30,7 +30,7 @@ const FILES: &[&str] = &[
 /// files under /proc/net
 const NET_FILES: &[&str] = &[
     "tcp", "udp", "unix", "dev", "operstate", "owners", "route", "iptables", "nat", "natsave",
-    "ipt_recent",
+    "ipt_recent", "nfacct",
     "snmp", "nf_conntrack", "arp", "fib_trie", "tc", "dns", "neigh", "mtu",
     "tcpinfo", "iptsave",
 ];
@@ -356,6 +356,7 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
         "/proc/net/tcpinfo" => net::net_tcpinfo(),
         "/proc/net/iptsave" => net::net_iptsave(),
         "/proc/net/ipt_recent" => net::net_ipt_recent(),
+        "/proc/net/nfacct" => net::net_nfacct(),
         "/proc/net/operstate" => alloc::format!(
             "{}\n",
             if net::is_up() { "up" } else { "down" }
@@ -614,6 +615,18 @@ pub fn write_file(path: &str, buf: &[u8]) -> Option<usize> {
                 continue;
             }
             ok &= net::ipt_recent_ctl(line);
+        }
+        return ok.then_some(buf.len());
+    }
+    if path == "/proc/net/nfacct" {
+        // 'A <name>' add / 'R <name>' reset / 'F' flush.
+        let text = String::from(String::from_utf8_lossy(buf));
+        let mut ok = true;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            ok &= net::net_nfacct_ctl(line);
         }
         return ok.then_some(buf.len());
     }

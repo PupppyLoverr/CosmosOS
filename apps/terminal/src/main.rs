@@ -8116,6 +8116,9 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     let mut hlim_name = String::new();
     let mut msocket = false;
     let mut ctdir = String::new();
+    let mut cpu_set = false;
+    let mut cpu_n = 0u8;
+    let mut nfacct = String::new();
     let mut atype_dst = String::new();
     let mut atype_src = String::new();
     let mut rpfilter = false;
@@ -8388,6 +8391,17 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
             // `-m conntrack --ctdir ORIGINAL|REPLY`.
             "--ctdir" => {
                 ctdir = String::from(args.get(i + 1).copied().unwrap_or("ORIGINAL"));
+                i += 1;
+            }
+            // `-m cpu --cpu N`.
+            "--cpu" => {
+                cpu_n = args.get(i + 1).and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
+                cpu_set = true;
+                i += 1;
+            }
+            // `-m nfacct --nfacct-name X`.
+            "--nfacct-name" => {
+                nfacct = String::from(args.get(i + 1).copied().unwrap_or(""));
                 i += 1;
             }
             // `-m addrtype --src-type/--dst-type`.
@@ -8694,6 +8708,12 @@ fn ipt_rule_from_args(args: &[&str]) -> Option<String> {
     }
     if !ctdir.is_empty() {
         line.push_str(&alloc::format!(" ctdir {}", ctdir));
+    }
+    if cpu_set {
+        line.push_str(&alloc::format!(" cpu {}", cpu_n));
+    }
+    if !nfacct.is_empty() {
+        line.push_str(&alloc::format!(" nfacct {}", nfacct));
     }
     if !atype_dst.is_empty() {
         line.push_str(&alloc::format!(" addrtype dst {}", atype_dst));
@@ -27008,6 +27028,59 @@ impl Term {
                         continue;
                     }
                     self.emit(l);
+                }
+            }
+            "nfacct" => {
+                // nfacct add/list/flush/reset/get — the real accounting
+                // objects `-m nfacct` rules charge, via /proc/net/nfacct.
+                let p = "/proc/net/nfacct";
+                match args.first().copied() {
+                    Some("add") => match args.get(1) {
+                        Some(n) => {
+                            if ustd::write_all(p, alloc::format!("A {}\n", n).as_bytes()).is_err()
+                            {
+                                self.fail("nfacct: add failed (object exists?)");
+                            }
+                        }
+                        None => self.fail("usage: nfacct add <name>"),
+                    },
+                    Some("flush") => {
+                        let _ = ustd::write_all(p, b"F\n");
+                    }
+                    Some("reset") => match args.get(1) {
+                        Some(n) => {
+                            if ustd::write_all(p, alloc::format!("R {}\n", n).as_bytes()).is_err()
+                            {
+                                self.fail("nfacct: no such object");
+                            }
+                        }
+                        None => self.fail("usage: nfacct reset <name>"),
+                    },
+                    Some("get") => match (args.get(1), ustd::read_all(p)) {
+                        (Some(n), Ok(d)) => {
+                            let want = alloc::format!(" = {};", n);
+                            let mut any = false;
+                            for l in String::from_utf8_lossy(&d).lines() {
+                                if l.ends_with(&want) {
+                                    self.emit(l);
+                                    any = true;
+                                }
+                            }
+                            if !any {
+                                self.fail("nfacct: no such object");
+                            }
+                        }
+                        (_, Err(e)) => self.fail(&alloc::format!("nfacct: err {}", e)),
+                        _ => self.fail("usage: nfacct get <name>"),
+                    },
+                    _ => match ustd::read_all(p) {
+                        Ok(d) => {
+                            for l in String::from_utf8_lossy(&d).lines() {
+                                self.emit(l);
+                            }
+                        }
+                        Err(e) => self.fail(&alloc::format!("nfacct: err {}", e)),
+                    },
                 }
             }
             "conntrack" => {

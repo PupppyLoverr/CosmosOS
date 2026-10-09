@@ -5925,6 +5925,47 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::write_all(ipt, b"F\n/\n");
         a1 && p1 && a2 && p2 && a3 && p3
     });
+    check("ipt-cpu", {
+        // `-m cpu`: UP box classifies every packet on cpu 0, so
+        // --cpu 0 gates and --cpu 1 can never match.
+        let ipt = "/proc/net/iptables";
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let a1 = ustd::write_all(ipt, b"A INPUT icmp cpu 0 drop\n").is_ok();
+        let p1 = ustd::net_ping(0x0A00_0202, 1500).is_none();
+        let _ = ustd::write_all(ipt, b"F\n");
+        let a2 = ustd::write_all(ipt, b"A INPUT icmp cpu 1 drop\n").is_ok();
+        let p2 = ustd::net_ping(0x0A00_0202, 1500).is_some();
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        a1 && p1 && a2 && p2
+    });
+    check("ipt-nfacct", {
+        // `-m nfacct`: a fully-matched packet charges the named
+        // object's pkts/bytes — verified against the live table after
+        // two real gateway replies.
+        let ipt = "/proc/net/iptables";
+        let nfa = "/proc/net/nfacct";
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let _ = ustd::write_all(nfa, b"F\n");
+        let add = ustd::write_all(nfa, b"A NF188\n").is_ok();
+        let a1 = ustd::write_all(ipt, b"A INPUT icmp nfacct NF188 accept\n").is_ok();
+        let _ = ustd::net_ping(0x0A00_0202, 1500);
+        let _ = ustd::net_ping(0x0A00_0202, 1500);
+        let charged = ustd::read_all(nfa)
+            .map(|d| {
+                let t = String::from_utf8_lossy(&d);
+                t.lines().any(|l| {
+                    l.ends_with(" = NF188;")
+                        && l.split("pkts = ").nth(1).and_then(|n| n.split(',').next())
+                            .and_then(|n| n.trim().parse::<u64>().ok())
+                            .unwrap_or(0)
+                            >= 2
+                })
+            })
+            .unwrap_or(false);
+        let _ = ustd::write_all(ipt, b"F\n/\n");
+        let _ = ustd::write_all(nfa, b"F\n");
+        add && a1 && charged
+    });
     check("ipt-rpfilter", {
         // `-m rpfilter`: while a route back to the gw exists the rule
         // matches and drops; with the subnet route gone there's no
