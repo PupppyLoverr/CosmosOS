@@ -825,3 +825,16 @@ pub const KEYCTL_READ: u64 = 1;
 pub const KEYCTL_REVOKE: u64 = 3;
 pub const KEYCTL_UNLINK: u64 = 5;
 pub const KEYCTL_SEARCH: u64 = 10;
+
+// Batch 229 — sigqueueinfo + futex_waitv + cachestat + l/f xattr variants.
+pub const SYS_RT_SIGQUEUEINFO: u64 = 294;
+pub const SYS_FUTEX_WAITV: u64 = 295;
+pub const SYS_CACHESTAT: u64 = 296;
+pub const SYS_LSETXATTR: u64 = 297;
+pub const SYS_LGETXATTR: u64 = 298;
+pub const SYS_LLISTXATTR: u64 = 299;
+pub const SYS_LREMOVEXATTR: u64 = 300;
+pub const SYS_FSETXATTR: u64 = 301;
+pub const SYS_FGETXATTR: u64 = 302;
+pub const SYS_FLISTXATTR: u64 = 303;
+pub const SYS_FREMOVEXATTR: u64 = 304;

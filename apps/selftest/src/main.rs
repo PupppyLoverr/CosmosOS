@@ -3771,6 +3771,100 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         ok = ok && ustd::keyctl_unlink(serial as u32) == -126;
         ok
     });
+    check("sigqueue-info", {
+        // queued signal payload: si_code + si_value ride through to the
+        // signalfd record (ssi_code@8, ssi_int@44)
+        let _ = ustd::sigprocmask(0, 1 << 10); // block SIGUSR1
+        let mut ok = true;
+        let fd = ustd::signalfd4(1 << 10, 0);
+        ok = ok && fd >= 0;
+        let sq = ustd::sigqueueinfo(ustd::getpid(), 10, -2, 0xABCD);
+        ok = ok && sq == 0;
+        let mut rec = [0u8; 128];
+        let rn = ustd::read(fd, &mut rec);
+        ok = ok && rn.map(|n| n == 128).unwrap_or(false);
+        let signo = u32::from_le_bytes(rec[0..4].try_into().unwrap());
+        let code = i32::from_le_bytes(rec[8..12].try_into().unwrap());
+        let val = u32::from_le_bytes(rec[44..48].try_into().unwrap());
+        ok = ok && signo == 10 && code == -2 && val == 0xABCD;
+        let e1 = ustd::sigqueueinfo(ustd::getpid(), 10, 4, 0);
+        let e2 = ustd::sigqueueinfo(ustd::getpid(), 99, -2, 0);
+        ok = ok && e1 == -1 && e2 == -22;
+        if fd >= 0 { ustd::close(fd); }
+        ok
+    });
+    check("futex-waitv", {
+        static WA: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        static WB: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        use core::sync::atomic::Ordering;
+        extern "C" fn waiter(_: u64) -> i64 {
+            // waits on A==0 or B==0; returns the satisfied index
+            ustd::futex_waitv(
+                &[(&WA as *const _ as u64, 0), (&WB as *const _ as u64, 0)],
+                3000,
+            )
+        }
+        let spawn = ustd::thread_spawn(waiter, 0);
+        let mut ok = matches!(spawn, Ok(_));
+        ustd::sleep_ms(150);
+        WB.store(9, Ordering::SeqCst);
+        ustd::futex_wake(&WB, 1);
+        // EAGAIN: a word that already differs rejects immediately
+        let eg = ustd::futex_waitv(
+            &[(&WA as *const _ as u64, 55)], 2000);
+        // ETIMEDOUT: drain stale pending signals first so nothing
+        // signal-wakes the wait mid-sleep, then expect a clean -110
+        while ustd::sigtimedwait(u64::MAX, Some(0)) >= 0 {}
+        let to = ustd::futex_waitv(
+            &[(&WA as *const _ as u64, 0)], 80);
+        ok = ok && eg == -11 && to == -110;
+        ok
+    });
+    check("cachestat", {
+        // real residency: an mmap_file region reports resident pages only
+        // after they've faulted in
+        let mut ok = false;
+        if let Ok(fd) = ustd::open("/bin/cosmos-ucat", ustd::O_RDONLY) {
+            let empty = ustd::cachestat(fd, 0, 0x100000).unwrap_or([9; 5]);
+            ok = empty == [0; 5];
+            let mp = ustd::mmap_file(fd, 8192, 0);
+            if let Some(p) = mp {
+                unsafe { core::ptr::read_volatile(p) };
+                let st = ustd::cachestat(fd, 0, 0x100000).unwrap_or([9; 5]);
+                ok = ok && st[0] >= 1 && st[1] == 0 && st[2] == 0;
+            }
+            ustd::close(fd);
+        }
+        ok
+    });
+    check("xattr-lf", {
+        // l*: user.* mutation on a symlink node is EPERM (Linux rule);
+        // f*: fd-addressed ops hit the same tmpfs store
+        let mut ok = match ustd::open("/tmp/xlf", ustd::O_RDWR | ustd::O_CREATE) {
+            Ok(fd) => { ustd::close(fd); true }
+            _ => false,
+        };
+        let _ = ustd::symlinkat("/tmp/xlf", ustd::AT_FDCWD, "/tmp/xlnk");
+        ok = ok && ustd::lsetxattr("/tmp/xlnk", "user.a", b"v") == -1;
+        ok = ok && match ustd::open("/tmp/xlf", ustd::O_RDWR) {
+            Ok(fd) => {
+                let mut r = ustd::fsetxattr(fd, "user.fk", b"zz") == 0;
+                let mut buf = [0u8; 32];
+                let n = ustd::fgetxattr(fd, "user.fk", &mut buf);
+                r = r && n == 2 && &buf[..2] == b"zz";
+                let n = ustd::flistxattr(fd, &mut buf);
+                r = r && n > 0;
+                r = r && ustd::fremovexattr(fd, "user.fk") == 0;
+                r = r && ustd::fgetxattr(fd, "user.fk", &mut buf) == -61;
+                ustd::close(fd);
+                r
+            }
+            _ => false,
+        };
+        ok
+    });
     check("epoll-flags", {
         // EPOLLET fires once per ready level, EPOLLONESHOT until MOD
         // re-arms, EPOLLHUP surfaces on writer close, and the epoll fd

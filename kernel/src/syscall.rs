@@ -1323,6 +1323,21 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 _ => (-22i64) as u64,
             }
         }
+        shared::SYS_RT_SIGQUEUEINFO => {
+            // (pid, sig, si_code i32, si_value) — queued RT send carrying
+            // the payload through to signalfd reads
+            task::sigqueue_info(a1 as u32, a2 as u32, a3 as i32, a4 as u32) as u64
+        }
+        shared::SYS_FUTEX_WAITV => sys_futex_waitv(ctx, a1, a2, a3, a4),
+        shared::SYS_CACHESTAT => sys_cachestat(a1, a2, a3),
+        shared::SYS_LSETXATTR
+        | shared::SYS_LGETXATTR
+        | shared::SYS_LLISTXATTR
+        | shared::SYS_LREMOVEXATTR
+        | shared::SYS_FSETXATTR
+        | shared::SYS_FGETXATTR
+        | shared::SYS_FLISTXATTR
+        | shared::SYS_FREMOVEXATTR => sys_xattr2(nr, a1, a2, a3, a4, a5, ctx.r10),
         shared::SYS_CLOCK_NANOSLEEP => {
             // absolute deadline in ms; ticks run 10ms each. A past deadline
             // returns immediately (POSIX TIMER_ABSTIME).
@@ -6317,3 +6332,223 @@ fn copy_out_pcap(ptr: u64, cap: usize) -> Result<i64, i64> {
         None => Err(-2),
     }
 }
+
+/// SYS_FUTEX_WAITV(waiters, nr, flags, timeout_ms): block until ANY of the
+/// nr <= 8 {uaddr u64, val u64} pairs is woken; returns the waiter index,
+/// -EAGAIN when a word already differs at call time, -ETIMEDOUT on the
+/// deadline, or the futex_error path of the single-wait syscall.
+fn sys_futex_waitv(ctx: &mut CpuContext, list: u64, nr: u64, flags: u64, timeout_ms: u64) -> u64 {
+    if flags != 0 || nr == 0 || nr > 8 {
+        return (u64::MAX - 21) as u64; // -EINVAL
+    }
+    let pml4 = task::with_current(|t| t.pml4);
+    let Some(pml4) = pml4 else { return ERR };
+    let was_waiting = task::with_current(|t| t.wait_timeout != 0);
+    if !was_waiting {
+        // pre-check + collect keys
+        let mut keys = [0u64; 8];
+        for i in 0..nr as usize {
+            let Some(ent) = copy_in(list + (i * 16) as u64, 16) else {
+                return (u64::MAX - 13) as u64;
+            };
+            let uaddr = u64::from_le_bytes(ent[..8].try_into().unwrap_or([0; 8]));
+            let val = u64::from_le_bytes(ent[8..16].try_into().unwrap_or([0; 8]));
+            if uaddr & 7 != 0 {
+                return (u64::MAX - 13) as u64;
+            }
+            let Some(cur) = copy_in(uaddr, 8) else {
+                return (u64::MAX - 13) as u64;
+            };
+            let cur = u64::from_le_bytes(cur[..8].try_into().unwrap_or([0; 8]));
+            if cur != val {
+                return (u64::MAX - 10) as u64; // -EAGAIN
+            }
+            let Some(phys) = elf::translate_user(pml4, uaddr & !0xfff) else {
+                return (u64::MAX - 13) as u64;
+            };
+            keys[i] = phys | (uaddr & 0xfff);
+        }
+        let now = task::ticks();
+        let dl = if timeout_ms == u64::MAX {
+            u64::MAX
+        } else {
+            now + timeout_ms.div_ceil(10) + 1
+        };
+        task::with_current(|t| {
+            t.wait_timeout = dl;
+            t.wait_futex = u64::MAX; // sentinel: claimed via the set
+            t.wait_futex_set = keys;
+            t.wait_futex_set_n = nr as u8;
+            t.wait_futex_hit = 0xFF;
+        });
+    } else {
+        // re-entry: waker cleared our sentinel -> hit index; tick wake with
+        // the claim standing -> ETIMEDOUT.
+        let (claimed, hit, dl) = task::with_current(|t| {
+            (t.wait_futex != 0, t.wait_futex_hit, t.wait_timeout)
+        });
+        if !claimed {
+            task::with_current(|t| t.wait_timeout = 0);
+            if hit == 0xFF {
+                // a signal wake cleared the claim — real EINTR, not a
+                // futex wake; no waiter fired
+                return (u64::MAX - 3) as u64; // -EINTR
+            }
+            return hit as u64;
+        }
+        if task::ticks() >= dl {
+            task::with_current(|t| {
+                t.wait_timeout = 0;
+                t.wait_futex = 0;
+                t.wait_futex_set_n = 0;
+                t.wait_futex_set = [0; 8];
+            });
+            return (u64::MAX - 109) as u64;
+        }
+    }
+    let still = task::with_current(|t| {
+        if t.wait_futex != 0 {
+            t.state = task::State::Blocked;
+            t.wake_at = t.wait_timeout;
+            true
+        } else {
+            t.wait_timeout = 0;
+            false
+        }
+    });
+    if !still {
+        return task::with_current(|t| t.wait_futex_hit as u64);
+    }
+    ctx.rip -= 2; // re-enter the syscall instruction after the wake
+    task::yield_ctx(ctx)
+}
+
+/// SYS_CACHESTAT(fd, range_ptr{off,len}, out_ptr): page-residency of the
+/// task's file-backed mappings for the fd's path — a real page-table walk
+/// per page, matching Linux's nr_cache semantics; dirty/writeback/evicted
+/// stay 0 because this kernel has no writeback queue (honest zeroes).
+fn sys_cachestat(fd: u64, range_ptr: u64, out: u64) -> u64 {
+    let Some(rg) = copy_in(range_ptr, 16) else {
+        return (u64::MAX - 13) as u64;
+    };
+    let off = u64::from_le_bytes(rg[..8].try_into().unwrap_or([0; 8]));
+    let len = u64::from_le_bytes(rg[8..16].try_into().unwrap_or([0; 8]));
+    let path = task::with_current(|t| {
+        if fd as usize >= t.fds.len() {
+            return None;
+        }
+        t.fds[fd as usize].as_ref().map(|f| f.path.clone())
+    });
+    let Some(path) = path else {
+        return (u64::MAX - 8) as u64; // -EBADF
+    };
+    let mut res = [0u64; 5];
+    let ok = task::with_current(|t| {
+        let Some(pml4) = t.pml4 else { return false };
+        for fm in &t.filemaps {
+            if fm.path != path {
+                continue;
+            }
+            // file offsets [off, off+len) map at [fm.start + (x-off..)]
+            let mut va = fm.start;
+            while va < fm.end {
+                let foff = fm.off + (va - fm.start);
+                if foff >= off && foff < off.saturating_add(len) {
+                    if elf::translate(pml4, va).is_some() {
+                        res[0] += 1;
+                    }
+                }
+                va += 0x1000;
+            }
+        }
+        true
+    });
+    if !ok {
+        return (u64::MAX - 8) as u64;
+    }
+    let mut buf = [0u8; 40];
+    for (i, v) in res.iter().enumerate() {
+        buf[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    match copy_out(out, &buf) {
+        Some(_) => 0,
+        None => ERR,
+    }
+}
+
+/// l*/f* xattr variants over the same tmpfs store:
+/// - l*: the literal node at `path` — on a symlink node (attr 0x40) Linux
+///   gives EPERM(-1) for set/remove in the user.* space; get/list read the
+///   link's own attrs.
+/// - f*: path resolved from the fd's backing path (object fds → ENOTSUP).
+fn sys_xattr2(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, r10: u64) -> u64 {
+    let is_f = matches!(
+        nr,
+        shared::SYS_FSETXATTR
+            | shared::SYS_FGETXATTR
+            | shared::SYS_FLISTXATTR
+            | shared::SYS_FREMOVEXATTR
+    );
+    let full = if is_f {
+        let p = task::with_current(|t| {
+            if a1 as usize >= t.fds.len() {
+                return None;
+            }
+            t.fds[a1 as usize].as_ref().map(|f| f.path.clone())
+        });
+        let Some(p) = p else {
+            return (u64::MAX - 8) as u64; // -EBADF
+        };
+        p
+    } else {
+        let Some(p) = copy_str(a1, a2) else {
+            return ERR;
+        };
+        let cwd = task::with_current(|t| t.cwd.clone());
+        crate::vfs::normalize(&cwd, &p)
+    };
+    if !crate::tmpfs::handles(&full) {
+        return (-95i64) as u64;
+    }
+    // symlink-node check for l* set/remove (user.* rule)
+    let is_set = matches!(nr, shared::SYS_LSETXATTR | shared::SYS_FSETXATTR);
+    let is_get = matches!(nr, shared::SYS_LGETXATTR | shared::SYS_FGETXATTR);
+    let is_list = matches!(nr, shared::SYS_LLISTXATTR | shared::SYS_FLISTXATTR);
+    if !is_f && crate::tmpfs::readlink(&full).is_some() && (is_set || matches!(nr, shared::SYS_LREMOVEXATTR)) {
+        return (-1i64) as u64; // EPERM on symlink nodes for user.* mutation
+    }
+    let (name_a, name_b) = if is_f { (a2, a3) } else { (a3, a4) };
+    let (val_ptr, val_len) = if is_f { (a4, a5) } else { (a5, r10) };
+    if is_set {
+        let name = copy_str(name_a, name_b).unwrap_or_default();
+        let val = copy_in(val_ptr, val_len.min(4096)).unwrap_or_default();
+        crate::tmpfs::xattr_set(&full, &name, &val) as u64
+    } else if matches!(nr, shared::SYS_LREMOVEXATTR | shared::SYS_FREMOVEXATTR) {
+        let name = copy_str(name_a, name_b).unwrap_or_default();
+        crate::tmpfs::xattr_remove(&full, &name) as u64
+    } else {
+        let res = if is_get {
+            let name = copy_str(name_a, name_b).unwrap_or_default();
+            crate::tmpfs::xattr_get(&full, &name)
+        } else {
+            let _ = is_list;
+            crate::tmpfs::xattr_list(&full)
+        };
+        let (buf, cap) = if is_f { (a4, a5) } else { (a5, r10) };
+        match res {
+            Err(e) => e as u64,
+            Ok(v) => {
+                if buf == 0 {
+                    v.len() as u64
+                } else if (cap as usize) < v.len() {
+                    (-34i64) as u64
+                } else if copy_out(buf, &v).is_some() {
+                    v.len() as u64
+                } else {
+                    ERR
+                }
+            }
+        }
+    }
+}
+

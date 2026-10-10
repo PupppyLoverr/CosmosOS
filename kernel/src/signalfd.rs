@@ -47,12 +47,14 @@ pub fn try_read(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
         let Some(s) = g.get(&id) else { return Err(-3) };
         (s.owner, s.mask)
     };
-    match crate::task::take_pending_sig(owner, mask) {
-        Some(sig) => {
+    match crate::task::take_siginfo(owner, mask) {
+        Some((sig, code, val)) => {
             for b in buf[..128].iter_mut() {
                 *b = 0;
             }
             buf[..4].copy_from_slice(&sig.to_le_bytes());
+            buf[8..12].copy_from_slice(&code.to_le_bytes());   // ssi_code
+            buf[44..48].copy_from_slice(&val.to_le_bytes());   // ssi_int
             Ok(128)
         }
         None => {
