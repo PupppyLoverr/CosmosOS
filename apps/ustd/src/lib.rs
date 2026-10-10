@@ -3480,3 +3480,81 @@ pub fn fchmodat2(dirfd: i64, path: &str, mode: u64, flags: u64) -> i64 {
 pub fn process_mrelease(pidfd: i64, flags: u64) -> i64 {
     sc2(shared::SYS_PROCESS_MRELEASE, pidfd as u64, flags) as i64
 }
+
+/// fnv1a-64 — the kernel's stable mount-id function (mntfd.rs).
+pub fn mnt_id(path: &str) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in path.as_bytes() {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
+/// open_tree(2): clone the subtree at path into a detached mount fd.
+/// flags: OPEN_TREE_CLONE=1 required, AT_EMPTY_PATH=0x1000 optional.
+pub fn open_tree(dirfd: i64, path: &str, flags: u64) -> i64 {
+    sc4(
+        shared::SYS_OPEN_TREE,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        flags,
+    ) as i64
+}
+
+/// move_mount(2): attach a detached mount fd (F_EMPTY=0x40, from_path
+/// empty) at the target, or move an existing mount point.
+pub fn move_mount(fdfd: i64, fpath: &str, tdfd: i64, tpath: &str, flags: u64) -> i64 {
+    sc7(
+        shared::SYS_MOVE_MOUNT,
+        fdfd as u64,
+        fpath.as_ptr() as u64,
+        fpath.len() as u64,
+        tdfd as u64,
+        tpath.as_ptr() as u64,
+        tpath.len() as u64,
+        flags,
+    ) as i64
+}
+
+/// mount_setattr(2): fold set/clr MS_* bits into the mount behind mfd.
+pub fn mount_setattr(mfd: i64, set: u64, clr: u64) -> i64 {
+    sc3(shared::SYS_MOUNT_SETATTR, mfd as u64, set, clr) as i64
+}
+
+/// statmount(2): (parent_id, opts, kind, target_path) or None.
+pub fn statmount(id: u64) -> Option<(u64, u64, u64, alloc::string::String)> {
+    let mut hdr = [0u64; 3];
+    let mut pb = [0u8; 128];
+    let r = sc4(
+        shared::SYS_STATMOUNT,
+        id,
+        hdr.as_mut_ptr() as u64,
+        pb.as_mut_ptr() as u64,
+        pb.len() as u64,
+    ) as i64;
+    if r < 0 {
+        None
+    } else {
+        Some((
+            hdr[0],
+            hdr[1],
+            hdr[2],
+            alloc::string::String::from_utf8_lossy(&pb[..r as usize]).into_owned(),
+        ))
+    }
+}
+
+/// listmount(2): mounts whose parent is `parent`, into out; count.
+pub fn listmount(parent: u64, out: &mut [u64]) -> i64 {
+    sc3(
+        shared::SYS_LISTMOUNT,
+        parent,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+    ) as i64
+}

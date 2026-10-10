@@ -1345,6 +1345,13 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_CLOCK_ADJTIME => sys_clock_adjtime(a1),
         shared::SYS_FCHMODAT2 => sys_fchmodat2(a1 as i64, a2, a3, a4, a5),
         shared::SYS_PROCESS_MRELEASE => sys_mrelease(a1, a2),
+        shared::SYS_OPEN_TREE => sys_open_tree(a1 as i64, a2, a3, a4),
+        shared::SYS_MOVE_MOUNT => {
+            sys_move_mount(a1 as i64, a2, a3, a4 as i64, a5, ctx.r10, ctx.r11)
+        }
+        shared::SYS_STATMOUNT => sys_statmount(a1, a2, a3, a4),
+        shared::SYS_LISTMOUNT => sys_listmount(a1, a2, a3),
+        shared::SYS_MOUNT_SETATTR => sys_mount_setattr(a1, a2, a3),
         shared::SYS_CLOCK_NANOSLEEP => {
             // absolute deadline in ms; ticks run 10ms each. A past deadline
             // returns immediately (POSIX TIMER_ABSTIME).
@@ -3013,6 +3020,16 @@ fn sys_mmap_file(fd: u64, size: u64, offset: u64) -> u64 {
 
 /// SYS_MUNMAP(addr,len): real unmap — PTEs cleared, owned frames freed,
 /// borrowed (shm/fb) frames just detached, tracked entries shrunk/split.
+
+/// EROFS gate for mutating syscalls: the covering mount of the user's
+/// named path (pre-bind-resolution) carrying MS_RDONLY refuses writes.
+fn guard_mnt_ro(cwd: &str, path: &str) -> u64 {
+    let pre = vfs::normalize_prebind(cwd, path);
+    if task::mount_opts(&pre) & shared::MS_RDONLY != 0 {
+        return (-30i64) as u64;
+    }
+    0
+}
 /// Any tracked mapping overlapping [addr,end) marked sealed?
 fn sealed_overlaps(t: &task::Task, addr: u64, end: u64) -> bool {
     t.maps.iter().any(|m| m.sealed && m.start < end && m.end > addr)
@@ -4216,6 +4233,10 @@ fn on_real_fs(path: &str) -> bool {
 /// Write the `LNK>target` file + symlink attribute — what `ln -s` does
 /// in userspace, callable kernel-side for symlinkat.
 fn sys_symlink_impl(target: &str, link: &str) -> u64 {
+    let cwd = task::with_current(|t| t.cwd.clone());
+    if guard_mnt_ro(&cwd, link) != 0 {
+        return (-30i64) as u64;
+    }
     if vfs::stat_path(link).is_ok() || vfs::readlink_path(link).is_ok() {
         return (-17i64) as u64; // EEXIST
     }
@@ -4333,7 +4354,10 @@ fn sys_umount(ptr: u64, len: u64, flags: u64) -> u64 {
     }
     let Some(tgt) = copy_str(ptr, len) else { return ERR };
     let cwd = task::with_current(|t| t.cwd.clone());
-    let t = vfs::normalize(&cwd, tgt.trim_matches('\0'));
+    // The target names a mount point itself: resolving it through the
+    // bind table would umount the SOURCE the bind covers (a real bug —
+    // umount /mnt2 used to unmount /tmp).
+    let t = vfs::normalize_prebind(&cwd, tgt.trim_matches('\0'));
     match crate::tmpfs::umount(&t, flags) {
         Err(-22) => crate::bind::umount(&t)
             .map(|_| 0)
@@ -4847,6 +4871,9 @@ fn sys_getresid(out: u64, group: bool) -> u64 {
 fn sys_chown(pptr: u64, plen: u64, uid: u64, gid: u64) -> u64 {
     let Some(path) = copy_str(pptr, plen) else { return ERR };
     let cwd = task::with_current(|t| t.cwd.clone());
+    if guard_mnt_ro(&cwd, &path) != 0 {
+        return (-30i64) as u64;
+    }
     let full = vfs::normalize(&cwd, path.trim_matches('\0'));
     if crate::tmpfs::handles(&full) {
         return crate::tmpfs::chown(&full, uid as u32, gid as u32)
@@ -4882,6 +4909,9 @@ fn sys_fchown(fd: u64, uid: u64, gid: u64) -> u64 {
 fn sys_chmod(pptr: u64, plen: u64, mode: u64) -> u64 {
     let Some(path) = copy_str(pptr, plen) else { return ERR };
     let cwd = task::with_current(|t| t.cwd.clone());
+    if guard_mnt_ro(&cwd, &path) != 0 {
+        return (-30i64) as u64;
+    }
     let full = vfs::normalize(&cwd, path.trim_matches('\0'));
     if crate::tmpfs::handles(&full) {
         return crate::tmpfs::chmod(&full, mode as u16)
@@ -5267,16 +5297,28 @@ fn sys_readdir(pptr: u64, plen: u64, buf: u64, max: u64) -> u64 {
 
 fn sys_mkdir(pptr: u64, plen: u64) -> u64 {
     let Some(path) = copy_str(pptr, plen) else { return ERR };
+    let cwd = task::with_current(|t| t.cwd.clone());
+    if guard_mnt_ro(&cwd, &path) != 0 {
+        return (-30i64) as u64;
+    }
     vfs::mkdir(&path).map(|_| 0).unwrap_or_else(|e| e as u64)
 }
 
 fn sys_remove(pptr: u64, plen: u64) -> u64 {
     let Some(path) = copy_str(pptr, plen) else { return ERR };
+    let cwd = task::with_current(|t| t.cwd.clone());
+    if guard_mnt_ro(&cwd, &path) != 0 {
+        return (-30i64) as u64;
+    }
     vfs::remove(&path).map(|_| 0).unwrap_or_else(|e| e as u64)
 }
 
 fn sys_rename(optr: u64, olen: u64, nptr: u64, nlen: u64) -> u64 {
     let (Some(o), Some(n)) = (copy_str(optr, olen), copy_str(nptr, nlen)) else { return ERR };
+    let cwd = task::with_current(|t| t.cwd.clone());
+    if guard_mnt_ro(&cwd, &o) != 0 || guard_mnt_ro(&cwd, &n) != 0 {
+        return (-30i64) as u64;
+    }
     vfs::rename(&o, &n).map(|_| 0).unwrap_or_else(|e| e as u64)
 }
 
@@ -6790,6 +6832,9 @@ fn sys_fchmodat2(dirfd: i64, pptr: u64, plen: u64, mode: u64, flags: u64) -> u64
         return (-9i64) as u64;
     };
     let cwd = task::with_current(|t| t.cwd.clone());
+    if guard_mnt_ro(&cwd, &p) != 0 {
+        return (-30i64) as u64;
+    }
     let mut full = vfs::normalize(&cwd, &p);
     // follow: resolve the final component's links before chmod
     if flags & AT_SYMLINK_NOFOLLOW == 0 {
@@ -6845,4 +6890,160 @@ fn sys_mrelease(pidfd: u64, flags: u64) -> u64 {
     } else {
         r as u64
     }
+}
+
+
+/// SYS_OPEN_TREE(dirfd,path,len,flags): clone the subtree at path into
+/// a detached mount record behind a /mntfd/{id} fd. OPEN_TREE_CLONE
+/// (bit0) required — it's the only meaningful mode for us.
+fn sys_open_tree(dirfd: i64, pptr: u64, plen: u64, flags: u64) -> u64 {
+    const OPEN_TREE_CLONE: u64 = 1;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    if flags & !(OPEN_TREE_CLONE | AT_EMPTY_PATH) != 0 || flags & OPEN_TREE_CLONE == 0 {
+        return (-22i64) as u64;
+    }
+    let Some(p) = resolve_at(dirfd, pptr, plen) else {
+        return (-2i64) as u64;
+    };
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let full = vfs::normalize(&cwd, &p);
+    // cloning a nonexistent tree is ENOENT
+    if vfs::stat_path(&full).is_err() && !crate::tmpfs::handles(&full) {
+        return (-2i64) as u64;
+    }
+    // inherit the covering mount's flags, like a real subtree clone
+    let pre = vfs::normalize_prebind(&cwd, &p);
+    let opts = task::mount_opts(&pre)
+        & (shared::MS_RDONLY | shared::MS_NOSUID | shared::MS_NODEV | shared::MS_NOEXEC);
+    let id = crate::mntfd::clone_tree(&full, opts);
+    task::with_current(|t| {
+        let Some(s) = alloc_slot(t) else { return ERR; };
+        t.fds[s] = Some(task::FileDesc {
+            path: alloc::format!("/mntfd/{}", id),
+            pos: 0,
+            flags: 0,
+        });
+        s as u64
+    })
+}
+
+/// SYS_MOVE_MOUNT(fdfd,fpath,flen,tdfd,tpath,tlen,flags): attach a
+/// detached mount-fd (MOVE_MOUNT_F_EMPTY_PATH) at a target, or move an
+/// existing mount point (plain form = MS_MOVE on binds).
+fn sys_move_mount(
+    fdfd: i64,
+    fptr: u64,
+    flen: u64,
+    tdfd: i64,
+    tptr: u64,
+    tlen: u64,
+    flags: u64,
+) -> u64 {
+    const F_EMPTY: u64 = 0x40;
+    const T_EMPTY: u64 = 0x10;
+    if flags & !(F_EMPTY | T_EMPTY) != 0 {
+        return (-22i64) as u64;
+    }
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let target = if tlen == 0 {
+        if flags & T_EMPTY == 0 {
+            return (-22i64) as u64;
+        }
+        task::with_current(|t| match t.fds.get(tdfd as usize) {
+            Some(Some(f)) => Some(f.path.clone()),
+            _ => None,
+        })
+    } else {
+        resolve_at(tdfd, tptr, tlen)
+    };
+    let Some(tp) = target else { return (-9i64) as u64 };
+    let t = vfs::normalize_prebind(&cwd, &tp);
+    if flen == 0 {
+        // from is a detached mount-fd
+        if flags & F_EMPTY == 0 {
+            return (-22i64) as u64;
+        }
+        let mp = task::with_current(|t| match t.fds.get(fdfd as usize) {
+            Some(Some(f)) => Some(f.path.clone()),
+            _ => None,
+        });
+        let Some(id) = mp.as_deref().and_then(crate::mntfd::fd_id) else {
+            return (-9i64) as u64; // EBADF: not a mount fd
+        };
+        return crate::mntfd::attach(id, &t).map(|_| 0).unwrap_or_else(|e| e as u64);
+    }
+    // plain move: relocate the mount point at `from` onto `target`
+    let Some(fp) = resolve_at(fdfd, fptr, flen) else {
+        return (-2i64) as u64;
+    };
+    let f = vfs::normalize(&cwd, &fp);
+    crate::bind::move_mount(&f, &t).map(|_| 0).unwrap_or_else(|e| e as u64)
+}
+
+/// SYS_STATMOUNT(mnt_id, out{parent u64, opts u64, kind u64}, pbuf, cap):
+/// describe one mount of the caller's namespace; writes the canonical
+/// target path (ERANGE when cap < len+1).
+fn sys_statmount(id: u64, out: u64, pbuf: u64, cap: u64) -> u64 {
+    let set = crate::mntfd::mount_set();
+    let Some((_, parent, target, opts, kind)) = set.iter().find(|m| m.0 == id) else {
+        return (-2i64) as u64; // ENOENT: no such mount in this ns
+    };
+    let v = [*parent, *opts, *kind as u64];
+    if copy_out(out, unsafe {
+        core::slice::from_raw_parts(v.as_ptr() as *const u8, 24)
+    })
+    .is_none()
+    {
+        return ERR;
+    }
+    let tb = target.as_bytes();
+    if cap < tb.len() as u64 + 1 {
+        return (-34i64) as u64;
+    }
+    let mut b = tb.to_vec();
+    b.push(0);
+    match copy_out(pbuf, &b) {
+        Some(_) => tb.len() as u64,
+        None => ERR,
+    }
+}
+
+/// SYS_LISTMOUNT(parent_id, out_ids, max): ids of mounts whose parent
+/// is `parent_id`, up to `max` — count written (or needed, when the
+/// buffer was short — Linux-style truncation semantics).
+fn sys_listmount(parent: u64, out: u64, max: u64) -> u64 {
+    let set = crate::mntfd::mount_set();
+    let kids: Vec<u64> = set
+        .iter()
+        .filter(|m| m.1 == parent && m.0 != parent)
+        .map(|m| m.0)
+        .collect();
+    let n = kids.len().min(max as usize);
+    if n > 0 {
+        let mut b = Vec::with_capacity(n * 8);
+        for id in &kids[..n] {
+            b.extend_from_slice(&id.to_le_bytes());
+        }
+        if copy_out(out, &b).is_none() {
+            return ERR;
+        }
+    }
+    n as u64
+}
+
+/// SYS_MOUNT_SETATTR(mntfd, set, clr): fold MS_* bits into the mount
+/// behind the fd — detached records update their inherited opts;
+/// attached ones mutate the live bind's flags.
+fn sys_mount_setattr(mfd: u64, set: u64, clr: u64) -> u64 {
+    let mp = task::with_current(|t| match t.fds.get(mfd as usize) {
+        Some(Some(f)) => Some(f.path.clone()),
+        _ => None,
+    });
+    let Some(id) = mp.as_deref().and_then(crate::mntfd::fd_id) else {
+        return (-9i64) as u64;
+    };
+    let mask = shared::MS_RDONLY | shared::MS_NOSUID | shared::MS_NODEV | shared::MS_NOEXEC;
+    crate::mntfd::set_opts(id, set & mask, clr & mask)
+        .map(|_| 0)
+        .unwrap_or_else(|e| e as u64)
 }

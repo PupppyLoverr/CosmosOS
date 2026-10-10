@@ -114,6 +114,19 @@ pub fn move_mount(old: &str, new: &str) -> Result<(), i64> {
     Ok(())
 }
 
+/// mount_setattr on an attached mount-fd: fold set/clr into the bind's
+/// opts. EINVAL when `target` isn't a bind mount.
+pub fn set_opts(target: &str, set: u64, clr: u64) -> Result<(), i64> {
+    let ns = crate::task::ns_of();
+    let mut g = ns.lock();
+    let Some(b) = g.binds.iter_mut().find(|b| b.0 == target) else {
+        return Err(-22);
+    };
+    b.2 |= set;
+    b.2 &= !clr;
+    Ok(())
+}
+
 /// (target, source) list in the current namespace — /proc output.
 pub fn mounts() -> Vec<(String, String)> {
     let ns = crate::task::ns_of();

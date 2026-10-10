@@ -44,6 +44,7 @@ mod memfd;
 mod tmpfs;
 mod nsfd;
 mod bind;
+mod mntfd;
 mod signalfd;
 mod vfs;
 mod virtio;
