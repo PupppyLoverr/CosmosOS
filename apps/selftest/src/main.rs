@@ -3936,6 +3936,42 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         ok = ok && ustd::process_mrelease(0xFFFFFF, 0) == -9; // EBADF
         check("mrelease", ok);
     }
+    // --- new mount API (b231) ---
+    {
+        let _ = ustd::mkdir("/mnt2");
+        let mfd = ustd::open_tree(ustd::AT_FDCWD, "/tmp", 1);
+        let mut ok = mfd >= 0;
+        // seal the detached mount read-only, then attach it at /mnt2
+        ok = ok && ustd::mount_setattr(mfd, 1, 0) == 0; // MS_RDONLY
+        ok = ok && ustd::move_mount(mfd, "", ustd::AT_FDCWD, "/mnt2", 0x40) == 0;
+        // the alias resolves: a file created under /tmp reads via /mnt2
+        match ustd::open("/tmp/ma-f", ustd::O_RDWR | ustd::O_CREATE) {
+            Ok(fd) => { let _ = ustd::write(fd, b"ma"); ustd::close(fd); }
+            Err(_) => ok = false,
+        }
+        ok = ok && ustd::open("/mnt2/ma-f", ustd::O_RDONLY).is_ok();
+        // writes through the read-only mount are refused — EROFS
+        ok = ok && match ustd::open("/mnt2/ma-w", ustd::O_RDWR | ustd::O_CREATE) {
+            Err(e) => e == -30,
+            Ok(fd) => { ustd::close(fd); false }
+        };
+        // but the same file through /tmp (not read-only there) writes
+        ok = ok && ustd::open("/tmp/ma-w", ustd::O_RDWR | ustd::O_CREATE).is_ok();
+        // statmount describes the attached bind; listmount finds it
+        let mid = ustd::mnt_id("/mnt2");
+        ok = ok && match ustd::statmount(mid) {
+            Some((parent, opts, kind, path)) => {
+                opts & 1 != 0 && kind == 2 && path == "/mnt2"
+                    && parent == ustd::mnt_id("/")
+            }
+            None => false,
+        };
+        let mut ids = [0u64; 16];
+        let n = ustd::listmount(ustd::mnt_id("/"), &mut ids);
+        ok = ok && n > 0 && ids[..n.min(16) as usize].contains(&mid);
+        let _ = ustd::umount("/mnt2");
+        check("mount-api", ok);
+    }
     check("epoll-flags", {
         // EPOLLET fires once per ready level, EPOLLONESHOT until MOD
         // re-arms, EPOLLHUP surfaces on writer close, and the epoll fd

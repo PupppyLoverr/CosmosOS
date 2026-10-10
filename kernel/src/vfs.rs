@@ -377,6 +377,17 @@ pub fn open(path: &str, flags: u64) -> Result<i64, i64> {
     } else {
         flags
     };
+    // MS_RDONLY on the covering mount (tmpfs or a bind alias) bars any
+    // write-ish open — checked on the pre-resolution path, the mount
+    // the user actually named.
+    if flags & (shared::O_WRONLY | shared::O_RDWR | shared::O_CREATE
+        | shared::O_TRUNC | shared::O_APPEND) != 0
+    {
+        let pre = normalize_prebind(&cwd, path);
+        if task::mount_opts(&pre) & shared::MS_RDONLY != 0 {
+            return Err(-30);
+        }
+    }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     // links are fully transparent: resolve first, then classify the target
@@ -1032,6 +1043,12 @@ pub fn btime(path: &str) -> u64 {
 
 pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
+    // MS_RDONLY on the covering mount (tmpfs or bind alias) refuses
+    // mutations — checked on the pre-resolution path.
+    if task::mount_opts(&normalize_prebind(&cwd, path)) & shared::MS_RDONLY != 0 {
+        return Err(-30);
+    }
+
     let full = normalize(&cwd, path);
     if crate::tmpfs::handles(&full) {
         return crate::tmpfs::utime(&full, secs);
@@ -1055,6 +1072,12 @@ pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
 /// on a path. Pseudo-filesystems are read-only: always an error.
 pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
+    // MS_RDONLY on the covering mount (tmpfs or bind alias) refuses
+    // mutations — checked on the pre-resolution path.
+    if task::mount_opts(&normalize_prebind(&cwd, path)) & shared::MS_RDONLY != 0 {
+        return Err(-30);
+    }
+
     let full = normalize(&cwd, path);
     // pipe registry entries are exact-path objects; check them before the
     // prefix-based tmpfs resolver so a fifo under /tmp still takes attrs
@@ -1137,6 +1160,12 @@ pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
 
 pub fn mkdir(path: &str) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
+    // MS_RDONLY on the covering mount (tmpfs or bind alias) refuses
+    // mutations — checked on the pre-resolution path.
+    if task::mount_opts(&normalize_prebind(&cwd, path)) & shared::MS_RDONLY != 0 {
+        return Err(-30);
+    }
+
     let full = normalize(&cwd, path);
     if crate::tmpfs::handles(&full) {
         return crate::tmpfs::mkdir(&full);
@@ -1161,6 +1190,12 @@ pub fn mkdir(path: &str) -> Result<(), i64> {
 
 pub fn remove(path: &str) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
+    // MS_RDONLY on the covering mount (tmpfs or bind alias) refuses
+    // mutations — checked on the pre-resolution path.
+    if task::mount_opts(&normalize_prebind(&cwd, path)) & shared::MS_RDONLY != 0 {
+        return Err(-30);
+    }
+
     let full = normalize(&cwd, path);
     if crate::pipes::handles(&full) && !crate::pipes::is_dir(&full) {
         let r = crate::pipes::remove(&full);
@@ -1202,6 +1237,12 @@ pub fn remove(path: &str) -> Result<(), i64> {
 
 pub fn rename(from: &str, to: &str) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
+    if task::mount_opts(&normalize_prebind(&cwd, from)) & shared::MS_RDONLY != 0
+        || task::mount_opts(&normalize_prebind(&cwd, to)) & shared::MS_RDONLY != 0
+    {
+        return Err(-30);
+    }
+
     let f = normalize(&cwd, from);
     let t2 = normalize(&cwd, to);
     let ft = crate::tmpfs::handles(&f);
@@ -1251,6 +1292,12 @@ pub fn rename2(from: &str, to: &str, flags: u64) -> Result<(), i64> {
         0 => rename(from, to),
         shared::RENAME_NOREPLACE => {
             let cwd = task::with_current(|t| t.cwd.clone());
+    if task::mount_opts(&normalize_prebind(&cwd, from)) & shared::MS_RDONLY != 0
+        || task::mount_opts(&normalize_prebind(&cwd, to)) & shared::MS_RDONLY != 0
+    {
+        return Err(-30);
+    }
+
             if stat_path(&normalize(&cwd, to)).is_ok() {
                 return Err(-17); // EEXIST
             }
@@ -1319,6 +1366,9 @@ pub fn truncate_path(path: &str, len: u64) -> Result<(), i64> {
 pub fn write_all_path(path: &str, data: &[u8]) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
     let full = normalize(&cwd, path);
+    if task::mount_opts(&normalize_prebind(&cwd, path)) & shared::MS_RDONLY != 0 {
+        return Err(-30);
+    }
     if immutable(&full) || append_only(&full) {
         return Err(-1);
     }
