@@ -4117,6 +4117,50 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         check("pidfd-open", ok);
     }
     {
+        // name_to_handle_at + open_by_handle_at round-trip on a real file
+        let _ = ustd::write_all("/hnd-target", b"HANDLE-DATA");
+        let mut ok = false;
+        if let Ok((hb, _ht, ino, mid)) =
+            ustd::name_to_handle_at(ustd::AT_FDCWD, "/hnd-target", 0)
+        {
+            ok = hb == 8 && ino != 0 && mid != 0;
+            // open_by_handle via any fd on the mount (root fs dir fd)
+            let mfd = ustd::open("/", 0).unwrap_or(-1);
+            if mfd >= 0 {
+                let fd = ustd::open_by_handle_at(mfd, ino, 0);
+                ok = ok && fd >= 0;
+                if fd >= 0 {
+                    let mut b = [0u8; 16];
+                    ok = ok && ustd::read(fd, &mut b)
+                        .map(|n| &b[..n] == b"HANDLE-DATA")
+                        .unwrap_or(false);
+                    let _ = ustd::close(fd);
+                }
+                let _ = ustd::close(mfd);
+            }
+            // bogus ino -> ESTALE (-116)
+            ok = ok && {
+                let mfd2 = ustd::open("/", 0).unwrap_or(-1);
+                let r = ustd::open_by_handle_at(mfd2, 0xdeadbeef, 0);
+                let _ = ustd::close(mfd2);
+                r == -116
+            };
+        }
+        let _ = ustd::remove("/hnd-target");
+        check("handle-at", ok);
+    }
+    {
+        // sched_setattr sets policy+nice round-trip through sched_getattr
+        let me = ustd::getpid() as u32;
+        let mut ok = ustd::sched_setattr(me, 0, 5, 0) == 0;
+        ok = ok && ustd::sched_getattr(me)
+            .map(|(_s, _p, nice, _rp)| nice == 5)
+            .unwrap_or(false);
+        let _ = ustd::sched_setattr(me, 0, 0, 0); // restore
+        ok = ok && ustd::sched_setattr(me, 0, 0, 0) == 0;
+        check("sched-setattr", ok);
+    }
+    {
         // sched_getattr: self reports policy/nice/rt_prio, dead pid -> ESRCH
         let me = ustd::getpid() as u32;
         let got = ustd::sched_getattr(me);
