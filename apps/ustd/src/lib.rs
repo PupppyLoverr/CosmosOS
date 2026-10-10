@@ -3427,3 +3427,56 @@ pub fn fremovexattr(fd: i64, name: &str) -> i64 {
     sc4(shared::SYS_FREMOVEXATTR, fd as u64,
         name.as_ptr() as u64, name.len() as u64, 0) as i64
 }
+
+/// mseal(2): seal a mapped range against munmap/mprotect/MAP_FIXED.
+/// 0 ok, -1 EPERM-ish, -12 ENOMEM (nothing whole in range), -22 EINVAL.
+pub fn mseal(addr: *mut u8, len: u64) -> i64 {
+    sc3(shared::SYS_MSEAL, addr as u64, len, 0) as i64
+}
+
+/// kcmp(2): 0 = pid1/pid2 share the resource, 1 = differ, <0 errno.
+/// types: 0 FILE (fd idx1 vs idx2), 1 FILES, 3 VM, 4 FS, 5 SIGHAND.
+pub fn kcmp(pid1: u32, pid2: u32, typ: u64, idx1: u64, idx2: u64) -> i64 {
+    sc5(
+        shared::SYS_KCMP,
+        pid1 as u64,
+        pid2 as u64,
+        typ,
+        idx1,
+        idx2,
+    ) as i64
+}
+
+/// clock_adjtime: modes bit0 = set off_ms absolute, bit1 = add delta.
+pub fn clock_adjtime(modes: u64, off_ms: i64) -> i64 {
+    let buf = [modes, off_ms as u64];
+    sc1(shared::SYS_CLOCK_ADJTIME, buf.as_ptr() as u64) as i64
+}
+
+/// Read the current realtime offset (modes==0 query form).
+pub fn clock_adjtime_get() -> Option<i64> {
+    let buf = [0u64, 0u64];
+    let r = sc1(shared::SYS_CLOCK_ADJTIME, buf.as_ptr() as u64) as i64;
+    if r == 0 {
+        Some(unsafe { (buf.as_ptr().add(1) as *const i64).read() })
+    } else {
+        None
+    }
+}
+
+/// fchmodat2: flags AT_EMPTY_PATH(0x1000) / AT_SYMLINK_NOFOLLOW(0x100).
+pub fn fchmodat2(dirfd: i64, path: &str, mode: u64, flags: u64) -> i64 {
+    sc5(
+        shared::SYS_FCHMODAT2,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        mode,
+        flags,
+    ) as i64
+}
+
+/// process_mrelease(2): drop the pidfd's target's address space.
+pub fn process_mrelease(pidfd: i64, flags: u64) -> i64 {
+    sc2(shared::SYS_PROCESS_MRELEASE, pidfd as u64, flags) as i64
+}

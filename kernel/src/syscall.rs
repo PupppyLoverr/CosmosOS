@@ -535,7 +535,9 @@ pub fn dispatch(ctx: &mut CpuContext) {
             let ms = if a1 == 1 {
                 task::ticks_ns() * 10
             } else if a1 == 0 {
-                crate::timer::rtc_ms()
+                // realtime honors the clock_adjtime offset (can go
+                // backwards, like Linux ADJ_OFFSET_SINGLESHOT)
+                (crate::timer::rtc_ms() as i64 + *CLOCK_ADJ_MS.lock()).max(0) as u64
             } else {
                 ctx.rax = ERR;
                 return;
@@ -1338,6 +1340,11 @@ pub fn dispatch(ctx: &mut CpuContext) {
         | shared::SYS_FGETXATTR
         | shared::SYS_FLISTXATTR
         | shared::SYS_FREMOVEXATTR => sys_xattr2(nr, a1, a2, a3, a4, a5, ctx.r10),
+        shared::SYS_MSEAL => sys_mseal(a1, a2, a3),
+        shared::SYS_KCMP => sys_kcmp(a1, a2, a3, a4, a5),
+        shared::SYS_CLOCK_ADJTIME => sys_clock_adjtime(a1),
+        shared::SYS_FCHMODAT2 => sys_fchmodat2(a1 as i64, a2, a3, a4, a5),
+        shared::SYS_PROCESS_MRELEASE => sys_mrelease(a1, a2),
         shared::SYS_CLOCK_NANOSLEEP => {
             // absolute deadline in ms; ticks run 10ms each. A past deadline
             // returns immediately (POSIX TIMER_ABSTIME).
@@ -2884,6 +2891,11 @@ fn sys_mmap(size: u64, flags: u64, addr: u64) -> u64 {
     }
     let pages = size.div_ceil(0x1000);
     if fixed {
+        // mseal(2): cannot replace a sealed range — EPERM
+        let fend = addr.saturating_add(pages * 0x1000);
+        if task::with_current(|t| sealed_overlaps(t, addr, fend)) {
+            return (-1i64) as u64;
+        }
         // POSIX MAP_FIXED: evict overlapping maps first (real munmap —
         // unmaps frames, releases COW/shm bookkeeping, propagates to
         // thread peers) before the fresh map lands on the range
@@ -2920,6 +2932,7 @@ fn sys_mmap(size: u64, flags: u64, addr: u64) -> u64 {
             start: base,
             end: base + pages * 0x1000,
             perm: 1 | 2,
+            sealed: false,
             name: alloc::string::String::from("[anon]"),
         });
         base
@@ -2983,6 +2996,7 @@ fn sys_mmap_file(fd: u64, size: u64, offset: u64) -> u64 {
             start: base,
             end: base + pages * 0x1000,
             perm: 1 | 2,
+            sealed: false,
             name: path.clone(),
         });
         t.filemaps.push(task::FileMap {
@@ -2991,6 +3005,7 @@ fn sys_mmap_file(fd: u64, size: u64, offset: u64) -> u64 {
             path,
             off: offset,
             perm: 1 | 2,
+            sealed: false,
         });
         base
     })
@@ -2998,11 +3013,24 @@ fn sys_mmap_file(fd: u64, size: u64, offset: u64) -> u64 {
 
 /// SYS_MUNMAP(addr,len): real unmap — PTEs cleared, owned frames freed,
 /// borrowed (shm/fb) frames just detached, tracked entries shrunk/split.
+/// Any tracked mapping overlapping [addr,end) marked sealed?
+fn sealed_overlaps(t: &task::Task, addr: u64, end: u64) -> bool {
+    t.maps.iter().any(|m| m.sealed && m.start < end && m.end > addr)
+        || t.filemaps
+            .iter()
+            .any(|f| f.sealed && f.start < end && f.end > addr)
+}
+
 fn sys_munmap(addr: u64, len: u64) -> u64 {
     if len == 0 || addr & 0xFFF != 0 {
         return ERR;
     }
     let end = addr.saturating_add(len.div_ceil(0x1000) * 0x1000);
+    // mseal(2): sealed mappings refuse munmap (also the eviction path
+    // used by MAP_FIXED and mremap-style flows) — EPERM.
+    if task::with_current(|t| sealed_overlaps(t, addr, end)) {
+        return (-1i64) as u64;
+    }
     let mut pml4_phys = None;
     let ret: Option<u64> = task::with_current(|t| {
         let pml4 = t.pml4?;
@@ -3065,6 +3093,7 @@ fn trim_map_lists(t: &mut task::Task, addr: u64, end: u64) {
                 start: m.start,
                 end: addr,
                 perm: m.perm,
+                sealed: m.sealed,
                 name: m.name.clone(),
             });
         }
@@ -3073,6 +3102,7 @@ fn trim_map_lists(t: &mut task::Task, addr: u64, end: u64) {
                 start: end,
                 end: m.end,
                 perm: m.perm,
+                sealed: m.sealed,
                 name: m.name,
             });
         }
@@ -3092,6 +3122,7 @@ fn trim_map_lists(t: &mut task::Task, addr: u64, end: u64) {
                 path: f.path.clone(),
                 off: f.off,
                 perm: f.perm,
+                sealed: f.sealed,
             });
         }
         if f.end > end {
@@ -3101,6 +3132,7 @@ fn trim_map_lists(t: &mut task::Task, addr: u64, end: u64) {
                 path: f.path,
                 off: f.off + (end - f.start),
                 perm: f.perm,
+                sealed: f.sealed,
             });
         }
     }
@@ -3116,6 +3148,10 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     let w = prot & shared::PROT_WRITE != 0;
     let x = prot & shared::PROT_EXEC != 0;
     let end = addr.saturating_add(len.div_ceil(0x1000) * 0x1000);
+    // mseal(2): sealed mappings keep their PTE flags — EPERM.
+    if task::with_current(|t| sealed_overlaps(t, addr, end)) {
+        return (-1i64) as u64;
+    }
     let changed = task::with_current(|t| {
         let Some(pml4) = t.pml4 else { return 0 };
         let mut a = addr;
@@ -5257,6 +5293,7 @@ fn sys_shm_map(id: u64) -> u64 {
             start: vaddr,
             end: vaddr + n,
             perm: 1 | 2,
+            sealed: false,
             name: alloc::format!("shm#{}", id),
         });
         vaddr
@@ -6552,3 +6589,260 @@ fn sys_xattr2(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, r10: u64) ->
     }
 }
 
+
+
+static CLOCK_ADJ_MS: spin::Mutex<i64> = spin::Mutex::new(0);
+
+/// SYS_MSEAL(addr,len,flags): seal every mapping fully inside
+/// [addr,end) — munmap/mprotect/MAP_FIXED-replace then fail EPERM.
+/// Flags must be 0. ENOMEM when the range covers no whole mapping.
+fn sys_mseal(addr: u64, len: u64, flags: u64) -> u64 {
+    if flags != 0 || len == 0 || addr & 0xFFF != 0 {
+        return (-22i64) as u64;
+    }
+    let end = addr.saturating_add(len);
+    let seal = |t: &mut task::Task| -> bool {
+        let mut any = false;
+        for m in t.maps.iter_mut() {
+            if m.start >= addr && m.end <= end {
+                m.sealed = true;
+                any = true;
+            }
+        }
+        for f in t.filemaps.iter_mut() {
+            if f.start >= addr && f.end <= end {
+                f.sealed = true;
+                any = true;
+            }
+        }
+        any
+    };
+    // a seal is per-mm: every thread sharing the tables sees it
+    let (any, pp) = task::with_current(|t| {
+        (seal(t), t.pml4.map(|p| p.start_address().as_u64()))
+    });
+    if !any {
+        return (-12i64) as u64; // ENOMEM: nothing whole to seal
+    }
+    if let Some(pp) = pp {
+        task::for_mm_peers(pp, |o| {
+            seal(o);
+        });
+    }
+    0
+}
+
+/// SYS_KCMP(pid1,pid2,type,idx1,idx2): compare kernel resources of two
+/// tasks. Returns 0 when they share the resource, 1 otherwise (we have
+/// no stable kernel ordering, so never 2). ESRCH on a dead pid.
+fn sys_kcmp(pid1: u64, pid2: u64, typ: u64, i1: u64, i2: u64) -> u64 {
+    let get = |pid: u64, f: &dyn Fn(&task::Task) -> u64| -> i64 {
+        task::with_pid_mut(pid as u32, |t| f(t) as i64)
+    };
+    match typ {
+        // KCMP_FILE: fd idx1 of pid1 and idx2 of pid2 name the same open
+        // file description — our FileDesc identity is (path,pos,flags);
+        // cloned/dup'd descriptors compare equal like Linux's same-OFD.
+        0 => {
+            let f = |t: &task::Task, i: u64| -> u64 {
+                match t.fds.get(i as usize) {
+                    Some(Some(d)) => {
+                        // hash the identity tuple — strings can't leave
+                        // the lock so fold them
+                        let mut h = d.pos ^ d.flags << 32;
+                        for &b in d.path.as_bytes() {
+                            h = h.rotate_left(5) ^ b as u64;
+                        }
+                        h
+                    }
+                    _ => u64::MAX - 1, // EBADF marker
+                }
+            };
+            let a = get(pid1, &|t| f(t, i1));
+            let b = get(pid2, &|t| f(t, i2));
+            const BADF: i64 = (u64::MAX - 1) as i64;
+            if a < 0 || b < 0 {
+                return (-3i64) as u64;
+            }
+            if a == BADF || b == BADF {
+                return (-9i64) as u64; // EBADF
+            }
+            if a == b {
+                0
+            } else {
+                1
+            }
+        }
+        // KCMP_FILES: same descriptor table — threads of one mm share it
+        1 | 3 => {
+            // VM(3) = same mm; FILES(1) = same table, which clone wires
+            // to the same mm — pml4 is the honest proxy for both
+            let a = get(pid1, &|t| t.pml4.map(|p| p.start_address().as_u64()).unwrap_or(0));
+            let b = get(pid2, &|t| t.pml4.map(|p| p.start_address().as_u64()).unwrap_or(0));
+            if a < 0 || b < 0 {
+                return (-3i64) as u64;
+            }
+            if a == b {
+                0
+            } else {
+                1
+            }
+        }
+        // KCMP_FS: same cwd + chroot root
+        4 => {
+            let a = get(pid1, &|t| {
+                let mut h = 0u64;
+                for &b in t.cwd.as_bytes().iter().chain(t.root.as_bytes()) {
+                    h = h.rotate_left(5) ^ b as u64;
+                }
+                h
+            });
+            let b = get(pid2, &|t| {
+                let mut h = 0u64;
+                for &b in t.cwd.as_bytes().iter().chain(t.root.as_bytes()) {
+                    h = h.rotate_left(5) ^ b as u64;
+                }
+                h
+            });
+            if a < 0 || b < 0 {
+                return (-3i64) as u64;
+            }
+            if a == b {
+                0
+            } else {
+                1
+            }
+        }
+        // KCMP_SIGHAND: identical disposition arrays
+        5 => {
+            let a = get(pid1, &|t| {
+                let mut h = 0u64;
+                for &v in t.sighandlers.iter() {
+                    h = h.rotate_left(5) ^ v;
+                }
+                h
+            });
+            let b = get(pid2, &|t| {
+                let mut h = 0u64;
+                for &v in t.sighandlers.iter() {
+                    h = h.rotate_left(5) ^ v;
+                }
+                h
+            });
+            if a < 0 || b < 0 {
+                return (-3i64) as u64;
+            }
+            if a == b {
+                0
+            } else {
+                1
+            }
+        }
+        _ => (-22i64) as u64, // EINVAL
+    }
+}
+
+/// SYS_CLOCK_ADJTIME(buf {modes u64, off_ms i64}): modes==0 reads the
+/// current offset into buf.off_ms; bit0 sets it absolute, bit1 adds.
+/// The realtime clock then reports rtc + offset (CLOCK_GETTIME arm).
+fn sys_clock_adjtime(buf: u64) -> u64 {
+    let Some(v) = copy_in(buf, 16) else { return ERR };
+    let modes = u64::from_le_bytes(v[0..8].try_into().unwrap());
+    if modes == 0 {
+        let cur = *CLOCK_ADJ_MS.lock();
+        let v2 = [0u64, cur as u64];
+        return match copy_out(buf, unsafe {
+            core::slice::from_raw_parts(v2.as_ptr() as *const u8, 16)
+        }) {
+            Some(_) => 0,
+            None => ERR,
+        };
+    }
+    let off = i64::from_le_bytes(v[8..16].try_into().unwrap());
+    if !task::capable(task::CAP_SYS_TIME) {
+        return (-1i64) as u64;
+    }
+    {
+        let mut g = CLOCK_ADJ_MS.lock();
+        if modes & 1 != 0 {
+            *g = off;
+        } else {
+            *g = g.saturating_add(off);
+        }
+    }
+    0
+}
+
+/// SYS_FCHMODAT2(dirfd,path,len,mode,flags): AT_EMPTY_PATH chmods the
+/// dirfd's own file; AT_SYMLINK_NOFOLLOW chmods the link node itself
+/// (tmpfs links are their own nodes) — without it the final link is
+/// resolved first, matching Linux follow semantics.
+fn sys_fchmodat2(dirfd: i64, pptr: u64, plen: u64, mode: u64, flags: u64) -> u64 {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return (-22i64) as u64;
+    }
+    if plen == 0 && flags & AT_EMPTY_PATH == 0 {
+        return (-22i64) as u64;
+    }
+    let Some(p) = resolve_at(dirfd, pptr, plen) else {
+        return (-9i64) as u64;
+    };
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let mut full = vfs::normalize(&cwd, &p);
+    // follow: resolve the final component's links before chmod
+    if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        for _ in 0..8 {
+            let tgt = if crate::tmpfs::handles(&full) {
+                crate::tmpfs::readlink(&full)
+            } else {
+                vfs::readlink_path(&full).ok()
+            };
+            match tgt {
+                Some(t) => {
+                    let base = match full.rfind('/') {
+                        Some(i) => String::from(&full[..i + 1]),
+                        None => String::from("/"),
+                    };
+                    full = vfs::normalize(&base, &t);
+                }
+                None => break,
+            }
+        }
+    }
+    if crate::tmpfs::handles(&full) {
+        return crate::tmpfs::chmod(&full, mode as u16)
+            .map(|_| 0)
+            .unwrap_or_else(|e| e as u64);
+    }
+    if !task::capable(task::CAP_FOWNER) {
+        return (-1i64) as u64;
+    }
+    let ro = mode & 0o222 == 0;
+    let cur = vfs::stat_path(&full).map(|s| s.attr).unwrap_or(0) as u8;
+    let attr = if ro { cur | 0x01 } else { cur & !0x01 };
+    vfs::setattr(&full, attr).map(|_| 0).unwrap_or_else(|e| e as u64)
+}
+
+/// SYS_PROCESS_MRELEASE(pidfd,flags): drop the target's user address
+/// space — every tracked range unmapped, frames freed (respecting COW
+/// borrows), bookkeeping cleared on every thread sharing the mm.
+fn sys_mrelease(pidfd: u64, flags: u64) -> u64 {
+    if flags != 0 {
+        return (-22i64) as u64;
+    }
+    let path = task::with_current(|t| match t.fds.get(pidfd as usize) {
+        Some(Some(f)) => f.path.clone(),
+        _ => String::new(),
+    });
+    let Some(pid) = crate::pidfd::target(&path) else {
+        return (-9i64) as u64; // EBADF: not a pidfd
+    };
+    let r = task::mrelease(pid);
+    if r == 0 {
+        0
+    } else {
+        r as u64
+    }
+}

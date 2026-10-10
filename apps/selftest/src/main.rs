@@ -3865,6 +3865,77 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         };
         ok
     });
+    // --- mseal + kcmp + clock_adjtime + fchmodat2 + mrelease (b230) ---
+    {
+        let p = ustd::mmap(0x4000).expect("mmap");
+        let mut ok = ustd::mseal(p, 0x4000) == 0;
+        // sealed: protect/unmap both refuse; sealing again is fine
+        ok = ok && !ustd::mprotect(p, 0x4000, 7);
+        ok = ok && !ustd::munmap(p, 0x4000);
+        ok = ok && ustd::mseal(p, 0x4000) == 0;
+        // a sub-range seals nothing whole -> ENOMEM(-12)
+        ok = ok && ustd::mseal(p, 0x2000) == -12;
+        check("mseal", ok);
+    }
+    {
+        let me = ustd::getpid();
+        let mut ok = ustd::kcmp(me, me, 1, 0, 0) == 0; // FILES
+        ok = ok && ustd::kcmp(me, me, 3, 0, 0) == 0; // VM
+        let fa = ustd::open("/etc/passwd", ustd::O_RDONLY);
+        let fb = ustd::open("/etc/hosts", ustd::O_RDONLY);
+        if let (Ok(a), Ok(b)) = (fa, fb) {
+            ok = ok && ustd::kcmp(me, me, 0, a as u64, a as u64) == 0;
+            ok = ok && ustd::kcmp(me, me, 0, a as u64, b as u64) == 1;
+            let _ = ustd::close(a);
+            let _ = ustd::close(b);
+        } else {
+            ok = false;
+        }
+        ok = ok && ustd::kcmp(me, 0xFFFFFF, 1, 0, 0) == -3; // ESRCH
+        check("kcmp", ok);
+    }
+    {
+        let mut ok = ustd::clock_adjtime_get() == Some(0);
+        let before = ustd::clock_gettime(0).map(|t| t.0).unwrap_or(0);
+        ok = ok && ustd::clock_adjtime(1, 5000) == 0; // set +5s
+        ok = ok && ustd::clock_adjtime_get() == Some(5000);
+        let after = ustd::clock_gettime(0).map(|t| t.0).unwrap_or(0);
+        ok = ok && after >= before + 4; // realtime really jumped
+        ok = ok && ustd::clock_adjtime(2, -5000) == 0; // add -5s back
+        ok = ok && ustd::clock_adjtime_get() == Some(0);
+        check("clock-adjtime", ok);
+    }
+    {
+        let fd = ustd::open("/tmp/chm2", ustd::O_RDWR | ustd::O_CREATE);
+        let mut ok = fd.is_ok();
+        if let Ok(fd) = fd {
+            ok = ok && ustd::fchmodat2(fd, "", 0o600, 0x1000) == 0; // EMPTY_PATH
+            ok = ok && ustd::fchmodat2(fd, "", 0o600, 0) == -22; // flagless empty
+            let _ = ustd::close(fd);
+        }
+        ok = ok && ustd::fchmodat2(ustd::AT_FDCWD, "/tmp/chm2", 0o444, 0) == 0;
+        let _ = ustd::symlinkat("/tmp/chm2", ustd::AT_FDCWD, "/tmp/chm2-ln");
+        // NOFOLLOW chmods the link node; follow chmods the target
+        ok = ok && ustd::fchmodat2(ustd::AT_FDCWD, "/tmp/chm2-ln", 0o777, 0x100) == 0;
+        ok = ok && ustd::fchmodat2(ustd::AT_FDCWD, "/tmp/chm2-ln", 0o600, 0) == 0;
+        ok = ok && ustd::fchmodat2(ustd::AT_FDCWD, "/tmp/chm2", 0o600, 0x2000) == -22;
+        check("fchmodat2", ok);
+    }
+    {
+        let mut ok = true;
+        match ustd::spawn("/bin/cosmos-selftest-child", "linger") {
+            Ok(pid) => {
+                let pfd = ustd::pidfd(pid);
+                ok = ok && pfd >= 0;
+                ok = ok && ustd::process_mrelease(pfd, 0) == 0;
+                ok = ok && ustd::process_mrelease(pfd, 1) == -22;
+                let _ = ustd::waitpid(pid, 15000); // may die after mm wipe
+            }
+            Err(_) => ok = false,
+        }
+        ok = ok && ustd::process_mrelease(0xFFFFFF, 0) == -9; // EBADF
+        check("mrelease", ok);
+    }
     check("epoll-flags", {
         // EPOLLET fires once per ready level, EPOLLONESHOT until MOD
         // re-arms, EPOLLHUP surfaces on writer close, and the epoll fd
