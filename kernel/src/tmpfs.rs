@@ -485,7 +485,17 @@ pub fn open(path: &str, flags: u64) -> Result<u64, i64> {
     }
     let mut ng = NODES.lock();
     match ng.get(path) {
-        Some(n) if n.is_dir => return Err(-4), // EISDIR
+        // Linux open(dir, O_RDONLY) succeeds — getdents64/fchdir/statx
+        // run on dir fds; writes still reject (EISDIR via wants_write is
+        // checked above; read() on the fd gets EISDIR in vfs::read).
+        Some(n) if n.is_dir => {
+            if flags & (shared::O_WRONLY | shared::O_RDWR | shared::O_CREATE
+                | shared::O_TRUNC | shared::O_APPEND) != 0
+            {
+                return Err(-4);
+            }
+            return Ok(0);
+        }
         Some(n) => {
             if flags & shared::O_CREATE != 0 && flags & shared::O_EXCL != 0 {
                 return Err(-17); // EEXIST

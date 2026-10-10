@@ -885,3 +885,11 @@ pub const SYS_FCHOWNAT: u64 = 338;       // (dirfd,pptr,plen,uid,gid,flags)
 pub const SYS_FCHMODAT: u64 = 339;       // (dirfd,pptr,plen,mode,flags)
 pub const SYS_RMDIR: u64 = 340;          // (pptr,plen) dir-only remove
 pub const SYS_FDASYNC: u64 = 341;        // (fd)
+
+pub const SYS_MQ_GETATTR: u64 = 342;      // (fd,&attr[4])
+pub const SYS_MQ_TIMEDSEND: u64 = 343;    // (fd,ptr,len,prio,&abs{sec,nsec})
+pub const SYS_MQ_TIMEDRECEIVE: u64 = 344; // (fd,buf,len,&abs) -> n|err
+pub const SYS_SYNC_FILE_RANGE: u64 = 345; // (fd,off,len,flags)
+pub const SYS_STATVFS: u64 = 347;         // (pptr,plen,&statvfs[15])
+pub const SYS_GETDENTS64: u64 = 349;      // (fd,buf,len) linux_dirent64
+pub const SYS_PROCESS_MADVISE: u64 = 350; // (pid,addr,len,advice,flags)
