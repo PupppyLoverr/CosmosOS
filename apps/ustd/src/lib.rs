@@ -3364,3 +3364,66 @@ pub fn keyctl_search(desc: &str) -> i64 {
     sc4(shared::SYS_KEYCTL, shared::KEYCTL_SEARCH,
         desc.as_ptr() as u64, desc.len() as u64, 0) as i64
 }
+
+// Batch 229 — sigqueueinfo + futex_waitv + cachestat + l/f xattrs.
+/// rt_sigqueueinfo: queue `sig` to `pid` carrying si_code + si_value,
+/// visible on signalfd reads (ssi_code@8 / ssi_int@44).
+pub fn sigqueueinfo(pid: u32, sig: u64, code: i32, val: u32) -> i64 {
+    sc4(shared::SYS_RT_SIGQUEUEINFO, pid as u64, sig, code as i64 as u64,
+        val as u64) as i64
+}
+/// futex_waitv over {uaddr,val} pairs — returns the satisfied index,
+/// -11 EAGAIN (word changed), or -110 ETIMEDOUT.
+pub fn futex_waitv(list: &[(u64, u64)], timeout_ms: u64) -> i64 {
+    sc4(shared::SYS_FUTEX_WAITV, list.as_ptr() as u64, list.len() as u64,
+        0, timeout_ms) as i64
+}
+/// cachestat(fd, off, len) -> [nr_cache, dirty, writeback, evicted,
+/// recently_evicted]. Real residency walk over file-backed mappings.
+pub fn cachestat(fd: i64, off: u64, len: u64) -> Option<[u64; 5]> {
+    let rg = [off, len];
+    let mut out = [0u64; 5];
+    let r = sc3(shared::SYS_CACHESTAT, fd as u64, rg.as_ptr() as u64,
+        out.as_mut_ptr() as u64);
+    if is_err(r) { None } else { Some(out) }
+}
+/// lsetxattr: same store, but on a symlink node mutation is EPERM (the
+/// Linux user.* rule) — and get/list read the link's own attrs.
+pub fn lsetxattr(path: &str, name: &str, val: &[u8]) -> i64 {
+    sc6(shared::SYS_LSETXATTR, path.as_ptr() as u64, path.len() as u64,
+        name.as_ptr() as u64, name.len() as u64,
+        val.as_ptr() as u64, val.len() as u64) as i64
+}
+pub fn lgetxattr(path: &str, name: &str, buf: &mut [u8]) -> i64 {
+    sc6(shared::SYS_LGETXATTR, path.as_ptr() as u64, path.len() as u64,
+        name.as_ptr() as u64, name.len() as u64,
+        buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+pub fn llistxattr(path: &str, buf: &mut [u8]) -> i64 {
+    sc6(shared::SYS_LLISTXATTR, path.as_ptr() as u64, path.len() as u64,
+        0, 0, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+pub fn lremovexattr(path: &str, name: &str) -> i64 {
+    sc4(shared::SYS_LREMOVEXATTR, path.as_ptr() as u64, path.len() as u64,
+        name.as_ptr() as u64, name.len() as u64) as i64
+}
+/// f*xattr: fd-addressed — the fd's backing path gates the same tmpfs
+/// store; object fds (/pipes/* etc.) get ENOTSUP.
+pub fn fsetxattr(fd: i64, name: &str, val: &[u8]) -> i64 {
+    sc6(shared::SYS_FSETXATTR, fd as u64,
+        name.as_ptr() as u64, name.len() as u64,
+        val.as_ptr() as u64, val.len() as u64, 0) as i64
+}
+pub fn fgetxattr(fd: i64, name: &str, buf: &mut [u8]) -> i64 {
+    sc6(shared::SYS_FGETXATTR, fd as u64,
+        name.as_ptr() as u64, name.len() as u64,
+        buf.as_mut_ptr() as u64, buf.len() as u64, 0) as i64
+}
+pub fn flistxattr(fd: i64, buf: &mut [u8]) -> i64 {
+    sc6(shared::SYS_FLISTXATTR, fd as u64, 0, 0,
+        buf.as_mut_ptr() as u64, buf.len() as u64, 0) as i64
+}
+pub fn fremovexattr(fd: i64, name: &str) -> i64 {
+    sc4(shared::SYS_FREMOVEXATTR, fd as u64,
+        name.as_ptr() as u64, name.len() as u64, 0) as i64
+}

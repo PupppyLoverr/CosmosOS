@@ -123,6 +123,15 @@ pub struct Task {
     pub waiting_on: u32, // pid we're wait_pid'ing on, 0 = none
     pub wait_port: u32,  // port id we're blocked receiving on, 0 = none
     pub wait_futex: u64, // phys-page key of the futex word we block on, 0 = none
+    /// FUTEX_WAITV multi-set: up to 8 keys; when claimed, wait_futex holds
+    /// the sentinel 0xFFFF_FFFF_FFFF_FFFF (nonzero => claimed semantics).
+    pub wait_futex_set: [u64; 8],
+    pub wait_futex_set_n: u8,
+    /// Index inside wait_futex_set that a waker hit (0xFF = none).
+    pub wait_futex_hit: u8,
+    /// rt_sigqueueinfo payloads, FIFO per (sig) — drained by signalfd reads.
+    /// (sig, si_code, si_value); cap 32 like a small RT queue.
+    pub sig_queue: alloc::vec::Vec<(u8, i32, u32)>,
     pub borrowed: Vec<u64>, // phys frames mapped in but owned by shm objects
     pub mmap_next: u64,  // next anonymous mmap vaddr
     pub arg_page: u64,   // vaddr of arg page (0 if none)
@@ -356,6 +365,10 @@ pub fn init() {
         waiting_on: 0,
         wait_port: 0,
         wait_futex: 0,
+        wait_futex_set: [0; 8],
+        wait_futex_set_n: 0,
+        wait_futex_hit: 0xFF,
+        sig_queue: alloc::vec::Vec::new(),
         borrowed: Vec::new(),
         mmap_next: USER_MMAP_BASE,
         arg_page: 0,
@@ -961,6 +974,10 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         waiting_on: 0,
         wait_port: 0,
         wait_futex: 0,
+        wait_futex_set: [0; 8],
+        wait_futex_set_n: 0,
+        wait_futex_hit: 0xFF,
+        sig_queue: alloc::vec::Vec::new(),
         borrowed: Vec::new(),
         mmap_next: USER_MMAP_BASE,
         arg_page: USER_ARG_PAGE,
@@ -1126,6 +1143,10 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         waiting_on: 0,
         wait_port: 0,
         wait_futex: 0,
+        wait_futex_set: [0; 8],
+        wait_futex_set_n: 0,
+        wait_futex_hit: 0xFF,
+        sig_queue: alloc::vec::Vec::new(),
         borrowed: Vec::new(),
         mmap_next: 0,
         arg_page: 0,
@@ -1374,6 +1395,10 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         waiting_on: 0,
         wait_port: 0,
         wait_futex: 0,
+        wait_futex_set: [0; 8],
+        wait_futex_set_n: 0,
+        wait_futex_hit: 0xFF,
+        sig_queue: alloc::vec::Vec::new(),
         borrowed,
         mmap_next: s.tasks[s.cur].mmap_next,
         arg_page: USER_ARG_PAGE,
@@ -2003,6 +2028,10 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         waiting_on: 0,
         wait_port: 0,
         wait_futex: 0,
+        wait_futex_set: [0; 8],
+        wait_futex_set_n: 0,
+        wait_futex_hit: 0xFF,
+        sig_queue: alloc::vec::Vec::new(),
         borrowed: cborrowed,
         mmap_next: mnext,
         arg_page: apage,
@@ -3326,8 +3355,7 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
                         unsafe { *w |= 1 << 30 };
                         // wake inline: SCHED is already locked here
                         for o in s.tasks.iter_mut() {
-                            if o.wait_futex == fpa {
-                                o.wait_futex = 0;
+                            if futex_hit(o, fpa) {
                                 if o.state == State::Blocked {
                                     o.state = State::Running;
                                 }
@@ -3348,8 +3376,7 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
                 let w = crate::mem::phys_to_virt(pa) as *mut u64;
                 unsafe { *w = 0 };
                 for o in s.tasks.iter_mut() {
-                    if o.wait_futex == pa {
-                        o.wait_futex = 0;
+                    if futex_hit(o, pa) {
                         if o.state == State::Blocked {
                             o.state = State::Running;
                         }
@@ -4285,6 +4312,13 @@ pub fn sys_prctl(op: u64, arg: u64) -> i64 {
 /// Consume the lowest pending signal of `pid` that `mask` allows — used
 /// by signalfd reads. None = nothing deliverable (or no such task).
 pub fn take_pending_sig(pid: u32, mask: u64) -> Option<u32> {
+    take_siginfo(pid, mask).map(|(sig, _, _)| sig)
+}
+
+/// Signalfd/signal-read path: takes one masked pending signal and, when a
+/// queued rt_sigqueueinfo record rides with it, its si_code + si_value.
+/// Plain sends return (sig, 0, 0).
+pub fn take_siginfo(pid: u32, mask: u64) -> Option<(u32, i32, u32)> {
     let mut g = SCHED.lock();
     let s = g.as_mut().unwrap();
     let t = s.tasks.iter_mut().find(|t| t.id == pid && t.is_user)?;
@@ -4294,7 +4328,39 @@ pub fn take_pending_sig(pid: u32, mask: u64) -> Option<u32> {
     }
     let sig = avail.trailing_zeros();
     t.sigpending &= !(1 << sig);
-    Some(sig)
+    if let Some(i) = t.sig_queue.iter().position(|(s_, _, _)| *s_ == sig as u8) {
+        let (_, code, val) = t.sig_queue.remove(i);
+        return Some((sig, code, val));
+    }
+    Some((sig, 0, 0))
+}
+
+/// rt_sigqueueinfo: queue a signal carrying si_code + si_value to `pid`.
+/// si_code must be <= 0 (SI_QUEUE/SI_USER-family) or EPERM — kernel codes
+/// are kernel-only. Cap 32 queued records per task (RT queue bound).
+pub fn sigqueue_info(pid: u32, sig: u32, code: i32, val: u32) -> i64 {
+    if sig == 0 || sig >= 64 {
+        return -22;
+    }
+    if code > 0 {
+        return -1; // EPERM: positive si_codes are kernel-reserved
+    }
+    let mut g = SCHED.lock();
+    let Some(s) = g.as_mut() else { return -3 };
+    let Some(t) = s.tasks.iter_mut().find(|t| t.id == pid && t.is_user && t.state != State::Dead) else {
+        return -3; // ESRCH
+    };
+    if t.sig_queue.len() >= 32 {
+        return -11; // EAGAIN: RT queue full
+    }
+    t.sig_queue.push((sig as u8, code, val));
+    t.sigpending |= 1 << sig;
+    if t.state == State::Stopped && (sig == 19 || sig == 18) {
+        // SIGKILL/CONT wake semantics handled by the normal send path
+    } else if t.state == State::Blocked && t.sigmask & (1 << sig) == 0 {
+        t.state = State::Running;
+    }
+    0
 }
 
 /// Is any of `pid`'s pending signals visible through `mask`? (poll support)
@@ -4720,6 +4786,27 @@ pub fn pid_rt(pid: u32) -> Option<bool> {
 /// FUTEX_WAKE: mark up to `n` blocked waiters on `key` runnable. Returns
 /// how many were woken. A claimed-but-not-yet-blocked waiter still counts
 /// (its commit step will see the cleared flag and not sleep).
+/// Does `key` match task `t`'s current futex claim (single or WAITV set)?
+/// On a hit: clears the claim, records the set index, returns true.
+pub fn futex_hit(t: &mut Task, key: u64) -> bool {
+    if t.wait_futex == key && t.wait_futex != 0 {
+        t.wait_futex = 0;
+        t.wait_futex_hit = 0;
+        return true;
+    }
+    if t.wait_futex_set_n > 0 {
+        let n = t.wait_futex_set_n as usize;
+        if let Some(i) = t.wait_futex_set[..n].iter().position(|k| *k == key) {
+            t.wait_futex = 0;
+            t.wait_futex_set_n = 0;
+            t.wait_futex_set = [0; 8];
+            t.wait_futex_hit = i as u8;
+            return true;
+        }
+    }
+    false
+}
+
 pub fn futex_wake(key: u64, n: u64) -> u64 {
     let mut g = SCHED.lock();
     let Some(s) = g.as_mut() else {
@@ -4727,8 +4814,7 @@ pub fn futex_wake(key: u64, n: u64) -> u64 {
     };
     let mut woke = 0;
     for t in s.tasks.iter_mut() {
-        if t.wait_futex == key {
-            t.wait_futex = 0;
+        if futex_hit(t, key) {
             if t.state == State::Blocked {
                 t.state = State::Running;
             }
@@ -4752,19 +4838,33 @@ pub fn futex_requeue(key_a: u64, wake: u64, key_b: u64, cap: u64) -> u64 {
     let mut woke = 0u64;
     let mut moved = 0u64;
     for t in s.tasks.iter_mut() {
-        if t.wait_futex == key_a {
-            if woke < wake {
-                t.wait_futex = 0;
-                if t.state == State::Blocked {
-                    t.state = State::Running;
-                }
-                woke += 1;
-            } else if moved < cap {
-                t.wait_futex = key_b;
-                moved += 1;
-            } else {
-                break;
+        // WAITV sets participate too: a hit on key_a either wakes the
+        // waiter (wake budget) or swaps the element for key_b (requeue).
+        let on_a = (t.wait_futex == key_a && t.wait_futex != 0)
+            || (t.wait_futex_set_n > 0
+                && t.wait_futex_set[..t.wait_futex_set_n as usize].contains(&key_a));
+        if !on_a {
+            continue;
+        }
+        if woke < wake {
+            futex_hit(t, key_a);
+            if t.state == State::Blocked {
+                t.state = State::Running;
             }
+            woke += 1;
+        } else if moved < cap {
+            if t.wait_futex == key_a {
+                t.wait_futex = key_b;
+            } else if let Some(slot) =
+                t.wait_futex_set[..t.wait_futex_set_n as usize]
+                    .iter_mut()
+                    .find(|k| **k == key_a)
+            {
+                *slot = key_b;
+            }
+            moved += 1;
+        } else {
+            break;
         }
     }
     woke + moved
