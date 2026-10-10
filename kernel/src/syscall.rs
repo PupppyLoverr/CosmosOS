@@ -1988,6 +1988,12 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 None => ERR,
             }
         }
+        shared::SYS_EXECVEAT => {
+            sys_execveat(ctx, a1 as i64, a2, a3, a4, a5, ctx.r10)
+        }
+        shared::SYS_PIDFD_OPEN => sys_pidfd_open(a1 as u32, a2),
+        shared::SYS_SCHED_GETATTR => sys_sched_getattr(a1 as u32, a2, a3, a4),
+        shared::SYS_FACCESSAT2 => sys_faccessat2(a1 as i64, a2, a3, a4, a5),
         shared::SYS_PIDFD => {
             // (pid) -> fd readable when the task dies; read = 8B status
             match crate::pidfd::create(a1 as u32) {
@@ -5524,11 +5530,82 @@ fn sys_execve(ctx: &mut CpuContext, pptr: u64, plen: u64, aptr: u64, alen: u64) 
     let args = String::from(
         String::from_utf8_lossy(&ab).trim_matches('\0'),
     );
+    exec_path(ctx, &path, &args)
+}
+
+/// execveat(2): dirfd + flags variant. AT_EMPTY_PATH execs the file
+/// behind dirfd itself (the fd's stored path); AT_SYMLINK_NOFOLLOW
+/// refuses to exec through a symlink (ELOOP, like Linux).
+fn sys_execveat(
+    ctx: &mut CpuContext,
+    dirfd: i64,
+    pptr: u64,
+    plen: u64,
+    aptr: u64,
+    alen: u64,
+    flags: u64,
+) -> u64 {
+    if flags & !(shared::AT_EMPTY_PATH | shared::AT_SYMLINK_NOFOLLOW) != 0 {
+        return (-22i64) as u64;
+    }
+    let Some(pb) = copy_in(pptr, plen.min(4096)) else {
+        return ERR;
+    };
+    let Some(ab) = copy_in(aptr, alen.min(4096)) else {
+        return ERR;
+    };
+    let rel = String::from(
+        String::from_utf8_lossy(&pb).trim_matches('\0'),
+    );
+    let args = String::from(
+        String::from_utf8_lossy(&ab).trim_matches('\0'),
+    );
+    if rel.is_empty() && flags & shared::AT_EMPTY_PATH == 0 {
+        return (-2i64) as u64; // ENOENT: empty path needs AT_EMPTY_PATH
+    }
+    let path = if rel.is_empty() {
+        match task::with_current(|t| {
+            t.fds
+                .get(dirfd as usize)
+                .and_then(|s| s.as_ref())
+                .map(|f| f.path.clone())
+        }) {
+            Some(p) => p,
+            None => return (-9i64) as u64, // EBADF
+        }
+    } else if rel.starts_with('/') {
+        rel
+    } else if dirfd == shared::AT_FDCWD {
+        alloc::format!(
+            "{}/{}",
+            task::with_current(|t| t.cwd.clone()).trim_end_matches('/'),
+            rel
+        )
+    } else {
+        let Some(base) = task::with_current(|t| {
+            t.fds
+                .get(dirfd as usize)
+                .and_then(|s| s.as_ref())
+                .map(|f| f.path.clone())
+        }) else {
+            return (-9i64) as u64;
+        };
+        alloc::format!("{}/{}", base.trim_end_matches('/'), rel)
+    };
+    if flags & shared::AT_SYMLINK_NOFOLLOW != 0
+        && vfs::readlink_path(&path).is_ok()
+    {
+        return (-40i64) as u64; // ELOOP: execing the link itself
+    }
+    exec_path(ctx, &path, &args)
+}
+
+fn exec_path(ctx: &mut CpuContext, path: &str, args: &str) -> u64 {
     // MS_NOEXEC on the covering mount (tmpfs or bind alias) bars exec
     // through it — EACCES like Linux.
     {
         let cwd = task::with_current(|t| t.cwd.clone());
-        let pre = vfs::normalize_prebind(&cwd, &path);
+        let pre = vfs::normalize_prebind(&cwd, path);
         if task::mount_opts(&pre) & shared::MS_NOEXEC != 0 {
             return (-13i64) as u64;
         }
@@ -5547,13 +5624,133 @@ fn sys_execve(ctx: &mut CpuContext, pptr: u64, plen: u64, aptr: u64, alen: u64) 
             .map(|(i, _)| i)
             .collect()
     });
-    if task::exec_current(ctx, &path, &args) {
+    if task::exec_current(ctx, path, args) {
         for i in clo {
             vfs::close(i as i64);
         }
         0 // unreachable in practice — the frame is already the new image's
     } else {
         ERR
+    }
+}
+
+
+/// pidfd_open(2): pidfd for `pid`; flags may only carry O_NONBLOCK
+/// (Linux: PIDFD_NONBLOCK). Same object SYS_PIDFD makes.
+fn sys_pidfd_open(pid: u32, flags: u64) -> u64 {
+    if flags & !shared::O_NONBLOCK != 0 {
+        return (-22i64) as u64;
+    }
+    match crate::pidfd::create(pid) {
+        Some(p) => task::with_current(|t| {
+            let Some(slot) = alloc_slot(t) else { return ERR; };
+            t.fds[slot] = Some(task::FileDesc {
+                path: p,
+                pos: 0,
+                flags: shared::O_RDONLY | (flags & shared::O_NONBLOCK),
+            });
+            slot as u64
+        }),
+        None => ERR,
+    }
+}
+
+/// sched_getattr(2): Linux sched_attr layout (48 bytes, ver 0):
+/// {size, policy, sched_flags, nice, priority, runtime, deadline, period}
+fn sys_sched_getattr(pid: u32, out: u64, size: u64, flags: u64) -> u64 {
+    if flags != 0 || size < 48 {
+        return (-22i64) as u64;
+    }
+    let Some((nice, rt, rp, ..)) = task::sched_fields(pid) else {
+        return (-3i64) as u64; // ESRCH
+    };
+    let mut b = [0u8; 48];
+    b[0..4].copy_from_slice(&48u32.to_le_bytes()); // size
+    b[4..8].copy_from_slice(&((if rt {
+        shared::SCHED_RT
+    } else {
+        shared::SCHED_OTHER
+    }) as u32)
+        .to_le_bytes());
+    // bytes 8..16 sched_flags = 0
+    b[16..20].copy_from_slice(&(nice as i32).to_le_bytes());
+    b[20..24].copy_from_slice(&(rp as u32).to_le_bytes()); // sched_priority
+    // 24..48 runtime/deadline/period = 0 (not modeled)
+    if copy_out(out, &b[..size.min(48) as usize]).is_none() {
+        return (-14i64) as u64;
+    }
+    0
+}
+
+/// faccessat2(2): faccessat + flag semantics.
+///  - AT_EACCESS: check effective ids (default = real ids, like access(2))
+///  - AT_SYMLINK_NOFOLLOW: mode applies to the link itself (rwxrwxrwx → pass)
+///  - AT_EMPTY_PATH handled by resolve_at
+/// DAC on tmpfs nodes uses the node's real uid/gid/mode; R/W for root bypasses
+/// via the DAC capabilities, X_OK for root needs any exec bit on a file.
+fn sys_faccessat2(dirfd: i64, pptr: u64, plen: u64, mode: u64, flags: u64) -> u64 {
+    const KNOWN: u64 = shared::AT_EACCESS
+        | shared::AT_SYMLINK_NOFOLLOW
+        | shared::AT_EMPTY_PATH;
+    if flags & !KNOWN != 0 {
+        return (-22i64) as u64;
+    }
+    let empty = copy_str(pptr, plen).map(|p| p.is_empty()).unwrap_or(false);
+    if empty && flags & shared::AT_EMPTY_PATH == 0 {
+        return (-2i64) as u64;
+    }
+    let Some(path) = resolve_at(dirfd, pptr, plen) else { return ERR };
+    // nofollow on a symlink: the link itself is 0777 — any check passes,
+    // except it still must exist (readlink_path proving that).
+    if flags & shared::AT_SYMLINK_NOFOLLOW != 0
+        && vfs::readlink_path(&path).is_ok()
+    {
+        return 0;
+    }
+    if mode == 0 {
+        return match vfs::stat_path(&path) {
+            Ok(_) => 0,
+            Err(e) => e as u64,
+        };
+    }
+    // tmpfs DAC: real ids by default, effective under AT_EACCESS
+    if crate::tmpfs::any() && crate::tmpfs::stat(&path).is_some() {
+        let (ouid, ogid, omode) = crate::tmpfs::owner(&path);
+        let (uid, gid) = if flags & shared::AT_EACCESS != 0 {
+            task::eff_cred()
+        } else {
+            task::with_current(|t| (t.uid, t.gid))
+        };
+        let bits: [(u64, u16); 3] = [(4, 0o400), (2, 0o200), (1, 0o100)];
+        let is_root = uid == 0;
+        for (mbit, want) in bits {
+            if mode & mbit == 0 {
+                continue;
+            }
+            let ok = if is_root {
+                // root: R/W always pass (CAP_DAC_*); X needs any exec bit
+                mbit != 1 || omode & 0o111 != 0
+            } else {
+                (uid == ouid && omode & want != 0)
+                    || ((gid == ogid
+                        || task::with_current(|t| t.groups.contains(&ogid)))
+                        && omode & (want >> 3) != 0)
+                    || omode & (want >> 6) != 0
+            };
+            if !ok {
+                return (-13i64) as u64; // EACCES
+            }
+        }
+        return 0;
+    }
+    match vfs::stat_path(&path) {
+        Ok(st) => {
+            if mode & 2 != 0 && (st.attr & 0x01 != 0 || !on_real_fs(&path)) {
+                return (-13i64) as u64;
+            }
+            0
+        }
+        Err(e) => e as u64,
     }
 }
 

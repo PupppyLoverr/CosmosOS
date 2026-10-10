@@ -3656,3 +3656,53 @@ pub fn epoll_pwait2(
         },
     ) as i64
 }
+
+/// execveat(2): flags AT_EMPTY_PATH execs the dirfd's own file.
+/// Does not return on success.
+pub fn execveat(dirfd: i64, path: &str, args: &str, flags: u64) -> i64 {
+    sc6(
+        shared::SYS_EXECVEAT,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        args.as_ptr() as u64,
+        args.len() as u64,
+        flags,
+    ) as i64
+}
+
+/// pidfd_open(2): flags may only carry O_NONBLOCK.
+pub fn pidfd_open(pid: u32, flags: u64) -> i64 {
+    sc2(shared::SYS_PIDFD_OPEN, pid as u64, flags) as i64
+}
+
+/// sched_getattr(2): fills the 48-byte sched_attr, returns raw words
+/// (size, policy, nice, rt_priority).
+pub fn sched_getattr(pid: u32) -> Option<(u32, u32, i32, u32)> {
+    let mut b = [0u8; 48];
+    let r = sc4(
+        shared::SYS_SCHED_GETATTR,
+        pid as u64,
+        b.as_mut_ptr() as u64,
+        48,
+        0,
+    ) as i64;
+    if r != 0 {
+        return None;
+    }
+    let g32 = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    Some((g32(0), g32(4), g32(16) as i32, g32(20)))
+}
+
+/// faccessat2(2): access with AT_EACCESS / AT_SYMLINK_NOFOLLOW /
+/// AT_EMPTY_PATH flags.
+pub fn faccessat2(dirfd: i64, path: &str, mode: u64, flags: u64) -> i64 {
+    sc5(
+        shared::SYS_FACCESSAT2,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        mode,
+        flags,
+    ) as i64
+}
