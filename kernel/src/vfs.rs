@@ -350,7 +350,7 @@ fn resolve_links(
 /// with a "LNK>" body, else Err(-22) EINVAL (not a symlink).
 pub fn readlink(path: &str) -> Result<String, i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
-    let full = normalize(&cwd, path);
+    let mut full = normalize(&cwd, path);
     if crate::tmpfs::handles(&full) {
         return crate::tmpfs::readlink(&full).ok_or(-22);
     }
@@ -687,7 +687,7 @@ pub fn read(fd: i64, buf: &mut [u8]) -> Result<i64, i64> {
 /// files like `/proc/<pid>/exe` resolve to the recorded spawn path.
 pub fn readlink_path(path: &str) -> Result<String, i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
-    let full = normalize(&cwd, path);
+    let mut full = normalize(&cwd, path);
     if crate::proc::handles(&full) {
         if let Some(target) = crate::proc::readlink(&full) {
             return Ok(target);
@@ -885,8 +885,12 @@ pub fn seek(fd: i64, pos: u64) -> Result<i64, i64> {
 }
 
 pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
+    stat_path_impl(path, true)
+}
+
+fn stat_path_impl(path: &str, follow: bool) -> Result<shared::Stat, i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
-    let full = normalize(&cwd, path);
+    let mut full = normalize(&cwd, path);
     if crate::memfd::handles(&full) {
         return match crate::memfd::stat(&full) {
             Some((sz, at)) => Ok(shared::Stat { size: sz, is_dir: 0, mtime: 0, attr: at as u32 }),
@@ -927,20 +931,49 @@ pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
             .ok_or(-2);
     }
     if crate::tmpfs::handles(&full) {
-        return match crate::tmpfs::stat(&full) {
-            Some((sz, dir, mt, _ct, at)) => Ok(shared::Stat {
-                size: sz,
-                is_dir: dir as u32,
-                mtime: mt,
-                attr: at as u32,
-            }),
-            None => Err(-2),
-        };
+        if follow {
+            // lstat-vs-stat split lives here: stat() must report the
+            // link's TARGET — chase tmpfs LNK> nodes like resolve_links
+            // does on the FAT path (target may land back on FAT).
+            for _ in 0..8 {
+                match crate::tmpfs::readlink(&full) {
+                    Some(tgt) => {
+                        if crate::tmpfs::link_follow_denied(&full) {
+                            return Err(-1);
+                        }
+                        let base = match full.rfind('/') {
+                            Some(i) => String::from(&full[..i + 1]),
+                            None => String::from("/"),
+                        };
+                        full = normalize(&base, &tgt);
+                        if !crate::tmpfs::handles(&full) {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+        if !crate::tmpfs::handles(&full) {
+            // link escaped to FAT — fall through to the fs.stat tail
+        } else {
+            return match crate::tmpfs::stat(&full) {
+                Some((sz, dir, mt, _ct, at)) => Ok(shared::Stat {
+                    size: sz,
+                    is_dir: dir as u32,
+                    mtime: mt,
+                    attr: at as u32,
+                }),
+                None => Err(-2),
+            };
+        }
     }
     let mut g = FS.lock();
     let fs = g.as_mut().ok_or(-1i64)?;
     let mut full = full;
-    resolve_links(fs, &mut full)?;
+    if follow {
+        resolve_links(fs, &mut full)?;
+    }
     let e = fs.stat(&full).map_err(err_to_i64)?;
     Ok(shared::Stat { size: e.size, is_dir: e.is_dir as u32, mtime: e.mtime, attr: e.attr as u32 })
 }
@@ -950,22 +983,7 @@ pub fn stat_path(path: &str) -> Result<shared::Stat, i64> {
 /// stat without following a trailing symlink (lstat): links report the
 /// link's own Stat, everything else falls through to stat_path.
 pub fn stat_path_nofollow(path: &str) -> Result<shared::Stat, i64> {
-    let path = &crate::bind::resolve(path);
-    match readlink_path(path) {
-        Ok(_) => {
-            let mut g = FS.lock();
-            match g.as_mut().and_then(|fs| fs.stat(path).ok()) {
-                Some(s) => Ok(shared::Stat {
-                    size: s.size,
-                    is_dir: if s.is_dir { 1 } else { 0 },
-                    mtime: s.mtime,
-                    attr: s.attr as u32,
-                }),
-                None => Err(-2),
-            }
-        }
-        Err(_) => stat_path(path),
-    }
+    stat_path_impl(path, false)
 }
 
 /// Which mount domain owns `path`: 0 = root fs, n>0 = the nth tmpfs
@@ -1049,7 +1067,7 @@ pub fn utime(path: &str, secs: u64) -> Result<(), i64> {
         return Err(-30);
     }
 
-    let full = normalize(&cwd, path);
+    let mut full = normalize(&cwd, path);
     if crate::tmpfs::handles(&full) {
         return crate::tmpfs::utime(&full, secs);
     }
@@ -1078,7 +1096,7 @@ pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
         return Err(-30);
     }
 
-    let full = normalize(&cwd, path);
+    let mut full = normalize(&cwd, path);
     // pipe registry entries are exact-path objects; check them before the
     // prefix-based tmpfs resolver so a fifo under /tmp still takes attrs
     if crate::pipes::handles(&full) {
@@ -1104,7 +1122,7 @@ pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
 
 pub fn listdir(path: &str) -> Result<Vec<shared::DirEntry>, i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
-    let full = normalize(&cwd, path);
+    let mut full = normalize(&cwd, path);
     if crate::pipes::handles(&full) {
         return if crate::pipes::is_dir(&full) {
             Ok(crate::pipes::entries())
@@ -1166,7 +1184,7 @@ pub fn mkdir(path: &str) -> Result<(), i64> {
         return Err(-30);
     }
 
-    let full = normalize(&cwd, path);
+    let mut full = normalize(&cwd, path);
     if crate::tmpfs::handles(&full) {
         return crate::tmpfs::mkdir(&full);
     }
@@ -1196,7 +1214,7 @@ pub fn remove(path: &str) -> Result<(), i64> {
         return Err(-30);
     }
 
-    let full = normalize(&cwd, path);
+    let mut full = normalize(&cwd, path);
     if crate::pipes::handles(&full) && !crate::pipes::is_dir(&full) {
         let r = crate::pipes::remove(&full);
         if r.is_ok() {
@@ -1327,7 +1345,7 @@ pub fn truncate_path(path: &str, len: u64) -> Result<(), i64> {
         return crate::memfd::truncate(path, len);
     }
     let cwd = task::with_current(|t| t.cwd.clone());
-    let full = normalize(&cwd, path);
+    let mut full = normalize(&cwd, path);
     if immutable(&full) || append_only(&full) {
         return Err(-1);
     }
@@ -1365,7 +1383,7 @@ pub fn truncate_path(path: &str, len: u64) -> Result<(), i64> {
 /// (screenshots). Path is normalized against the caller's cwd.
 pub fn write_all_path(path: &str, data: &[u8]) -> Result<(), i64> {
     let cwd = task::with_current(|t| t.cwd.clone());
-    let full = normalize(&cwd, path);
+    let mut full = normalize(&cwd, path);
     if task::mount_opts(&normalize_prebind(&cwd, path)) & shared::MS_RDONLY != 0 {
         return Err(-30);
     }

@@ -7904,6 +7904,132 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         metric("syscall-1000", uptime_ms() - t0);
     }
 
+    // ---- batch 236: POSIX-variant syscalls ----
+
+    check("lstat-nofollow", {
+        let _ = ustd::remove("/tmp/lst-tgt");
+        let _ = ustd::remove("/tmp/lst-link");
+        let _ = ustd::write_all("/tmp/lst-tgt", b"x");
+        let _ = ustd::symlinkat("/tmp/lst-tgt", ustd::AT_FDCWD, "/tmp/lst-link");
+        // lstat reports the LINK node; stat follows to the target
+        let l = ustd::lstat("/tmp/lst-link");
+        let s = ustd::stat("/tmp/lst-link");
+        // lstat reports the link node (attr 0x40); stat follows to the
+        // 1-byte target file
+        l.is_some() && s.is_ok()
+            && l.unwrap().attr & 0x40 != 0
+            && s.unwrap().size == 1
+    });
+
+    check("truncate-syscall", {
+        let _ = ustd::remove("/tmp/trc");
+        let _ = ustd::write_all("/tmp/trc", b"0123456789");
+        let r = ustd::truncate_path("/tmp/trc", 4);
+        let st = ustd::stat("/tmp/trc");
+        let d = ustd::truncate_path("/tmp", 1);
+        r == 0 && st.is_ok() && st.unwrap().size == 4 && d < 0
+    });
+
+    check("nanosleep", {
+        // EINVAL on nsec >= 1e9; real sleep of ~1ms
+        let bad = ustd::nanosleep(0, 1_000_000_000);
+        let ok = ustd::nanosleep(0, 1_000);
+        bad == -22 && ok == 0
+    });
+
+    check("futimens", {
+        let _ = ustd::remove("/tmp/fut");
+        let _ = ustd::write_all("/tmp/fut", b"t");
+        let fd = ustd::open("/tmp/fut", 0).unwrap_or(-1);
+        let r = if fd >= 0 { ustd::futimens(fd) } else { -9 };
+        if fd >= 0 { let _ = ustd::close(fd); }
+        let st = ustd::stat("/tmp/fut");
+        r == 0 && st.is_ok() && st.unwrap().mtime > 0
+    });
+
+    check("timer-gettime", {
+        let id = ustd::timer_create(14);
+        let mut ok = id >= 0;
+        if ok {
+            ok = ustd::timer_settime(id as u64, 500, 100) == 0;
+        }
+        let g = if ok { ustd::timer_gettime(id as u64) } else { None };
+        ok = ok && g.is_some() && g.unwrap().0 == 100 && g.unwrap().1 > 0;
+        if id >= 0 { let _ = ustd::timer_delete(id as u64); }
+        ok && ustd::timer_getoverrun(if id >= 0 { id as u64 } else { 0 }) == -22
+    });
+
+    check("mq-notify", {
+        use core::sync::atomic::Ordering;
+        // register sig 10 one-shot; empty->nonempty send fires it
+        static MQHIT: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn mh(sig: u64) {
+            MQHIT.store(sig, Ordering::SeqCst);
+        }
+        ustd::sigaction(10, mh as usize as u64);
+        let _ = ustd::mq_unlink("/mqn-st");
+        let fd = ustd::mq_open("/mqn-st", 4, 16);
+        let mut ok = fd >= 0;
+        if ok {
+            ok = ustd::mq_notify(fd, 10) == 0 && ustd::mq_notify(fd, 64) == -22;
+        }
+        if ok {
+            ok = ustd::mq_send(fd, b"m", 0) >= 0;
+        }
+        ustd::sleep_ms(60);
+        if ok {
+            ok = MQHIT.load(Ordering::SeqCst) == 10;
+        }
+        if fd >= 0 { let _ = ustd::close(fd); let _ = ustd::mq_unlink("/mqn-st"); }
+        ok
+    });
+
+    check("mknodat", {
+        let _ = ustd::remove("/tmp/mkn-fifo");
+        let _ = ustd::remove("/tmp/mkn-reg");
+        // S_IFIFO -> a real named pipe; second mknod -> EEXIST; chr -> EPERM
+        let f = ustd::mknodat(ustd::AT_FDCWD, "/tmp/mkn-fifo", 0o010644, 0);
+        let e = ustd::mknodat(ustd::AT_FDCWD, "/tmp/mkn-fifo", 0o010644, 0);
+        let c = ustd::mknodat(ustd::AT_FDCWD, "/tmp/mkn-chr", 0o020644, 0);
+        let g = ustd::mknodat(ustd::AT_FDCWD, "/tmp/mkn-reg", 0o100644, 0);
+        f == 0 && e == -17 && c == -1 && g == 0
+    });
+
+    check("fchownat-fchmodat", {
+        let _ = ustd::remove("/tmp/fco");
+        let _ = ustd::write_all("/tmp/fco", b"c");
+        let c1 = ustd::fchmodat(ustd::AT_FDCWD, "/tmp/fco", 0o600, 0);
+        let c2 = ustd::fchownat(ustd::AT_FDCWD, "/tmp/fco", 0, 0, 0);
+        let bad = ustd::fchownat(ustd::AT_FDCWD, "/tmp/fco", 0, 0, 0x8000);
+        c1 == 0 && c2 == 0 && bad == -22
+    });
+
+    check("rmdir-syscall", {
+        let _ = ustd::mkdir("/tmp/rmd");
+        let _ = ustd::write_all("/tmp/rmd-file", b"x");
+        let nd = ustd::rmdir("/tmp/rmd-file");   // ENOTDIR on a file
+        let d = ustd::rmdir("/tmp/rmd");
+        let st = ustd::stat("/tmp/rmd");
+        nd == -20 && d == 0 && st.is_err()
+    });
+
+    check("fdatasync", {
+        let _ = ustd::write_all("/tmp/fds", b"d");
+        let fd = ustd::open("/tmp/fds", 0).unwrap_or(-1);
+        let r = if fd >= 0 { ustd::fdatasync(fd) } else { -9 };
+        if fd >= 0 { let _ = ustd::close(fd); }
+        r == 0
+    });
+
+    check("lchown", {
+        let _ = ustd::remove("/tmp/lco-tgt");
+        let _ = ustd::remove("/tmp/lco-link");
+        let _ = ustd::write_all("/tmp/lco-tgt", b"y");
+        let _ = ustd::symlinkat("/tmp/lco-tgt", ustd::AT_FDCWD, "/tmp/lco-link");
+        // chown the link node itself — tmpfs links carry uid
+        ustd::lchown("/tmp/lco-link", 0, 0) == 0
+    });
+
     let (pass, fail) = unsafe { (PASS, FAIL) };
     for i in 0..unsafe { NFAIL.min(64) } {
         let b = unsafe { &FAILED[i] };
