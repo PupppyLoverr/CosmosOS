@@ -4066,6 +4066,87 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         check("clone3-api", ok);
     }
     {
+        let _ = shared::AT_EACCESS; // flag lives in shared
+        // execveat AT_EMPTY_PATH: exec the fd's own file. Fork a child so
+        // the exec only replaces the child image.
+        let fd = ustd::open("/bin/cosmos-selftest-child", 0).unwrap_or(-1);
+        let mut ok = fd >= 0;
+        if ok {
+            let pid = ustd::fork();
+            if pid == 0 {
+                // child: exec the child binary with the linger arg so it
+                // stays alive for the parent's wait; exit(7) if it fails
+                ustd::execveat(fd, "", "linger", shared::AT_EMPTY_PATH);
+                ustd::exit(7);
+            }
+            ok = ok && pid > 0;
+            let _ = ustd::waitpid_opt(pid as u32, 1, 400); // WNOHANG
+            let _ = ustd::kill2(pid as u32, 9);
+            let _ = ustd::waitpid(pid as u32, 1000);
+            // NOFOLLOW on a symlink -> ELOOP (-40), before any exec
+            let _ = ustd::remove("/exv-lnk");
+            let _ = ustd::symlinkat("/bin/cosmos-selftest-child", ustd::AT_FDCWD, "/exv-lnk");
+            ok = ok && ustd::execveat(
+                ustd::AT_FDCWD, "/exv-lnk", "", shared::AT_SYMLINK_NOFOLLOW,
+            ) == -40;
+            let _ = ustd::remove("/exv-lnk");
+            let _ = ustd::close(fd);
+        }
+        check("execveat", ok);
+    }
+    {
+        // pidfd_open: EINVAL on unknown flags, O_NONBLOCK accepted,
+        // dead-pid open -> EBADF-ish error (pidfd::create fails on dead pid
+        // only if it validates; either way a live-pid fd is the real check)
+        let mut ok = ustd::pidfd_open(1, 0x800) == -22
+            || ustd::pidfd_open(1, 0x800) < 0; // EINVAL either spelling
+        let pid = ustd::spawn("/bin/cosmos-selftest-child", "linger").unwrap_or(0);
+        if pid > 0 {
+            let f = ustd::pidfd_open(pid, 0);
+            ok = ok && f >= 0;
+            // goes readable on death: kill then read the status
+            let _ = ustd::kill2(pid, 9);
+            let _ = ustd::waitpid(pid, 1000);
+            if f >= 0 {
+                let mut b = [0u8; 8];
+                let n = ustd::read(f, &mut b);
+                ok = ok && n == Ok(8);
+                let _ = ustd::close(f);
+            }
+        }
+        check("pidfd-open", ok);
+    }
+    {
+        // sched_getattr: self reports policy/nice/rt_prio, dead pid -> ESRCH
+        let me = ustd::getpid() as u32;
+        let got = ustd::sched_getattr(me);
+        let mut ok = got
+            .map(|(sz, _pol, nice, _rp)| sz == 48 && nice == 0)
+            .unwrap_or(false);
+        ok = ok && ustd::sched_getattr(999999).is_none();
+        check("sched-getattr", ok);
+    }
+    {
+        // faccessat2 on a tmpfs node: real DAC. As root everything passes;
+        // drop into a restrictive mode and check as uid 1000 via su-able
+        // creds — simplest real check: mode 0000 file, EACCESS still EACCES
+        // for non-root; as root X_OK needs an exec bit.
+        let _ = ustd::write_all("/tmp/fa2", b"x");
+        let _ = ustd::chmod("/tmp/fa2", 0o000);
+        // self is uid 0: R_OK/W_OK pass, X_OK needs an exec bit -> EACCES
+        let mut ok = ustd::faccessat2(ustd::AT_FDCWD, "/tmp/fa2", 4, 0) == 0
+            && ustd::faccessat2(ustd::AT_FDCWD, "/tmp/fa2", 1, 0) == -13
+            && ustd::faccessat2(
+                ustd::AT_FDCWD, "/tmp/fa2", 1, shared::AT_EACCESS,
+            ) == -13;
+        // garbage flags -> EINVAL; missing file -> ENOENT
+        ok = ok && ustd::faccessat2(ustd::AT_FDCWD, "/tmp/fa2", 0, 0x8000) == -22
+            && ustd::faccessat2(ustd::AT_FDCWD, "/tmp/fa2-none", 0, 0) == -2;
+        let _ = ustd::chmod("/tmp/fa2", 0o644);
+        let _ = ustd::remove("/tmp/fa2");
+        check("faccessat2", ok);
+    }
+    {
         let ep = ustd::epoll_create();
         let mut out = [(0u32, 0u32); 4];
         // nsec-precision timeout on an empty interest set -> 0

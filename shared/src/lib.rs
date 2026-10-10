@@ -859,3 +859,9 @@ pub const SYS_EPOLL_PWAIT2: u64 = 319;   // (epfd,out,max,&ts{sec,nsec},&mask|0)
 pub const SYS_CLONE3: u64 = 320;         // (&clone_args{flags,pidfd,ctid,ptid,esig,stack,ssz,tls},size)
 pub const FSPICK_CLOEXEC: u64 = 1;
 pub const FSPICK_EMPTY_PATH: u64 = 0x1000;
+
+pub const SYS_EXECVEAT: u64 = 321;       // (dirfd,pptr,plen,aptr,alen,flags)
+pub const SYS_PIDFD_OPEN: u64 = 322;     // (pid,flags) -> pidfd
+pub const SYS_SCHED_GETATTR: u64 = 323;  // (pid,&attr,size,flags)
+pub const SYS_FACCESSAT2: u64 = 324;     // (dirfd,pptr,plen,mode,flags)
+pub const AT_EACCESS: u64 = 0x200;
