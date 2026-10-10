@@ -8030,6 +8030,123 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         ustd::lchown("/tmp/lco-link", 0, 0) == 0
     });
 
+    // ---- batch 237: mq attrs/timed ops, dirent64, statvfs, madvise ----
+
+    check("mq-getattr", {
+        let _ = ustd::mq_unlink("/mqg-st");
+        let fd = ustd::mq_open("/mqg-st", 6, 32);
+        let mut ok = fd >= 0;
+        if ok {
+            let _ = ustd::mq_send(fd, b"ab", 0);
+            let g = ustd::mq_getattr(fd);
+            ok = g == Some((6, 32, 1));
+        }
+        if fd >= 0 { let _ = ustd::close(fd); let _ = ustd::mq_unlink("/mqg-st"); }
+        ok
+    });
+
+    check("mq-timed", {
+        // timedreceive on an empty queue hits the past deadline -> -110;
+        // timedsend succeeds immediately when there's room
+        let _ = ustd::mq_unlink("/mqt-st");
+        let fd = ustd::mq_open("/mqt-st", 4, 16);
+        let mut ok = fd >= 0;
+        let mut b = [0u8; 16];
+        if ok {
+            // a deadline already passed -> ETIMEDOUT, no hang
+            let r = ustd::mq_timedreceive(fd, &mut b, (1, 0));
+            ok = r == Err(-110);
+        }
+        if ok {
+            ok = ustd::mq_timedsend(fd, b"qq", 0, (1, 0)) == 0;
+        }
+        if ok {
+            // message now present: even an expired deadline still receives
+            let r = ustd::mq_timedreceive(fd, &mut b, (1, 0));
+            ok = r.is_ok() && &b[..2] == b"qq";
+        }
+        if fd >= 0 { let _ = ustd::close(fd); let _ = ustd::mq_unlink("/mqt-st"); }
+        ok
+    });
+
+    check("getdents64", {
+        let _ = ustd::mkdir("/tmp/d64");
+        let _ = ustd::write_all("/tmp/d64/f1", b"1");
+        let _ = ustd::mkdir("/tmp/d64/sub");
+        let fd = ustd::open("/tmp/d64", 0).unwrap_or(-1);
+        let ents = if fd >= 0 { ustd::getdents64(fd) } else { None };
+        if fd >= 0 { let _ = ustd::close(fd); }
+        match ents {
+            Some(e) => {
+                let f1 = e.iter().find(|x| x.3 == "f1");
+                let sub = e.iter().find(|x| x.3 == "sub");
+                f1.is_some() && f1.unwrap().2 == 8 && f1.unwrap().0 != 0
+                    && sub.is_some() && sub.unwrap().2 == 4
+            }
+            None => false,
+        }
+    });
+
+    check("statvfs", {
+        let v = ustd::statvfs("/");
+        // real FAT geometry: 128M image, nonzero free, namemax 255
+        v.is_some() && v.unwrap().1 > 0 && v.unwrap().2 > 0 && v.unwrap().3 == 255
+    });
+
+    check("sync-file-range", {
+        let _ = ustd::write_all("/tmp/sfr", b"s");
+        let fd = ustd::open("/tmp/sfr", 0).unwrap_or(-1);
+        let r = if fd >= 0 { ustd::sync_file_range(fd, 0, 1, 5) } else { -9 };
+        let bad = if fd >= 0 { ustd::sync_file_range(fd, 0, 1, 8) } else { -9 };
+        if fd >= 0 { let _ = ustd::close(fd); }
+        r == 0 && bad == -22
+    });
+
+    check("process-madvise", {
+        // madvise ANOTHER task's pages: child fills a page, publishes its
+        // VA through /tmp, parent DONTNEEDs it by pid; child sees zeros.
+        let _ = ustd::remove("/tmp/pm-addr");
+        match ustd::fork() {
+            0 => {
+                let Some(m) = ustd::mmap(8192) else { ustd::exit(7) };
+                unsafe {
+                    core::ptr::write_bytes(m, 0xAB, 8192);
+                }
+                let mut s = [0u8; 16];
+                let a = m as u64;
+                for i in 0..16 {
+                    s[i] = b"0123456789abcdef"[((a >> ((15 - i) * 4)) & 0xf) as usize];
+                }
+                let _ = ustd::write_all("/tmp/pm-addr", &s);
+                ustd::sleep_ms(400); // parent madvises in the meantime
+                let z = unsafe {
+                    *(m as *const u8) == 0 && *(m.add(4096) as *const u8) == 0xAB
+                };
+                ustd::exit(if z { 0 } else { 8 });
+            }
+            p => {
+                // read the child's published VA
+                let mut addr = 0u64;
+                for _ in 0..40 {
+                    if let Ok(h) = ustd::read_all("/tmp/pm-addr") {
+                        if h.len() >= 16 {
+                            let v = u64::from_str_radix(
+                                core::str::from_utf8(&h[..16]).unwrap_or("0"), 16);
+                            addr = v.unwrap_or(0);
+                            break;
+                        }
+                    }
+                    ustd::sleep_ms(15);
+                }
+                let r = if addr != 0 {
+                    ustd::process_madvise(p as u64, addr, 4096)
+                } else { -1 };
+                let code = ustd::waitpid(p as u32, 5000).unwrap_or(-1);
+                r == 0 && code == 0
+            }
+        }
+    });
+
     let (pass, fail) = unsafe { (PASS, FAIL) };
     for i in 0..unsafe { NFAIL.min(64) } {
         let b = unsafe { &FAILED[i] };

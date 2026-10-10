@@ -3886,3 +3886,105 @@ pub fn rmdir(path: &str) -> i64 {
 pub fn fdatasync(fd: i64) -> i64 {
     sc1(shared::SYS_FDASYNC, fd as u64) as i64
 }
+
+/// mq_getattr(2): (maxmsg, msgsize, curmsgs) of the queue behind fd.
+pub fn mq_getattr(fd: i64) -> Option<(u64, u64, u64)> {
+    let mut b = [0u64; 4];
+    let r = sc2(shared::SYS_MQ_GETATTR, fd as u64, b.as_mut_ptr() as u64) as i64;
+    if r != 0 {
+        return None;
+    }
+    Some((b[1], b[2], b[3]))
+}
+
+/// mq_timedsend(2): send bounded by an absolute {sec,nsec} deadline.
+pub fn mq_timedsend(fd: i64, data: &[u8], prio: u32, abs_ms: (u64, u64)) -> i64 {
+    let t = [abs_ms.0, abs_ms.1];
+    sc5(
+        shared::SYS_MQ_TIMEDSEND,
+        fd as u64,
+        data.as_ptr() as u64,
+        data.len() as u64,
+        prio as u64,
+        t.as_ptr() as u64,
+    ) as i64
+}
+
+/// mq_timedreceive(2): receive bounded by an absolute deadline.
+pub fn mq_timedreceive(fd: i64, buf: &mut [u8], abs_ms: (u64, u64)) -> Result<usize, i64> {
+    let t = [abs_ms.0, abs_ms.1];
+    let r = sc4(
+        shared::SYS_MQ_TIMEDRECEIVE,
+        fd as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        t.as_ptr() as u64,
+    ) as i64;
+    if r < 0 { Err(r) } else { Ok(r as usize) }
+}
+
+/// sync_file_range(2): fd's device flush; flags {1,2,4} allowed.
+pub fn sync_file_range(fd: i64, off: u64, len: u64, flags: u64) -> i64 {
+    sc4(
+        shared::SYS_SYNC_FILE_RANGE,
+        fd as u64,
+        off,
+        len,
+        flags,
+    ) as i64
+}
+
+/// statvfs(2): (bsize, blocks, bavail, namemax) for the volume.
+pub fn statvfs(path: &str) -> Option<(u64, u64, u64, u64)> {
+    let mut v = [0u64; 11];
+    let r = sc3(
+        shared::SYS_STATVFS,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        v.as_mut_ptr() as u64,
+    ) as i64;
+    if r != 0 {
+        return None;
+    }
+    Some((v[0], v[2], v[4], v[10]))
+}
+
+/// getdents64(2): raw linux_dirent64 buffer — parsed here into
+/// (ino, off, dtype, name) tuples.
+pub fn getdents64(fd: i64) -> Option<alloc::vec::Vec<(u64, i64, u8, alloc::string::String)>> {
+    let mut buf = alloc::vec![0u8; 8192];
+    let r = sc3(shared::SYS_GETDENTS64, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) as i64;
+    if r < 0 {
+        return None;
+    }
+    let n = r as usize;
+    let mut out = alloc::vec::Vec::new();
+    let mut off = 0usize;
+    while off + 19 <= n {
+        let ino = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+        let doff = i64::from_le_bytes(buf[off + 8..off + 16].try_into().unwrap());
+        let reclen = u16::from_le_bytes(buf[off + 16..off + 18].try_into().unwrap()) as usize;
+        if reclen < 19 || off + reclen > n {
+            break;
+        }
+        let ty = buf[off + 18];
+        let nb = &buf[off + 19..off + reclen];
+        let z = nb.iter().position(|&c| c == 0).unwrap_or(nb.len());
+        let name = alloc::string::String::from_utf8_lossy(&nb[..z]).into_owned();
+        out.push((ino, doff, ty, name));
+        off += reclen;
+    }
+    Some(out)
+}
+
+/// process_madvise(2): MADV_DONTNEED on another task's pages.
+pub fn process_madvise(pid: u64, addr: u64, len: u64) -> i64 {
+    sc5(
+        shared::SYS_PROCESS_MADVISE,
+        pid,
+        addr,
+        len,
+        shared::MADV_DONTNEED,
+        0,
+    ) as i64
+}

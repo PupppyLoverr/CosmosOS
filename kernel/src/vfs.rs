@@ -598,6 +598,25 @@ pub fn read(fd: i64, buf: &mut [u8]) -> Result<i64, i64> {
     if pos == u64::MAX {
         return Err(-3);
     }
+    // read() on a directory fd is EISDIR (getdents64 is the dir API).
+    // tmpfs dirs via their own stat; FAT dirs via the generic nofollow
+    // stat — pseudo-fs paths can never be opened as dirs anyway.
+    {
+        let isdir = if crate::tmpfs::handles(&path) {
+            crate::tmpfs::stat(&path).map(|s| s.1).unwrap_or(false)
+        } else if crate::pipes::handles(&path)
+            || crate::proc::handles(&path)
+            || crate::dev::handles(&path)
+            || crate::pty::handles(&path)
+        {
+            false
+        } else {
+            stat_path_nofollow(&path).map(|s| s.is_dir != 0).unwrap_or(false)
+        };
+        if isdir {
+            return Err(-21);
+        }
+    }
     if crate::pipes::handles(&path) {
         return match crate::pipes::try_read(&path, buf) {
             crate::pipes::TryRead::Data(n) => Ok(n as i64),

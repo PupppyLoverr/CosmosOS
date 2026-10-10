@@ -154,6 +154,14 @@ pub fn recv(path: &str, buf: &mut [u8]) -> Result<(usize, u32), i64> {
     }
 }
 
+/// mq_getattr: {flags,maxmsg,msgsize,curmsgs} of the queue behind an fd path.
+pub fn getattr(path: &str) -> Result<(usize, usize, usize), i64> {
+    let id = qid_of(path).ok_or(-9i64)?;
+    let g = MQS.lock();
+    let q = g.get(&id).ok_or(-9i64)?;
+    Ok((q.maxmsg, q.msgsize, q.msgs.len()))
+}
+
 /// Whether a queue exists for this fd path (a live, non-closed fd still
 /// resolves even after mq_unlink — POSIX keeps the queue alive on the
 /// open description; ours keeps it until the last fd releases).

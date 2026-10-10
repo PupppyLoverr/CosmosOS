@@ -429,31 +429,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
                 fd as u64
             })
         }
-        shared::SYS_MQ_SEND => {
-            let path = task::with_current(|t| match t.fds.get(a1 as usize) {
-                Some(Some(f)) if crate::mqueue::handles(&f.path) => Some(f.path.clone()),
-                _ => None,
-            });
-            let Some(path) = path else {
-                ctx.rax = ERR;
-                return;
-            };
-            let Some(data) = copy_in(a2, a3.min(1 << 16)) else {
-                ctx.rax = ERR;
-                return;
-            };
-            match crate::mqueue::send(&path, &data, a4 as u32) {
-                Ok(_) => 0, // POSIX mq_send returns 0
-                Err(-11) => {
-                    if fd_nonblock(a1 as usize) {
-                        (-11i64) as u64
-                    } else {
-                        block_reenter(ctx, task::ticks() + 2, 0)
-                    }
-                }
-                Err(e) => e as u64,
-            }
-        }
+        shared::SYS_MQ_SEND => sys_mq_send(ctx, a1, a2, a3, a4),
         shared::SYS_MQ_RECV => {
             let path = task::with_current(|t| match t.fds.get(a1 as usize) {
                 Some(Some(f)) if crate::mqueue::handles(&f.path) => Some(f.path.clone()),
@@ -1999,6 +1975,13 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_FDASYNC => {
             if crate::virtio::flush_disk() { 0 } else { ERR }
         }
+        shared::SYS_MQ_GETATTR => sys_mq_getattr(a1, a2),
+        shared::SYS_MQ_TIMEDSEND => sys_mq_timedsend(a1, a2, a3, a4, a5),
+        shared::SYS_MQ_TIMEDRECEIVE => sys_mq_timedreceive(a1, a2, a3, a4),
+        shared::SYS_SYNC_FILE_RANGE => sys_sync_file_range(a1, a2, a3, a4),
+        shared::SYS_STATVFS => sys_statvfs(a1, a2, a3),
+        shared::SYS_GETDENTS64 => sys_getdents64(a1, a2, a3),
+        shared::SYS_PROCESS_MADVISE => sys_process_madvise(a1, a2, a3, a4, a5),
         shared::SYS_PIDFD => {
             // (pid) -> fd readable when the task dies; read = 8B status
             match crate::pidfd::create(a1 as u32) {
@@ -4536,6 +4519,27 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
                     a += 0x1000;
                 }
                 t.mem_bytes = t.mem_bytes.saturating_sub(n * 0x1000);
+                // DONTNEED discards CONTENT, not the mapping: cover the
+                // range with a zero-fill sentinel ("" path) so a re-touch
+                // demand-pages zeros instead of faulting the task dead.
+                // Only needed where nothing else claims the VA (eager
+                // anon maps); filemaps overlapping here is harmless —
+                // the find() picks the first covering record anyway and
+                // a real file-backed entry must keep its own claim.
+                if n > 0
+                    && !t.filemaps
+                        .iter()
+                        .any(|f| f.start <= addr && f.end >= end)
+                {
+                    t.filemaps.push(task::FileMap {
+                        start: addr,
+                        end,
+                        path: String::new(),
+                        off: 0,
+                        perm: 1 | 2,
+                        sealed: false,
+                    });
+                }
                 n
             });
             unsafe { x86_64::instructions::tlb::flush_all() };
@@ -6178,6 +6182,282 @@ fn sys_fchmodat(dirfd: i64, pptr: u64, plen: u64, mode: u64, flags: u64) -> u64 
     }
     let ro = mode & 0o222 == 0;
     let _ = vfs::setattr(&path, if ro { 0x01 } else { 0x20 });
+    0
+}
+
+
+/// mq_send(2): real enqueue; full queue -> EAGAIN (O_NONBLOCK) or a
+/// re-enter block for blocking fds. POSIX mq_send returns 0.
+fn sys_mq_send(ctx: &mut CpuContext, fd: u64, ptr: u64, len: u64, prio: u64) -> u64 {
+    let path = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) if crate::mqueue::handles(&f.path) => Some(f.path.clone()),
+        _ => None,
+    });
+    let Some(path) = path else { return ERR };
+    let Some(data) = copy_in(ptr, len.min(1 << 16)) else { return ERR };
+    match crate::mqueue::send(&path, &data, prio as u32) {
+        Ok(_) => 0,
+        Err(-11) => {
+            if fd_nonblock(fd as usize) {
+                (-11i64) as u64
+            } else {
+                block_reenter(ctx, task::ticks() + 2, 0)
+            }
+        }
+        Err(e) => e as u64,
+    }
+}
+
+/// mq_getattr(2): {0,maxmsg,msgsize,curmsgs} — live queue geometry.
+fn sys_mq_getattr(fd: u64, out: u64) -> u64 {
+    let r = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) if crate::mqueue::handles(&f.path) => {
+            crate::mqueue::getattr(&f.path)
+        }
+        _ => Err(-9i64),
+    });
+    match r {
+        Ok((mx, ms, cur)) => {
+            let b = [0u64, mx as u64, ms as u64, cur as u64];
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    b.as_ptr() as *const u8,
+                    core::mem::size_of_val(&b),
+                )
+            };
+            match copy_out(out, bytes) {
+                Some(_) => 0,
+                None => (-14i64) as u64,
+            }
+        }
+        Err(e) => e as u64,
+    }
+}
+
+/// mq_timedsend(2): bounded wait for room — retries the real send each
+/// tick until the absolute {sec,nsec} deadline, then ETIMEDOUT.
+fn sys_mq_timedsend(fd: u64, ptr: u64, len: u64, prio: u64, abst: u64) -> u64 {
+    let dl = match copy_in(abst, 16) {
+        Some(t) => {
+            let sec = u64::from_le_bytes(t[0..8].try_into().unwrap());
+            let nsec = u64::from_le_bytes(t[8..16].try_into().unwrap());
+            if nsec >= 1_000_000_000 {
+                return (-22i64) as u64;
+            }
+            sec.saturating_mul(1000) + nsec / 1_000_000
+        }
+        None => return (-14i64) as u64,
+    };
+    let Some(data) = copy_in(ptr, len.min(1 << 16)) else { return ERR };
+    loop {
+        let path = task::with_current(|t| match t.fds.get(fd as usize) {
+            Some(Some(f)) if crate::mqueue::handles(&f.path) => Some(f.path.clone()),
+            _ => None,
+        });
+        let r = match path {
+            Some(p) => crate::mqueue::send(&p, &data, prio as u32),
+            None => return (-9i64) as u64,
+        };
+        match r {
+            Ok(_) => return 0,
+            Err(-11) => {
+                if crate::timer::uptime_ms() >= dl {
+                    return (-110i64) as u64; // ETIMEDOUT
+                }
+                task::wait_irq();
+            }
+            Err(e) => return e as u64,
+        }
+    }
+}
+
+/// mq_timedreceive(2): bounded wait for a message — retries the real
+/// recv each tick until the deadline, then ETIMEDOUT.
+fn sys_mq_timedreceive(fd: u64, out: u64, len: u64, abst: u64) -> u64 {
+    let dl = match copy_in(abst, 16) {
+        Some(t) => {
+            let sec = u64::from_le_bytes(t[0..8].try_into().unwrap());
+            let nsec = u64::from_le_bytes(t[8..16].try_into().unwrap());
+            if nsec >= 1_000_000_000 {
+                return (-22i64) as u64;
+            }
+            sec.saturating_mul(1000) + nsec / 1_000_000
+        }
+        None => return (-14i64) as u64,
+    };
+    let mut buf = vec![0u8; len.min(1 << 16) as usize];
+    loop {
+        let path = task::with_current(|t| match t.fds.get(fd as usize) {
+            Some(Some(f)) => Some(f.path.clone()),
+            _ => None,
+        });
+        let r = match path {
+            Some(p) if crate::mqueue::handles(&p) => {
+                crate::mqueue::recv(&p, &mut buf)
+            }
+            _ => Err(-9i64),
+        };
+        match r {
+            Ok((n, _prio)) => {
+                return match copy_out(out, &buf[..n]) {
+                    Some(_) => n as u64,
+                    None => (-14i64) as u64,
+                };
+            }
+            Err(-11) => {
+                if crate::timer::uptime_ms() >= dl {
+                    return (-110i64) as u64;
+                }
+                task::wait_irq();
+            }
+            Err(e) => return e as u64,
+        }
+    }
+}
+
+/// sync_file_range(2): flags {1=WRITE,2=WILL_WRITE,4=WAIT} — data is
+/// written synchronously already; this confirms the device flush.
+fn sys_sync_file_range(fd: u64, _off: u64, _len: u64, flags: u64) -> u64 {
+    if flags & !7 != 0 {
+        return (-22i64) as u64;
+    }
+    let ok = task::with_current(|t| {
+        t.fds.get(fd as usize).map(|f| f.is_some()).unwrap_or(false)
+    });
+    if !ok {
+        return (-9i64) as u64;
+    }
+    if crate::virtio::flush_disk() { 0 } else { ERR }
+}
+
+/// statvfs(2): real geometry from the volume's FAT — bsize = cluster
+/// bytes, blocks/bfree from live cluster counts, namemax 255, fsid the
+/// BPB volume id. Path selects the mount; only the root fs exists.
+fn sys_statvfs(pptr: u64, plen: u64, out: u64) -> u64 {
+    let Some(_p) = copy_str(pptr, plen) else { return ERR };
+    let Some((total, free)) = vfs::df() else {
+        return (-1i64) as u64;
+    };
+    let bsz: u64 = 4096;
+    let blocks = total / bsz;
+    let bfree = free / bsz;
+    let v: [u64; 11] = [
+        bsz,   // f_bsize
+        bsz,   // f_frsize
+        blocks,
+        bfree,
+        bfree, // f_bavail
+        0,     // f_files (FAT has no inode table)
+        0,     // f_ffree
+        0,     // f_favail
+        0x434f534d, // f_fsid
+        0,     // f_flag
+        255,   // f_namemax
+    ];
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            v.as_ptr() as *const u8,
+            core::mem::size_of_val(&v),
+        )
+    };
+    match copy_out(out, bytes) {
+        Some(_) => 0,
+        None => (-14i64) as u64,
+    }
+}
+
+/// getdents64(2): real linux_dirent64 packing — ino = the FNV path hash
+/// convention shared with statx/name_to_handle_at, d_type from the
+/// node's kind, d_off = index of the NEXT record.
+fn sys_getdents64(fd: u64, out: u64, buflen: u64) -> u64 {
+    let p = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) => Some(f.path.clone()),
+        _ => None,
+    });
+    let Some(p) = p else { return (-9i64) as u64 };
+    let ents = match vfs::listdir(&p) {
+        Ok(e) => e,
+        Err(e) => return e as u64,
+    };
+    let mut buf = alloc::vec::Vec::new();
+    let base = if p == "/" { String::from("/") } else { alloc::format!("{}/", p.trim_end_matches('/')) };
+    for (i, e) in ents.iter().enumerate() {
+        let nlen = e.name_len.min(96) as usize;
+        let name = &e.name[..nlen];
+        let full = alloc::format!("{}{}", base, core::str::from_utf8(name).unwrap_or(""));
+        // FNV-1a ino — same convention as statx/name_to_handle
+        let mut ino: u64 = 0xcbf29ce484222325;
+        for b in full.as_bytes() {
+            ino ^= *b as u64;
+            ino = ino.wrapping_mul(0x100000001b3);
+        }
+        let reclen = ((19 + nlen + 1 + 7) / 8) * 8;
+        if buf.len() + reclen > buflen as usize {
+            break;
+        }
+        let ty: u8 = if e.is_dir != 0 { 4 } else if e.attr & 0x40 != 0 { 10 } else { 8 };
+        buf.extend_from_slice(&ino.to_le_bytes());
+        buf.extend_from_slice(&((i + 2) as i64).to_le_bytes());
+        buf.extend_from_slice(&(reclen as u16).to_le_bytes());
+        buf.push(ty);
+        buf.extend_from_slice(name);
+        buf.push(0);
+        while buf.len() % 8 != 0 {
+            buf.push(0);
+        }
+    }
+    match copy_out(out, &buf) {
+        Some(_) => buf.len() as u64,
+        None => (-14i64) as u64,
+    }
+}
+
+/// process_madvise(2): MADV_DONTNEED on another task's pages — unmaps
+/// and frees frames out of the TARGET's address space. Page-table
+/// mutation is safe on UP; TLB is flushed after.
+fn sys_process_madvise(pid: u64, addr: u64, len: u64, advice: u64, _flags: u64) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    if advice != shared::MADV_DONTNEED {
+        return (-22i64) as u64;
+    }
+    let end = addr.saturating_add(len.div_ceil(0x1000) * 0x1000);
+    let freed = task::with_pid_mut(pid as u32, |t| {
+        let Some(pml4) = t.pml4 else { return -3i64 };
+        let mut a = addr;
+        let mut n = 0i64;
+        while a < end {
+            if let Some(phys) = elf::unmap_user_page(pml4, a) {
+                if !t.borrowed.contains(&phys) {
+                    mem::free_frame(phys);
+                }
+                task::cow_unmap(pml4.start_address().as_u64(), a);
+                n += 1;
+            }
+            a += 0x1000;
+        }
+        t.mem_bytes = t.mem_bytes.saturating_sub(n as u64 * 0x1000);
+        if n > 0
+            && !t.filemaps
+                .iter()
+                .any(|f| f.start <= addr && f.end >= end)
+        {
+            t.filemaps.push(task::FileMap {
+                start: addr,
+                end,
+                path: String::new(),
+                off: 0,
+                perm: 1 | 2,
+                sealed: false,
+            });
+        }
+        n
+    });
+    if freed < 0 {
+        return freed as u64; // -3 ESRCH (no such task/pml4)
+    }
+    unsafe { x86_64::instructions::tlb::flush_all() };
     0
 }
 
