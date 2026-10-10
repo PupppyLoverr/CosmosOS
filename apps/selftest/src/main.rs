@@ -3972,6 +3972,32 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::umount("/mnt2");
         check("mount-api", ok);
     }
+    // --- fsopen/fsconfig/fsmount + per-mount tmpfs quota (b232) ---
+    {
+        let ctx = ustd::fsopen("tmpfs");
+        let mut ok = ctx >= 0;
+        ok = ok && ustd::fsopen("bogusfs") == -19; // ENODEV
+        ok = ok && ustd::fsconfig_str(ctx, "size", "96K") == 0;
+        ok = ok && ustd::fsconfig_flag(ctx, "nosuid") == 0;
+        ok = ok && ustd::fsconfig_str(ctx, "boguskey", "1") == -22;
+        let mfd = ustd::fsmount(ctx, 0);
+        let _ = ustd::mkdir("/fmp");
+        ok = ok && mfd >= 0 && ustd::move_mount(mfd, "", ustd::AT_FDCWD, "/fmp", 0x40) == 0;
+        // the 96K cap is real: 64K fits, another 48K overflows -> ENOSPC
+        let big = alloc::vec![b'x'; 65536];
+        ok = ok && ustd::write_all("/fmp/a", &big).is_ok();
+        ok = ok && match ustd::write_all("/fmp/b", &alloc::vec![b'y'; 49152]) {
+            Err(e) => e == -28,
+            Ok(()) => false,
+        };
+        // attached as a real tmpfs superblock (kind 1), parent root
+        ok = ok && match ustd::statmount(ustd::mnt_id("/fmp")) {
+            Some((p, _, k, path)) => k == 1 && path == "/fmp" && p == ustd::mnt_id("/"),
+            None => false,
+        };
+        let _ = ustd::umount("/fmp");
+        check("fsapi-quota", ok);
+    }
     check("epoll-flags", {
         // EPOLLET fires once per ready level, EPOLLONESHOT until MOD
         // re-arms, EPOLLHUP surfaces on writer close, and the epoll fd

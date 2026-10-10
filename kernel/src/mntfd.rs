@@ -8,6 +8,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
 
+pub const KIND_SUBTREE: u8 = 0; // open_tree clone → attaches as a bind alias
+pub const KIND_TMPFS: u8 = 1; // fsmount product → attaches as a real tmpfs super
+
 #[derive(Clone)]
 pub struct MntRec {
     pub id: u64,
@@ -15,7 +18,24 @@ pub struct MntRec {
     pub opts: u64,
     /// Some(target) once move_mount has attached the record.
     pub attached: Option<String>,
+    /// KIND_SUBTREE | KIND_TMPFS
+    pub kind: u8,
+    /// Per-instance byte cap for KIND_TMPFS (0 = tmpfs default).
+    pub quota: u64,
 }
+
+/// Filesystem-context record created by fsopen (tmpfs only). fsconfig
+/// mutates it; fsmount materializes it into a detached MntRec.
+#[derive(Clone)]
+pub struct FsCtx {
+    pub id: u64,
+    pub opts: u64,
+    /// `size=` byte cap, 0 = default.
+    pub size: u64,
+}
+
+static FSCTX: Mutex<Vec<FsCtx>> = Mutex::new(Vec::new());
+static FCNEXT: Mutex<u64> = Mutex::new(1);
 
 static REG: Mutex<Vec<MntRec>> = Mutex::new(Vec::new());
 static NEXT: Mutex<u64> = Mutex::new(1);
@@ -42,6 +62,8 @@ pub fn clone_tree(source: &str, opts: u64) -> u64 {
         id,
         source: String::from(source),
         opts,
+        kind: KIND_SUBTREE,
+        quota: 0,
         attached: None,
     });
     id
@@ -82,7 +104,7 @@ pub fn set_opts(id: u64, set: u64, clr: u64) -> Result<(), i64> {
 /// move_mount attach: the record must be detached; installs it as a
 /// bind at `target`, then marks it attached. EBUSY/EINVAL propagate.
 pub fn attach(id: u64, target: &str) -> Result<(), i64> {
-    let (source, opts) = {
+    let (source, opts, kind, quota) = {
         let g = REG.lock();
         let Some(r) = g.iter().find(|r| r.id == id) else {
             return Err(-9);
@@ -90,9 +112,12 @@ pub fn attach(id: u64, target: &str) -> Result<(), i64> {
         if r.attached.is_some() {
             return Err(-16); // EBUSY: already attached
         }
-        (r.source.clone(), r.opts)
+        (r.source.clone(), r.opts, r.kind, r.quota)
     };
-    crate::bind::mount(&source, target, opts)?;
+    match kind {
+        KIND_TMPFS => crate::tmpfs::mount_sized(target, opts, quota)?,
+        _ => crate::bind::mount(&source, target, opts)?,
+    }
     if let Some(r) = REG.lock().iter_mut().find(|r| r.id == id) {
         r.attached = Some(String::from(target));
     }
@@ -132,4 +157,120 @@ fn parent_of(path: &str) -> u64 {
         }
     }
     mnt_id(best)
+}
+
+// ---------------------------------------------------------------------------
+// fsopen/fsconfig/fsmount — a mutable filesystem context that fsmount
+// materializes into a detached mount record. tmpfs is the only fstype.
+
+/// fsopen("tmpfs") → context id. ENODEV for anything else.
+pub fn ctx_create(fstype: &str) -> Result<u64, i64> {
+    if fstype != "tmpfs" {
+        return Err(-19);
+    }
+    let mut n = FCNEXT.lock();
+    let id = *n;
+    *n += 1;
+    FSCTX.lock().push(FsCtx {
+        id,
+        opts: 0,
+        size: 0,
+    });
+    Ok(id)
+}
+
+/// Parse "/fsctx/{id}" fd paths.
+pub fn fd_ctx(path: &str) -> Option<u64> {
+    path.strip_prefix("/fsctx/")?.parse().ok()
+}
+
+fn ctx_mut(id: u64, f: impl Fn(&mut FsCtx) -> Result<(), i64>) -> Result<(), i64> {
+    let mut g = FSCTX.lock();
+    let Some(c) = g.iter_mut().find(|c| c.id == id) else {
+        return Err(-9);
+    };
+    f(c)
+}
+
+fn flag_of(key: &str) -> Option<u64> {
+    match key {
+        "ro" | "rdonly" => Some(shared::MS_RDONLY),
+        "nosuid" => Some(shared::MS_NOSUID),
+        "nodev" => Some(shared::MS_NODEV),
+        "noexec" => Some(shared::MS_NOEXEC),
+        _ => None,
+    }
+}
+
+/// "96K"/"4M"/"1G" or plain digits → bytes.
+fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (d, mul) = match s.as_bytes().last() {
+        Some(b'K') | Some(b'k') => (&s[..s.len() - 1], 1024u64),
+        Some(b'M') | Some(b'm') => (&s[..s.len() - 1], 1024 * 1024),
+        Some(b'G') | Some(b'g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        _ => (s, 1u64),
+    };
+    d.parse::<u64>().ok().map(|v| v.saturating_mul(mul))
+}
+
+/// FSCONFIG_SET_FLAG — a boolean mount flag by name.
+pub fn ctx_flag(id: u64, key: &str) -> Result<(), i64> {
+    let Some(bit) = flag_of(key) else { return Err(-22) };
+    ctx_mut(id, |c| {
+        c.opts |= bit;
+        Ok(())
+    })
+}
+
+/// FSCONFIG_UNSET — clear a flag by name.
+pub fn ctx_unset(id: u64, key: &str) -> Result<(), i64> {
+    let Some(bit) = flag_of(key) else { return Err(-22) };
+    ctx_mut(id, |c| {
+        c.opts &= !bit;
+        Ok(())
+    })
+}
+
+/// FSCONFIG_SET_STRING — "size=96K" (real per-mount quota) or a flag
+/// name carried as a string ("ro"/"nosuid"/...).
+pub fn ctx_string(id: u64, key: &str, val: &str) -> Result<(), i64> {
+    if key == "size" {
+        let Some(q) = parse_size(val) else { return Err(-22) };
+        return ctx_mut(id, |c| {
+            c.size = q;
+            Ok(())
+        });
+    }
+    if let Some(bit) = flag_of(key) {
+        return ctx_mut(id, |c| {
+            c.opts |= bit;
+            Ok(())
+        });
+    }
+    Err(-22)
+}
+
+/// fsmount(ctx) → a detached mount-fd record carrying the ctx's opts
+/// and size; attach materializes a real tmpfs superblock.
+pub fn fsmount(ctx_id: u64) -> Result<u64, i64> {
+    let (opts, quota) = {
+        let g = FSCTX.lock();
+        let Some(c) = g.iter().find(|c| c.id == ctx_id) else {
+            return Err(-9);
+        };
+        (c.opts, c.size)
+    };
+    let mut n = NEXT.lock();
+    let id = *n;
+    *n += 1;
+    REG.lock().push(MntRec {
+        id,
+        source: String::from("tmpfs"),
+        opts,
+        attached: None,
+        kind: KIND_TMPFS,
+        quota,
+    });
+    Ok(id)
 }

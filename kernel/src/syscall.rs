@@ -1352,6 +1352,9 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_STATMOUNT => sys_statmount(a1, a2, a3, a4),
         shared::SYS_LISTMOUNT => sys_listmount(a1, a2, a3),
         shared::SYS_MOUNT_SETATTR => sys_mount_setattr(a1, a2, a3),
+        shared::SYS_FSOPEN => sys_fsopen(a1, a2, a3),
+        shared::SYS_FSCONFIG => sys_fsconfig(a1, a2, a3, a4, a5, ctx.r10),
+        shared::SYS_FSMOUNT => sys_fsmount(a1, a2),
         shared::SYS_CLOCK_NANOSLEEP => {
             // absolute deadline in ms; ticks run 10ms each. A past deadline
             // returns immediately (POSIX TIMER_ABSTIME).
@@ -4321,7 +4324,8 @@ fn sys_mount(argp: u64) -> u64 {
     }
     let opts = flags
         & (shared::MS_RDONLY | shared::MS_NOSUID | shared::MS_NODEV | shared::MS_NOEXEC);
-    crate::tmpfs::mount(&t, opts)
+    // u64[7] (the ABI's spare slot) = tmpfs size= in bytes, 0 = default
+    crate::tmpfs::mount_sized(&t, opts, rd(7))
         .map(|_| 0)
         .unwrap_or_else(|e| e as u64)
 }
@@ -5098,8 +5102,8 @@ fn sys_statx(argp: u64) -> u64 {
 
 fn sys_statfs_out(path: &str, out: u64) -> u64 {
     if crate::tmpfs::handles(path) {
-        let (total, free) = crate::tmpfs::df();
-        let (files, ffree) = crate::tmpfs::ifree();
+        let (total, free) = crate::tmpfs::df(path);
+        let (files, ffree) = crate::tmpfs::ifree(path);
         let cb = 4096u64;
         let b = [
             0x1021_994u64.to_le_bytes(), // TMPFS_MAGIC
@@ -7046,4 +7050,84 @@ fn sys_mount_setattr(mfd: u64, set: u64, clr: u64) -> u64 {
     crate::mntfd::set_opts(id, set & mask, clr & mask)
         .map(|_| 0)
         .unwrap_or_else(|e| e as u64)
+}
+
+/// SYS_FSOPEN(fstype_ptr,len,flags): a mutable fs context for
+/// fsconfig/fsmount. Only "tmpfs" exists.
+fn sys_fsopen(pptr: u64, plen: u64, flags: u64) -> u64 {
+    if flags != 0 {
+        return (-22i64) as u64;
+    }
+    let Some(name) = copy_str(pptr, plen) else {
+        return ERR;
+    };
+    let id = match crate::mntfd::ctx_create(name.trim_matches('\0')) {
+        Ok(i) => i,
+        Err(e) => return e as u64,
+    };
+    task::with_current(|t| {
+        let Some(s) = alloc_slot(t) else { return ERR; };
+        t.fds[s] = Some(task::FileDesc {
+            path: alloc::format!("/fsctx/{}", id),
+            pos: 0,
+            flags: 0,
+        });
+        s as u64
+    })
+}
+
+/// SYS_FSCONFIG(ctxfd,cmd,key_ptr,key_len,val_ptr,val_len): mutate the
+/// context's mount flags / size before fsmount materializes it.
+fn sys_fsconfig(fd: u64, cmd: u64, kptr: u64, klen: u64, vptr: u64, vlen: u64) -> u64 {
+    let mp = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) => Some(f.path.clone()),
+        _ => None,
+    });
+    let Some(id) = mp.as_deref().and_then(crate::mntfd::fd_ctx) else {
+        return (-9i64) as u64; // EBADF: not an fs-context fd
+    };
+    let Some(key) = copy_str(kptr, klen) else {
+        return ERR;
+    };
+    let key = key.trim_matches('\0');
+    let r = match cmd {
+        shared::FSCONFIG_SET_FLAG => crate::mntfd::ctx_flag(id, key),
+        shared::FSCONFIG_UNSET => crate::mntfd::ctx_unset(id, key),
+        shared::FSCONFIG_SET_STRING => {
+            let Some(val) = copy_str(vptr, vlen) else {
+                return ERR;
+            };
+            crate::mntfd::ctx_string(id, key, val.trim_matches('\0'))
+        }
+        _ => Err(-22),
+    };
+    r.map(|_| 0).unwrap_or_else(|e| e as u64)
+}
+
+/// SYS_FSMOUNT(ctxfd,flags): materialize the context into a detached
+/// mount fd; move_mount attaches it as a real tmpfs superblock.
+fn sys_fsmount(fd: u64, flags: u64) -> u64 {
+    if flags != 0 {
+        return (-22i64) as u64;
+    }
+    let mp = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) => Some(f.path.clone()),
+        _ => None,
+    });
+    let Some(ctx_id) = mp.as_deref().and_then(crate::mntfd::fd_ctx) else {
+        return (-9i64) as u64;
+    };
+    let id = match crate::mntfd::fsmount(ctx_id) {
+        Ok(i) => i,
+        Err(e) => return e as u64,
+    };
+    task::with_current(|t| {
+        let Some(s) = alloc_slot(t) else { return ERR; };
+        t.fds[s] = Some(task::FileDesc {
+            path: alloc::format!("/mntfd/{}", id),
+            pos: 0,
+            flags: 0,
+        });
+        s as u64
+    })
 }

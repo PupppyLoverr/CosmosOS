@@ -152,12 +152,12 @@ pub fn under(m: &str, path: &str) -> bool {
     path == m || (path.len() > m.len() && path.starts_with(m) && path.as_bytes()[m.len()] == b'/')
 }
 
-fn mounted(g: &[(String, u64)], path: &str) -> bool {
+fn mounted(g: &[(String, u64, u64)], path: &str) -> bool {
     g.iter().any(|m| under(&m.0, path))
 }
 
 /// Is `path` under a READ-ONLY mount? EROFS gate for all mutators.
-fn ro_of(g: &[(String, u64)], path: &str) -> bool {
+fn ro_of(g: &[(String, u64, u64)], path: &str) -> bool {
     g.iter().any(|m| m.1 & shared::MS_RDONLY != 0 && under(&m.0, path))
 }
 
@@ -179,14 +179,14 @@ pub fn handles(path: &str) -> bool {
     }
     let ns = crate::task::ns_of();
     let g = ns.lock();
-    mounted(&g.tmpfs, path) || g.detached.iter().any(|p| under(p, path))
+    mounted(&g.tmpfs, path) || g.detached.iter().any(|p| under(&p.0, path))
 }
 
 /// Mount points with option flags in the current task's namespace.
 pub fn mounts() -> Vec<(String, u64)> {
     let ns = crate::task::ns_of();
     let g = ns.lock();
-    g.tmpfs.clone()
+    g.tmpfs.iter().map(|m| (m.0.clone(), m.1)).collect()
 }
 
 /// MS_REMOUNT: update the existing mount's ro flag. EINVAL if not mounted.
@@ -220,6 +220,53 @@ fn name_of(path: &str) -> &str {
 fn used_bytes(g: &BTreeMap<String, Node>) -> u64 {
     g.values()
         .map(|n| n.size + n.pages.len() as u64 * 64 + 128)
+        .sum()
+}
+
+/// Every tmpfs/detached mount prefix in the current namespace.
+fn mount_prefixes() -> Vec<(String, u64)> {
+    let ns = crate::task::ns_of();
+    let g = ns.lock();
+    let mut v: Vec<(String, u64)> = g
+        .tmpfs
+        .iter()
+        .map(|m| (m.0.clone(), m.2))
+        .collect();
+    v.extend(g.detached.iter().cloned());
+    v
+}
+
+/// The mount that covers `path` — (prefix, quota). Defaults to the
+/// global cap when nothing matches (unmounted writes can't happen, but
+/// keep a sane fallback for the detached-tree window).
+fn cover(path: &str) -> (String, u64, Vec<(String, u64)>) {
+    let all = mount_prefixes();
+    let mut best: Option<&(String, u64)> = None;
+    for m in &all {
+        if under(&m.0, path) && best.map(|b| m.0.len() > b.0.len()).unwrap_or(true) {
+            best = Some(m);
+        }
+    }
+    match best {
+        Some(m) => (m.0.clone(), m.1, all),
+        None => (String::new(), QUOTA, all),
+    }
+}
+
+/// Bytes charged to one mount: nodes whose *covering* mount is `mp` —
+/// a nested mount's usage does not count toward its parent.
+fn used_for_mount(g: &BTreeMap<String, Node>, all: &[(String, u64)], mp: &str) -> u64 {
+    g.iter()
+        .filter(|(k, _)| {
+            let mut best = "";
+            for m in all {
+                if under(&m.0, k) && m.0.len() >= best.len() {
+                    best = &m.0;
+                }
+            }
+            best == mp
+        })
+        .map(|(_, n)| n.size + n.pages.len() as u64 * 64 + 128)
         .sum()
 }
 
@@ -268,6 +315,14 @@ fn write_pages(n: &mut Node, off: u64, buf: &[u8]) {
 /// existing directory by the caller). EBUSY(-16) if already a mount,
 /// EINVAL(-22) for "/".
 pub fn mount(target: &str, opts: u64) -> Result<(), i64> {
+    mount_sized(target, opts, 0)
+}
+
+/// mount with an explicit per-instance quota (0 = the default QUOTA).
+/// `size=` on tmpfs is real here: each mount's ENOSPC is bounded by its
+/// own byte cap, accounting only nodes under its prefix.
+pub fn mount_sized(target: &str, opts: u64, quota: u64) -> Result<(), i64> {
+    let quota = if quota == 0 { QUOTA } else { quota };
     if target == "/" {
         return Err(-22);
     }
@@ -299,7 +354,7 @@ pub fn mount(target: &str, opts: u64) -> Result<(), i64> {
             xattrs: Vec::new(),
         },
     );
-    mg.tmpfs.push((String::from(target), opts));
+    mg.tmpfs.push((String::from(target), opts, quota));
     mg.tmpfs.sort_by(|a, b| b.0.len().cmp(&a.0.len())); // longest prefix wins
     ANY.fetch_add(1, Ordering::Relaxed);
     Ok(())
@@ -364,16 +419,17 @@ pub fn umount(target: &str, flags: u64) -> Result<(), i64> {
             return Err(-16);
         }
     }
+    let q = mg.tmpfs[i].2;
     mg.tmpfs.remove(i);
     ANY.fetch_sub(1, Ordering::Relaxed);
     if flags & shared::MNT_DETACH != 0 {
         // lazy: keep the node tree serving resolved paths
-        mg.detached.push(String::from(target));
+        mg.detached.push((String::from(target), q));
         return Ok(());
     }
     let mut ng = NODES.lock();
     ng.retain(|k, _| k.as_str() != target && !k.starts_with(&under));
-    mg.detached.retain(|p| p.as_str() != target);
+    mg.detached.retain(|p| p.0.as_str() != target);
     Ok(())
 }
 
@@ -508,7 +564,7 @@ pub fn read_range_pf(path: &str, off: u64, buf: &mut [u8]) -> Option<Result<usiz
                 crate::task::wait_irq();
                 continue;
             };
-            if !mounted(&mg.tmpfs, path) && !mg.detached.iter().any(|p| under(p, path)) {
+            if !mounted(&mg.tmpfs, path) && !mg.detached.iter().any(|p| under(&p.0, path)) {
                 return None;
             }
         }
@@ -559,7 +615,8 @@ pub fn write_range(path: &str, off: u64, buf: &[u8]) -> Result<usize, i64> {
     }
     let end = off + buf.len() as u64;
     let grow = end.saturating_sub(ng.get(path).map(|n| n.size).unwrap_or(0));
-    if used_bytes(&ng) + grow > QUOTA {
+    let (mp, cap, all) = cover(path);
+    if used_for_mount(&ng, &all, &mp) + grow > cap {
         return Err(-28); // ENOSPC
     }
     let n = ng.get_mut(path).unwrap();
@@ -814,19 +871,22 @@ pub fn setattr(path: &str, attr: u8) -> Result<(), i64> {
     Ok(())
 }
 
-/// (total, free) for statfs/df on tmpfs paths.
-pub fn df() -> (u64, u64) {
+/// (total, free) for statfs/df on tmpfs paths — per-mount quota.
+pub fn df(path: &str) -> (u64, u64) {
     let ng = NODES.lock();
-    let u = used_bytes(&ng);
-    (QUOTA, QUOTA.saturating_sub(u))
+    let (mp, cap, all) = cover(path);
+    let u = used_for_mount(&ng, &all, &mp);
+    (cap, cap.saturating_sub(u))
 }
 
 /// (files, ffree) for statfs/df -i: every node (dirs included) is a real
 /// inode; free inodes are bound by the quota — one inode per minimal node.
-pub fn ifree() -> (u64, u64) {
+pub fn ifree(path: &str) -> (u64, u64) {
     let ng = NODES.lock();
+    let (mp, cap, all) = cover(path);
+    let u = used_for_mount(&ng, &all, &mp);
     let used = ng.len() as u64;
-    let free = QUOTA.saturating_sub(used_bytes(&ng)) / 64;
+    let free = cap.saturating_sub(u) / 64;
     (used, free.max(used))
 }
 
