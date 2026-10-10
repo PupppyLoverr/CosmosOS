@@ -3706,3 +3706,67 @@ pub fn faccessat2(dirfd: i64, path: &str, mode: u64, flags: u64) -> i64 {
         flags,
     ) as i64
 }
+
+/// pause(2): block until a signal; returns -4 (EINTR) after delivery.
+pub fn pause() -> i64 {
+    sc0(shared::SYS_PAUSE) as i64
+}
+
+/// name_to_handle_at(2): returns (handle_bytes, handle_type, ino, mount_id).
+pub fn name_to_handle_at(
+    dirfd: i64,
+    path: &str,
+    flags: u64,
+) -> Result<(u32, i32, u64, u64), i64> {
+    let mut fh = [0u8; 16];
+    let mut mid = 0u64;
+    let r = sc6(
+        shared::SYS_NAME_TO_HANDLE,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        fh.as_mut_ptr() as u64,
+        &mut mid as *mut u64 as u64,
+        flags,
+    ) as i64;
+    if r < 0 {
+        return Err(r);
+    }
+    let hb = u32::from_le_bytes([fh[0], fh[1], fh[2], fh[3]]);
+    let ht = i32::from_le_bytes([fh[4], fh[5], fh[6], fh[7]]);
+    let ino = u64::from_le_bytes([
+        fh[8], fh[9], fh[10], fh[11], fh[12], fh[13], fh[14], fh[15],
+    ]);
+    Ok((hb, ht, ino, mid))
+}
+
+/// open_by_handle_at(2): open the file a name_to_handle_at handle names.
+/// mount_fd identifies the mount (any fd on it, or an mntfd). Needs
+/// CAP_DAC_READ_SEARCH.
+pub fn open_by_handle_at(mfd: i64, ino: u64, flags: u64) -> i64 {
+    let mut fh = [0u8; 16];
+    fh[0..4].copy_from_slice(&8u32.to_le_bytes());
+    fh[4..8].copy_from_slice(&1i32.to_le_bytes());
+    fh[8..16].copy_from_slice(&ino.to_le_bytes());
+    sc3(
+        shared::SYS_OPEN_BY_HANDLE,
+        mfd as u64,
+        fh.as_ptr() as u64,
+        flags,
+    ) as i64
+}
+
+/// sched_setattr(2): apply {policy, nice, rt_priority} from a sched_attr.
+pub fn sched_setattr(pid: u32, policy: u32, nice: i32, prio: u32) -> i64 {
+    let mut b = [0u8; 48];
+    b[0..4].copy_from_slice(&48u32.to_le_bytes());
+    b[4..8].copy_from_slice(&policy.to_le_bytes());
+    b[16..20].copy_from_slice(&nice.to_le_bytes());
+    b[20..24].copy_from_slice(&prio.to_le_bytes());
+    sc3(
+        shared::SYS_SCHED_SETATTR,
+        pid as u64,
+        b.as_ptr() as u64,
+        0,
+    ) as i64
+}

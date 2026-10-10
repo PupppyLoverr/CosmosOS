@@ -1994,6 +1994,12 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_PIDFD_OPEN => sys_pidfd_open(a1 as u32, a2),
         shared::SYS_SCHED_GETATTR => sys_sched_getattr(a1 as u32, a2, a3, a4),
         shared::SYS_FACCESSAT2 => sys_faccessat2(a1 as i64, a2, a3, a4, a5),
+        shared::SYS_PAUSE => sys_pause(ctx),
+        shared::SYS_NAME_TO_HANDLE => {
+            sys_name_to_handle(a1 as i64, a2, a3, a4, a5, ctx.r10)
+        }
+        shared::SYS_OPEN_BY_HANDLE => sys_open_by_handle(a1, a2, a3),
+        shared::SYS_SCHED_SETATTR => sys_sched_setattr(a1 as u32, a2, a3),
         shared::SYS_PIDFD => {
             // (pid) -> fd readable when the task dies; read = 8B status
             match crate::pidfd::create(a1 as u32) {
@@ -5752,6 +5758,197 @@ fn sys_faccessat2(dirfd: i64, pptr: u64, plen: u64, mode: u64, flags: u64) -> u6
         }
         Err(e) => e as u64,
     }
+}
+
+
+/// pause(2): sigsuspend with the caller's unchanged mask — returns EINTR
+/// after a delivered (or pending unmasked) signal.
+fn sys_pause(ctx: &mut CpuContext) -> u64 {
+    let m = task::with_current(|t| t.sigmask);
+    sys_sigsuspend(ctx, m)
+}
+
+/// name_to_handle_at(2): {handle_bytes u32, handle_type i32, f_handle u64}
+/// = 16 bytes; f_handle carries our stable FNV-1a path-ino, mount_id the
+/// covering mount's stable id. Default does NOT follow the final symlink —
+/// AT_SYMLINK_FOLLOW names the link's resolved target instead.
+fn sys_name_to_handle(
+    dirfd: i64,
+    pptr: u64,
+    plen: u64,
+    hptr: u64,
+    midptr: u64,
+    flags: u64,
+) -> u64 {
+    const KNOWN: u64 = shared::AT_EMPTY_PATH | shared::AT_SYMLINK_FOLLOW_HANDLE;
+    if flags & !KNOWN != 0 {
+        return (-22i64) as u64;
+    }
+    let empty = copy_str(pptr, plen).map(|p| p.is_empty()).unwrap_or(false);
+    if empty && flags & shared::AT_EMPTY_PATH == 0 {
+        return (-2i64) as u64;
+    }
+    let Some(mut path) = resolve_at(dirfd, pptr, plen) else { return ERR };
+    // FOLLOW: hop the resolved link chain to the target's canonical path
+    if flags & shared::AT_SYMLINK_FOLLOW_HANDLE != 0 {
+        let cwd = task::with_current(|t| t.cwd.clone());
+        for _ in 0..8 {
+            match vfs::readlink_path(&path) {
+                Ok(tgt) => {
+                    path = vfs::normalize(&cwd, &tgt);
+                }
+                Err(_) => break,
+            }
+        }
+    } else if vfs::stat_path_nofollow(&path).is_err()
+        && vfs::stat_path(&path).is_err()
+    {
+        return (-2i64) as u64;
+    }
+    if vfs::stat_path(&path).is_err() {
+        return (-2i64) as u64;
+    }
+    let mut ino: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in path.as_bytes() {
+        ino = (ino ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    // covering mount root: longest ns tmpfs/bind mountpoint under path
+    let root = mount_root_for(&path);
+    let mid = crate::mntfd::mnt_id(&root);
+    let mut fh = [0u8; 16];
+    fh[0..4].copy_from_slice(&8u32.to_le_bytes()); // handle_bytes = 8
+    fh[4..8].copy_from_slice(&1i32.to_le_bytes()); // handle_type = 1 (path-ino)
+    fh[8..16].copy_from_slice(&ino.to_le_bytes());
+    if copy_out(hptr, &fh).is_none() {
+        return (-14i64) as u64;
+    }
+    if copy_out(midptr, &mid.to_le_bytes()).is_none() {
+        return (-14i64) as u64;
+    }
+    0
+}
+
+/// Longest-prefix covering mountpoint (tmpfs or bind dst) — "/" if none.
+fn mount_root_for(path: &str) -> String {
+    let mut best = String::from("/");
+    let mut blen = 0usize;
+    let ns = task::ns_of();
+    let g = ns.lock();
+    for m in &g.tmpfs {
+        if crate::tmpfs::under(&m.0, path) && m.0.len() >= blen {
+            blen = m.0.len();
+            best = m.0.clone();
+        }
+    }
+    for b in &g.binds {
+        if crate::tmpfs::under(&b.0, path) && b.0.len() >= blen {
+            blen = b.0.len();
+            best = b.0.clone();
+        }
+    }
+    best
+}
+
+/// open_by_handle_at(2): resolve the path whose FNV ino the handle carries
+/// by walking the mount's real tree (FAT or tmpfs), then open it.
+/// Needs CAP_DAC_READ_SEARCH (Linux gate); ESTALE when nothing matches.
+fn sys_open_by_handle(mfd: u64, hptr: u64, flags: u64) -> u64 {
+    if !task::capable_ns_dac(crate::task::CAP_DAC_READ_SEARCH) {
+        return (-1i64) as u64; // EPERM
+    }
+    let Some(fh) = copy_in(hptr, 16) else {
+        return (-14i64) as u64;
+    };
+    let hbytes = u32::from_le_bytes([fh[0], fh[1], fh[2], fh[3]]) as usize;
+    if hbytes != 8 {
+        return (-22i64) as u64; // EINVAL: unknown handle layout
+    }
+    let ino = u64::from_le_bytes([
+        fh[8], fh[9], fh[10], fh[11], fh[12], fh[13], fh[14], fh[15],
+    ]);
+    // identify the mount root from the fd's path
+    let fpath = task::with_current(|t| {
+        t.fds
+            .get(mfd as usize)
+            .and_then(|s| s.as_ref())
+            .map(|f| f.path.clone())
+    });
+    let Some(fp) = fpath else { return (-9i64) as u64 };
+    let root = if let Some(id) = crate::mntfd::fd_id(&fp) {
+        // a mount fd: root is its attached target or its source tree
+        match crate::mntfd::get(id) {
+            Some(r) => r.attached.unwrap_or(r.source),
+            None => return (-9i64) as u64,
+        }
+    } else {
+        mount_root_for(&fp)
+    };
+    let Some(found) = find_ino(&root, ino, 0) else {
+        return (-116i64) as u64; // ESTALE
+    };
+    match vfs::open(&found, flags) {
+        Ok(fd) => fd as u64,
+        Err(e) => e as u64,
+    }
+}
+
+/// Depth-first walk matching a path-ino; pseudo trees are skipped so
+/// handles only name real filesystem paths. Node cap guards runaway trees.
+fn find_ino(dir: &str, ino: u64, depth: u32) -> Option<String> {
+    if depth > 12 || dir.starts_with("/proc") || dir.starts_with("/dev/")
+        || dir.starts_with("/pipes") || dir.starts_with("/sys/")
+    {
+        return None;
+    }
+    let ents = vfs::listdir(dir).ok()?;
+    for e in ents {
+        let nlen = e.name.iter().position(|&c| c == 0).unwrap_or(e.name.len());
+        let name = unsafe { core::str::from_utf8_unchecked(&e.name[..nlen]) };
+        if name == "." || name == ".." {
+            continue;
+        }
+        let p = if dir == "/" {
+            alloc::format!("/{}", name)
+        } else {
+            alloc::format!("{}/{}", dir, name)
+        };
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in p.as_bytes() {
+            h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+        if h == ino {
+            return Some(p);
+        }
+        if e.is_dir != 0 {
+            if let Some(hit) = find_ino(&p, ino, depth + 1) {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
+/// sched_setattr(2): apply a sched_attr's policy/priority/nice — EINVAL on
+/// flags, unknown policy or bad prio propagates from sched_set.
+fn sys_sched_setattr(pid: u32, aptr: u64, flags: u64) -> u64 {
+    if flags != 0 {
+        return (-22i64) as u64;
+    }
+    let Some(b) = copy_in(aptr, 48) else {
+        return (-14i64) as u64;
+    };
+    let policy = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as u64;
+    let nice = i32::from_le_bytes([b[16], b[17], b[18], b[19]]) as i64;
+    let prio = u32::from_le_bytes([b[20], b[21], b[22], b[23]]);
+    let r = task::sched_set(pid, policy, prio);
+    if r < 0 {
+        return r as u64;
+    }
+    let r = task::set_nice(pid, nice);
+    if r < 0 {
+        return r as u64;
+    }
+    0
 }
 
 /// SYS_SIGACTION(sig, handler): handler 0=SIG_DFL, 1=SIG_IGN, else a

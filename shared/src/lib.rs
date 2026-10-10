@@ -865,3 +865,9 @@ pub const SYS_PIDFD_OPEN: u64 = 322;     // (pid,flags) -> pidfd
 pub const SYS_SCHED_GETATTR: u64 = 323;  // (pid,&attr,size,flags)
 pub const SYS_FACCESSAT2: u64 = 324;     // (dirfd,pptr,plen,mode,flags)
 pub const AT_EACCESS: u64 = 0x200;
+
+pub const SYS_PAUSE: u64 = 325;              // () -> EINTR on signal
+pub const SYS_NAME_TO_HANDLE: u64 = 326;     // (dirfd,pptr,plen,&fh,&mid,flags)
+pub const SYS_OPEN_BY_HANDLE: u64 = 327;     // (mountfd,&fh,flags) -> fd
+pub const SYS_SCHED_SETATTR: u64 = 328;      // (pid,&attr,flags)
+pub const AT_SYMLINK_FOLLOW_HANDLE: u64 = 0x400; // name_to_handle_at follow bit
