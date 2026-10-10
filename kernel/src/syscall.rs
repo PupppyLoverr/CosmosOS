@@ -1355,6 +1355,9 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_FSOPEN => sys_fsopen(a1, a2, a3),
         shared::SYS_FSCONFIG => sys_fsconfig(a1, a2, a3, a4, a5, ctx.r10),
         shared::SYS_FSMOUNT => sys_fsmount(a1, a2),
+        shared::SYS_FSPICK => sys_fspick(a1 as i64, a2, a3, a4),
+        shared::SYS_EPOLL_PWAIT2 => sys_epoll_pwait2(ctx, a1, a2, a3, a4, a5),
+        shared::SYS_CLONE3 => sys_clone3(ctx, a1, a2),
         shared::SYS_CLOCK_NANOSLEEP => {
             // absolute deadline in ms; ticks run 10ms each. A past deadline
             // returns immediately (POSIX TIMER_ABSTIME).
@@ -7130,4 +7133,116 @@ fn sys_fsmount(fd: u64, flags: u64) -> u64 {
         });
         s as u64
     })
+}
+
+/// SYS_FSPICK(dirfd,path,flags): detach the mount *containing* path
+/// into a mount-fd — unlike open_tree it picks the covering mount
+/// itself, so attaching it anywhere aliases the whole superblock.
+fn sys_fspick(dirfd: i64, pptr: u64, plen: u64, flags: u64) -> u64 {
+    if flags & !(shared::FSPICK_CLOEXEC | shared::FSPICK_EMPTY_PATH) != 0 {
+        return (-22i64) as u64;
+    }
+    let Some(p) = resolve_at(dirfd, pptr, plen) else {
+        return (-2i64) as u64;
+    };
+    let cwd = task::with_current(|t| t.cwd.clone());
+    let pre = vfs::normalize_prebind(&cwd, &p);
+    if vfs::stat_path(&vfs::normalize(&cwd, &p)).is_err() {
+        return (-2i64) as u64;
+    }
+    let cover = task::mount_cover(&pre);
+    let opts = task::mount_opts(&pre)
+        & (shared::MS_RDONLY | shared::MS_NOSUID | shared::MS_NODEV | shared::MS_NOEXEC);
+    let id = crate::mntfd::clone_tree(&cover, opts);
+    task::with_current(|t| {
+        let Some(s) = alloc_slot(t) else { return ERR; };
+        t.fds[s] = Some(task::FileDesc {
+            path: alloc::format!("/mntfd/{}", id),
+            pos: 0,
+            flags: if flags & shared::FSPICK_CLOEXEC != 0 {
+                shared::O_CLOEXEC
+            } else {
+                0
+            },
+        });
+        s as u64
+    })
+}
+
+/// SYS_EPOLL_PWAIT2(epfd,out,max,&timespec{sec,nsec},&mask|0): epoll_wait
+/// with nsec-precision deadline and an optional signal mask held for
+/// the wait's duration (poll_saved_mask swap, like ppoll).
+fn sys_epoll_pwait2(
+    ctx: &mut CpuContext,
+    epfd: u64,
+    out: u64,
+    max: u64,
+    tsp: u64,
+    maskp: u64,
+) -> u64 {
+    let ms = if tsp == 0 {
+        u64::MAX
+    } else {
+        let Some(ts) = copy_in(tsp, 16) else {
+            return ERR;
+        };
+        let sec = u64::from_le_bytes(ts[0..8].try_into().unwrap());
+        let nsec = u64::from_le_bytes(ts[8..16].try_into().unwrap());
+        if nsec >= 1_000_000_000 {
+            return (-22i64) as u64;
+        }
+        sec.saturating_mul(1000).saturating_add(nsec.div_ceil(1_000_000))
+    };
+    if maskp != 0 {
+        let Some(m) = copy_in(maskp, 8) else {
+            return ERR;
+        };
+        let mask = u64::from_le_bytes(m[0..8].try_into().unwrap());
+        task::with_current(|t| {
+            if t.poll_saved_mask == u64::MAX {
+                t.poll_saved_mask = t.sigmask;
+                t.sigmask = mask;
+            }
+        });
+    }
+    // a pending signal the new mask unblocks interrupts immediately
+    let eintr = task::with_current(|t| {
+        let pend = t.sigpending & !t.sigmask;
+        (0..32).any(|i| pend & (1u64 << i) != 0 && t.sighandlers[i] > 1)
+    });
+    if eintr {
+        return (-4i64) as u64;
+    }
+    sys_epoll_wait(ctx, epfd, out, max, ms)
+}
+
+/// SYS_CLONE3(&clone_args,size): struct-passed clone — reads the first
+/// 64B {flags,pidfd,ctid,ptid,exit_signal,stack,stack_size,tls}.
+fn sys_clone3(ctx: &mut CpuContext, argp: u64, size: u64) -> u64 {
+    if size < 64 {
+        return (-22i64) as u64;
+    }
+    let Some(a) = copy_in(argp, 64) else {
+        return ERR;
+    };
+    let rd = |i: usize| u64::from_le_bytes(a[i * 8..i * 8 + 8].try_into().unwrap());
+    let (flags, ctid, ptid, esig, stack, ssz, tls) =
+        (rd(0), rd(2), rd(3), rd(4), rd(5), rd(6), rd(7));
+    if esig > 63 {
+        return (-22i64) as u64;
+    }
+    match task::clone3(ctx, flags, stack, ssz, tls, ctid, esig as u8) {
+        Ok(pid) => {
+            if ptid != 0 && flags & 0x100000 != 0 {
+                // CLONE_PARENT_SETTID: write the child pid to *ptid
+                let _ = copy_out(ptid, &(pid as u64).to_le_bytes());
+            }
+            if ctid != 0 && flags & 0x1000000 != 0 {
+                // CLONE_CHILD_SETTID
+                let _ = copy_out(ctid, &(pid as u64).to_le_bytes());
+            }
+            pid as u64
+        }
+        Err(e) => e as u64,
+    }
 }

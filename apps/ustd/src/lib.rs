@@ -3599,3 +3599,60 @@ pub fn fsconfig_str(ctxfd: i64, key: &str, val: &str) -> i64 {
 pub fn fsmount(ctxfd: i64, flags: u64) -> i64 {
     sc2(shared::SYS_FSMOUNT, ctxfd as u64, flags) as i64
 }
+
+/// fspick(2): detach the mount containing path into a mount fd.
+pub fn fspick(dirfd: i64, path: &str, flags: u64) -> i64 {
+    sc4(
+        shared::SYS_FSPICK,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        flags,
+    ) as i64
+}
+
+/// clone_args for SYS_CLONE3 (first 64 bytes of the Linux struct).
+#[repr(C)]
+pub struct CloneArgs {
+    pub flags: u64,
+    pub pidfd: u64,
+    pub ctid: u64,
+    pub ptid: u64,
+    pub exit_signal: u64,
+    pub stack: u64,
+    pub stack_size: u64,
+    pub tls: u64,
+}
+
+/// clone3(2): child returns 0 at the same instruction, parent gets pid.
+pub fn clone3(a: &CloneArgs) -> i64 {
+    sc2(
+        shared::SYS_CLONE3,
+        a as *const CloneArgs as u64,
+        core::mem::size_of::<CloneArgs>() as u64,
+    ) as i64
+}
+
+/// epoll_pwait2(2): epoll_wait with a nsec timespec and optional mask.
+pub fn epoll_pwait2(
+    epfd: i64,
+    out: &mut [(u32, u32)],
+    sec: u64,
+    nsec: u64,
+    mask: Option<u64>,
+) -> i64 {
+    let ts = [sec, nsec];
+    let m = mask.unwrap_or(0);
+    sc5(
+        shared::SYS_EPOLL_PWAIT2,
+        epfd as u64,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+        ts.as_ptr() as u64,
+        if mask.is_some() {
+            &m as *const u64 as u64
+        } else {
+            0
+        },
+    ) as i64
+}

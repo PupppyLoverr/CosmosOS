@@ -217,6 +217,7 @@ pub struct Task {
     pub ctty: u64,              // controlling tty: /dev/pts/{id} index (0 = none)
     pub ctid_va: u64,           // clear_child_tid: user u64 zeroed+futex-woken on exit
     pub pdeathsig: u8,          // PR_SET_PDEATHSIG: signal on parent's death
+    pub exit_sig: u8,           // clone3 exit_signal — signal parent on death (0 = none, default SIGCHLD)
     pub stop_notified: bool,    // this stop already reported to waitpid
     pub stop_sig: u8,           // signal that stopped it (for WUNTRACED)
     pub sigsuspend_saved: u64,  // pre-suspend mask; u64::MAX = not in sigsuspend
@@ -431,6 +432,7 @@ pub fn init() {
         ctty: 0,
         ctid_va: 0,
         pdeathsig: 0,
+        exit_sig: 17,
         stop_notified: false,
         stop_sig: 0,
         sigsuspend_saved: u64::MAX,
@@ -1043,6 +1045,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         ctty: s.tasks.iter().find(|t| t.id == parent).map(|t| t.ctty).unwrap_or(0),
         ctid_va: 0,
         pdeathsig: 0,
+        exit_sig: 17,
         stop_notified: false,
         stop_sig: 0,
         sigsuspend_saved: u64::MAX,
@@ -1211,6 +1214,7 @@ pub fn spawn_kernel(name: &str, func: extern "C" fn() -> !) -> u32 {
         ctty: 0,
         ctid_va: 0,
         pdeathsig: 0,
+        exit_sig: 17,
         stop_notified: false,
         stop_sig: 0,
         sigsuspend_saved: u64::MAX,
@@ -1443,6 +1447,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         ctty: s.tasks[s.cur].ctty,
         ctid_va: ctid,
         pdeathsig: 0,
+        exit_sig: 17,
         stop_notified: false,
         stop_sig: 0,
         sigsuspend_saved: u64::MAX,
@@ -2076,6 +2081,7 @@ pub fn fork_current(parent_ctx: &CpuContext) -> Option<u32> {
         ctty: cur.ctty,
         ctid_va: 0,
         pdeathsig: 0,
+        exit_sig: 17,
         stop_notified: false,
         stop_sig: 0,
         sigsuspend_saved: u64::MAX,
@@ -3230,6 +3236,28 @@ pub fn set_ns(arc: alloc::sync::Arc<spin::Mutex<MountNs>>) {
 
 /// Mount options of the longest-prefix mount covering `path` in the
 /// current namespace — tmpfs mounts and bind mounts alike.
+/// Longest-prefix mount covering `path` in the current namespace —
+/// fspick's notion of "the mount itself" ("/" when nothing covers).
+pub fn mount_cover(path: &str) -> String {
+    let ns = ns_of();
+    let g = ns.lock();
+    let mut best = "/";
+    let mut best_len = 0usize;
+    for m in &g.tmpfs {
+        if crate::tmpfs::under(&m.0, path) && m.0.len() >= best_len {
+            best_len = m.0.len();
+            best = &m.0;
+        }
+    }
+    for b in &g.binds {
+        if crate::tmpfs::under(&b.0, path) && b.0.len() >= best_len {
+            best_len = b.0.len();
+            best = &b.0;
+        }
+    }
+    String::from(best)
+}
+
 pub fn mount_opts(path: &str) -> u64 {
     let ns = ns_of();
     let g = ns.lock();
@@ -3496,14 +3524,16 @@ fn kill_at(s: &mut Sched, idx: usize, code: i64) {
     let name = t.name.clone();
     let parent = t.parent;
     let dead_sid = t.sid;
+    let esig = t.exit_sig;
     s.tasks.push(t); // keep as tombstone for wait_pid
-    // SIGCHLD: every death path (exit, kill, fault) notifies the parent;
+    // child-death notification: every path (exit, kill, fault) signals the
+    // parent with the clone3 exit_signal (default SIGCHLD, 0 = silent);
     // default disposition ignores it, a registered handler interrupts
-    if parent != 0 {
+    if parent != 0 && esig != 0 {
         if let Some(p) = s.tasks.iter_mut().find(|x| x.id == parent) {
             if p.state != State::Dead {
-                p.sigpending |= 1 << 17;
-                wake_for_signal(p, 17);
+                p.sigpending |= 1 << (esig as u64);
+                wake_for_signal(p, esig as usize);
             }
         }
     }
@@ -5214,4 +5244,106 @@ pub fn mrelease(pid: u32) -> i64 {
     }
     unsafe { x86_64::instructions::tlb::flush_all() };
     0
+}
+
+/// clone3(ctx, flags, stack, stack_size, tls, ctid, exit_sig):
+/// the Linux clone_args contract — CLONE_VM|CLONE_THREAD picks the
+/// shared-mm thread path, otherwise a COW process fork; the child
+/// resumes at the caller's rip with rax=0 on the given (or inherited)
+/// stack. exit_sig is the signal the parent gets on the child's death
+/// (0 = silent; threads must pass 0 like Linux requires).
+pub fn clone3(
+    ctx: &CpuContext,
+    flags: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    ctid: u64,
+    exit_sig: u8,
+) -> Result<u32, i64> {
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_SIGHAND: u64 = 0x800;
+    const CLONE_THREAD: u64 = 0x10000;
+    const CLONE_SETTLS: u64 = 0x80000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+    const ALLOWED: u64 = CLONE_VM
+        | 0x200 // CLONE_FS
+        | 0x400 // CLONE_FILES
+        | CLONE_SIGHAND
+        | CLONE_THREAD
+        | CLONE_SETTLS
+        | 0x100000 // CLONE_PARENT_SETTID
+        | CLONE_CHILD_CLEARTID
+        | 0x400000 // CLONE_DETACHED
+        | 0x1000000; // CLONE_CHILD_SETTID
+    if flags & !ALLOWED != 0 {
+        return Err(-22);
+    }
+    if flags & CLONE_THREAD != 0 && (flags & CLONE_SIGHAND == 0 || exit_sig != 0) {
+        return Err(-22); // Linux: threads share sighand and signal nothing
+    }
+    if stack != 0 && stack_size == 0 {
+        return Err(-22);
+    }
+    // a caller-supplied stack must already be user-mapped at its top
+    if stack != 0 {
+        let ok = with_current(|t| {
+            t.pml4
+                .map(|p| {
+                    crate::elf::translate(p, stack + stack_size - 0x1000).is_some()
+                })
+                .unwrap_or(false)
+        });
+        if !ok {
+            return Err(-12);
+        }
+    }
+    if flags & (CLONE_VM | CLONE_THREAD) != 0 {
+        let Some(pid) = clone_user(ctx.rip, 0, tls, ctid) else {
+            return Err(-11);
+        };
+        // reshape the newborn thread's saved context: same rip, rax=0;
+        // keep clone_user's arena rsp unless the caller gave a stack
+        let _ = with_pid_mut(pid, |t| {
+            let c = unsafe {
+                &mut *((t.kstack_top - core::mem::size_of::<CpuContext>() as u64)
+                    as *mut CpuContext)
+            };
+            let arena_rsp = c.rsp;
+            *c = *ctx;
+            c.rax = 0;
+            c.rsp = if stack != 0 {
+                stack + stack_size
+            } else {
+                arena_rsp
+            };
+            if flags & CLONE_CHILD_CLEARTID != 0 && ctid != 0 {
+                t.ctid_va = ctid;
+            }
+            t.exit_sig = exit_sig;
+            0
+        });
+        return Ok(pid);
+    }
+    let Some(pid) = fork_current(ctx) else {
+        return Err(-11);
+    };
+    let _ = with_pid_mut(pid, |t| {
+        t.exit_sig = exit_sig;
+        if flags & CLONE_SETTLS != 0 {
+            t.fs_base = tls;
+        }
+        if flags & CLONE_CHILD_CLEARTID != 0 && ctid != 0 {
+            t.ctid_va = ctid;
+        }
+        if stack != 0 {
+            let c = unsafe {
+                &mut *((t.kstack_top - core::mem::size_of::<CpuContext>() as u64)
+                    as *mut CpuContext)
+            };
+            c.rsp = stack + stack_size;
+        }
+        0
+    });
+    Ok(pid)
 }

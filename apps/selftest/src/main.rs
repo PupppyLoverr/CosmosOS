@@ -12,6 +12,9 @@ use ustd::*;
 
 static mut PASS: u32 = 0;
 static mut FAIL: u32 = 0;
+// Serial lines get dropped under burst; failed names are re-printed at DONE.
+static mut FAILED: [[u8; 40]; 64] = [[0; 40]; 64];
+static mut NFAIL: usize = 0;
 use core::sync::atomic::{AtomicI64, AtomicU64};
 static THREAD_HIT: AtomicU64 = AtomicU64::new(0);
 
@@ -20,7 +23,14 @@ fn check(name: &str, ok: bool) {
         unsafe { PASS += 1 };
         println!("[selftest] PASS {}", name);
     } else {
-        unsafe { FAIL += 1 };
+        unsafe {
+            FAIL += 1;
+            if NFAIL < FAILED.len() {
+                let n = name.len().min(39);
+                FAILED[NFAIL][..n].copy_from_slice(&name.as_bytes()[..n]);
+                NFAIL += 1;
+            }
+        }
         println!("[selftest] FAIL {}", name);
     }
 }
@@ -3998,6 +4008,72 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
         let _ = ustd::umount("/fmp");
         check("fsapi-quota", ok);
     }
+    // --- fspick / clone3 / epoll_pwait2 (b233) ---
+    {
+        // fspick picks the covering mount itself: /fpk aliases /tmp's root
+        let _ = ustd::mkdir("/fpk");
+        let mfd = ustd::fspick(ustd::AT_FDCWD, "/tmp", 0);
+        let mut ok = mfd >= 0
+            && ustd::move_mount(mfd, "", ustd::AT_FDCWD, "/fpk", 0x40) == 0;
+        ok = ok && ustd::write_all("/fpk/fpk-x", b"FP").is_ok()
+            && ustd::read_all("/tmp/fpk-x")
+                .map(|d| d == b"FP")
+                .unwrap_or(false);
+        let _ = ustd::umount("/fpk");
+        check("fspick-mount", ok);
+    }
+    {
+        // clone3 process child: returns 0 at the same rip
+        let args = ustd::CloneArgs {
+            flags: 0,
+            pidfd: 0,
+            ctid: 0,
+            ptid: 0,
+            exit_signal: 17,
+            stack: 0,
+            stack_size: 0,
+            tls: 0,
+        };
+        let pid = ustd::clone3(&args);
+        let mut ok = pid != 0;
+        if pid == 0 {
+            ustd::exit(6);
+        }
+        ok = ok && ustd::waitpid(pid as u32, 2000) == Ok(6);
+        // EINVAL cases: garbage flags, bad exit_signal, THREAD + signal
+        let mut bad = ustd::CloneArgs { flags: 0x400000000, ..args };
+        ok = ok && ustd::clone3(&bad) == -22;
+        bad.flags = 0x100 | 0x200 | 0x400 | 0x800 | 0x10000;
+        bad.exit_signal = 17; // Linux: threads can't signal the parent
+        ok = ok && ustd::clone3(&bad) == -22;
+        // real shared-mm thread: CLONE_VM|FS|FILES|SIGHAND|THREAD, esig 0
+        static SHARED: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let mut targs = ustd::CloneArgs {
+            flags: 0x100 | 0x200 | 0x400 | 0x800 | 0x10000,
+            exit_signal: 0,
+            ..args
+        };
+        let tid = ustd::clone3(&targs);
+        if tid == 0 {
+            SHARED.store(42, core::sync::atomic::Ordering::SeqCst);
+            ustd::exit(0);
+        }
+        ok = ok && tid > 0;
+        ustd::sleep_ms(150);
+        ok = ok && SHARED.load(core::sync::atomic::Ordering::SeqCst) == 42;
+        targs.exit_signal = 0; // silence unused-field warnings via real reuse
+        check("clone3-api", ok);
+    }
+    {
+        let ep = ustd::epoll_create();
+        let mut out = [(0u32, 0u32); 4];
+        // nsec-precision timeout on an empty interest set -> 0
+        let r = ustd::epoll_pwait2(ep, &mut out, 0, 5_000_000, None);
+        // EINVAL when nsec >= 1e9 — a real validation path
+        let ok = r == 0 && ustd::epoll_pwait2(ep, &mut out, 0, 1_000_000_000, None) == -22;
+        check("epoll-pwait2", ok);
+    }
     check("epoll-flags", {
         // EPOLLET fires once per ready level, EPOLLONESHOT until MOD
         // re-arms, EPOLLHUP surfaces on writer close, and the epoll fd
@@ -7704,6 +7780,13 @@ extern "C" fn user_main(_a: u64, _b: u64) -> i64 {
     }
 
     let (pass, fail) = unsafe { (PASS, FAIL) };
+    for i in 0..unsafe { NFAIL.min(64) } {
+        let b = unsafe { &FAILED[i] };
+        let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+        println!("[selftest] FAILED {}", unsafe {
+            core::str::from_utf8_unchecked(&b[..n])
+        });
+    }
     println!("[selftest] DONE ok={} fail={}", pass, fail);
     fail as i64
 }
