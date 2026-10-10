@@ -70,6 +70,8 @@ pub struct MapEnt {
     pub end: u64,
     pub perm: u8,
     pub name: String,
+    /// mseal(2): reject munmap/mprotect overlap; splits carry it.
+    pub sealed: bool,
 }
 
 /// A file-backed mmap region: VA range -> (path, file offset of `start`).
@@ -82,6 +84,7 @@ pub struct FileMap {
     pub path: String, // "" = demand-zero (bss sentinel)
     pub off: u64,
     pub perm: u8, // R1W2X4 — the demand pager maps with these flags
+    pub sealed: bool,
 }
 
 /// One POSIX timer (timer_create): decays on wall ticks, pends `sig`.
@@ -900,6 +903,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         start: stack_lo,
         end: USER_STACK_TOP,
         perm: 1 | 2,
+        sealed: false,
         name: String::from("[stack]"),
     });
 
@@ -909,6 +913,7 @@ pub fn spawn_user(path: &str, args: &str, parent: u32) -> Result<u32, u64> {
         start: USER_ARG_PAGE,
         end: USER_ARG_PAGE + 0x1000,
         perm: 1 | 2,
+        sealed: false,
         name: String::from("[args]"),
     });
     let abytes = args.as_bytes();
@@ -1304,6 +1309,7 @@ pub fn clone_user(entry: u64, arg: u64, tls: u64, ctid: u64) -> Option<u32> {
         start: slot,
         end: stack_top,
         perm: 1 | 2,
+        sealed: false,
         name: String::from("[tstack]"),
     });
     let filemaps = cur.filemaps.clone();
@@ -2170,6 +2176,7 @@ pub fn exec_current(ctx: &mut CpuContext, path: &str, args: &str) -> bool {
         start: stack_lo,
         end: USER_STACK_TOP,
         perm: 1 | 2,
+        sealed: false,
         name: String::from("[stack]"),
     });
     let Some(argf) = crate::elf::map_user_range(pml4n, USER_ARG_PAGE, 0x1000, &mut frames) else {
@@ -2180,6 +2187,7 @@ pub fn exec_current(ctx: &mut CpuContext, path: &str, args: &str) -> bool {
         start: USER_ARG_PAGE,
         end: USER_ARG_PAGE + 0x1000,
         perm: 1 | 2,
+        sealed: false,
         name: String::from("[args]"),
     });
     let abytes = args.as_bytes();
@@ -4485,7 +4493,7 @@ pub fn record_map(pid: u32, start: u64, end: u64, perm: u8, name: &str) {
     let mut g = SCHED.lock();
     if let Some(s) = g.as_mut() {
         if let Some(t) = s.tasks.iter_mut().find(|t| t.id == pid) {
-            t.maps.push(MapEnt { start, end, perm, name: String::from(name) });
+            t.maps.push(MapEnt { start, end, perm, name: String::from(name), sealed: false });
         }
     }
 }
@@ -5143,4 +5151,66 @@ pub fn sys_arch_prctl(op: u64, val: u64) -> i64 {
         3 => with_current(|t| t.fs_base as i64),
         _ => -22,
     }
+}
+
+/// process_mrelease(2): drop the target's user address space — the
+/// shared pml4's pages are unmapped once (threads share tables), COW
+/// bookkeeping released, then every sharer's maps/filemaps cleared.
+/// Returns 0, -3 ESRCH.
+pub fn mrelease(pid: u32) -> i64 {
+    let mut g = SCHED.lock();
+    let Some(s) = g.as_mut() else { return -1 };
+    let Some(pos) = s
+        .tasks
+        .iter()
+        .position(|t| t.id == pid && t.state != State::Dead)
+    else {
+        return -3;
+    };
+    let Some(pml4) = s.tasks[pos].pml4 else {
+        return 0; // kernel task: no user mm to release
+    };
+    let pml4_phys = pml4.start_address().as_u64();
+    // collect every tracked range across the mm's sharers
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for t in s.tasks.iter().filter(|t| {
+        t.pml4.map(|p| p.start_address().as_u64()) == Some(pml4_phys)
+    }) {
+        for m in &t.maps {
+            ranges.push((m.start, m.end));
+        }
+        for f in &t.filemaps {
+            ranges.push((f.start, f.end));
+        }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    for (a0, e0) in ranges {
+        let mut a = a0 & !0xFFF;
+        while a < e0 {
+            if let Some(phys) = crate::elf::unmap_user_page(pml4, a) {
+                // borrowed frames belong to shm objects — only free a
+                // frame no mm sharer marked borrowed
+                let borrowed = s.tasks.iter().any(|t| {
+                    t.pml4.map(|p| p.start_address().as_u64())
+                        == Some(pml4_phys)
+                        && t.borrowed.contains(&phys)
+                });
+                if !borrowed {
+                    crate::mem::free_frame(phys);
+                }
+            }
+            cow_unmap(pml4_phys, a);
+            a += 0x1000;
+        }
+    }
+    for t in s.tasks.iter_mut().filter(|t| {
+        t.pml4.map(|p| p.start_address().as_u64()) == Some(pml4_phys)
+    }) {
+        t.maps.clear();
+        t.filemaps.clear();
+        t.mem_bytes = 0;
+    }
+    unsafe { x86_64::instructions::tlb::flush_all() };
+    0
 }

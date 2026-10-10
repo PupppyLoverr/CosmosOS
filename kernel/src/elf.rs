@@ -224,6 +224,7 @@ pub fn load_into(
             start: page_lo,
             end: page_hi,
             perm,
+            sealed: false,
             name: String::new(), // filled with the image path by the caller
         });
         // copy file bytes via the phys map (works regardless of active CR3)
@@ -623,6 +624,7 @@ pub fn load_into_lazy(
             start: page_lo,
             end: page_hi,
             perm,
+            sealed: false,
             name: String::new(),
         });
         // misaligned (vaddr,offset) can't be paged in 1:1 — eager that seg
@@ -667,6 +669,7 @@ pub fn load_into_lazy(
                 path: String::from(path),
                 off: poffset - (pvaddr - page_lo),
                 perm,
+            sealed: false,
             });
         }
         // overlap page (file tail + bss head): fill eagerly, zero the tail.
@@ -705,6 +708,7 @@ pub fn load_into_lazy(
                 path: String::new(), // "" = zero-fill
                 off: 0,
                 perm,
+            sealed: false,
             });
         }
     }
