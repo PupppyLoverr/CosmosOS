@@ -30,12 +30,12 @@ static NAMES: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 static SEQ: AtomicU64 = AtomicU64::new(1);
 
-fn id_of(path: &str) -> Option<u64> {
+pub fn qid_of(path: &str) -> Option<u64> {
     path.strip_prefix("/mqueue/")?.parse().ok()
 }
 
 pub fn handles(path: &str) -> bool {
-    id_of(path).is_some()
+    qid_of(path).is_some()
 }
 
 /// mq_open(name, maxmsg, msgsize): returns the fd path, or EEXIST-ish err.
@@ -84,10 +84,25 @@ pub fn unlink(name: &str) -> i64 {
     }
 }
 
+/// mq_notify registrations: qid -> (pid, sig). One-shot per POSIX.
+static NOTIFY: spin::Mutex<alloc::collections::BTreeMap<u64, (u32, u64)>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+/// Register (sig>0) or clear (sig==0) the queue's empty->nonempty signal.
+pub fn notify_set(qid: u64, pid: u32, sig: u64) {
+    let mut g = NOTIFY.lock();
+    if sig == 0 {
+        g.remove(&qid);
+    } else {
+        g.insert(qid, (pid, sig));
+    }
+}
+
 /// mq_send: enqueue (prio,msg) honoring the queue's msgsize cap.
 /// Err(-11) = full (blockable); Err(-28) = EMSGSIZE.
+/// An empty->nonempty transition fires the registered mq_notify signal.
 pub fn send(path: &str, data: &[u8], prio: u32) -> Result<usize, i64> {
-    let id = id_of(path).ok_or(-9i64)?; // EBADF
+    let id = qid_of(path).ok_or(-9i64)?; // EBADF
     let mut g = MQS.lock();
     let q = g.get_mut(&id).ok_or(-9i64)?;
     if data.len() > q.msgsize {
@@ -107,7 +122,13 @@ pub fn send(path: &str, data: &[u8], prio: u32) -> Result<usize, i64> {
         .iter()
         .position(|o| o.prio < prio || (o.prio == prio && o.seq > m.seq))
         .unwrap_or(q.msgs.len());
+    let was_empty = q.msgs.is_empty();
     q.msgs.insert(pos, m);
+    if was_empty {
+        if let Some((pid, sig)) = NOTIFY.lock().remove(&id) {
+            crate::task::signal(pid, sig);
+        }
+    }
     Ok(data.len())
 }
 
@@ -115,7 +136,7 @@ pub fn send(path: &str, data: &[u8], prio: u32) -> Result<usize, i64> {
 /// priority. Err(-11) = empty (blockable); Err(-28) = buf < msgsize
 /// (POSIX requires the buffer to hold a whole message).
 pub fn recv(path: &str, buf: &mut [u8]) -> Result<(usize, u32), i64> {
-    let id = id_of(path).ok_or(-9i64)?;
+    let id = qid_of(path).ok_or(-9i64)?;
     let mut g = MQS.lock();
     let q = g.get_mut(&id).ok_or(-9i64)?;
     let msgsize = q.msgsize;
@@ -137,7 +158,7 @@ pub fn recv(path: &str, buf: &mut [u8]) -> Result<(usize, u32), i64> {
 /// resolves even after mq_unlink — POSIX keeps the queue alive on the
 /// open description; ours keeps it until the last fd releases).
 pub fn exists(path: &str) -> bool {
-    match id_of(path) {
+    match qid_of(path) {
         Some(id) => MQS.lock().contains_key(&id),
         None => false,
     }
@@ -145,7 +166,7 @@ pub fn exists(path: &str) -> bool {
 
 /// poll-readability: nonempty queue
 pub fn ready(path: &str) -> bool {
-    match id_of(path) {
+    match qid_of(path) {
         Some(id) => MQS.lock().get(&id).map(|q| !q.msgs.is_empty()).unwrap_or(false),
         None => false,
     }
@@ -154,7 +175,7 @@ pub fn ready(path: &str) -> bool {
 /// Another desc now references this queue (dup/fork/clone) — POSIX
 /// open-file-description sharing: the queue lives while any fd is open.
 pub fn acquire(path: &str) {
-    if let Some(id) = id_of(path) {
+    if let Some(id) = qid_of(path) {
         if let Some(q) = MQS.lock().get_mut(&id) {
             q.open_ct += 1;
         }
@@ -164,7 +185,7 @@ pub fn acquire(path: &str) {
 /// fd released: decrement open count; a queue whose name was unlinked
 /// AND whose last fd closed is destroyed (POSIX lifetime).
 pub fn release(path: &str) {
-    let Some(id) = id_of(path) else { return };
+    let Some(id) = qid_of(path) else { return };
     let mut names = NAMES.lock();
     let mut g = MQS.lock();
     let Some(q) = g.get_mut(&id) else { return };

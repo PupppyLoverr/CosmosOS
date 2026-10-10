@@ -3770,3 +3770,119 @@ pub fn sched_setattr(pid: u32, policy: u32, nice: i32, prio: u32) -> i64 {
         0,
     ) as i64
 }
+
+/// lstat(2): stat without following the final link.
+pub fn lstat(path: &str) -> Option<shared::Stat> {
+    let mut st = shared::Stat::default();
+    let r = sc3(
+        shared::SYS_LSTAT,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        &mut st as *mut _ as u64,
+    ) as i64;
+    if r == 0 { Some(st) } else { None }
+}
+
+/// truncate(2): resize by path.
+pub fn truncate_path(path: &str, len: u64) -> i64 {
+    sc3(
+        shared::SYS_TRUNCATE,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        len,
+    ) as i64
+}
+
+/// nanosleep(2): {sec,nsec}.
+pub fn nanosleep(sec: u64, nsec: u64) -> i64 {
+    let t = [sec, nsec];
+    sc1(shared::SYS_NANOSLEEP, t.as_ptr() as u64) as i64
+}
+
+/// futimens(2): set mtime on an open fd (times=NULL -> now).
+pub fn futimens(fd: i64) -> i64 {
+    sc2(shared::SYS_FUTIMENS, fd as u64, 0) as i64
+}
+
+/// timer_gettime(2): returns (interval_ms, remaining_ms).
+pub fn timer_gettime(id: u64) -> Option<(u64, u64)> {
+    let mut b = [0u64; 4];
+    let r = sc2(shared::SYS_TIMER_GETTIME, id, b.as_mut_ptr() as u64) as i64;
+    if r != 0 {
+        return None;
+    }
+    let ms = |s: u64, n: u64| s * 1000 + n / 1_000_000;
+    Some((ms(b[0], b[1]), ms(b[2], b[3])))
+}
+
+/// timer_getoverrun(2): always 0 (expiries collapse per tick).
+pub fn timer_getoverrun(id: u64) -> i64 {
+    sc1(shared::SYS_TIMER_OVERRUN, id) as i64
+}
+
+/// mq_notify(2): one-shot signal on empty->nonempty; sig 0 unregisters.
+pub fn mq_notify(fd: i64, sig: u64) -> i64 {
+    sc2(shared::SYS_MQ_NOTIFY, fd as u64, sig) as i64
+}
+
+/// mknodat(2): S_IFIFO -> real fifo; S_IFREG/0 -> regular file.
+pub fn mknodat(dirfd: i64, path: &str, mode: u64, dev: u64) -> i64 {
+    sc5(
+        shared::SYS_MKNODAT,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        mode,
+        dev,
+    ) as i64
+}
+
+/// lchown(2): chown without following the final link.
+pub fn lchown(path: &str, uid: u64, gid: u64) -> i64 {
+    sc4(
+        shared::SYS_LCHOWN,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        uid,
+        gid,
+    ) as i64
+}
+
+/// fchownat(2): dirfd + flags (NOFOLLOW/EMPTY_PATH).
+pub fn fchownat(dirfd: i64, path: &str, uid: u64, gid: u64, flags: u64) -> i64 {
+    sc6(
+        shared::SYS_FCHOWNAT,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        uid,
+        gid,
+        flags,
+    ) as i64
+}
+
+/// fchmodat(2): dirfd + mode + flags.
+pub fn fchmodat(dirfd: i64, path: &str, mode: u64, flags: u64) -> i64 {
+    sc5(
+        shared::SYS_FCHMODAT,
+        dirfd as u64,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        mode,
+        flags,
+    ) as i64
+}
+
+/// rmdir(2): remove a directory only.
+pub fn rmdir(path: &str) -> i64 {
+    sc2(
+        shared::SYS_RMDIR,
+        path.as_ptr() as u64,
+        path.len() as u64,
+    ) as i64
+}
+
+/// fdatasync(2): data-only flush (same device flush as fsync here).
+pub fn fdatasync(fd: i64) -> i64 {
+    sc1(shared::SYS_FDASYNC, fd as u64) as i64
+}

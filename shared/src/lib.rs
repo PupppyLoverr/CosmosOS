@@ -871,3 +871,17 @@ pub const SYS_NAME_TO_HANDLE: u64 = 326;     // (dirfd,pptr,plen,&fh,&mid,flags)
 pub const SYS_OPEN_BY_HANDLE: u64 = 327;     // (mountfd,&fh,flags) -> fd
 pub const SYS_SCHED_SETATTR: u64 = 328;      // (pid,&attr,flags)
 pub const AT_SYMLINK_FOLLOW_HANDLE: u64 = 0x400; // name_to_handle_at follow bit
+
+pub const SYS_LSTAT: u64 = 329;          // (pptr,plen,&Stat)
+pub const SYS_TRUNCATE: u64 = 330;       // (pptr,plen,len)
+pub const SYS_NANOSLEEP: u64 = 331;      // (&timespec{sec,nsec})
+pub const SYS_FUTIMENS: u64 = 332;       // (fd,&times[4u64]|0)
+pub const SYS_TIMER_GETTIME: u64 = 333;  // (id,&itimerspec[4u64])
+pub const SYS_TIMER_OVERRUN: u64 = 334;  // (id) -> overrun count
+pub const SYS_MQ_NOTIFY: u64 = 335;      // (fd,sig|0) register/unregister
+pub const SYS_MKNODAT: u64 = 336;        // (dirfd,pptr,plen,mode,dev)
+pub const SYS_LCHOWN: u64 = 337;         // (pptr,plen,uid,gid) no-follow
+pub const SYS_FCHOWNAT: u64 = 338;       // (dirfd,pptr,plen,uid,gid,flags)
+pub const SYS_FCHMODAT: u64 = 339;       // (dirfd,pptr,plen,mode,flags)
+pub const SYS_RMDIR: u64 = 340;          // (pptr,plen) dir-only remove
+pub const SYS_FDASYNC: u64 = 341;        // (fd)

@@ -638,23 +638,7 @@ pub fn dispatch(ctx: &mut CpuContext) {
         shared::SYS_FSTATAT => sys_fstatat(a1 as i64, a2, a3, a4, a5),
         shared::SYS_FACCESSAT => sys_access_at(a1 as i64, a2, a3, a4),
         shared::SYS_ACCESS => sys_access_at(shared::AT_FDCWD, a1, a2, a3),
-        shared::SYS_UNLINKAT => match resolve_at(a1 as i64, a2, a3) {
-            Some(p) => {
-                // POSIX split: unlink() on a dir is EISDIR, rmdir() on a
-                // non-dir is ENOTDIR.
-                match vfs::stat_path(&p) {
-                    Ok(st) if st.is_dir != 0 && a4 & shared::AT_REMOVEDIR == 0 => {
-                        (-21i64) as u64
-                    }
-                    Ok(st) if st.is_dir == 0 && a4 & shared::AT_REMOVEDIR != 0 => {
-                        (-20i64) as u64
-                    }
-                    Ok(_) => vfs::remove(&p).map(|_| 0).unwrap_or_else(|e| e as u64),
-                    Err(e) => e as u64,
-                }
-            }
-            None => ERR,
-        },
+        shared::SYS_UNLINKAT => sys_unlinkat(a1 as i64, a2, a3, a4),
         shared::SYS_RENAMEAT => {
             // 6-arg shape doesn't fit the 5-register ABI: a1 packs the two
             // dirfds (old low 32, new high 32), then opath,olen,npath,nlen.
@@ -2000,6 +1984,21 @@ pub fn dispatch(ctx: &mut CpuContext) {
         }
         shared::SYS_OPEN_BY_HANDLE => sys_open_by_handle(a1, a2, a3),
         shared::SYS_SCHED_SETATTR => sys_sched_setattr(a1 as u32, a2, a3),
+        shared::SYS_LSTAT => sys_lstat(a1, a2, a3),
+        shared::SYS_TRUNCATE => sys_truncate(a1, a2, a3),
+        shared::SYS_NANOSLEEP => sys_nanosleep(ctx, a1),
+        shared::SYS_FUTIMENS => sys_futimens(a1, a2),
+        shared::SYS_TIMER_GETTIME => sys_timer_gettime(a1, a2),
+        shared::SYS_TIMER_OVERRUN => sys_timer_overrun(a1),
+        shared::SYS_MQ_NOTIFY => sys_mq_notify(a1, a2),
+        shared::SYS_MKNODAT => sys_mknodat(a1 as i64, a2, a3, a4, a5),
+        shared::SYS_LCHOWN => sys_lchown(a1, a2, a3, a4),
+        shared::SYS_FCHOWNAT => sys_fchownat(a1 as i64, a2, a3, a4, a5, ctx.r10),
+        shared::SYS_FCHMODAT => sys_fchmodat(a1 as i64, a2, a3, a4, a5),
+        shared::SYS_RMDIR => sys_unlinkat(shared::AT_FDCWD as i64, a1, a2, shared::AT_REMOVEDIR),
+        shared::SYS_FDASYNC => {
+            if crate::virtio::flush_disk() { 0 } else { ERR }
+        }
         shared::SYS_PIDFD => {
             // (pid) -> fd readable when the task dies; read = 8B status
             match crate::pidfd::create(a1 as u32) {
@@ -5948,6 +5947,237 @@ fn sys_sched_setattr(pid: u32, aptr: u64, flags: u64) -> u64 {
     if r < 0 {
         return r as u64;
     }
+    0
+}
+
+
+/// unlinkat(2): POSIX split — unlink() on a dir is EISDIR, rmdir() on a
+/// non-dir is ENOTDIR. SYS_RMDIR forwards with AT_REMOVEDIR.
+fn sys_unlinkat(dirfd: i64, pptr: u64, plen: u64, flags: u64) -> u64 {
+    match resolve_at(dirfd, pptr, plen) {
+        Some(p) => match vfs::stat_path(&p) {
+            Ok(st) if st.is_dir != 0 && flags & shared::AT_REMOVEDIR == 0 => {
+                (-21i64) as u64
+            }
+            Ok(st) if st.is_dir == 0 && flags & shared::AT_REMOVEDIR != 0 => {
+                (-20i64) as u64
+            }
+            Ok(_) => vfs::remove(&p).map(|_| 0).unwrap_or_else(|e| e as u64),
+            Err(e) => e as u64,
+        },
+        None => ERR,
+    }
+}
+
+/// lstat(2): stat without following the final link.
+fn sys_lstat(pptr: u64, plen: u64, out: u64) -> u64 {
+    let Some(path) = copy_str(pptr, plen) else { return ERR };
+    match vfs::stat_path_nofollow(&path) {
+        Ok(st) => {
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &st as *const _ as *const u8,
+                    core::mem::size_of::<shared::Stat>(),
+                )
+            };
+            match copy_out(out, bytes) {
+                Some(_) => 0,
+                None => ERR,
+            }
+        }
+        Err(e) => e as u64,
+    }
+}
+
+/// truncate(2): resize by path (ftruncate without the fd).
+fn sys_truncate(pptr: u64, plen: u64, len: u64) -> u64 {
+    let Some(path) = copy_str(pptr, plen) else { return ERR };
+    match vfs::truncate_path(&path, len) {
+        Ok(()) => 0,
+        Err(e) => e as u64,
+    }
+}
+
+/// nanosleep(2): {sec,nsec} -> ms ceil through the real sleep path.
+fn sys_nanosleep(ctx: &mut CpuContext, tptr: u64) -> u64 {
+    let Some(t) = copy_in(tptr, 16) else {
+        return (-14i64) as u64;
+    };
+    let sec = u64::from_le_bytes(t[0..8].try_into().unwrap());
+    let nsec = u64::from_le_bytes(t[8..16].try_into().unwrap());
+    if nsec >= 1_000_000_000 {
+        return (-22i64) as u64;
+    }
+    let ms = sec.saturating_mul(1000) + (nsec + 999_999) / 1_000_000;
+    sys_sleep(ctx, ms.max(1))
+}
+
+/// futimens(2): utimensat over the fd's own path.
+fn sys_futimens(fd: u64, tptr: u64) -> u64 {
+    let p = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) => Some(f.path.clone()),
+        _ => None,
+    });
+    let secs = if tptr == 0 {
+        vfs::now_unix()
+    } else {
+        match copy_in(tptr, 32) {
+            Some(t) => u64::from_le_bytes(t[16..24].try_into().unwrap()),
+            None => return (-14i64) as u64,
+        }
+    };
+    match p {
+        Some(p) => vfs::utime(&p, secs).map(|_| 0).unwrap_or_else(|e| e as u64),
+        None => (-9i64) as u64,
+    }
+}
+
+/// timer_gettime(2): itimerspec {interval{sec,nsec}, value{sec,nsec}} —
+/// PTimer ticks are 10ms; 0 value = disarmed.
+fn sys_timer_gettime(id: u64, out: u64) -> u64 {
+    let (cur, int) = task::with_current(|t| {
+        t.ptimers
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| (p.cur, p.int))
+    })
+    .unwrap_or((u64::MAX, 0));
+    if cur == u64::MAX {
+        return (-22i64) as u64; // EINVAL: unknown timer id
+    }
+    let iv_ms = int * 10;
+    let v_ms = cur * 10;
+    let mut b = [0u8; 32];
+    b[0..8].copy_from_slice(&(iv_ms / 1000).to_le_bytes());
+    b[8..16].copy_from_slice(&((iv_ms % 1000) * 1_000_000).to_le_bytes());
+    b[16..24].copy_from_slice(&(v_ms / 1000).to_le_bytes());
+    b[24..32].copy_from_slice(&((v_ms % 1000) * 1_000_000).to_le_bytes());
+    if copy_out(out, &b).is_none() {
+        return (-14i64) as u64;
+    }
+    0
+}
+
+/// timer_getoverrun(2): expiries are collapsed per tick — honest 0.
+fn sys_timer_overrun(id: u64) -> u64 {
+    let found = task::with_current(|t| t.ptimers.iter().any(|p| p.id == id));
+    if found {
+        0
+    } else {
+        (-22i64) as u64
+    }
+}
+
+/// mq_notify(2): one-shot signal registration on empty->nonempty
+/// transitions; sig==0 unregisters. Registration is consumed on fire
+/// (POSIX) and superseded on re-register.
+fn sys_mq_notify(fd: u64, sig: u64) -> u64 {
+    let qid = task::with_current(|t| match t.fds.get(fd as usize) {
+        Some(Some(f)) if crate::mqueue::handles(&f.path) => {
+            crate::mqueue::qid_of(&f.path)
+        }
+        _ => None,
+    });
+    let Some(qid) = qid else { return (-9i64) as u64 };
+    if sig >= 64 {
+        return (-22i64) as u64;
+    }
+    crate::mqueue::notify_set(qid, cur_id(), sig);
+    0
+}
+
+/// mknodat(2): mode's S_IFMT picks the node kind — S_IFIFO makes a real
+/// named pipe; S_IFREG (or 0) a regular file; chr/blk/sock -> EPERM,
+/// matching mknod on vfat.
+fn sys_mknodat(dirfd: i64, pptr: u64, plen: u64, mode: u64, _dev: u64) -> u64 {
+    let Some(path) = resolve_at(dirfd, pptr, plen) else { return ERR };
+    if task::with_current(|t| {
+        t.fds.iter().any(|f| f.as_ref().map(|f| f.path == path).unwrap_or(false))
+    }) || vfs::stat_path(&path).is_ok() || crate::pipes::handles(&path)
+    {
+        return (-17i64) as u64; // EEXIST
+    }
+    match mode & 0o170000 {
+        0o010000 => match crate::pipes::mkfifo(&path) {
+            Ok(()) => 0,
+            Err(e) => e as u64,
+        },
+        0 | 0o100000 => {
+            match vfs::write_all_path(&path, b"") {
+                Ok(()) => 0,
+                Err(e) => e as u64,
+            }
+        }
+        _ => (-1i64) as u64, // EPERM: chr/blk nodes unrepresentable on FAT
+    }
+}
+
+/// lchown(2): chown without following the final link — on tmpfs the
+/// link node itself carries ownership, so the non-resolved path already
+/// names the right node.
+fn sys_lchown(pptr: u64, plen: u64, uid: u64, gid: u64) -> u64 {
+    sys_chown(pptr, plen, uid, gid)
+}
+
+/// fchownat(2): dirfd + AT_SYMLINK_NOFOLLOW (link node, not target) +
+/// AT_EMPTY_PATH.
+fn sys_fchownat(dirfd: i64, pptr: u64, plen: u64, uid: u64, gid: u64, flags: u64) -> u64 {
+    const KNOWN: u64 = shared::AT_EMPTY_PATH | shared::AT_SYMLINK_NOFOLLOW;
+    if flags & !KNOWN != 0 {
+        return (-22i64) as u64;
+    }
+    let empty = copy_str(pptr, plen).map(|p| p.is_empty()).unwrap_or(false);
+    if empty && flags & shared::AT_EMPTY_PATH == 0 {
+        return (-2i64) as u64;
+    }
+    let Some(path) = resolve_at(dirfd, pptr, plen) else { return ERR };
+    let cwd = task::with_current(|t| t.cwd.clone());
+    // follow the link only when NOFOLLOW is absent
+    let full = if flags & shared::AT_SYMLINK_NOFOLLOW == 0 {
+        let mut p = path;
+        for _ in 0..8 {
+            match vfs::readlink_path(&p) {
+                Ok(t) => p = vfs::normalize(&cwd, &t),
+                Err(_) => break,
+            }
+        }
+        p
+    } else {
+        path
+    };
+    if crate::tmpfs::handles(&full) {
+        return crate::tmpfs::chown(&full, uid as u32, gid as u32)
+            .map(|_| 0)
+            .unwrap_or_else(|e| e as u64);
+    }
+    if !task::capable(task::CAP_CHOWN) {
+        return (-1i64) as u64;
+    }
+    (-1i64) as u64 // EPERM on vfat
+}
+
+/// fchmodat(2): dirfd + mode; NOFOLLOW on a symlink -> ENOTSUP (Linux).
+fn sys_fchmodat(dirfd: i64, pptr: u64, plen: u64, mode: u64, flags: u64) -> u64 {
+    const KNOWN: u64 = shared::AT_EMPTY_PATH | shared::AT_SYMLINK_NOFOLLOW;
+    if flags & !KNOWN != 0 {
+        return (-22i64) as u64;
+    }
+    let Some(path) = resolve_at(dirfd, pptr, plen) else { return ERR };
+    if flags & shared::AT_SYMLINK_NOFOLLOW != 0
+        && vfs::readlink_path(&path).is_ok()
+    {
+        return (-95i64) as u64; // ENOTSUP: chmod the link itself
+    }
+    if crate::tmpfs::handles(&path) {
+        return crate::tmpfs::chmod(&path, mode as u16)
+            .map(|_| 0)
+            .unwrap_or_else(|e| e as u64);
+    }
+    if !task::capable(task::CAP_FOWNER) {
+        return (-1i64) as u64;
+    }
+    let ro = mode & 0o222 == 0;
+    let _ = vfs::setattr(&path, if ro { 0x01 } else { 0x20 });
     0
 }
 
