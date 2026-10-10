@@ -2422,12 +2422,13 @@ pub struct MountNs {
     pub id: u64,
     /// Creator's euid — ucounts accounting for max_mnt_namespaces.
     pub owner: u32,
-    /// (mount path, opts) — MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC.
-    pub tmpfs: Vec<(String, u64)>,
+    /// (mount path, opts, quota bytes) — MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC.
+    pub tmpfs: Vec<(String, u64, u64)>,
     /// (target, source, opts) bind aliases — longest-target-prefix first.
     pub binds: Vec<(String, String, u64)>,
     /// Prefixes whose tmpfs node trees outlive their mount point.
-    pub detached: Vec<String>,
+    /// (path, quota bytes) — the mount's quota survives the detach.
+    pub detached: Vec<(String, u64)>,
 }
 
 impl Drop for MountNs {

@@ -3558,3 +3558,44 @@ pub fn listmount(parent: u64, out: &mut [u64]) -> i64 {
         out.len() as u64,
     ) as i64
 }
+
+/// fsopen(2): a mutable tmpfs filesystem context (fstype must be "tmpfs").
+pub fn fsopen(fstype: &str) -> i64 {
+    sc3(
+        shared::SYS_FSOPEN,
+        fstype.as_ptr() as u64,
+        fstype.len() as u64,
+        0,
+    ) as i64
+}
+
+/// fsconfig(2) SET_FLAG — a boolean mount flag by name.
+pub fn fsconfig_flag(ctxfd: i64, key: &str) -> i64 {
+    sc6(
+        shared::SYS_FSCONFIG,
+        ctxfd as u64,
+        shared::FSCONFIG_SET_FLAG,
+        key.as_ptr() as u64,
+        key.len() as u64,
+        0,
+        0,
+    ) as i64
+}
+
+/// fsconfig(2) SET_STRING — "size" byte cap or a flag name.
+pub fn fsconfig_str(ctxfd: i64, key: &str, val: &str) -> i64 {
+    sc6(
+        shared::SYS_FSCONFIG,
+        ctxfd as u64,
+        shared::FSCONFIG_SET_STRING,
+        key.as_ptr() as u64,
+        key.len() as u64,
+        val.as_ptr() as u64,
+        val.len() as u64,
+    ) as i64
+}
+
+/// fsmount(2): materialize the context into a detached mount fd.
+pub fn fsmount(ctxfd: i64, flags: u64) -> i64 {
+    sc2(shared::SYS_FSMOUNT, ctxfd as u64, flags) as i64
+}
